@@ -25,7 +25,6 @@ from src.auth import (
     consume_premium_model_usage,
     create_session_token,
     delete_users_by_usernames,
-    get_remaining_free_quota,
     get_remaining_pro_weekly_quota,
     get_user_by_username,
     is_premium_model,
@@ -38,7 +37,6 @@ from src.auth import (
     verify_session_token,
 )
 from src.config import (
-    AVAILABLE_MODELS,
     CONCEPT_DB_BUILD_MODEL,
     CONCEPT_SCOPE_MODEL,
     DEFAULT_MODEL,
@@ -84,7 +82,6 @@ from src.pdf_parser import (
     extract_exam_metadata_fast,
     extract_first_page_for_metadata,
     extract_pdf_page_catalog,
-    extract_pdf_slice,
     get_page_text_lengths,
     get_pdf_page_count,
     parse_exam_pdf,
@@ -288,7 +285,7 @@ with st.sidebar:
             with st.form("sidebar_login_form"):
                 login_id = st.text_input("아이디 (학번 또는 영문 ID)", placeholder="예: 2026101")
                 login_pw = st.text_input("비밀번호", type="password")
-                login_submit = st.form_submit_button("로그인", type="primary", use_container_width=True)
+                login_submit = st.form_submit_button("로그인", type="primary", width="stretch")
             if login_submit:
                 ok, msg, logged_user = authenticate_user(storage, login_id, login_pw)
                 if ok and logged_user is not None:
@@ -307,7 +304,7 @@ with st.sidebar:
                 reg_nick = st.text_input("닉네임", placeholder="예: 김민준")
                 reg_pw = st.text_input("비밀번호 (4자 이상)", type="password")
                 reg_pw2 = st.text_input("비밀번호 확인", type="password")
-                reg_submit = st.form_submit_button("회원가입", type="primary", use_container_width=True)
+                reg_submit = st.form_submit_button("회원가입", type="primary", width="stretch")
             if reg_submit:
                 if reg_pw != reg_pw2:
                     st.error("비밀번호 확인이 일치하지 않습니다.")
@@ -403,7 +400,7 @@ with st.sidebar:
                     save_key_btn = st.form_submit_button(
                         "💾 개인 키 저장 & 무제한 모드 전환",
                         type="primary",
-                        use_container_width=True,
+                        width="stretch",
                     )
                 if save_key_btn:
                     ok_k, msg_k, updated_u = save_user_custom_api_key(
@@ -419,7 +416,7 @@ with st.sidebar:
             if st.button(
                 "🗑️ 개인 키 삭제 / 무료 회원으로 복귀",
                 key="clear_custom_key_btn",
-                use_container_width=True,
+                width="stretch",
             ):
                 ok_c, msg_c, _ = clear_user_custom_api_key(storage, current_user.username)
                 if ok_c:
@@ -428,7 +425,7 @@ with st.sidebar:
                 else:
                     st.error(msg_c)
 
-        if st.button("🚪 로그아웃", key="logout_btn", use_container_width=True):
+        if st.button("🚪 로그아웃", key="logout_btn", width="stretch"):
             st.session_state["logged_in_username"] = ""
             st.session_state["matched_items"] = []
             st.session_state["generated_exam_pdf"] = None
@@ -459,7 +456,7 @@ with st.sidebar:
             sync_res = st.session_state.get("drive_sync_result") or {}
             if sync_res.get("error"):
                 st.warning(f"Drive 동기화 오류: {sync_res['error'][:160]}")
-            if st.button("🔄 Drive 최신화", key="sidebar_force_sync_btn", use_container_width=True):
+            if st.button("🔄 Drive 최신화", key="sidebar_force_sync_btn", width="stretch"):
                 _run_startup_drive_sync.clear()
                 st.session_state["drive_sync_key"] = ""
                 st.rerun()
@@ -556,11 +553,11 @@ def _render_mode_b_solve_fragment(
 
                 with st.expander("🖼️ 원본 문제 이미지 & 개조 검증 내역 보기", expanded=False):
                     if crop_b:
-                        st.image(crop_b, caption=f"원본 ({q.exam_name} {q.q_num}번)", use_container_width=True)
+                        st.image(crop_b, caption=f"원본 ({q.exam_name} {q.q_num}번)", width="stretch")
                     st.info(f"**자가 검증:** {rw.self_verification_note}")
             else:
                 if crop_b:
-                    st.image(crop_b, use_container_width=True)
+                    st.image(crop_b, width="stretch")
                 else:
                     st.warning("문항 이미지를 불러올 수 없습니다.")
 
@@ -587,7 +584,7 @@ def _render_mode_b_solve_fragment(
                             f"{CIRCLED_MAP[opt_num]} ({opt_num}번)",
                             key=f"omr_{q.id}_{opt_num}",
                             type="primary" if selected else "secondary",
-                            use_container_width=True,
+                            width="stretch",
                         ):
                             st.session_state["user_answers"][q.id] = opt_num
                             st.rerun(scope="fragment")
@@ -625,7 +622,7 @@ def _render_mode_b_solve_fragment(
             # ✨ AI 자동 해설 버튼 & 추가 질문 채팅
             ai_col1, ai_col2 = st.columns([1, 2])
             with ai_col1:
-                if st.button("✨ AI 자동 해설", key=f"ai_btn_{q.id}", use_container_width=True):
+                if st.button("✨ AI 자동 해설", key=f"ai_btn_{q.id}", width="stretch"):
                     if not active_gemini_key:
                         st.error(f"사용 가능한 Gemini API 키({active_key_label})가 설정되지 않았습니다.")
                     elif whitelist is None:
@@ -696,11 +693,11 @@ def _render_mode_b_solve_fragment(
     # 하단 채점하기 버튼
     grade_c1, grade_c2 = st.columns([2, 1])
     with grade_c1:
-        if st.button("📝 채점하기", type="primary", use_container_width=True):
+        if st.button("📝 채점하기", type="primary", width="stretch"):
             st.session_state["graded"] = True
             st.rerun(scope="fragment")
     with grade_c2:
-        if st.button("🔄 답안 초기화", use_container_width=True):
+        if st.button("🔄 답안 초기화", width="stretch"):
             st.session_state["user_answers"] = {}
             st.session_state["graded"] = False
             st.rerun(scope="fragment")
@@ -721,7 +718,7 @@ def _render_admin_panel() -> None:
         ).strip().lower()
     with col_top2:
         st.markdown("<div style='height: 1.65rem;'></div>", unsafe_allow_html=True)
-        if st.button("🔄 회원 목록 새로고침", use_container_width=True, key="admin_refresh_btn"):
+        if st.button("🔄 회원 목록 새로고침", width="stretch", key="admin_refresh_btn"):
             if storage.drive_connected:
                 _run_startup_drive_sync.clear()
                 storage.sync_on_startup(sync_media=False)
@@ -779,7 +776,7 @@ def _render_admin_panel() -> None:
             "주간 고급사용": st.column_config.NumberColumn("주간 고급사용", disabled=True),
         },
         hide_index=True,
-        use_container_width=True,
+        width="stretch",
         key="admin_users_editor",
     )
 
@@ -1010,14 +1007,14 @@ def _render_concept_book_builder_section(key_prefix: str = "tab3") -> None:
                             st.image(
                                 render_pdf_page_png(cb_pdf_bytes, first_s, dpi=130),
                                 caption=f"첫 시작 페이지 (p.{first_s})",
-                                use_container_width=True,
+                                width="stretch",
                             )
                         with pv2:
                             if first_e != first_s:
                                 st.image(
                                     render_pdf_page_png(cb_pdf_bytes, first_e, dpi=130),
                                     caption=f"마지막 끝 페이지 (p.{first_e})",
-                                    use_container_width=True,
+                                    width="stretch",
                                 )
                 except ValueError as ve:
                     st.error(str(ve))
@@ -1098,13 +1095,13 @@ def _render_concept_book_builder_section(key_prefix: str = "tab3") -> None:
                 auto_build_btn = st.button(
                     "🤖 AI 개념 구간 자동 판별 & 단원별 공용 DB 저장",
                     type="primary",
-                    use_container_width=True,
+                    width="stretch",
                     key=f"{key_prefix}_auto_build_btn",
                 )
             with auto_b2:
                 auto_preview_btn = st.button(
                     "🔍 AI 개념 구간만 먼저 미리보기",
-                    use_container_width=True,
+                    width="stretch",
                     key=f"{key_prefix}_auto_preview_btn",
                 )
 
@@ -1208,7 +1205,7 @@ def _render_concept_book_builder_section(key_prefix: str = "tab3") -> None:
             build_db_btn = st.button(
                 "🧠 PyMuPDF 개념 구간 추출 & Gemini 단원별 공용 DB 저장",
                 type="primary",
-                use_container_width=True,
+                width="stretch",
                 key=f"{key_prefix}_build_btn",
             )
 
@@ -1272,13 +1269,13 @@ def _render_concept_book_builder_section(key_prefix: str = "tab3") -> None:
                         file_name=f"{sanitize_id_part(book.book_title)}_concept_db.json",
                         mime="application/json",
                         key=f"{key_prefix}_dl_cb_{b_idx}_{book.id}",
-                        use_container_width=True,
+                        width="stretch",
                     )
                 with b_col3:
                     if st.button(
                         "🗑️ 삭제",
                         key=f"{key_prefix}_del_cb_{b_idx}_{book.id}",
-                        use_container_width=True,
+                        width="stretch",
                     ):
                         del_err = storage.delete_concept_book(book.id)
                         if del_err:
@@ -1335,7 +1332,7 @@ with tab1:
                 "EBSi 기출 문제지 URL 입력",
                 placeholder="https://www.ebsi.co.kr/...",
             )
-            if st.button("🌐 EBSi 링크에서 공개 PDF 추출 시도", use_container_width=False):
+            if st.button("🌐 EBSi 링크에서 공개 PDF 추출 시도", width="content"):
                 with st.spinner("EBSi 페이지에서 공개 PDF 링크 확인 중..."):
                     ebsi_res = attempt_ebsi_pdf_fetch(ebsi_url)
                 if ebsi_res.success and ebsi_res.problem_pdf_bytes:
@@ -1527,7 +1524,7 @@ with tab1:
             run_crop_btn = st.button(
                 "✂️ 1단계: 2단 편집 분석 및 고해상도 문항 크롭",
                 type="primary",
-                use_container_width=True,
+                width="stretch",
                 disabled=is_duplicate_exam,
             )
         with parse_col2:
@@ -1542,8 +1539,8 @@ with tab1:
             elif not exam_name_input.strip():
                 st.error("시험 회차명을 입력해 주세요.")
             else:
-                with st.spinner("PyMuPDF 2단 편집(좌→우 칼럼) 분석 및 250 DPI PNG 크롭 중..."):
-                    crops, has_text = parse_exam_pdf(active_prob_bytes, dpi=250)
+                with st.spinner("PyMuPDF 2단 편집(좌→우 칼럼) 분석 및 220 DPI PNG 크롭 중..."):
+                    crops, has_text = parse_exam_pdf(active_prob_bytes, dpi=220)
                     total_p = get_pdf_page_count(active_prob_bytes)
 
                     # 스캔 PDF 또는 일부 페이지만 이미지(텍스트 부족)인 경우 1페이지씩 순차 Gemini Vision 보완
@@ -1652,7 +1649,7 @@ with tab1:
                         st.image(
                             cq.png_bytes,
                             caption=f"{cq.q_num}번 ({cq.page_num}쪽 · {cq.width}x{cq.height}px)",
-                            use_container_width=True,
+                            width="stretch",
                         )
 
         q_nums_all = [c.q_num for c in parsed_crops]
@@ -1973,7 +1970,7 @@ with tab1:
                                 exam_name=rec.exam_name,
                             )
                             if b:
-                                st.image(b, use_container_width=True)
+                                st.image(b, width="stretch")
                         with c_info:
                             st.markdown("**본질적 풀이 원리 (`core_principles`)**")
                             render_chips(rec.core_principles, variant="blue")
@@ -2077,12 +2074,12 @@ with tab1:
                 search_clicked = st.form_submit_button(
                     "🔍 기출 DB 검색 (파일·문항 불러오기)",
                     type="primary",
-                    use_container_width=True,
+                    width="stretch",
                 )
             with btn_c2:
                 reset_clicked = st.form_submit_button(
                     "🧹 검색 초기화",
-                    use_container_width=True,
+                    width="stretch",
                 )
 
         if search_clicked:
@@ -2143,7 +2140,7 @@ with tab1:
                             if st.button(
                                 "🗑️ 회차 삭제",
                                 key=f"del_exam_search_{subj_cat}_{safe_fn_prefix}",
-                                use_container_width=True,
+                                width="stretch",
                             ):
                                 cnt = storage.delete_exam(exam_name)
                                 _build_cached_exam_exports.clear()
@@ -2167,7 +2164,7 @@ with tab1:
                                 file_name=f"{safe_fn_prefix}_기출정리.html",
                                 mime="text/html",
                                 key=f"dl_html_search_{subj_cat}_{safe_fn_prefix}",
-                                use_container_width=True,
+                                width="stretch",
                             )
                         with dl_c2:
                             st.download_button(
@@ -2176,7 +2173,7 @@ with tab1:
                                 file_name=f"{safe_fn_prefix}_기출정리.md",
                                 mime="text/markdown",
                                 key=f"dl_md_search_{subj_cat}_{safe_fn_prefix}",
-                                use_container_width=True,
+                                width="stretch",
                             )
                         with dl_c3:
                             st.download_button(
@@ -2185,7 +2182,7 @@ with tab1:
                                 file_name=f"{safe_fn_prefix}_ai_index.jsonl",
                                 mime="application/x-ndjson",
                                 key=f"dl_jsonl_search_{subj_cat}_{safe_fn_prefix}",
-                                use_container_width=True,
+                                width="stretch",
                             )
                         with dl_c4:
                             st.download_button(
@@ -2194,7 +2191,7 @@ with tab1:
                                 file_name=f"{safe_fn_prefix}_문제목록.json",
                                 mime="application/json",
                                 key=f"dl_json_search_{subj_cat}_{safe_fn_prefix}",
-                                use_container_width=True,
+                                width="stretch",
                             )
 
                         prob_pdf_name = next((r.source_pdf for r in exam_recs if r.source_pdf), "")
@@ -2212,7 +2209,7 @@ with tab1:
                                     file_name=prob_pdf_name,
                                     mime="application/pdf",
                                     key=f"dl_prob_search_{subj_cat}_{safe_fn_prefix}",
-                                    use_container_width=True,
+                                    width="stretch",
                                 )
                         with dl_c6:
                             ans_bytes = (
@@ -2227,7 +2224,7 @@ with tab1:
                                     file_name=ans_pdf_name,
                                     mime="application/pdf",
                                     key=f"dl_ans_search_{subj_cat}_{safe_fn_prefix}",
-                                    use_container_width=True,
+                                    width="stretch",
                                 )
 
                         with st.expander(f"📋 '{exam_name}' 문항 상세 보기 ({len(exam_recs)}문항)", expanded=False):
@@ -2244,7 +2241,7 @@ with tab1:
                                         exam_name=rec.exam_name,
                                     )
                                     if img_b:
-                                        st.image(img_b, use_container_width=True)
+                                        st.image(img_b, width="stretch")
                                 with col_b:
                                     st.markdown("**본질 원리 (`core_principles`)**")
                                     render_chips(rec.core_principles, variant="blue")
@@ -2335,7 +2332,7 @@ with tab2:
                 if st.button(
                     "📚 선택한 단원으로 지식 화이트리스트 즉시 적용",
                     type="primary",
-                    use_container_width=True,
+                    width="stretch",
                     key="apply_shared_concept_units_btn",
                 ):
                     if not selected_units_list:
@@ -2420,14 +2417,14 @@ with tab2:
                         st.image(
                             render_pdf_page_png(concept_pdf_bytes, first_page_num, dpi=140),
                             caption=f"시작 페이지 ({first_page_num}쪽)",
-                            use_container_width=True,
+                            width="stretch",
                         )
                     with prev_c2:
                         if last_page_num != first_page_num:
                             st.image(
                                 render_pdf_page_png(concept_pdf_bytes, last_page_num, dpi=140),
                                 caption=f"끝 페이지 ({last_page_num}쪽)",
-                                use_container_width=True,
+                                width="stretch",
                             )
                         else:
                             st.caption("단일 페이지가 선택되었습니다.")
@@ -2828,7 +2825,7 @@ with tab2:
                             file_name=f"{sanitize_id_part(pdf_title)}.pdf",
                             mime="application/pdf",
                             type="primary",
-                            use_container_width=True,
+                            width="stretch",
                         )
 
         # ----- 모드 B: 웹에서 바로 풀기 & 자동 채점 + AI 자동 해설 -----
