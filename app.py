@@ -12,7 +12,6 @@ from typing import Any
 import streamlit as st
 
 from src.auth import (
-    FREE_DAILY_LIMIT,
     FREE_EXAMS_PER_UNLOCK,
     PRO_WEEKLY_PREMIUM_LIMIT,
     TIER_LABELS,
@@ -196,6 +195,38 @@ def _get_cached_storage(
 @st.cache_data(ttl=300, show_spinner=False)
 def _run_startup_drive_sync(_storage: StorageManager, sync_fingerprint: str) -> dict[str, Any]:
     return _storage.sync_on_startup(sync_media=False)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _build_cached_exam_exports(
+    _storage: StorageManager,
+    exam_name: str,
+    subj_cat: str,
+    records_sig: str,
+    _exam_recs: list[QuestionRecord],
+) -> tuple[bytes, bytes, bytes, bytes]:
+    """회차별 HTML/MD/JSONL/JSON 내보내기 바이트를 캐싱해 불필요한 크롭 이미지 반복 로드·인코딩을 방지한다."""
+    html_str = build_exam_html(
+        exam_name,
+        subj_cat,
+        _exam_recs,
+        crop_loader=lambda fn, s=subj_cat, e=exam_name: _storage.get_crop_bytes(
+            fn, subject_category=s, exam_name=e
+        ),
+    )
+    md_str = build_exam_markdown(exam_name, subj_cat, _exam_recs)
+    ai_jsonl_str = build_exam_ai_jsonl(_exam_recs)
+    json_str = json.dumps(
+        [r.model_dump() for r in _exam_recs],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return (
+        html_str.encode("utf-8"),
+        md_str.encode("utf-8"),
+        ai_jsonl_str.encode("utf-8"),
+        json_str.encode("utf-8"),
+    )
 
 
 creds = resolve_credentials()
@@ -407,11 +438,11 @@ with st.sidebar:
         st.markdown("---")
         # 등급별 최적 모델 자동 배정 (사이드바 모델 선택 UI 제거)
         if tier_code == "FREE":
-            selected_model = "gemini-3.5-flash-lite"
+            selected_model = EXAM_TAGGING_MODEL
         elif tier_code == "PRO":
-            selected_model, _ = resolve_model_for_user(current_user, "gemini-3.8-flash")
+            selected_model, _ = resolve_model_for_user(current_user, CONCEPT_DB_BUILD_MODEL)
         else:
-            selected_model = "gemini-3.8-flash"
+            selected_model = CONCEPT_DB_BUILD_MODEL
 
         # 저장소 & DB 요약
         all_records = storage.load_db()
@@ -449,6 +480,230 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+
+
+@st.fragment
+def _render_mode_b_solve_fragment(
+    matched_items: list[dict[str, Any]],
+    whitelist: ConceptWhitelist | None,
+    active_gemini_key: str,
+    active_key_label: str,
+    selected_model: str,
+) -> None:
+    """모드 B(웹에서 바로 풀기 & 자동 채점 + AI 자동 해설/채팅) 전용 프래그먼트."""
+    st.markdown("#### ✏️ 실전 풀이 & 자동 채점 + 개념서 기반 AI 자동 해설")
+
+    # 채점 완료 시 상단 성적표 배너
+    if st.session_state.get("graded"):
+        correct_cnt = 0
+        for item in matched_items:
+            q: QuestionRecord = item["question"]
+            rw: RewrittenQuestion | None = item.get("rewritten")
+            truth = rw.preserved_answer if rw else q.answer
+            user_val = st.session_state["user_answers"].get(q.id, "")
+            if normalize_answer(user_val) == normalize_answer(truth) and normalize_answer(user_val) != "":
+                correct_cnt += 1
+        total_q = len(matched_items)
+        score_pct = round((correct_cnt / max(1, total_q)) * 100, 1)
+        st.success(f"📊 **채점 결과: {total_q}문항 중 {correct_cnt}문항 정답 ({score_pct}점)**")
+
+    for seq_num, item in enumerate(matched_items, start=1):
+        q = item["question"]
+        j = item["judgment"]
+        crop_b = item.get("crop_png_bytes")
+        rw = item.get("rewritten")
+        truth_ans = rw.preserved_answer if rw else q.answer
+        concept_ref_str = (
+            item.get("concept_reference")
+            or resolve_question_concept_reference(
+                q, j, whitelist, fallback_source_label=st.session_state.get("concept_source_label", "")
+            )
+        )
+
+        with st.container(border=True):
+            # 카드 상단 헤더 + 배지
+            hdr_col1, hdr_col2 = st.columns([3, 1])
+            with hdr_col1:
+                st.markdown(f"### 문제 {seq_num}번")
+                st.caption(
+                    f"출처: {q.exam_name} {q.q_num}번 · {q.curriculum_subject} ({q.unit_name}) · 본질 원리: {', '.join(q.core_principles)}"
+                )
+            with hdr_col2:
+                if rw is not None:
+                    st.markdown("<span class='chip chip-blue'>✨ 개념서 기준 개조 문항</span>", unsafe_allow_html=True)
+                else:
+                    st.markdown("<span class='chip chip-green'>📌 원문 그대로 출제</span>", unsafe_allow_html=True)
+
+            # 문제 본문 표시
+            if rw is not None:
+                stem_html = _html.escape(rw.rewritten_stem).replace("\n", "<br/>")
+                choices_html = "".join(
+                    f"<div class='rewritten-choice'><b>{CIRCLED_MAP.get(str(ci + 1), f'{ci+1})')}</b> "
+                    f"{_html.escape(rw.rewritten_choices[ci]).replace(chr(10), '<br/>')}</div>"
+                    for ci in range(len(rw.rewritten_choices))
+                )
+                st.markdown(
+                    f"""
+                    <div class="rewritten-card">
+                      <div class="rewritten-stem">{stem_html}</div>
+                      {choices_html}
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+                if rw.replaced_terms_map:
+                    render_chips(rw.replaced_terms_map, variant="purple")
+
+                with st.expander("🖼️ 원본 문제 이미지 & 개조 검증 내역 보기", expanded=False):
+                    if crop_b:
+                        st.image(crop_b, caption=f"원본 ({q.exam_name} {q.q_num}번)", use_container_width=True)
+                    st.info(f"**자가 검증:** {rw.self_verification_note}")
+            else:
+                if crop_b:
+                    st.image(crop_b, use_container_width=True)
+                else:
+                    st.warning("문항 이미지를 불러올 수 없습니다.")
+
+            # 문항 카드 하단: 참고 개념서 단원 및 페이지 번호 표기
+            st.markdown(
+                f"<div style='background:#EFF6FF; border-left:4px solid #2563EB; padding:8px 12px; "
+                f"border-radius:6px; margin:8px 0; font-size:0.9rem; font-weight:600; color:#1E3A8A;'>"
+                f"{_html.escape(concept_ref_str)}</div>",
+                unsafe_allow_html=True,
+            )
+
+            # 답안 입력 UI (객관식 1~5 터치 버튼 또는 주관식 입력)
+            st.markdown("**내 답안 선택 / 입력:**")
+            current_ans = st.session_state["user_answers"].get(q.id, "")
+            is_mc = is_multiple_choice_question(q, rw)
+
+            if is_mc:
+                st.markdown("<div class='omr-row'>", unsafe_allow_html=True)
+                omr_cols = st.columns(5)
+                for opt_num in ("1", "2", "3", "4", "5"):
+                    with omr_cols[int(opt_num) - 1]:
+                        selected = normalize_answer(current_ans) == opt_num
+                        if st.button(
+                            f"{CIRCLED_MAP[opt_num]} ({opt_num}번)",
+                            key=f"omr_{q.id}_{opt_num}",
+                            type="primary" if selected else "secondary",
+                            use_container_width=True,
+                        ):
+                            st.session_state["user_answers"][q.id] = opt_num
+                            st.rerun(scope="fragment")
+                st.markdown("</div>", unsafe_allow_html=True)
+            else:
+                typed = st.text_input(
+                    "주관식 답안 입력",
+                    value=current_ans,
+                    key=f"short_{q.id}",
+                    placeholder="정답을 입력하세요",
+                )
+                st.session_state["user_answers"][q.id] = typed
+
+            # 채점 상태 표시
+            if st.session_state.get("graded"):
+                is_correct = (
+                    normalize_answer(st.session_state["user_answers"].get(q.id, ""))
+                    == normalize_answer(truth_ans)
+                    and normalize_answer(st.session_state["user_answers"].get(q.id, "")) != ""
+                )
+                disp_truth = CIRCLED_MAP.get(normalize_answer(truth_ans), truth_ans)
+                disp_user = CIRCLED_MAP.get(normalize_answer(current_ans), current_ans) or "미입력"
+                if is_correct:
+                    st.success(f"⭕ **정답입니다!** (내 답: {disp_user} / 정답: {disp_truth})")
+                else:
+                    st.error(f"❌ **오답입니다.** (내 답: {disp_user} / 정답: {disp_truth})")
+
+                with st.expander("📖 빠른 정답 해설 보기", expanded=not is_correct):
+                    if rw is not None:
+                        st.markdown(rw.pdf_grounded_explanation)
+                    else:
+                        st.markdown(q.official_explanation)
+                    st.caption(concept_ref_str)
+
+            # ✨ AI 자동 해설 버튼 & 추가 질문 채팅
+            ai_col1, ai_col2 = st.columns([1, 2])
+            with ai_col1:
+                if st.button("✨ AI 자동 해설", key=f"ai_btn_{q.id}", use_container_width=True):
+                    if not active_gemini_key:
+                        st.error(f"사용 가능한 Gemini API 키({active_key_label})가 설정되지 않았습니다.")
+                    elif whitelist is None:
+                        st.error("개념서 화이트리스트가 필요합니다.")
+                    else:
+                        with st.spinner("개념서 범위 내 용어만 사용하여 맞춤 해설 작성 중..."):
+                            try:
+                                exp_md = generate_pdf_grounded_explanation(
+                                    api_key=active_gemini_key,
+                                    model_name=selected_model,
+                                    question=q,
+                                    crop_png_bytes=crop_b,
+                                    whitelist=whitelist,
+                                    user_answer=st.session_state["user_answers"].get(q.id, ""),
+                                    rewritten=rw,
+                                    sliced_text=st.session_state.get("concept_sliced_text", ""),
+                                    concept_reference=concept_ref_str,
+                                )
+                                st.session_state["ai_explanations"][q.id] = exp_md
+                            except Exception as exc:
+                                st.error(f"AI 해설 생성 실패: {exc}")
+
+            if q.id in st.session_state["ai_explanations"]:
+                st.info("✨ **개념서 범위 기준 AI 맞춤 해설**")
+                st.markdown(st.session_state["ai_explanations"][q.id])
+                if concept_ref_str not in st.session_state["ai_explanations"][q.id]:
+                    st.markdown(f"**{_html.escape(concept_ref_str)}**")
+
+                # 문항별 추가 질문 채팅
+                st.markdown("💬 **추가 질문 채팅 (개념서 범위 내 1:1 질의응답)**")
+                q_chat_history: list[dict[str, str]] = st.session_state["ai_chats"].get(q.id, [])
+                for msg in q_chat_history:
+                    with st.chat_message(msg["role"]):
+                        st.markdown(msg["content"])
+
+                with st.form(key=f"chat_form_{q.id}", clear_on_submit=True):
+                    followup_q = st.text_input(
+                        "이 문제에 대해 궁금한 점을 질문하세요",
+                        placeholder="예: 왜 이 식에서 질량비가 이렇게 적용되나요?",
+                        label_visibility="collapsed",
+                    )
+                    send_chat = st.form_submit_button("질문 보내기")
+
+                if send_chat and followup_q.strip():
+                    if not active_gemini_key or whitelist is None:
+                        st.error(f"사용 가능한 Gemini API 키({active_key_label})와 개념서 화이트리스트가 필요합니다.")
+                    else:
+                        q_chat_history.append({"role": "user", "content": followup_q.strip()})
+                        with st.spinner("개념서 범위 내에서 답변 생성 중..."):
+                            try:
+                                reply = chat_followup_with_pdf(
+                                    api_key=active_gemini_key,
+                                    model_name=selected_model,
+                                    question=q,
+                                    crop_png_bytes=crop_b,
+                                    whitelist=whitelist,
+                                    chat_history=q_chat_history[:-1],
+                                    user_question=followup_q.strip(),
+                                    rewritten=rw,
+                                    sliced_text=st.session_state.get("concept_sliced_text", ""),
+                                )
+                                q_chat_history.append({"role": "assistant", "content": reply})
+                                st.session_state["ai_chats"][q.id] = q_chat_history
+                                st.rerun(scope="fragment")
+                            except Exception as exc:
+                                st.error(f"답변 생성 오류: {exc}")
+
+    # 하단 채점하기 버튼
+    grade_c1, grade_c2 = st.columns([2, 1])
+    with grade_c1:
+        if st.button("📝 채점하기", type="primary", use_container_width=True):
+            st.session_state["graded"] = True
+            st.rerun(scope="fragment")
+    with grade_c2:
+        if st.button("🔄 답안 초기화", use_container_width=True):
+            st.session_state["user_answers"] = {}
+            st.session_state["graded"] = False
+            st.rerun(scope="fragment")
 
 
 def _render_admin_panel() -> None:
@@ -1891,57 +2146,51 @@ with tab1:
                                 use_container_width=True,
                             ):
                                 cnt = storage.delete_exam(exam_name)
+                                _build_cached_exam_exports.clear()
                                 st.success(f"'{exam_name}' ({cnt}문항) 삭제 완료")
                                 st.rerun()
 
-                        # 회차별 정리 파일 & 원본 PDF 다운로드 바
+                        # 회차별 정리 파일 & 원본 PDF 다운로드 바 (캐싱 적용)
+                        records_sig = f"{len(exam_recs)}:{','.join(r.id for r in exam_recs)}"
+                        html_bytes, md_bytes, ai_jsonl_bytes, json_bytes = _build_cached_exam_exports(
+                            storage,
+                            exam_name,
+                            subj_cat,
+                            records_sig,
+                            exam_recs,
+                        )
                         dl_c1, dl_c2, dl_c3, dl_c4, dl_c5, dl_c6 = st.columns(6)
                         with dl_c1:
-                            html_str = build_exam_html(
-                                exam_name,
-                                subj_cat,
-                                exam_recs,
-                                crop_loader=lambda fn, s=subj_cat, e=exam_name: storage.get_crop_bytes(
-                                    fn, subject_category=s, exam_name=e
-                                ),
-                            )
                             st.download_button(
                                 "🌐 웹페이지(HTML)",
-                                data=html_str.encode("utf-8"),
+                                data=html_bytes,
                                 file_name=f"{safe_fn_prefix}_기출정리.html",
                                 mime="text/html",
                                 key=f"dl_html_search_{subj_cat}_{safe_fn_prefix}",
                                 use_container_width=True,
                             )
                         with dl_c2:
-                            md_str = build_exam_markdown(exam_name, subj_cat, exam_recs)
                             st.download_button(
                                 "📝 정리본(MD)",
-                                data=md_str.encode("utf-8"),
+                                data=md_bytes,
                                 file_name=f"{safe_fn_prefix}_기출정리.md",
                                 mime="text/markdown",
                                 key=f"dl_md_search_{subj_cat}_{safe_fn_prefix}",
                                 use_container_width=True,
                             )
                         with dl_c3:
-                            ai_jsonl_str = build_exam_ai_jsonl(exam_recs)
                             st.download_button(
                                 "🤖 AI용(JSONL)",
-                                data=ai_jsonl_str.encode("utf-8"),
+                                data=ai_jsonl_bytes,
                                 file_name=f"{safe_fn_prefix}_ai_index.jsonl",
                                 mime="application/x-ndjson",
                                 key=f"dl_jsonl_search_{subj_cat}_{safe_fn_prefix}",
                                 use_container_width=True,
                             )
                         with dl_c4:
-                            json_str = json.dumps(
-                                [r.model_dump() for r in exam_recs],
-                                ensure_ascii=False,
-                                separators=(",", ":"),
-                            )
                             st.download_button(
                                 "📦 JSON",
-                                data=json_str.encode("utf-8"),
+                                data=json_bytes,
                                 file_name=f"{safe_fn_prefix}_문제목록.json",
                                 mime="application/json",
                                 key=f"dl_json_search_{subj_cat}_{safe_fn_prefix}",
@@ -2271,22 +2520,22 @@ with tab2:
                     key="tab2_free_use_unlock_credit",
                 )
             if use_unlocked_premium:
-                match_model = "gemini-3.5-flash"
+                match_model = EXAM_TAGGING_MODEL
                 rewrite_model = REWRITE_MODEL
                 st.info(
                     f"🔓 **무료 회원 (FREE)** · 해금 크레딧 사용: 상위 문제 개조 **{MODEL_LABELS.get(rewrite_model, rewrite_model)}** "
                     f"(실행 시 크레딧 1회 차감 · 남은 크레딧 {free_credits}회)"
                 )
             else:
-                match_model = "gemini-3.5-flash-lite"
-                rewrite_model = "gemini-3.5-flash-lite"
+                match_model = EXAM_TAGGING_MODEL
+                rewrite_model = EXAM_TAGGING_MODEL
                 prog_mod = free_uploads % FREE_EXAMS_PER_UNLOCK
                 st.info(
                     f"🆓 **무료 회원 (FREE)** · **Gemini 3.5 Flash-Lite**로 추론 실행 "
                     f"(기출 PDF {FREE_EXAMS_PER_UNLOCK}회 업로드마다 PRO/ULTRA/ADMIN 전용 모델 1회 해금 · 현재 {prog_mod}/{FREE_EXAMS_PER_UNLOCK}회)"
                 )
         else:
-            match_model = "gemini-3.5-flash"
+            match_model = EXAM_TAGGING_MODEL
             rewrite_model, rewrite_notice = resolve_model_for_user(current_user, REWRITE_MODEL)
             if current_user.tier == "PRO":
                 st.info(
@@ -2398,47 +2647,75 @@ with tab2:
                             assembled: list[dict[str, Any]] = []
                             prog = st.progress(0.0)
                             stat = st.empty()
+                            sliced_text_ctx = st.session_state.get("concept_sliced_text", "")
+                            fallback_source_ctx = st.session_state.get("concept_source_label", "")
 
-                            for idx, (q, j) in enumerate(selected_pairs, start=1):
-                                crop_bytes = storage.get_crop_bytes(q.image_filename)
-                                rewritten_obj: RewrittenQuestion | None = None
+                            prepared_items: list[tuple[QuestionRecord, Any, bytes | None, str]] = []
+                            rewrite_indices: list[int] = []
+                            for idx, (q, j) in enumerate(selected_pairs):
+                                crop_bytes = storage.get_crop_bytes(
+                                    q.image_filename,
+                                    subject_category=q.subject_category,
+                                    exam_name=q.exam_name,
+                                )
                                 concept_ref = resolve_question_concept_reference(
                                     question=q,
                                     judgment=j,
                                     whitelist=whitelist,
-                                    fallback_source_label=st.session_state.get("concept_source_label", ""),
+                                    fallback_source_label=fallback_source_ctx,
                                 )
-
+                                prepared_items.append((q, j, crop_bytes, concept_ref))
                                 if j.needs_rewriting and auto_rewrite_mode:
-                                    stat.info(
-                                        f"상위 문제 자동 개조 중 ({idx}/{len(selected_pairs)}): {q.exam_name} {q.q_num}번 "
-                                        f"(치환 대상: {', '.join(j.out_of_scope_terms)})"
-                                    )
-                                    try:
-                                        rewritten_obj = rewrite_question_for_pdf(
+                                    rewrite_indices.append(idx)
+
+                            rewritten_results: dict[int, RewrittenQuestion] = {}
+                            failed_indices: set[int] = set()
+                            if rewrite_indices:
+                                total_rw = len(rewrite_indices)
+                                stat.info(f"상위 문제 {total_rw}문항 병렬 자동 개조 중 (최대 4스레드)...")
+                                with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+                                    future_map = {}
+                                    for idx in rewrite_indices:
+                                        q, j, crop_bytes, _ = prepared_items[idx]
+                                        fut = executor.submit(
+                                            rewrite_question_for_pdf,
                                             api_key=active_gemini_key,
                                             model_name=rewrite_model,
                                             question=q,
                                             crop_png_bytes=crop_bytes,
                                             whitelist=whitelist,
                                             out_of_scope_terms=j.out_of_scope_terms,
-                                            sliced_text=st.session_state.get("concept_sliced_text", ""),
+                                            sliced_text=sliced_text_ctx,
                                         )
-                                    except Exception as exc:
-                                        st.error(f"{q.id} 개조 실패 (원본 제외): {exc}")
-                                        continue
+                                        future_map[fut] = idx
 
+                                    done_cnt = 0
+                                    for fut in concurrent.futures.as_completed(future_map):
+                                        idx = future_map[fut]
+                                        q_done = prepared_items[idx][0]
+                                        done_cnt += 1
+                                        try:
+                                            rewritten_results[idx] = fut.result()
+                                        except Exception as exc:
+                                            failed_indices.add(idx)
+                                            st.error(f"{q_done.id} 개조 실패 (원본 제외): {exc}")
+                                        prog.progress(done_cnt / total_rw)
+                                        stat.info(f"상위 문제 병렬 자동 개조 중 ({done_cnt}/{total_rw})...")
+
+                            for idx, (q, j, crop_bytes, concept_ref) in enumerate(prepared_items):
+                                if idx in failed_indices:
+                                    continue
                                 assembled.append(
                                     {
                                         "question": q,
                                         "judgment": j,
                                         "crop_png_bytes": crop_bytes,
-                                        "rewritten": rewritten_obj,
+                                        "rewritten": rewritten_results.get(idx),
                                         "concept_reference": concept_ref,
                                     }
                                 )
-                                prog.progress(idx / len(selected_pairs))
 
+                            prog.progress(1.0)
                             stat.empty()
                             consume_extraction_quota(
                                 storage, current_user.username, len(assembled)
@@ -2556,219 +2833,13 @@ with tab2:
 
         # ----- 모드 B: 웹에서 바로 풀기 & 자동 채점 + AI 자동 해설 -----
         with mode_tab_b:
-            st.markdown("#### ✏️ 실전 풀이 & 자동 채점 + 개념서 기반 AI 자동 해설")
-
-            # 채점 완료 시 상단 성적표 배너
-            if st.session_state.get("graded"):
-                correct_cnt = 0
-                for item in matched_items:
-                    q: QuestionRecord = item["question"]
-                    rw: RewrittenQuestion | None = item.get("rewritten")
-                    truth = rw.preserved_answer if rw else q.answer
-                    user_val = st.session_state["user_answers"].get(q.id, "")
-                    if normalize_answer(user_val) == normalize_answer(truth) and normalize_answer(user_val) != "":
-                        correct_cnt += 1
-                total_q = len(matched_items)
-                score_pct = round((correct_cnt / max(1, total_q)) * 100, 1)
-                st.success(f"📊 **채점 결과: {total_q}문항 중 {correct_cnt}문항 정답 ({score_pct}점)**")
-
-            for seq_num, item in enumerate(matched_items, start=1):
-                q = item["question"]
-                j = item["judgment"]
-                crop_b = item.get("crop_png_bytes")
-                rw = item.get("rewritten")
-                truth_ans = rw.preserved_answer if rw else q.answer
-                concept_ref_str = (
-                    item.get("concept_reference")
-                    or resolve_question_concept_reference(
-                        q, j, whitelist, fallback_source_label=st.session_state.get("concept_source_label", "")
-                    )
-                )
-
-                with st.container(border=True):
-                    # 카드 상단 헤더 + 배지
-                    hdr_col1, hdr_col2 = st.columns([3, 1])
-                    with hdr_col1:
-                        st.markdown(f"### 문제 {seq_num}번")
-                        st.caption(
-                            f"출처: {q.exam_name} {q.q_num}번 · {q.curriculum_subject} ({q.unit_name}) · 본질 원리: {', '.join(q.core_principles)}"
-                        )
-                    with hdr_col2:
-                        if rw is not None:
-                            st.markdown("<span class='chip chip-blue'>✨ 개념서 기준 개조 문항</span>", unsafe_allow_html=True)
-                        else:
-                            st.markdown("<span class='chip chip-green'>📌 원문 그대로 출제</span>", unsafe_allow_html=True)
-
-                    # 문제 본문 표시
-                    if rw is not None:
-                        stem_html = _html.escape(rw.rewritten_stem).replace("\n", "<br/>")
-                        choices_html = "".join(
-                            f"<div class='rewritten-choice'><b>{CIRCLED_MAP.get(str(ci + 1), f'{ci+1})')}</b> "
-                            f"{_html.escape(rw.rewritten_choices[ci]).replace(chr(10), '<br/>')}</div>"
-                            for ci in range(len(rw.rewritten_choices))
-                        )
-                        st.markdown(
-                            f"""
-                            <div class="rewritten-card">
-                              <div class="rewritten-stem">{stem_html}</div>
-                              {choices_html}
-                            </div>
-                            """,
-                            unsafe_allow_html=True,
-                        )
-                        if rw.replaced_terms_map:
-                            render_chips(rw.replaced_terms_map, variant="purple")
-
-                        with st.expander("🖼️ 원본 문제 이미지 & 개조 검증 내역 보기", expanded=False):
-                            if crop_b:
-                                st.image(crop_b, caption=f"원본 ({q.exam_name} {q.q_num}번)", use_container_width=True)
-                            st.info(f"**자가 검증:** {rw.self_verification_note}")
-                    else:
-                        if crop_b:
-                            st.image(crop_b, use_container_width=True)
-                        else:
-                            st.warning("문항 이미지를 불러올 수 없습니다.")
-
-                    # 문항 카드 하단: 참고 개념서 단원 및 페이지 번호 표기
-                    st.markdown(
-                        f"<div style='background:#EFF6FF; border-left:4px solid #2563EB; padding:8px 12px; "
-                        f"border-radius:6px; margin:8px 0; font-size:0.9rem; font-weight:600; color:#1E3A8A;'>"
-                        f"{_html.escape(concept_ref_str)}</div>",
-                        unsafe_allow_html=True,
-                    )
-
-                    # 답안 입력 UI (객관식 1~5 터치 버튼 또는 주관식 입력)
-                    st.markdown("**내 답안 선택 / 입력:**")
-                    current_ans = st.session_state["user_answers"].get(q.id, "")
-                    is_mc = is_multiple_choice_question(q, rw)
-
-                    if is_mc:
-                        st.markdown("<div class='omr-row'>", unsafe_allow_html=True)
-                        omr_cols = st.columns(5)
-                        for opt_num in ("1", "2", "3", "4", "5"):
-                            with omr_cols[int(opt_num) - 1]:
-                                selected = normalize_answer(current_ans) == opt_num
-                                if st.button(
-                                    f"{CIRCLED_MAP[opt_num]} ({opt_num}번)",
-                                    key=f"omr_{q.id}_{opt_num}",
-                                    type="primary" if selected else "secondary",
-                                    use_container_width=True,
-                                ):
-                                    st.session_state["user_answers"][q.id] = opt_num
-                                    st.rerun()
-                        st.markdown("</div>", unsafe_allow_html=True)
-                    else:
-                        typed = st.text_input(
-                            "주관식 답안 입력",
-                            value=current_ans,
-                            key=f"short_{q.id}",
-                            placeholder="정답을 입력하세요",
-                        )
-                        st.session_state["user_answers"][q.id] = typed
-
-                    # 채점 상태 표시
-                    if st.session_state.get("graded"):
-                        is_correct = (
-                            normalize_answer(st.session_state["user_answers"].get(q.id, ""))
-                            == normalize_answer(truth_ans)
-                            and normalize_answer(st.session_state["user_answers"].get(q.id, "")) != ""
-                        )
-                        disp_truth = CIRCLED_MAP.get(normalize_answer(truth_ans), truth_ans)
-                        disp_user = CIRCLED_MAP.get(normalize_answer(current_ans), current_ans) or "미입력"
-                        if is_correct:
-                            st.success(f"⭕ **정답입니다!** (내 답: {disp_user} / 정답: {disp_truth})")
-                        else:
-                            st.error(f"❌ **오답입니다.** (내 답: {disp_user} / 정답: {disp_truth})")
-
-                        with st.expander("📖 빠른 정답 해설 보기", expanded=not is_correct):
-                            if rw is not None:
-                                st.markdown(rw.pdf_grounded_explanation)
-                            else:
-                                st.markdown(q.official_explanation)
-                            st.caption(concept_ref_str)
-
-                    # ✨ AI 자동 해설 버튼 & 추가 질문 채팅
-                    ai_col1, ai_col2 = st.columns([1, 2])
-                    with ai_col1:
-                        if st.button("✨ AI 자동 해설", key=f"ai_btn_{q.id}", use_container_width=True):
-                            if not active_gemini_key:
-                                st.error(f"사용 가능한 Gemini API 키({active_key_label})가 설정되지 않았습니다.")
-                            elif whitelist is None:
-                                st.error("개념서 화이트리스트가 필요합니다.")
-                            else:
-                                with st.spinner("개념서 범위 내 용어만 사용하여 맞춤 해설 작성 중..."):
-                                    try:
-                                        exp_md = generate_pdf_grounded_explanation(
-                                            api_key=active_gemini_key,
-                                            model_name=selected_model,
-                                            question=q,
-                                            crop_png_bytes=crop_b,
-                                            whitelist=whitelist,
-                                            user_answer=st.session_state["user_answers"].get(q.id, ""),
-                                            rewritten=rw,
-                                            sliced_text=st.session_state.get("concept_sliced_text", ""),
-                                            concept_reference=concept_ref_str,
-                                        )
-                                        st.session_state["ai_explanations"][q.id] = exp_md
-                                    except Exception as exc:
-                                        st.error(f"AI 해설 생성 실패: {exc}")
-
-                    if q.id in st.session_state["ai_explanations"]:
-                        st.info("✨ **개념서 범위 기준 AI 맞춤 해설**")
-                        st.markdown(st.session_state["ai_explanations"][q.id])
-                        if concept_ref_str not in st.session_state["ai_explanations"][q.id]:
-                            st.markdown(f"**{_html.escape(concept_ref_str)}**")
-
-                        # 문항별 추가 질문 채팅
-                        st.markdown("💬 **추가 질문 채팅 (개념서 범위 내 1:1 질의응답)**")
-                        q_chat_history: list[dict[str, str]] = st.session_state["ai_chats"].get(q.id, [])
-                        for msg in q_chat_history:
-                            with st.chat_message(msg["role"]):
-                                st.markdown(msg["content"])
-
-                        with st.form(key=f"chat_form_{q.id}", clear_on_submit=True):
-                            followup_q = st.text_input(
-                                "이 문제에 대해 궁금한 점을 질문하세요",
-                                placeholder="예: 왜 이 식에서 질량비가 이렇게 적용되나요?",
-                                label_visibility="collapsed",
-                            )
-                            send_chat = st.form_submit_button("질문 보내기")
-
-                        if send_chat and followup_q.strip():
-                            if not active_gemini_key or whitelist is None:
-                                st.error(f"사용 가능한 Gemini API 키({active_key_label})와 개념서 화이트리스트가 필요합니다.")
-                            else:
-                                q_chat_history.append({"role": "user", "content": followup_q.strip()})
-                                with st.spinner("개념서 범위 내에서 답변 생성 중..."):
-                                    try:
-                                        reply = chat_followup_with_pdf(
-                                            api_key=active_gemini_key,
-                                            model_name=selected_model,
-                                            question=q,
-                                            crop_png_bytes=crop_b,
-                                            whitelist=whitelist,
-                                            chat_history=q_chat_history[:-1],
-                                            user_question=followup_q.strip(),
-                                            rewritten=rw,
-                                            sliced_text=st.session_state.get("concept_sliced_text", ""),
-                                        )
-                                        q_chat_history.append({"role": "assistant", "content": reply})
-                                        st.session_state["ai_chats"][q.id] = q_chat_history
-                                        st.rerun()
-                                    except Exception as exc:
-                                        st.error(f"답변 생성 오류: {exc}")
-
-            # 하단 채점하기 버튼
-            grade_c1, grade_c2 = st.columns([2, 1])
-            with grade_c1:
-                if st.button("📝 채점하기", type="primary", use_container_width=True):
-                    st.session_state["graded"] = True
-                    st.rerun()
-            with grade_c2:
-                if st.button("🔄 답안 초기화", use_container_width=True):
-                    st.session_state["user_answers"] = {}
-                    st.session_state["graded"] = False
-                    st.rerun()
+            _render_mode_b_solve_fragment(
+                matched_items=matched_items,
+                whitelist=whitelist,
+                active_gemini_key=active_gemini_key,
+                active_key_label=active_key_label,
+                selected_model=selected_model,
+            )
 
 # ===========================================================================
 # TAB 3: 관리자 / Pro 전용 공용 개념서·교과서 DB 구축 및 관리
