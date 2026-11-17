@@ -3,6 +3,8 @@ from __future__ import annotations
 from typing import Any, Literal
 from pydantic import BaseModel, Field, field_validator
 
+SubjectCategory = Literal["수학", "사회", "과학"]
+
 
 def _coerce_grade_int(value: Any) -> int:
     if isinstance(value, bool):

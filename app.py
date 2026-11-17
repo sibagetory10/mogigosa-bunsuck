@@ -1678,9 +1678,15 @@ with tab1:
             safe_exam = sanitize_id_part(meta["exam_name"])
             tagging_model = EXAM_TAGGING_MODEL
             tagging_model_label = MODEL_LABELS.get(tagging_model, tagging_model)
-            sync_notice = st.warning(
-                "☁️ **\"Google Drive 동기화 완료\"** 문구가 뜰 때까지 브라우저 창을 닫지 말고 유지해 주세요. "
-                "(전체 PDF를 한 번에 태깅한 뒤 로컬 DB와 Google Drive에 일괄 저장합니다.)"
+            sync_notice = (
+                st.warning(
+                    "☁️ **\"Google Drive 동기화 완료\"** 문구가 뜰 때까지 브라우저 창을 닫지 말고 유지해 주세요. "
+                    "(전체 PDF를 한 번에 태깅한 뒤 로컬 DB와 Google Drive에 일괄 저장합니다.)"
+                )
+                if storage.drive_connected
+                else st.info(
+                    "💾 전체 PDF를 한 번에 태깅한 뒤 서버 영구 디스크(`./exam_db`)에 일괄 저장합니다."
+                )
             )
             status_placeholder = st.empty()
             log_placeholder = st.empty()

@@ -8,11 +8,16 @@ import os
 import re
 import secrets
 import time
+from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 
 from src.config import _safe_get_secret, resolve_admin_config
 from src.models import TierType, UserRecord
 from src.storage import StorageManager
+
+
+def _storage_lock(storage: StorageManager | None):
+    return getattr(storage, "_lock", None) or nullcontext()
 
 KST = timezone(timedelta(hours=9))
 FREE_DAILY_LIMIT = 5  # 하위 호환용 상수 (개편 후 FREE는 업로드/3.5-lite 무제한)
@@ -189,22 +194,23 @@ def _sync_user_state(user: UserRecord, today: str, admin_usernames: set[str]) ->
 
 def get_user_by_username(storage: StorageManager, username: str) -> UserRecord | None:
     norm = normalize_username(username)
-    users = storage.load_users()
-    today = get_kst_today_str()
-    admin_names = resolve_admin_config().admin_usernames
-    changed = False
-    found: UserRecord | None = None
+    with _storage_lock(storage):
+        users = storage.load_users()
+        today = get_kst_today_str()
+        admin_names = resolve_admin_config().admin_usernames
+        changed = False
+        found: UserRecord | None = None
 
-    for u in users:
-        if u.username == norm:
-            if _sync_user_state(u, today, admin_names):
-                changed = True
-            found = u
-            break
+        for u in users:
+            if u.username == norm:
+                if _sync_user_state(u, today, admin_names):
+                    changed = True
+                found = u
+                break
 
-    if changed:
-        storage.save_users(users)
-    return found
+        if changed:
+            storage.save_users(users)
+        return found
 
 
 def register_user(
@@ -229,25 +235,26 @@ def register_user(
         return False, "비밀번호는 최소 4자 이상이어야 합니다.", None
 
     norm_id = normalize_username(raw_id)
-    users = storage.load_users()
-    if any(u.username == norm_id for u in users):
-        return False, "이미 사용 중인 아이디입니다. 다른 아이디를 입력해 주세요.", None
+    with _storage_lock(storage):
+        users = storage.load_users()
+        if any(u.username == norm_id for u in users):
+            return False, "이미 사용 중인 아이디입니다. 다른 아이디를 입력해 주세요.", None
 
-    today = get_kst_today_str()
-    admin_cfg = resolve_admin_config()
-    initial_tier: TierType = "ADMIN" if norm_id in admin_cfg.admin_usernames else "FREE"
-    new_user = UserRecord(
-        username=norm_id,
-        nickname=clean_nick,
-        password_hash=hash_password(password),
-        tier=initial_tier,
-        custom_api_key="",
-        daily_count=0,
-        last_used_date=today,
-        created_at=datetime.now(KST).isoformat(timespec="seconds"),
-    )
-    users.append(new_user)
-    err = storage.save_users(users)
+        today = get_kst_today_str()
+        admin_cfg = resolve_admin_config()
+        initial_tier: TierType = "ADMIN" if norm_id in admin_cfg.admin_usernames else "FREE"
+        new_user = UserRecord(
+            username=norm_id,
+            nickname=clean_nick,
+            password_hash=hash_password(password),
+            tier=initial_tier,
+            custom_api_key="",
+            daily_count=0,
+            last_used_date=today,
+            created_at=datetime.now(KST).isoformat(timespec="seconds"),
+        )
+        users.append(new_user)
+        err = storage.save_users(users)
     tier_desc = TIER_LABELS[initial_tier]
     if err:
         return True, f"회원가입 완료! ({err})", new_user
@@ -263,16 +270,17 @@ def authenticate_user(
     if not norm_id or not password:
         return False, "아이디와 비밀번호를 모두 입력해 주세요.", None
 
-    users = storage.load_users()
-    today = get_kst_today_str()
-    admin_names = resolve_admin_config().admin_usernames
-    for u in users:
-        if u.username == norm_id:
-            if not verify_password(password, u.password_hash):
-                return False, "비밀번호가 일치하지 않습니다.", None
-            if _sync_user_state(u, today, admin_names):
-                storage.save_users(users)
-            return True, f"{u.nickname}님, 로그인되었습니다.", u
+    with _storage_lock(storage):
+        users = storage.load_users()
+        today = get_kst_today_str()
+        admin_names = resolve_admin_config().admin_usernames
+        for u in users:
+            if u.username == norm_id:
+                if not verify_password(password, u.password_hash):
+                    return False, "비밀번호가 일치하지 않습니다.", None
+                if _sync_user_state(u, today, admin_names):
+                    storage.save_users(users)
+                return True, f"{u.nickname}님, 로그인되었습니다.", u
 
     return False, "등록되지 않은 아이디입니다. 회원가입 탭에서 가입해 주세요.", None
 
@@ -288,21 +296,22 @@ def save_user_custom_api_key(
         return False, "올바른 형식의 Gemini API 키(`AIza...`)를 입력해 주세요.", None
 
     norm_id = normalize_username(username)
-    users = storage.load_users()
-    target: UserRecord | None = None
+    with _storage_lock(storage):
+        users = storage.load_users()
+        target: UserRecord | None = None
 
-    for u in users:
-        if u.username == norm_id:
-            u.custom_api_key = cleaned_key
-            if u.tier != "ADMIN":
-                u.tier = "CUSTOM"
-            target = u
-            break
+        for u in users:
+            if u.username == norm_id:
+                u.custom_api_key = cleaned_key
+                if u.tier != "ADMIN":
+                    u.tier = "CUSTOM"
+                target = u
+                break
 
-    if target is None:
-        return False, "사용자 계정을 찾을 수 없습니다.", None
+        if target is None:
+            return False, "사용자 계정을 찾을 수 없습니다.", None
 
-    err = storage.save_users(users)
+        err = storage.save_users(users)
     if err:
         return True, f"개인 API 키 저장 완료 ({err})", target
     return True, "개인 API 키가 계정에 영구 저장되어 '개인 키 모드(CUSTOM)'로 전환되었습니다!", target
@@ -314,21 +323,22 @@ def clear_user_custom_api_key(
 ) -> tuple[bool, str, UserRecord | None]:
     """저장된 개인 API 키를 삭제하고 FREE(무료 회원) 등급으로 복귀시킨다."""
     norm_id = normalize_username(username)
-    users = storage.load_users()
-    target: UserRecord | None = None
+    with _storage_lock(storage):
+        users = storage.load_users()
+        target: UserRecord | None = None
 
-    for u in users:
-        if u.username == norm_id:
-            u.custom_api_key = ""
-            if u.tier != "ADMIN":
-                u.tier = "FREE"
-            target = u
-            break
+        for u in users:
+            if u.username == norm_id:
+                u.custom_api_key = ""
+                if u.tier != "ADMIN":
+                    u.tier = "FREE"
+                target = u
+                break
 
-    if target is None:
-        return False, "사용자 계정을 찾을 수 없습니다.", None
+        if target is None:
+            return False, "사용자 계정을 찾을 수 없습니다.", None
 
-    err = storage.save_users(users)
+        err = storage.save_users(users)
     if err:
         return True, f"개인 키 삭제 완료 ({err})", target
     return True, "개인 API 키를 삭제하고 무료 회원(FREE)으로 복귀했습니다.", target
@@ -419,25 +429,29 @@ def record_exam_upload_for_user(
     FREE 등급인 경우 3회마다 고급 모델(3.8/Hydrogen) 해금 크레딧 1회를 지급한다.
     """
     norm_id = normalize_username(username)
-    users = storage.load_users()
-    today = get_kst_today_str()
-    admin_names = resolve_admin_config().admin_usernames
-    target: UserRecord | None = None
-    unlocked = False
+    with _storage_lock(storage):
+        users = storage.load_users()
+        today = get_kst_today_str()
+        admin_names = resolve_admin_config().admin_usernames
+        target: UserRecord | None = None
+        unlocked = False
 
-    for u in users:
-        if u.username == norm_id:
-            _sync_user_state(u, today, admin_names)
-            u.uploaded_exam_count += 1
-            if u.tier == "FREE" and u.uploaded_exam_count % FREE_EXAMS_PER_UNLOCK == 0:
-                u.premium_unlock_credits += 1
-                unlocked = True
-            target = u
-            break
+        for u in users:
+            if u.username == norm_id:
+                _sync_user_state(u, today, admin_names)
+                cur_uploads = int(getattr(u, "uploaded_exam_count", 0) or 0) + 1
+                if hasattr(u, "uploaded_exam_count"):
+                    u.uploaded_exam_count = cur_uploads
+                if u.tier == "FREE" and cur_uploads % FREE_EXAMS_PER_UNLOCK == 0:
+                    if hasattr(u, "premium_unlock_credits"):
+                        u.premium_unlock_credits = int(getattr(u, "premium_unlock_credits", 0) or 0) + 1
+                    unlocked = True
+                target = u
+                break
 
-    if target is not None:
-        storage.save_users(users)
-    return target, unlocked
+        if target is not None:
+            storage.save_users(users)
+        return target, unlocked
 
 
 def consume_premium_model_usage(
@@ -452,29 +466,34 @@ def consume_premium_model_usage(
     if not is_premium_model(used_model):
         return None
     norm_id = normalize_username(username)
-    users = storage.load_users()
-    today = get_kst_today_str()
-    admin_names = resolve_admin_config().admin_usernames
-    target: UserRecord | None = None
-    changed = False
+    with _storage_lock(storage):
+        users = storage.load_users()
+        today = get_kst_today_str()
+        admin_names = resolve_admin_config().admin_usernames
+        target: UserRecord | None = None
+        changed = False
 
-    for u in users:
-        if u.username == norm_id:
-            if _sync_user_state(u, today, admin_names):
-                changed = True
-            if u.tier == "FREE" and u.premium_unlock_credits > 0:
-                u.premium_unlock_credits -= 1
-                changed = True
-            elif u.tier == "PRO":
-                u.weekly_premium_count += 1
-                u.last_used_week = get_kst_week_str()
-                changed = True
-            target = u
-            break
+        for u in users:
+            if u.username == norm_id:
+                if _sync_user_state(u, today, admin_names):
+                    changed = True
+                cur_credits = int(getattr(u, "premium_unlock_credits", 0) or 0)
+                if u.tier == "FREE" and cur_credits > 0:
+                    if hasattr(u, "premium_unlock_credits"):
+                        u.premium_unlock_credits = cur_credits - 1
+                    changed = True
+                elif u.tier == "PRO":
+                    if hasattr(u, "weekly_premium_count"):
+                        u.weekly_premium_count = int(getattr(u, "weekly_premium_count", 0) or 0) + 1
+                    if hasattr(u, "last_used_week"):
+                        u.last_used_week = get_kst_week_str()
+                    changed = True
+                target = u
+                break
 
-    if changed and target is not None:
-        storage.save_users(users)
-    return target
+        if changed and target is not None:
+            storage.save_users(users)
+        return target
 
 
 def consume_extraction_quota(
@@ -486,23 +505,24 @@ def consume_extraction_quota(
     추출한 문항 수만큼 서버 사용량(daily_count)을 기록한다 (하위 호환용; 개편 후 FREE 한도 제한 없음).
     """
     norm_id = normalize_username(username)
-    users = storage.load_users()
-    today = get_kst_today_str()
-    admin_names = resolve_admin_config().admin_usernames
-    target: UserRecord | None = None
+    with _storage_lock(storage):
+        users = storage.load_users()
+        today = get_kst_today_str()
+        admin_names = resolve_admin_config().admin_usernames
+        target: UserRecord | None = None
 
-    for u in users:
-        if u.username == norm_id:
-            _sync_user_state(u, today, admin_names)
-            if u.tier != "CUSTOM":
-                u.daily_count += max(0, extracted_count)
-                u.last_used_date = today
-            target = u
-            break
+        for u in users:
+            if u.username == norm_id:
+                _sync_user_state(u, today, admin_names)
+                if u.tier != "CUSTOM":
+                    u.daily_count += max(0, extracted_count)
+                    u.last_used_date = today
+                target = u
+                break
 
-    if target is not None:
-        storage.save_users(users)
-    return target
+        if target is not None:
+            storage.save_users(users)
+        return target
 
 
 def batch_update_user_tiers(
@@ -510,18 +530,19 @@ def batch_update_user_tiers(
     tier_updates: dict[str, TierType],
 ) -> tuple[int, str | None]:
     """관리자가 여러 회원의 등급을 한 번에 업데이트해 users.json에 저장한다."""
-    users = storage.load_users()
-    changed_count = 0
-    for u in users:
-        new_tier = tier_updates.get(u.username)
-        if new_tier in VALID_TIERS and u.tier != new_tier:
-            u.tier = new_tier
-            changed_count += 1
+    with _storage_lock(storage):
+        users = storage.load_users()
+        changed_count = 0
+        for u in users:
+            new_tier = tier_updates.get(u.username)
+            if new_tier in VALID_TIERS and u.tier != new_tier:
+                u.tier = new_tier
+                changed_count += 1
 
-    if changed_count > 0:
-        err = storage.save_users(users)
-        return changed_count, err
-    return 0, None
+        if changed_count > 0:
+            err = storage.save_users(users)
+            return changed_count, err
+        return 0, None
 
 
 def delete_users_by_usernames(
@@ -539,31 +560,32 @@ def delete_users_by_usernames(
     if not targets:
         return 0, None, "삭제할 계정을 선택해 주세요."
 
-    users = storage.load_users()
-    admin_count = sum(1 for u in users if u.tier == "ADMIN")
-    remaining: list[UserRecord] = []
-    deleted_count = 0
-    skipped_reasons: list[str] = []
+    with _storage_lock(storage):
+        users = storage.load_users()
+        admin_count = sum(1 for u in users if u.tier == "ADMIN")
+        remaining: list[UserRecord] = []
+        deleted_count = 0
+        skipped_reasons: list[str] = []
 
-    for u in users:
-        if u.username in targets:
-            if actor_norm and u.username == actor_norm:
-                skipped_reasons.append(f"@{u.username}(본인 계정)")
+        for u in users:
+            if u.username in targets:
+                if actor_norm and u.username == actor_norm:
+                    skipped_reasons.append(f"@{u.username}(본인 계정)")
+                    remaining.append(u)
+                    continue
+                if u.tier == "ADMIN" and admin_count <= 1:
+                    skipped_reasons.append(f"@{u.username}(마지막 관리자)")
+                    remaining.append(u)
+                    continue
+                if u.tier == "ADMIN":
+                    admin_count -= 1
+                deleted_count += 1
+            else:
                 remaining.append(u)
-                continue
-            if u.tier == "ADMIN" and admin_count <= 1:
-                skipped_reasons.append(f"@{u.username}(마지막 관리자)")
-                remaining.append(u)
-                continue
-            if u.tier == "ADMIN":
-                admin_count -= 1
-            deleted_count += 1
-        else:
-            remaining.append(u)
 
-    err: str | None = None
-    if deleted_count > 0:
-        err = storage.save_users(remaining)
+        err: str | None = None
+        if deleted_count > 0:
+            err = storage.save_users(remaining)
 
     note = ""
     if skipped_reasons:

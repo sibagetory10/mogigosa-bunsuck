@@ -103,3 +103,30 @@ GCP_SERVICE_ACCOUNT = '''
   - Streamlit Community Cloud 무료 티어는 일정 시간 접속이 없으면 슬립 모드로 들어가며, 다시 접속하면 약 10~20초 내에 자동 기상하여 Google Drive 데이터를 다시 동기화합니다.
 - **Q. 개인 API 키가 없으면 사용할 수 없나요?**
   - 회원가입 시 기본 `FREE`(무료 회원) 등급으로도 **기출 PDF 업로드를 무제한**으로 이용할 수 있으며, 기본 추론은 **Gemini 3.5 Flash-Lite**로 실행되고 **기출 3회 업로드마다 고급 모델 1회 해금** 혜택이 제공됩니다. 개인 Gemini API 키를 사이드바에서 등록하면 즉시 `CUSTOM`(개인 키 모드)로 전환되어 모든 고급 모델을 무제한 이용하실 수 있습니다.
+
+---
+
+## 🖥️ 5단계: Oracle Cloud Ubuntu 24.04 (`VM.Standard.A1.Flex`) 24시간 영구 서버 배포
+
+Google Drive 용량 제한(403 `storageQuotaExceeded`)이나 Streamlit Cloud 슬립·메모리 제한(1GB) 없이 **서버 영구 디스크(`./exam_db`, `./concept_db`)**로 24시간 안정적으로 운영하는 방법입니다.
+
+1. **오라클 클라우드 VCN 수신 규칙(Ingress Rule) 열기**
+   - Oracle Cloud Console → **Networking → Virtual Cloud Networks → Security Lists → Default Security List**
+   - **Add Ingress Rules**: Source CIDR `0.0.0.0/0`, IP Protocol `TCP`, Destination Port Range `8501`
+2. **SSH 접속 후 원클릭 설치 및 `systemd` 등록**
+   ```bash
+   git clone https://github.com/sibagetory10/mogigosa-bunsuck.git
+   cd mogigosa-bunsuck
+   mkdir -p .streamlit
+   cat << 'EOF' > .streamlit/secrets.toml
+   GEMINI_API_KEY = "실제_GEMINI_API_KEY"
+   ADMIN_USERNAME = "sibagetory10"
+   EOF
+   bash scripts/oracle_ubuntu_setup.sh
+   ```
+   - Drive 관련 키(`GOOGLE_DRIVE_FOLDER_ID`, `GCP_SERVICE_ACCOUNT`, `GOOGLE_OAUTH`)를 비워두면 **로컬 디스크 영구 저장 모드**(`threading.RLock` + 원자적 `.tmp` 교체)로 안전하게 동작합니다.
+   - `scripts/oracle_ubuntu_setup.sh`가 `python3-venv`, `fonts-nanum`, `requirements.txt`, `iptables` 8501 포트 개방 및 단일 프로세스 `mogigosa.service`(`systemd`) 등록까지 한 번에 완료합니다.
+3. **코드 업데이트 반영 방법 (서버에서 1줄 실행)**
+   ```bash
+   cd ~/mogigosa-bunsuck && git pull origin main && sudo systemctl restart mogigosa
+   ```

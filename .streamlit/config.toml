@@ -2,6 +2,7 @@
 maxUploadSize = 200
 headless = true
 enableXsrfProtection = true
+fileWatcherType = "none"
 
 [browser]
 gatherUsageStats = false
@@ -13,6 +14,3 @@ backgroundColor = "#F8FAFC"
 secondaryBackgroundColor = "#FFFFFF"
 textColor = "#0F172A"
 font = "sans serif"
-
-[server]
-fileWatcherType = "none"
