@@ -229,7 +229,7 @@ def register_user(
 
     clean_nick = (nickname or "").strip()
     if not (1 <= len(clean_nick) <= 20):
-        return False, "닉네임은 1~20자 이내로 입력해 주세요.", None
+        return False, "이름은 1~20자 이내로 입력해 주세요.", None
 
     if len(password or "") < 4:
         return False, "비밀번호는 최소 4자 이상이어야 합니다.", None

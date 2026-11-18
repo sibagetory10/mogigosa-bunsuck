@@ -301,7 +301,7 @@ with st.sidebar:
         with auth_tab_signup:
             with st.form("sidebar_signup_form"):
                 reg_id = st.text_input("아이디 (영문·숫자 3~30자)", placeholder="예: student01")
-                reg_nick = st.text_input("닉네임", placeholder="예: 김민준")
+                reg_nick = st.text_input("이름", placeholder="예: 김민준")
                 reg_pw = st.text_input("비밀번호 (4자 이상)", type="password")
                 reg_pw2 = st.text_input("비밀번호 확인", type="password")
                 reg_submit = st.form_submit_button("회원가입", type="primary", width="stretch")
@@ -712,7 +712,7 @@ def _render_admin_panel() -> None:
     col_top1, col_top2 = st.columns([2, 1])
     with col_top1:
         search_q = st.text_input(
-            "회원 검색 (아이디 또는 닉네임)",
+            "회원 검색 (아이디 또는 이름)",
             placeholder="검색어를 입력하세요...",
             key="admin_user_search",
         ).strip().lower()
@@ -748,7 +748,7 @@ def _render_admin_panel() -> None:
     table_rows = [
         {
             "아이디": u.username,
-            "닉네임": u.nickname,
+            "이름": u.nickname,
             "현재 등급": u.tier,
             "등급 설명": TIER_LABELS.get(u.tier, u.tier),
             "개인 키": mask_api_key(u.custom_api_key) or "-",
@@ -763,7 +763,7 @@ def _render_admin_panel() -> None:
         table_rows,
         column_config={
             "아이디": st.column_config.TextColumn("아이디", disabled=True),
-            "닉네임": st.column_config.TextColumn("닉네임", disabled=True),
+            "이름": st.column_config.TextColumn("이름", disabled=True),
             "현재 등급": st.column_config.SelectboxColumn(
                 "현재 등급 (변경 가능)",
                 options=list(VALID_TIERS),
