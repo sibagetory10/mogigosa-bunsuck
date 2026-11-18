@@ -1,0 +1,119 @@
+{
+  "version": "2022-33",
+  "source_note": "교육부 고시 제2022-33호 고등학교 수학과·사회과·과학과 편제 기준 + NCIC 원문 PDF 파싱 성취기준 누적 저장소",
+  "categories": {
+    "수학": {
+      "subjects": [
+        {"name": "공통수학1", "track": "공통", "min_allowed_grade": 1, "aliases": ["공통수학", "수학(상)", "고1 수학(상)", "고1수학"]},
+        {"name": "공통수학2", "track": "공통", "min_allowed_grade": 1, "aliases": ["수학(하)", "고1 수학(하)"]},
+        {"name": "기본수학1", "track": "공통", "min_allowed_grade": 1, "aliases": []},
+        {"name": "기본수학2", "track": "공통", "min_allowed_grade": 1, "aliases": []},
+        {"name": "대수", "track": "일반선택", "min_allowed_grade": 2, "aliases": ["수학I", "수학Ⅰ", "수학1", "수1"]},
+        {"name": "미적분Ⅰ", "track": "일반선택", "min_allowed_grade": 2, "aliases": ["미적분1", "수학II", "수학Ⅱ", "수학2", "수2"]},
+        {"name": "확률과 통계", "track": "일반선택", "min_allowed_grade": 2, "aliases": ["확통", "확률과통계"]},
+        {"name": "기하", "track": "진로선택", "min_allowed_grade": 2, "aliases": ["기하와 벡터"]},
+        {"name": "미적분Ⅱ", "track": "진로선택", "min_allowed_grade": 2, "aliases": ["미적분2", "미적분", "미적분(심화)"]},
+        {"name": "경제 수학", "track": "진로선택", "min_allowed_grade": 2, "aliases": ["경제수학"]},
+        {"name": "인공지능 수학", "track": "진로선택", "min_allowed_grade": 2, "aliases": ["인공지능수학"]},
+        {"name": "직무 수학", "track": "진로선택", "min_allowed_grade": 2, "aliases": ["직무수학"]},
+        {"name": "수학과 문화", "track": "융합선택", "min_allowed_grade": 2, "aliases": []},
+        {"name": "실용 통계", "track": "융합선택", "min_allowed_grade": 2, "aliases": []},
+        {"name": "수학과제 탐구", "track": "융합선택", "min_allowed_grade": 2, "aliases": []}
+      ],
+      "shift_notes": [
+        "2022 개정에서 '행렬'과 그 연산은 공통수학1(고1)으로 이동했습니다.",
+        "2015 개정 '수학Ⅰ'은 '대수', '수학Ⅱ'는 '미적분Ⅰ', 기존 선택 '미적분'은 진로선택 '미적분Ⅱ'로 개편되었습니다.",
+        "다항식·방정식과 부등식·경우의 수 기초(순열/조합)·행렬(공통수학1), 도형의 방정식·집합과 명제·함수와 그래프(공통수학2)는 고1 공통입니다."
+      ],
+      "core_units": {
+        "공통수학1": ["다항식", "방정식과 부등식", "경우의 수", "행렬"],
+        "공통수학2": ["도형의 방정식", "집합과 명제", "함수와 그래프"],
+        "대수": ["지수함수와 로그함수", "삼각함수", "수열"],
+        "미적분Ⅰ": ["함수의 극한과 연속", "미분", "적분"],
+        "확률과 통계": ["경우의 수(중복순열/중복조합/이항정리)", "확률", "통계"],
+        "기하": ["이차곡선", "공간도형과 공간좌표", "벡터"],
+        "미적분Ⅱ": ["수열의 극한", "미분법", "적분법"]
+      },
+      "standards": []
+    },
+    "사회": {
+      "subjects": [
+        {"name": "통합사회1", "track": "공통", "min_allowed_grade": 1, "aliases": ["통합사회", "고1 통합사회"]},
+        {"name": "통합사회2", "track": "공통", "min_allowed_grade": 1, "aliases": []},
+        {"name": "한국사1", "track": "공통", "min_allowed_grade": 1, "aliases": ["한국사", "고1 한국사"]},
+        {"name": "한국사2", "track": "공통", "min_allowed_grade": 1, "aliases": []},
+        {"name": "세계시민과 지리", "track": "일반선택", "min_allowed_grade": 2, "aliases": ["세계지리", "세계 지리"]},
+        {"name": "세계사", "track": "일반선택", "min_allowed_grade": 2, "aliases": []},
+        {"name": "사회와 문화", "track": "일반선택", "min_allowed_grade": 2, "aliases": ["사회·문화", "사회문화"]},
+        {"name": "현대사회와 윤리", "track": "일반선택", "min_allowed_grade": 2, "aliases": ["생활과 윤리", "생활과윤리", "생윤"]},
+        {"name": "한국지리 탐구", "track": "진로선택", "min_allowed_grade": 2, "aliases": ["한국지리", "한지"]},
+        {"name": "도시의 미래 탐구", "track": "진로선택", "min_allowed_grade": 2, "aliases": []},
+        {"name": "동아시아 역사 기행", "track": "진로선택", "min_allowed_grade": 2, "aliases": ["동아시아사"]},
+        {"name": "정치", "track": "진로선택", "min_allowed_grade": 2, "aliases": ["정치와 법", "정치와법", "정법"]},
+        {"name": "법과 사회", "track": "진로선택", "min_allowed_grade": 2, "aliases": []},
+        {"name": "경제", "track": "진로선택", "min_allowed_grade": 2, "aliases": []},
+        {"name": "윤리와 사상", "track": "진로선택", "min_allowed_grade": 2, "aliases": ["윤사"]},
+        {"name": "인문학과 윤리", "track": "진로선택", "min_allowed_grade": 2, "aliases": []},
+        {"name": "국제 관계의 이해", "track": "진로선택", "min_allowed_grade": 2, "aliases": []},
+        {"name": "여행지리", "track": "융합선택", "min_allowed_grade": 2, "aliases": []},
+        {"name": "역사로 탐구하는 현대 세계", "track": "융합선택", "min_allowed_grade": 2, "aliases": []},
+        {"name": "사회문제 탐구", "track": "융합선택", "min_allowed_grade": 2, "aliases": []},
+        {"name": "금융과 경제생활", "track": "융합선택", "min_allowed_grade": 2, "aliases": []},
+        {"name": "윤리문제 탐구", "track": "융합선택", "min_allowed_grade": 2, "aliases": []},
+        {"name": "기후변화와 지속가능한 세계", "track": "융합선택", "min_allowed_grade": 2, "aliases": []}
+      ],
+      "shift_notes": [
+        "2022 개정에서 공통 '통합사회'와 '한국사'는 각각 통합사회1·2, 한국사1·2로 분리 편제되었습니다(고1 공통).",
+        "2015 개정 '사회·문화'→'사회와 문화', '생활과 윤리'→'현대사회와 윤리', '정치와 법'→'정치'/'법과 사회', '세계지리'→'세계시민과 지리', '한국지리'→'한국지리 탐구'로 개편되었습니다.",
+        "시장 가격·수요/공급, 기본권/헌법 기초, 인권/정의관 기초는 고1 통합사회1·2에서도 다뤄지므로 본질 원리가 기초 수준이면 min_grade=1 판정이 가능합니다."
+      ],
+      "core_units": {
+        "통합사회1": ["통합적 관점", "인간·사회·환경과 행복", "자연환경과 인간", "문화와 다양성", "생활공간과 사회"],
+        "통합사회2": ["인권 보장과 헌법", "사회정의와 불평등", "시장경제와 지속가능발전", "세계화와 평화", "미래와 지속가능한 삶"],
+        "사회와 문화": ["사회·문화 현상의 탐구", "개인과 사회 구조", "문화와 일상생활", "사회 계층과 불평등", "현대 사회의 변동"],
+        "현대사회와 윤리": ["현대 생활과 실천 윤리", "생명과 윤리", "사회와 윤리", "과학과 윤리", "문화와 윤리", "평화와 공존의 윤리"],
+        "경제": ["경제생활과 경제 문제", "시장과 경제 활동", "국가와 경제 활동", "세계 시장과 교역", "경제생활과 금융"],
+        "정치": ["정치와 민주주의", "헌법과 국가 기관", "정치 과정과 참여", "국제 정치와 법"],
+        "법과 사회": ["법의 이념과 권리 구제", "민법과 생활 법률", "형법과 형사 절차", "사회법과 기본권"]
+      },
+      "standards": []
+    },
+    "과학": {
+      "subjects": [
+        {"name": "통합과학1", "track": "공통", "min_allowed_grade": 1, "aliases": ["통합과학", "고1 통합과학"]},
+        {"name": "통합과학2", "track": "공통", "min_allowed_grade": 1, "aliases": []},
+        {"name": "과학탐구실험1", "track": "공통", "min_allowed_grade": 1, "aliases": ["과학탐구실험"]},
+        {"name": "과학탐구실험2", "track": "공통", "min_allowed_grade": 1, "aliases": []},
+        {"name": "물리학", "track": "일반선택", "min_allowed_grade": 2, "aliases": ["물리학I", "물리학Ⅰ", "물리1", "물리I", "물리"]},
+        {"name": "화학", "track": "일반선택", "min_allowed_grade": 2, "aliases": ["화학I", "화학Ⅰ", "화학1", "화학I"]},
+        {"name": "생명과학", "track": "일반선택", "min_allowed_grade": 2, "aliases": ["생명과학I", "생명과학Ⅰ", "생명과학1", "생명1", "생물1"]},
+        {"name": "지구과학", "track": "일반선택", "min_allowed_grade": 2, "aliases": ["지구과학I", "지구과학Ⅰ", "지구과학1", "지학1"]},
+        {"name": "역학과 에너지", "track": "진로선택", "min_allowed_grade": 2, "aliases": ["물리학II", "물리학Ⅱ", "물리2"]},
+        {"name": "전자기와 양자", "track": "진로선택", "min_allowed_grade": 2, "aliases": []},
+        {"name": "물질과 에너지", "track": "진로선택", "min_allowed_grade": 2, "aliases": ["화학II", "화학Ⅱ", "화학2"]},
+        {"name": "화학 반응의 세계", "track": "진로선택", "min_allowed_grade": 2, "aliases": []},
+        {"name": "세포와 물질대사", "track": "진로선택", "min_allowed_grade": 2, "aliases": ["생명과학II", "생명과학Ⅱ", "생명2"]},
+        {"name": "생물의 유전", "track": "진로선택", "min_allowed_grade": 2, "aliases": []},
+        {"name": "지구시스템과학", "track": "진로선택", "min_allowed_grade": 2, "aliases": ["지구과학II", "지구과학Ⅱ", "지구과학2"]},
+        {"name": "행성우주과학", "track": "진로선택", "min_allowed_grade": 2, "aliases": []},
+        {"name": "과학의 역사와 문화", "track": "융합선택", "min_allowed_grade": 2, "aliases": []},
+        {"name": "기후변화와 환경생태", "track": "융합선택", "min_allowed_grade": 2, "aliases": []},
+        {"name": "융합과학 탐구", "track": "융합선택", "min_allowed_grade": 2, "aliases": ["융합과학"]}
+      ],
+      "shift_notes": [
+        "2022 개정에서 공통 '통합과학'은 통합과학1·2(고1)로 분리되었습니다.",
+        "2015 개정 '물리학Ⅰ·화학Ⅰ·생명과학Ⅰ·지구과학Ⅰ'은 일반선택 '물리학·화학·생명과학·지구과학'으로 통합·개편되었으며, 기존 Ⅱ과목 내용은 주제별 진로선택(역학과 에너지, 전자기와 양자, 물질과 에너지, 화학 반응의 세계, 세포와 물질대사, 생물의 유전, 지구시스템과학, 행성우주과학)으로 재편되었습니다.",
+        "속력/가속도 기초, 충격량·운동량 기초, 원소 주기율·화학 결합, 산화·환원 및 중화 반응 기초, 세포/유전정보 흐름(전사·번역) 기초, 판구조론·온실효과 등은 고1 통합과학1·2에서도 다뤄집니다."
+      ],
+      "core_units": {
+        "통합과학1": ["과학의 기초", "물질의 규칙성", "물질과 규칙성(화학 결합)", "역학적 시스템", "지구 시스템", "생명 시스템"],
+        "통합과학2": ["변화와 다양성(산화환원/산염기)", "생물다양성과 유지", "환경과 에너지", "미래와 지속가능한 발전"],
+        "물리학": ["힘과 에너지", "전기와 자기", "파동과 정보 통신"],
+        "화학": ["화학의 언어와 양적 관계", "원자의 구조와 결합", "화학 반응과 에너지 출입"],
+        "생명과학": ["생명과학의 이해", "생명의 연속성", "항상성과 몸의 조절", "생태계와 상호작용"],
+        "지구과학": ["고체 지구", "대기와 해양", "우주"]
+      },
+      "standards": []
+    }
+  }
+}

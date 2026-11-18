@@ -15,6 +15,7 @@ __pycache__/
 exam_db/
 concept_db/
 *.json
+!data/curriculum_2022.json
 
 # OS & editor artifacts
 .DS_Store
