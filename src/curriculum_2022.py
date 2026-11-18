@@ -289,6 +289,29 @@ def merge_ncic_standards_to_catalog(
     return {"added": added, "updated": updated}
 
 
+def _infer_target_subject_from_exam_name(exam_name: str, cat_entry: dict[str, Any]) -> str:
+    """시험 회차명(예: '2026년 3월 고3 물리학1')에서 2022 공식 과목명을 정밀 추론한다."""
+    canon_exam = _canon_subject_key(exam_name)
+    if not canon_exam:
+        return ""
+    candidates: list[tuple[str, str]] = []
+    for subj in cat_entry.get("subjects") or []:
+        official_name = (subj.get("name") or "").strip()
+        if not official_name:
+            continue
+        candidates.append((_canon_subject_key(official_name), official_name))
+        for alias in subj.get("aliases") or []:
+            ck = _canon_subject_key(alias)
+            if ck:
+                candidates.append((ck, official_name))
+    # 긴 과목/별칭 우선 매칭 ('미적분2'가 '미적분'보다 우선)
+    candidates.sort(key=lambda x: len(x[0]), reverse=True)
+    for key, official_name in candidates:
+        if key and key in canon_exam:
+            return official_name
+    return ""
+
+
 def build_tagging_grounding_context(
     subject_category: str,
     exam_name: str = "",
@@ -299,13 +322,29 @@ def build_tagging_grounding_context(
 ) -> str:
     """
     Tab 1 태깅 프롬프트에 주입할 2022 개정 공식 기준표 + NCIC 성취기준 + 공용 개념서 DB 요약 컨텍스트를 조립한다.
+    현재 시험지의 과목이 판별되면 해당 과목과 고1 공통과목만 동적 필터링해 프롬프트 토큰을 절감한다.
     """
-    cat_data = (catalog or load_curriculum_2022_catalog()).get("categories", {})
+    cat_obj = catalog or load_curriculum_2022_catalog()
+    cat_data = cat_obj.get("categories", {})
     entry = cat_data.get(subject_category)
     if not entry:
         return ""
 
-    blocks: list[str] = [f"[2022 개정 교육과정 공식 기준표 — 대분류: {subject_category}]"]
+    target_subject = _infer_target_subject_from_exam_name(exam_name, entry)
+    common_subjects = {
+        (s.get("name") or "").strip()
+        for s in (entry.get("subjects") or [])
+        if s.get("track") == "공통" and s.get("name")
+    }
+    allowed_scope_subjects: set[str] | None = (
+        ({target_subject} | common_subjects) if target_subject else None
+    )
+
+    header = f"[2022 개정 교육과정 공식 기준표 — 대분류: {subject_category}"
+    if target_subject:
+        header += f" · 시험 과목 필터: {target_subject}"
+    header += "]"
+    blocks: list[str] = [header]
 
     # 1) 과목 편제표 (구분별 공식 과목명)
     by_track: dict[str, list[str]] = {}
@@ -324,41 +363,64 @@ def build_tagging_grounding_context(
         for note in shifts[:5]:
             blocks.append(f"- {note}")
 
-    # 3) 과목별 핵심 단원 개요
+    # 3) 과목별 핵심 단원 개요 (대상 과목이 판별되면 해당 과목 + 고1 공통만 포함)
     core_units = entry.get("core_units") or {}
     if core_units:
-        blocks.append("\n[2022 주요 과목별 단원 체계]")
-        for s_name, u_list in core_units.items():
-            blocks.append(f"- {s_name}: {', '.join(u_list)}")
+        filtered_units = {
+            s_name: u_list
+            for s_name, u_list in core_units.items()
+            if allowed_scope_subjects is None or s_name in allowed_scope_subjects
+        }
+        if filtered_units:
+            blocks.append("\n[2022 관련 과목 단원 체계]")
+            for s_name, u_list in filtered_units.items():
+                blocks.append(f"- {s_name}: {', '.join(u_list)}")
 
-    # 4) NCIC 공식 고시 PDF에서 파싱된 성취기준 (있을 때)
+    # 4) NCIC 공식 고시 PDF에서 파싱된 성취기준 (대상 과목 + 고1 공통만 동적 필터링)
     standards = entry.get("standards") or []
     if standards:
-        # 시험명 힌트에 해당 과목이 포함되어 있으면 그 과목 + 고1 공통과목 성취기준을 우선 배치
-        prioritized: list[dict[str, Any]] = []
-        others: list[dict[str, Any]] = []
+        primary_stds: list[dict[str, Any]] = []
+        common_stds: list[dict[str, Any]] = []
+        fallback_stds: list[dict[str, Any]] = []
         for st_item in standards:
-            s_name = st_item.get("subject", "")
-            if (exam_name and s_name and s_name in exam_name) or st_item.get("min_grade") == 1:
-                prioritized.append(st_item)
-            else:
-                others.append(st_item)
-        chosen = (prioritized + others)[:max_standards]
-        blocks.append(f"\n[NCIC 공식 고시 성취기준 발췌 ({len(chosen)}/{len(standards)}개)]")
-        for st_item in chosen:
-            blocks.append(
-                f"- [{st_item.get('code')}] ({st_item.get('subject')} · 고{st_item.get('min_grade')}) "
-                f"{st_item.get('statement', '')[:120]}"
-            )
+            raw_st_subj = st_item.get("subject", "")
+            norm_st_subj, _, _, _ = normalize_subject_2022(raw_st_subj, subject_category, cat_obj)
+            eff_st_subj = norm_st_subj or raw_st_subj
+            if target_subject and eff_st_subj == target_subject:
+                primary_stds.append(st_item)
+            elif eff_st_subj in common_subjects or st_item.get("min_grade") == 1:
+                common_stds.append(st_item)
+            elif allowed_scope_subjects is None:
+                fallback_stds.append(st_item)
 
-    # 5) 공용 개념서 DB(concept_db) 단원·허용 용어 연동
+        chosen = (primary_stds + common_stds + fallback_stds)[:max_standards]
+        if chosen:
+            blocks.append(f"\n[NCIC 공식 고시 성취기준 발췌 ({len(chosen)}/{len(standards)}개 · 과목 필터링 적용)]")
+            for st_item in chosen:
+                blocks.append(
+                    f"- [{st_item.get('code')}] ({st_item.get('subject')} · 고{st_item.get('min_grade')}) "
+                    f"{st_item.get('statement', '')[:120]}"
+                )
+
+    # 5) 공용 개념서 DB(concept_db) 단원·허용 용어 연동 (대상 과목 + 고1 공통 교재만 선택)
     if concept_books:
         matching_books: list[ConceptBookRecord] = []
         cat_subject_tokens = {subj.get("name", "") for subj in (entry.get("subjects") or []) if subj.get("name")}
         for bk in concept_books:
             bk_blob = f"{bk.book_title} {bk.subject}"
-            if subject_category in bk_blob or any(tok in bk_blob for tok in cat_subject_tokens):
-                matching_books.append(bk)
+            in_category = subject_category in bk_blob or any(tok in bk_blob for tok in cat_subject_tokens)
+            if not in_category:
+                continue
+            if allowed_scope_subjects is not None:
+                bk_subj_norm, bk_ok, _, _ = normalize_subject_2022(bk.subject, subject_category, cat_obj)
+                if not bk_ok:
+                    bk_subj_norm = _infer_target_subject_from_exam_name(bk_blob, entry)
+                is_grade1_book = "1" in (bk.grade or "")
+                if bk_subj_norm and bk_subj_norm not in allowed_scope_subjects:
+                    continue
+                if not bk_subj_norm and not is_grade1_book and target_subject not in bk_blob:
+                    continue
+            matching_books.append(bk)
 
         if matching_books:
             blocks.append("\n[등록된 공용 개념서 DB(concept_db) 단원 및 허용 용어]")
@@ -449,12 +511,29 @@ def validate_and_normalize_extracted_tag(
         needs_review = True
         review_notes.append(f"2022 '{subject_category}' 공식 과목 목록에서 확인되지 않은 과목명입니다: {extracted.curriculum_subject}")
 
-    # 성취기준 코드 검증 (NCIC 기준표가 로드되어 있을 경우 할루시네이션 코드 차단)
+    # 복수 성취기준 코드 정제·동기화 및 할루시네이션 검출
     std_code = re.sub(r"[\[\]\s]+", "", getattr(extracted, "standard_code", "") or "")
+    raw_codes = list(getattr(extracted, "standard_codes", []) or [])
+    cleaned_codes: list[str] = []
+    seen_codes: set[str] = set()
+    for rc in ([std_code] if std_code else []) + raw_codes:
+        c = re.sub(r"[\[\]\s]+", "", rc or "")
+        if c and c not in seen_codes:
+            seen_codes.add(c)
+            cleaned_codes.append(c)
+
+    if not std_code and cleaned_codes:
+        std_code = cleaned_codes[0]
+
     extracted.standard_code = std_code
-    if std_code and loaded_stds and _STD_CODE_ONLY_RE.match(std_code) and std_code not in loaded_stds:
-        needs_review = True
-        review_notes.append(f"로드된 NCIC 공식 성취기준 목록에 없는 코드입니다(할루시네이션 의심): [{std_code}]")
+    extracted.standard_codes = cleaned_codes
+
+    if loaded_stds:
+        fake_codes = [c for c in cleaned_codes if _STD_CODE_ONLY_RE.match(c) and c not in loaded_stds]
+        if fake_codes:
+            needs_review = True
+            joined_fake = ", ".join(f"[{c}]" for c in fake_codes)
+            review_notes.append(f"로드된 NCIC 공식 성취기준 목록에 없는 코드입니다(할루시네이션 의심): {joined_fake}")
 
     # 과목 편제(공통 vs 선택) ↔ 최저 학년 일관성 점검
     grade_evidence = (getattr(extracted, "grade_evidence", "") or "").strip()
@@ -466,10 +545,12 @@ def validate_and_normalize_extracted_tag(
             needs_review = True
             review_notes.append(f"'{extracted.curriculum_subject}'는 고1 공통과목이나 min_grade={extracted.min_grade}로 판정되어 확인이 필요합니다.")
         elif min_allowed >= 2 and extracted.min_grade == 1:
-            if std_code.startswith("12"):
+            has_only_grade2_codes = bool(cleaned_codes) and all(c.startswith("12") for c in cleaned_codes)
+            if has_only_grade2_codes:
                 needs_review = True
+                joined_c = ", ".join(f"[{c}]" for c in cleaned_codes)
                 review_notes.append(
-                    f"성취기준 코드([{std_code}])는 고2~3 선택과목 범위인데 min_grade=1로 판정되어 모순이 있습니다."
+                    f"성취기준 코드({joined_c})는 고2~3 선택과목 범위인데 min_grade=1로 판정되어 모순이 있습니다."
                 )
             elif not grade_evidence:
                 needs_review = True

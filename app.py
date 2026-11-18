@@ -549,6 +549,7 @@ def _tag_and_save_single_exam(
             advanced_terms=list(getattr(extracted, "advanced_terms", []) or []),
             basic_terms=list(getattr(extracted, "basic_terms", []) or []),
             standard_code=(getattr(extracted, "standard_code", "") or "").strip(),
+            standard_codes=list(getattr(extracted, "standard_codes", []) or []),
             grade_evidence=(getattr(extracted, "grade_evidence", "") or "").strip(),
             needs_review=bool(getattr(extracted, "needs_review", False)),
             review_notes=list(getattr(extracted, "review_notes", []) or []),
@@ -614,11 +615,14 @@ def _render_question_tag_details(
         st.warning(f"⚠️ **검토 필요 (할루시네이션·모순 점검):** {note_txt}")
 
     std_code = (getattr(rec, "standard_code", "") or "").strip()
+    std_codes = [c for c in (getattr(rec, "standard_codes", []) or []) if c]
+    if std_code and std_code not in std_codes:
+        std_codes = [std_code, *std_codes]
     grade_ev = (getattr(rec, "grade_evidence", "") or "").strip()
-    if std_code or grade_ev:
+    if std_codes or grade_ev:
         meta_bits: list[str] = []
-        if std_code:
-            meta_bits.append(f"**성취기준:** `[{std_code}]`")
+        if std_codes:
+            meta_bits.append("**성취기준:** " + ", ".join(f"`[{c}]`" for c in std_codes))
         if grade_ev:
             meta_bits.append(f"**학년 판정 근거:** {grade_ev}")
         st.caption(" · ".join(meta_bits))
@@ -670,11 +674,11 @@ def _render_question_tag_details(
                 format_func=lambda g: f"고{g}",
                 key=f"{key_prefix}_edit_grade_{rec.id}",
             )
-        ec4, ec5 = st.columns([1, 2])
+        ec4, ec5 = st.columns([1.2, 1.8])
         with ec4:
-            new_std = st.text_input(
-                "성취기준 코드",
-                value=std_code,
+            new_std_str = st.text_input(
+                "성취기준 코드 (복수 시 쉼표 구분)",
+                value=", ".join(std_codes) if std_codes else std_code,
                 key=f"{key_prefix}_edit_std_{rec.id}",
             )
         with ec5:
@@ -684,13 +688,20 @@ def _render_question_tag_details(
                 key=f"{key_prefix}_edit_ev_{rec.id}",
             )
         if st.button("💾 수정 저장 (검토 완료 처리)", key=f"{key_prefix}_save_edit_{rec.id}"):
+            parsed_stds = [
+                re.sub(r"[\[\]\s]+", "", tok)
+                for tok in new_std_str.split(",")
+                if re.sub(r"[\[\]\s]+", "", tok)
+            ]
+            dedup_stds = list(dict.fromkeys(parsed_stds))
             all_recs = storage.load_db()
             for r in all_recs:
                 if r.id == rec.id:
                     r.curriculum_subject = new_subj
                     r.unit_name = new_unit.strip() or r.unit_name
                     r.min_grade = int(new_grade)
-                    r.standard_code = new_std.strip()
+                    r.standard_code = dedup_stds[0] if dedup_stds else ""
+                    r.standard_codes = dedup_stds
                     r.grade_evidence = new_ev.strip()
                     r.needs_review = False
                     r.review_notes = []

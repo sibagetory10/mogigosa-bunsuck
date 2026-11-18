@@ -51,7 +51,11 @@ class QuestionRecord(BaseModel):
     )
     standard_code: str = Field(
         default="",
-        description="매칭된 2022 개정 성취기준 코드 또는 공용 개념서 기준 단원 식별자",
+        description="대표 2022 개정 성취기준 코드 또는 공용 개념서 기준 단원 식별자",
+    )
+    standard_codes: list[str] = Field(
+        default_factory=list,
+        description="복합 문항에 걸쳐 있는 모든 2022 개정 성취기준 코드 목록",
     )
     grade_evidence: str = Field(
         default="",
@@ -118,7 +122,11 @@ class QuestionExtractionOutput(BaseModel):
     )
     standard_code: str = Field(
         default="",
-        description="참고 기준표에 성취기준 코드가 있으면 해당 공식 코드(예: '10통과1-02-01'), 없으면 비우거나 개념서 단원명 기록",
+        description="대표 2022 성취기준 코드 (기준표에 있을 경우 공식 코드, 예: '10통과1-02-01')",
+    )
+    standard_codes: list[str] = Field(
+        default_factory=list,
+        description="복합 문항 등 여러 성취기준이 걸치는 경우 해당하는 모든 2022 공식 성취기준 코드 목록 (목록에 없으면 비움)",
     )
     grade_evidence: str = Field(
         default="",

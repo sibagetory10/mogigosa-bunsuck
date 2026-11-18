@@ -30,8 +30,13 @@ def build_exam_ai_jsonl(records: list[QuestionRecord]) -> str:
         if q_txt:
             compact_obj["txt"] = q_txt
         std_code = (getattr(r, "standard_code", "") or "").strip()
+        std_codes = list(getattr(r, "standard_codes", []) or [])
+        if std_code and std_code not in std_codes:
+            std_codes = [std_code, *std_codes]
         if std_code:
             compact_obj["std"] = std_code
+        if len(std_codes) > 1:
+            compact_obj["stds"] = std_codes
         adv_terms = list(getattr(r, "advanced_terms", []) or [])
         if adv_terms:
             compact_obj["adv_terms"] = adv_terms
@@ -64,8 +69,15 @@ def build_exam_markdown(
         adv_terms = list(getattr(rec, "advanced_terms", []) or [])
         basic_terms = list(getattr(rec, "basic_terms", []) or [])
         std_code = (getattr(rec, "standard_code", "") or "").strip()
+        std_codes = [c for c in (getattr(rec, "standard_codes", []) or []) if c]
+        if std_code and std_code not in std_codes:
+            std_codes = [std_code, *std_codes]
         grade_ev = (getattr(rec, "grade_evidence", "") or "").strip()
-        std_suffix = f" · 성취기준 `[{std_code}]`" if std_code else ""
+        std_suffix = (
+            " · 성취기준 " + ", ".join(f"`[{c}]`" for c in std_codes)
+            if std_codes
+            else ""
+        )
         lines.extend(
             [
                 f"## {rec.q_num}번 ({rec.curriculum_subject} · {rec.unit_name}{std_suffix})",
@@ -119,9 +131,12 @@ def build_exam_html(
         adv_terms = list(getattr(rec, "advanced_terms", []) or [])
         basic_terms = list(getattr(rec, "basic_terms", []) or [])
         std_code = (getattr(rec, "standard_code", "") or "").strip()
+        std_codes = [c for c in (getattr(rec, "standard_codes", []) or []) if c]
+        if std_code and std_code not in std_codes:
+            std_codes = [std_code, *std_codes]
         grade_ev = (getattr(rec, "grade_evidence", "") or "").strip()
 
-        std_badge = f'<span class="pill">[{html.escape(std_code)}]</span>' if std_code else ""
+        std_badge = "".join(f'<span class="pill">[{html.escape(c)}]</span>' for c in std_codes)
         ev_html = (
             f'<div class="field-label">학년 판정 근거</div><p class="expl">{html.escape(grade_ev)}</p>'
             if grade_ev
