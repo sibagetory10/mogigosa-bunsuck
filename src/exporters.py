@@ -29,6 +29,12 @@ def build_exam_ai_jsonl(records: list[QuestionRecord]) -> str:
         q_txt = (getattr(r, "question_text", "") or "").strip()
         if q_txt:
             compact_obj["txt"] = q_txt
+        std_code = (getattr(r, "standard_code", "") or "").strip()
+        if std_code:
+            compact_obj["std"] = std_code
+        adv_terms = list(getattr(r, "advanced_terms", []) or [])
+        if adv_terms:
+            compact_obj["adv_terms"] = adv_terms
         lines.append(json.dumps(compact_obj, ensure_ascii=False, separators=(",", ":")))
     return "\n".join(lines)
 
@@ -55,13 +61,28 @@ def build_exam_markdown(
         single_label = "단일 원리" if rec.is_single_concept else "복합 원리"
         principles = ", ".join(rec.core_principles) if rec.core_principles else "-"
         terms = ", ".join(rec.required_terms) if rec.required_terms else "-"
+        adv_terms = list(getattr(rec, "advanced_terms", []) or [])
+        basic_terms = list(getattr(rec, "basic_terms", []) or [])
+        std_code = (getattr(rec, "standard_code", "") or "").strip()
+        grade_ev = (getattr(rec, "grade_evidence", "") or "").strip()
+        std_suffix = f" · 성취기준 `[{std_code}]`" if std_code else ""
         lines.extend(
             [
-                f"## {rec.q_num}번 ({rec.curriculum_subject} · {rec.unit_name})",
+                f"## {rec.q_num}번 ({rec.curriculum_subject} · {rec.unit_name}{std_suffix})",
                 "",
                 f"- **최저 학년:** 고{rec.min_grade} | **개념 유형:** {single_label} | **정답:** `{rec.answer}`",
                 f"- **본질 원리:** {principles}",
-                f"- **표면 용어:** {terms}",
+                f"- **표면 용어(전체):** {terms}",
+            ]
+        )
+        if adv_terms or basic_terms:
+            lines.append(
+                f"- **용어 구분:** 상위 전문 용어({', '.join(adv_terms) or '-'}) / 해당 학년 기본 용어({', '.join(basic_terms) or '-'})"
+            )
+        if grade_ev:
+            lines.append(f"- **학년 판정 근거:** {grade_ev}")
+        lines.extend(
+            [
                 f"- **공식 해설:** {rec.official_explanation or '-'}",
                 "",
             ]
@@ -95,6 +116,25 @@ def build_exam_html(
             f'<span class="chip chip-amber">{html.escape(t)}</span>'
             for t in rec.required_terms
         ) or '<span class="muted">-</span>'
+        adv_terms = list(getattr(rec, "advanced_terms", []) or [])
+        basic_terms = list(getattr(rec, "basic_terms", []) or [])
+        std_code = (getattr(rec, "standard_code", "") or "").strip()
+        grade_ev = (getattr(rec, "grade_evidence", "") or "").strip()
+
+        std_badge = f'<span class="pill">[{html.escape(std_code)}]</span>' if std_code else ""
+        ev_html = (
+            f'<div class="field-label">학년 판정 근거</div><p class="expl">{html.escape(grade_ev)}</p>'
+            if grade_ev
+            else ""
+        )
+        split_terms_html = ""
+        if adv_terms or basic_terms:
+            adv_str = ", ".join(html.escape(t) for t in adv_terms) or "-"
+            bas_str = ", ".join(html.escape(t) for t in basic_terms) or "-"
+            split_terms_html = (
+                f'<div class="muted" style="margin-bottom:6px;">'
+                f'상위 전문: {adv_str} · 기본 용어: {bas_str}</div>'
+            )
 
         single_txt = "단일 원리" if rec.is_single_concept else "복합 원리"
         cards_html.append(
@@ -107,6 +147,7 @@ def build_exam_html(
                   <span class="unit">{html.escape(rec.unit_name)}</span>
                 </div>
                 <div class="meta-pills">
+                  {std_badge}
                   <span class="pill">고{rec.min_grade}</span>
                   <span class="pill">{single_txt}</span>
                   <span class="pill pill-ans">정답 {html.escape(rec.answer)}</span>
@@ -118,7 +159,9 @@ def build_exam_html(
                   <div class="field-label">본질 원리 (core_principles)</div>
                   <div class="chips">{principles_html}</div>
                   <div class="field-label">표면 용어 (required_terms)</div>
+                  {split_terms_html}
                   <div class="chips">{terms_html}</div>
+                  {ev_html}
                   <div class="field-label">공식 해설</div>
                   <p class="expl">{html.escape(rec.official_explanation or "-")}</p>
                 </div>

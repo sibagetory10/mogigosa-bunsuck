@@ -1,0 +1,510 @@
+from __future__ import annotations
+
+import json
+import re
+from pathlib import Path
+from typing import Any, Sequence
+
+import pymupdf
+
+from src.models import ConceptBookRecord, QuestionExtractionOutput
+
+_DATA_PATH = Path(__file__).resolve().parent.parent / "data" / "curriculum_2022.json"
+
+_EVERYDAY_TERM_STOPWORDS = frozenset(
+    {
+        "그림",
+        "표",
+        "자료",
+        "보기",
+        "다음",
+        "문항",
+        "문제",
+        "정답",
+        "해설",
+        "과정",
+        "결과",
+        "값",
+        "합",
+        "차",
+        "곱",
+        "비",
+        "수",
+        "점",
+        "선",
+        "면",
+        "ㄱ",
+        "ㄴ",
+        "ㄷ",
+        "ㄹ",
+        "개",
+        "번",
+        "명",
+        "회",
+        "가지",
+        "원",
+        "cm",
+        "mm",
+        "km",
+        "g",
+        "kg",
+        "mg",
+        "ml",
+        "mL",
+        "L",
+        "s",
+        "sec",
+        "min",
+        "h",
+    }
+)
+
+_NCIC_STD_LINE_RE = re.compile(r"\[((?:10|12)[가-힣0-9ⅠⅡ]+(?:\d+)?(?:-\d{2}){1,2})\]\s*(.*)")
+_STD_CODE_ONLY_RE = re.compile(r"^\[?(?:10|12)[가-힣0-9ⅠⅡ]+(?:\d+)?(?:-\d{2}){1,2}\]?$")
+
+
+def _canon_subject_key(text: str) -> str:
+    s = (text or "").strip().lower()
+    s = s.replace("ⅱ", "2").replace("ⅰ", "1").replace("Ⅱ", "2").replace("Ⅰ", "1")
+    s = re.sub(r"([가-힣])ii(?=$|\s)", r"\g<1>2", s)
+    s = re.sub(r"([가-힣])i(?=$|\s)", r"\g<1>1", s)
+    s = re.sub(r"[\s·ㆍ・\-_().]+", "", s)
+    return s
+
+
+def load_curriculum_2022_catalog(path: Path | None = None) -> dict[str, Any]:
+    """2022 개정 교육과정 공식 편제 및 NCIC 누적 성취기준 JSON을 로드한다."""
+    target = path or _DATA_PATH
+    if not target.exists():
+        return {"version": "2022-33", "categories": {}}
+    try:
+        return json.loads(target.read_text(encoding="utf-8"))
+    except Exception:
+        return {"version": "2022-33", "categories": {}}
+
+
+def save_curriculum_2022_catalog(catalog: dict[str, Any], path: Path | None = None) -> None:
+    """갱신된 2022 개정 교육과정 기준표를 JSON 파일로 저장한다."""
+    target = path or _DATA_PATH
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(
+        json.dumps(catalog, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def get_catalog_summary_stats(catalog: dict[str, Any] | None = None) -> dict[str, dict[str, int]]:
+    """대분류(수학·사회·과학)별 공식 과목 수 및 NCIC 성취기준 수 통계를 반환한다."""
+    cat_data = (catalog or load_curriculum_2022_catalog()).get("categories", {})
+    stats: dict[str, dict[str, int]] = {}
+    for cat_name in ("수학", "사회", "과학"):
+        entry = cat_data.get(cat_name, {})
+        stats[cat_name] = {
+            "subjects": len(entry.get("subjects") or []),
+            "standards": len(entry.get("standards") or []),
+        }
+    return stats
+
+
+def get_official_subjects_for_category(
+    subject_category: str,
+    catalog: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    cat_data = (catalog or load_curriculum_2022_catalog()).get("categories", {})
+    entry = cat_data.get(subject_category, {})
+    return list(entry.get("subjects") or [])
+
+
+def normalize_subject_2022(
+    raw_subject: str,
+    subject_category: str = "",
+    catalog: dict[str, Any] | None = None,
+) -> tuple[str, bool, dict[str, Any] | None, bool]:
+    """
+    추출된 세부 과목명을 2022 개정 공식 과목명으로 정규화한다.
+    반환: (정규화된_과목명, 공식_편제_일치_여부, 과목_메타_딕셔너리, 별칭_자동교정_여부)
+    """
+    cat_map = (catalog or load_curriculum_2022_catalog()).get("categories", {})
+    cleaned = re.sub(r"\s+", " ", (raw_subject or "").strip())
+    if not cleaned:
+        return "", False, None, False
+
+    raw_key = _canon_subject_key(cleaned)
+
+    search_cats: list[str] = []
+    if subject_category in cat_map:
+        search_cats.append(subject_category)
+    for c in ("수학", "사회", "과학"):
+        if c not in search_cats and c in cat_map:
+            search_cats.append(c)
+
+    for cat in search_cats:
+        for subj in cat_map[cat].get("subjects") or []:
+            official_name = subj.get("name", "")
+            if _canon_subject_key(official_name) == raw_key:
+                was_changed = official_name != cleaned
+                return official_name, True, subj, was_changed
+
+    for cat in search_cats:
+        for subj in cat_map[cat].get("subjects") or []:
+            official_name = subj.get("name", "")
+            for alias in subj.get("aliases") or []:
+                if _canon_subject_key(alias) == raw_key:
+                    return official_name, True, subj, True
+
+    return cleaned, False, None, False
+
+
+def _infer_category_from_std(code: str, subject_name: str, fallback_cat: str) -> str:
+    txt = f"{code} {subject_name}"
+    if any(k in txt for k in ("공수", "수학", "대수", "미적", "확통", "확률", "기하")):
+        return "수학"
+    if any(k in txt for k in ("통과", "과학", "물리", "화학", "생명", "지구", "역에", "전자", "물질", "화반", "세포", "유전", "지시", "행우")):
+        return "과학"
+    if any(k in txt for k in ("통사", "한사", "한국사", "사회", "지리", "역사", "윤리", "정치", "법과", "경제", "사문", "세지", "세사", "현윤", "윤사")):
+        return "사회"
+    return fallback_cat if fallback_cat in ("수학", "사회", "과학") else "과학"
+
+
+def parse_ncic_curriculum_pdf(
+    pdf_bytes: bytes,
+    subject_category_hint: str = "",
+    catalog: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """
+    NCIC(국가교육과정정보센터) 교육부 고시 제2022-33호 별책 PDF에서
+    성취기준 코드([10...]/[12...]), 과목명, 권장 학년, 성취기준 문장을 추출한다.
+    """
+    cat_obj = catalog or load_curriculum_2022_catalog()
+    all_subject_names: list[str] = []
+    for cat_entry in cat_obj.get("categories", {}).values():
+        for subj in cat_entry.get("subjects") or []:
+            if subj.get("name"):
+                all_subject_names.append(subj["name"])
+    # 긴 과목명 우선 매칭 (예: '통합과학1'이 '통합과학'보다 우선)
+    all_subject_names.sort(key=len, reverse=True)
+
+    current_subject = ""
+    current_unit = ""
+    parsed_items: list[dict[str, Any]] = []
+    seen_codes: set[str] = set()
+
+    with pymupdf.open(stream=pdf_bytes, filetype="pdf") as doc:
+        active_item: dict[str, Any] | None = None
+        for page in doc:
+            raw_text = page.get_text("text") or ""
+            for raw_line in raw_text.splitlines():
+                line = re.sub(r"\s+", " ", raw_line).strip()
+                if not line:
+                    continue
+
+                # 과목 제목 줄 감지
+                if len(line) <= 35:
+                    for s_name in all_subject_names:
+                        if s_name == line or line.endswith(s_name) or re.match(rf"^(?:\d+\.|[가-힣]\.)?\s*\[?{re.escape(s_name)}\]?(?:\s*\(.*\))?$", line):
+                            current_subject = s_name
+                            break
+
+                # 단원/영역 제목 감지
+                if re.match(r"^(?:\(\d+\)|[ⅠⅡⅢⅣⅤⅥⅦⅧ]\.|[1-9]\.)\s*[가-힣A-Za-z0-9·\s]{2,40}$", line):
+                    cleaned_u = re.sub(r"^(?:\(\d+\)|[ⅠⅡⅢⅣⅤⅥⅦⅧ]\.|[1-9]\.)\s*", "", line).strip()
+                    if cleaned_u and not any(s in cleaned_u for s in ("성취기준", "교수·학습", "평가")):
+                        current_unit = cleaned_u
+
+                m = _NCIC_STD_LINE_RE.match(line)
+                if m:
+                    if active_item is not None:
+                        active_item["statement"] = re.sub(r"\s+", " ", active_item["statement"]).strip()[:320]
+                        if active_item["code"] not in seen_codes and active_item["statement"]:
+                            parsed_items.append(active_item)
+                            seen_codes.add(active_item["code"])
+
+                    std_code = m.group(1).strip()
+                    rest = m.group(2).strip()
+                    grade_int = 1 if std_code.startswith("10") else 2
+                    inferred_cat = _infer_category_from_std(std_code, current_subject, subject_category_hint)
+                    norm_subj, _, _, _ = normalize_subject_2022(current_subject, inferred_cat, cat_obj)
+                    active_item = {
+                        "code": std_code,
+                        "category": inferred_cat,
+                        "subject": norm_subj or current_subject,
+                        "unit": current_unit,
+                        "min_grade": grade_int,
+                        "statement": rest,
+                    }
+                    continue
+
+                if active_item is not None:
+                    # 해설/다음 섹션 헤더가 나오면 현재 성취기준 문장 수집 종료
+                    if line.startswith(("<성취기준 해설>", "(가)", "(나)", "[성취기준 해설]", "교수·학습", "평가")):
+                        active_item["statement"] = re.sub(r"\s+", " ", active_item["statement"]).strip()[:320]
+                        if active_item["code"] not in seen_codes and active_item["statement"]:
+                            parsed_items.append(active_item)
+                            seen_codes.add(active_item["code"])
+                        active_item = None
+                    elif len(active_item["statement"]) < 260 and not line.startswith(("•", "◦", "※")):
+                        active_item["statement"] += " " + line
+
+        if active_item is not None:
+            active_item["statement"] = re.sub(r"\s+", " ", active_item["statement"]).strip()[:320]
+            if active_item["code"] not in seen_codes and active_item["statement"]:
+                parsed_items.append(active_item)
+
+    return parsed_items
+
+
+def merge_ncic_standards_to_catalog(
+    extracted_standards: list[dict[str, Any]],
+    path: Path | None = None,
+) -> dict[str, int]:
+    """추출된 NCIC 성취기준 리스트를 curriculum_2022.json에 병합 저장한다."""
+    catalog = load_curriculum_2022_catalog(path)
+    cat_map = catalog.setdefault("categories", {})
+    added = 0
+    updated = 0
+
+    for item in extracted_standards:
+        code = (item.get("code") or "").strip()
+        cat = (item.get("category") or "").strip()
+        if not code or cat not in ("수학", "사회", "과학"):
+            continue
+        cat_entry = cat_map.setdefault(cat, {"subjects": [], "shift_notes": [], "core_units": {}, "standards": []})
+        stds: list[dict[str, Any]] = cat_entry.setdefault("standards", [])
+        existing_idx = next((i for i, s in enumerate(stds) if s.get("code") == code), None)
+        clean_entry = {
+            "code": code,
+            "subject": (item.get("subject") or "").strip(),
+            "unit": (item.get("unit") or "").strip(),
+            "min_grade": int(item.get("min_grade") or (1 if code.startswith("10") else 2)),
+            "statement": (item.get("statement") or "").strip(),
+        }
+        if existing_idx is None:
+            stds.append(clean_entry)
+            added += 1
+        else:
+            stds[existing_idx] = clean_entry
+            updated += 1
+
+    save_curriculum_2022_catalog(catalog, path)
+    return {"added": added, "updated": updated}
+
+
+def build_tagging_grounding_context(
+    subject_category: str,
+    exam_name: str = "",
+    concept_books: Sequence[ConceptBookRecord] | None = None,
+    max_standards: int = 45,
+    max_book_units: int = 28,
+    catalog: dict[str, Any] | None = None,
+) -> str:
+    """
+    Tab 1 태깅 프롬프트에 주입할 2022 개정 공식 기준표 + NCIC 성취기준 + 공용 개념서 DB 요약 컨텍스트를 조립한다.
+    """
+    cat_data = (catalog or load_curriculum_2022_catalog()).get("categories", {})
+    entry = cat_data.get(subject_category)
+    if not entry:
+        return ""
+
+    blocks: list[str] = [f"[2022 개정 교육과정 공식 기준표 — 대분류: {subject_category}]"]
+
+    # 1) 과목 편제표 (구분별 공식 과목명)
+    by_track: dict[str, list[str]] = {}
+    for subj in entry.get("subjects") or []:
+        track = subj.get("track", "선택")
+        by_track.setdefault(track, []).append(subj.get("name", ""))
+    for track, names in by_track.items():
+        if names:
+            grade_hint = "고1 권장" if track == "공통" else "고2~3 선택"
+            blocks.append(f"- {track}({grade_hint}): {', '.join(names)}")
+
+    # 2) 2015→2022 개정 주요 변경 주의사항
+    shifts = entry.get("shift_notes") or []
+    if shifts:
+        blocks.append("\n[2015→2022 개정 이동 주의사항 (할루시네이션 방지)]")
+        for note in shifts[:5]:
+            blocks.append(f"- {note}")
+
+    # 3) 과목별 핵심 단원 개요
+    core_units = entry.get("core_units") or {}
+    if core_units:
+        blocks.append("\n[2022 주요 과목별 단원 체계]")
+        for s_name, u_list in core_units.items():
+            blocks.append(f"- {s_name}: {', '.join(u_list)}")
+
+    # 4) NCIC 공식 고시 PDF에서 파싱된 성취기준 (있을 때)
+    standards = entry.get("standards") or []
+    if standards:
+        # 시험명 힌트에 해당 과목이 포함되어 있으면 그 과목 + 고1 공통과목 성취기준을 우선 배치
+        prioritized: list[dict[str, Any]] = []
+        others: list[dict[str, Any]] = []
+        for st_item in standards:
+            s_name = st_item.get("subject", "")
+            if (exam_name and s_name and s_name in exam_name) or st_item.get("min_grade") == 1:
+                prioritized.append(st_item)
+            else:
+                others.append(st_item)
+        chosen = (prioritized + others)[:max_standards]
+        blocks.append(f"\n[NCIC 공식 고시 성취기준 발췌 ({len(chosen)}/{len(standards)}개)]")
+        for st_item in chosen:
+            blocks.append(
+                f"- [{st_item.get('code')}] ({st_item.get('subject')} · 고{st_item.get('min_grade')}) "
+                f"{st_item.get('statement', '')[:120]}"
+            )
+
+    # 5) 공용 개념서 DB(concept_db) 단원·허용 용어 연동
+    if concept_books:
+        matching_books: list[ConceptBookRecord] = []
+        cat_subject_tokens = {subj.get("name", "") for subj in (entry.get("subjects") or []) if subj.get("name")}
+        for bk in concept_books:
+            bk_blob = f"{bk.book_title} {bk.subject}"
+            if subject_category in bk_blob or any(tok in bk_blob for tok in cat_subject_tokens):
+                matching_books.append(bk)
+
+        if matching_books:
+            blocks.append("\n[등록된 공용 개념서 DB(concept_db) 단원 및 허용 용어]")
+            unit_budget = max_book_units
+            for bk in matching_books[:4]:
+                if unit_budget <= 0:
+                    break
+                blocks.append(f"• {bk.book_title} ({bk.grade} · {bk.subject}):")
+                for u in bk.units[: min(len(bk.units), unit_budget)]:
+                    concepts_str = ", ".join(u.core_concepts[:5])
+                    terms_str = ", ".join(u.allowed_terms_and_units[:8])
+                    blocks.append(f"  - {u.unit_name}: 원리[{concepts_str}] / 허용용어[{terms_str}]")
+                    unit_budget -= 1
+
+    return "\n".join(blocks)
+
+
+def _clean_term_list(terms: Sequence[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in terms:
+        t = re.sub(r"\s+", " ", (raw or "").strip())
+        if not t or t in _EVERYDAY_TERM_STOPWORDS or t.lower() in _EVERYDAY_TERM_STOPWORDS:
+            continue
+        if len(t) == 1 and t.isdigit():
+            continue
+        key = t.lower()
+        if key not in seen:
+            seen.add(key)
+            out.append(t)
+    return out
+
+
+def _collect_lower_grade_allowed_vocab(
+    subject_category: str,
+    min_grade: int,
+    concept_books: Sequence[ConceptBookRecord] | None,
+) -> set[str]:
+    vocab: set[str] = set()
+    if not concept_books:
+        return vocab
+    for bk in concept_books:
+        m = re.search(r"[123]", bk.grade or "")
+        bk_grade = int(m.group(0)) if m else 3
+        if bk_grade <= min_grade:
+            for u in bk.units:
+                for term in u.allowed_terms_and_units:
+                    clean_t = (term or "").strip()
+                    if clean_t:
+                        vocab.add(clean_t.lower())
+    return vocab
+
+
+def validate_and_normalize_extracted_tag(
+    extracted: QuestionExtractionOutput,
+    subject_category: str,
+    concept_books: Sequence[ConceptBookRecord] | None = None,
+    catalog: dict[str, Any] | None = None,
+) -> QuestionExtractionOutput:
+    """
+    Gemini 태깅 출력을 2022 개정 공식 기준표 및 공용 개념서 DB와 대조해
+    1) 2015→2022 과목명 자동 정규화
+    2) 기본 용어(basic_terms) vs 상위 전문 용어(advanced_terms) 분리 및 일상어 필터링
+    3) 과목-학년 모순 및 가짜 성취기준 코드 할루시네이션 검출(needs_review)
+    을 수행한다.
+    """
+    cat_obj = catalog or load_curriculum_2022_catalog()
+    cat_entry = cat_obj.get("categories", {}).get(subject_category, {})
+    loaded_stds = {
+        (s.get("code") or "").strip(): s
+        for s in (cat_entry.get("standards") or [])
+        if s.get("code")
+    }
+
+    review_notes: list[str] = list(getattr(extracted, "review_notes", []) or [])
+    needs_review = bool(getattr(extracted, "needs_review", False))
+
+    norm_subj, is_official, subj_meta, was_alias = normalize_subject_2022(
+        extracted.curriculum_subject,
+        subject_category=subject_category,
+        catalog=cat_obj,
+    )
+    if norm_subj:
+        extracted.curriculum_subject = norm_subj
+    if was_alias:
+        review_notes.append(f"2022 공식 과목명으로 자동 정규화됨: {norm_subj}")
+    if not is_official:
+        needs_review = True
+        review_notes.append(f"2022 '{subject_category}' 공식 과목 목록에서 확인되지 않은 과목명입니다: {extracted.curriculum_subject}")
+
+    # 성취기준 코드 검증 (NCIC 기준표가 로드되어 있을 경우 할루시네이션 코드 차단)
+    std_code = re.sub(r"[\[\]\s]+", "", getattr(extracted, "standard_code", "") or "")
+    extracted.standard_code = std_code
+    if std_code and loaded_stds and _STD_CODE_ONLY_RE.match(std_code) and std_code not in loaded_stds:
+        needs_review = True
+        review_notes.append(f"로드된 NCIC 공식 성취기준 목록에 없는 코드입니다(할루시네이션 의심): [{std_code}]")
+
+    # 과목 편제(공통 vs 선택) ↔ 최저 학년 일관성 점검
+    grade_evidence = (getattr(extracted, "grade_evidence", "") or "").strip()
+    extracted.grade_evidence = grade_evidence
+    if subj_meta:
+        track = subj_meta.get("track", "")
+        min_allowed = int(subj_meta.get("min_allowed_grade") or 1)
+        if track == "공통" and extracted.min_grade > 1:
+            needs_review = True
+            review_notes.append(f"'{extracted.curriculum_subject}'는 고1 공통과목이나 min_grade={extracted.min_grade}로 판정되어 확인이 필요합니다.")
+        elif min_allowed >= 2 and extracted.min_grade == 1:
+            if std_code.startswith("12"):
+                needs_review = True
+                review_notes.append(
+                    f"성취기준 코드([{std_code}])는 고2~3 선택과목 범위인데 min_grade=1로 판정되어 모순이 있습니다."
+                )
+            elif not grade_evidence:
+                needs_review = True
+                review_notes.append(
+                    f"선택과목('{extracted.curriculum_subject}') 문항을 고1(min_grade=1)로 판정했으나 고1 공통 원리 근거가 비어 있습니다."
+                )
+
+    if not extracted.core_principles:
+        needs_review = True
+        review_notes.append("핵심 풀이 원리(core_principles)가 비어 있습니다.")
+
+    # 용어 정제: everyday 불용어 제거 + concept_db 저학년 허용 용어는 basic_terms로 교정
+    adv_clean = _clean_term_list(getattr(extracted, "advanced_terms", []) or [])
+    basic_clean = _clean_term_list(getattr(extracted, "basic_terms", []) or [])
+    req_clean = _clean_term_list(extracted.required_terms or [])
+
+    lower_vocab = _collect_lower_grade_allowed_vocab(subject_category, extracted.min_grade, concept_books)
+    if lower_vocab and adv_clean:
+        rebalanced_adv: list[str] = []
+        for term in adv_clean:
+            if term.lower() in lower_vocab:
+                if term.lower() not in {b.lower() for b in basic_clean}:
+                    basic_clean.append(term)
+            else:
+                rebalanced_adv.append(term)
+        adv_clean = rebalanced_adv
+
+    # required_terms는 기존 Tab 2 매칭 호환을 위해 상위·기본 학술 용어 전체 합집합으로 유지
+    merged_req = _clean_term_list([*adv_clean, *basic_clean, *req_clean])
+    if not adv_clean and not basic_clean and merged_req:
+        adv_clean = list(merged_req)
+
+    extracted.advanced_terms = adv_clean
+    extracted.basic_terms = basic_clean
+    extracted.required_terms = merged_req
+    extracted.needs_review = needs_review
+    extracted.review_notes = list(dict.fromkeys(review_notes))
+    return extracted

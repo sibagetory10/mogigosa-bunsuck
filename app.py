@@ -46,6 +46,13 @@ from src.config import (
     REWRITE_MODEL,
     resolve_credentials,
 )
+from src.curriculum_2022 import (
+    build_tagging_grounding_context,
+    get_catalog_summary_stats,
+    get_official_subjects_for_category,
+    merge_ncic_standards_to_catalog,
+    parse_ncic_curriculum_pdf,
+)
 from src.ebsi_fetcher import attempt_ebsi_pdf_fetch
 from src.exporters import build_exam_ai_jsonl, build_exam_html, build_exam_markdown
 from src.gemini_service import (
@@ -442,6 +449,13 @@ def _tag_and_save_single_exam(
     batch_t0 = time.perf_counter()
     extracted_by_q: dict[int, Any] = {}
 
+    concept_books = storage.load_concept_books()
+    grounding_ctx = build_tagging_grounding_context(
+        subject_category=meta["subject_category"],
+        exam_name=meta["exam_name"],
+        concept_books=concept_books,
+    )
+
     if meta.get("prob_bytes"):
         _status(f"⚡ 전체 문제지 PDF({len(target_crops)}문항) 한 번에 태깅 중 (모델: {tagging_model_label})...")
         try:
@@ -455,6 +469,8 @@ def _tag_and_save_single_exam(
                 answer_snippets=answer_snippets,
                 answer_pdf_part=answer_pdf_part,
                 status_callback=_status,
+                concept_books=concept_books,
+                grounding_context=grounding_ctx,
             )
             extracted_by_q.update(batch_map)
             _log(
@@ -482,6 +498,8 @@ def _tag_and_save_single_exam(
                 answer_pdf_part=answer_pdf_part,
                 answer_text_hint=answer_snippets.get(cq_item.q_num, ""),
                 status_callback=None,
+                concept_books=concept_books,
+                grounding_context=grounding_ctx,
             )
             return cq_item, extracted_out, time.perf_counter() - t_start
 
@@ -528,6 +546,12 @@ def _tag_and_save_single_exam(
             min_grade=extracted.min_grade,
             core_principles=extracted.core_principles,
             required_terms=extracted.required_terms,
+            advanced_terms=list(getattr(extracted, "advanced_terms", []) or []),
+            basic_terms=list(getattr(extracted, "basic_terms", []) or []),
+            standard_code=(getattr(extracted, "standard_code", "") or "").strip(),
+            grade_evidence=(getattr(extracted, "grade_evidence", "") or "").strip(),
+            needs_review=bool(getattr(extracted, "needs_review", False)),
+            review_notes=list(getattr(extracted, "review_notes", []) or []),
             is_single_concept=extracted.is_single_concept,
             answer=extracted.answer,
             official_explanation=extracted.official_explanation,
@@ -575,6 +599,155 @@ def _tag_and_save_single_exam(
         "sync_err": sync_err or "",
         "elapsed_s": total_batch_s,
     }
+
+
+def _render_question_tag_details(
+    rec: QuestionRecord,
+    storage: StorageManager,
+    key_prefix: str,
+    allow_delete: bool = False,
+) -> None:
+    """문항 1건의 2022 원리/용어 분리 결과·검토 경고 배지·인라인 교정 UI를 공통 렌더링한다."""
+    if getattr(rec, "needs_review", False):
+        notes = getattr(rec, "review_notes", []) or []
+        note_txt = " / ".join(notes) if notes else "2022 개정 기준표와 불일치 의심 항목입니다."
+        st.warning(f"⚠️ **검토 필요 (할루시네이션·모순 점검):** {note_txt}")
+
+    std_code = (getattr(rec, "standard_code", "") or "").strip()
+    grade_ev = (getattr(rec, "grade_evidence", "") or "").strip()
+    if std_code or grade_ev:
+        meta_bits: list[str] = []
+        if std_code:
+            meta_bits.append(f"**성취기준:** `[{std_code}]`")
+        if grade_ev:
+            meta_bits.append(f"**학년 판정 근거:** {grade_ev}")
+        st.caption(" · ".join(meta_bits))
+
+    st.markdown("**본질적 풀이 원리 (`core_principles`)**")
+    render_chips(rec.core_principles, variant="blue")
+
+    adv_terms = list(getattr(rec, "advanced_terms", []) or [])
+    basic_terms = list(getattr(rec, "basic_terms", []) or [])
+    if adv_terms or basic_terms:
+        tc1, tc2 = st.columns(2)
+        with tc1:
+            st.markdown("**상위 전문 용어 (`advanced_terms`)**")
+            render_chips(adv_terms, variant="amber")
+        with tc2:
+            st.markdown(f"**해당 학년 기본 용어 (`basic_terms` · 고{rec.min_grade})**")
+            render_chips(basic_terms, variant="green")
+    else:
+        st.markdown("**표면 전문 용어·단위 (`required_terms`)**")
+        render_chips(rec.required_terms, variant="amber")
+
+    st.write(f"**단일 개념 여부:** {'예 (단일 원리)' if rec.is_single_concept else '아니오 (복합 원리)'}")
+    st.write(f"**공식 해설 요약:** {rec.official_explanation}")
+
+    with st.expander("✏️ 2022 과목·최저 학년·성취기준 빠른 수정", expanded=False):
+        official_subjs = [s["name"] for s in get_official_subjects_for_category(rec.subject_category)]
+        if rec.curriculum_subject and rec.curriculum_subject not in official_subjs:
+            official_subjs = [rec.curriculum_subject] + official_subjs
+
+        ec1, ec2, ec3 = st.columns([1.4, 1.4, 0.8])
+        with ec1:
+            new_subj = st.selectbox(
+                "2022 세부 과목",
+                options=official_subjs or [rec.curriculum_subject],
+                index=(official_subjs.index(rec.curriculum_subject) if rec.curriculum_subject in official_subjs else 0),
+                key=f"{key_prefix}_edit_subj_{rec.id}",
+            )
+        with ec2:
+            new_unit = st.text_input(
+                "단원명",
+                value=rec.unit_name,
+                key=f"{key_prefix}_edit_unit_{rec.id}",
+            )
+        with ec3:
+            new_grade = st.selectbox(
+                "최저 학년",
+                options=[1, 2, 3],
+                index=max(0, min(2, int(rec.min_grade) - 1)),
+                format_func=lambda g: f"고{g}",
+                key=f"{key_prefix}_edit_grade_{rec.id}",
+            )
+        ec4, ec5 = st.columns([1, 2])
+        with ec4:
+            new_std = st.text_input(
+                "성취기준 코드",
+                value=std_code,
+                key=f"{key_prefix}_edit_std_{rec.id}",
+            )
+        with ec5:
+            new_ev = st.text_input(
+                "학년 판정 근거",
+                value=grade_ev,
+                key=f"{key_prefix}_edit_ev_{rec.id}",
+            )
+        if st.button("💾 수정 저장 (검토 완료 처리)", key=f"{key_prefix}_save_edit_{rec.id}"):
+            all_recs = storage.load_db()
+            for r in all_recs:
+                if r.id == rec.id:
+                    r.curriculum_subject = new_subj
+                    r.unit_name = new_unit.strip() or r.unit_name
+                    r.min_grade = int(new_grade)
+                    r.standard_code = new_std.strip()
+                    r.grade_evidence = new_ev.strip()
+                    r.needs_review = False
+                    r.review_notes = []
+                    break
+            storage.save_db(all_recs, target_exams={rec.exam_name})
+            _build_cached_exam_exports.clear()
+            st.success("수정 사항을 저장했습니다.")
+            st.rerun()
+
+    if allow_delete:
+        if st.button("이 문항 삭제", key=f"{key_prefix}_del_{rec.id}"):
+            storage.delete_question(rec.id)
+            _build_cached_exam_exports.clear()
+            st.rerun()
+
+
+def _render_ncic_curriculum_manager(key_prefix: str = "ncic") -> None:
+    """2022 개정 교육과정(NCIC 고시 별책 7·8·9 PDF) 기준표 현황 조회 및 성취기준 누적 등록 UI."""
+    with st.expander("🧭 2022 개정 교육과정 공식 기준표(NCIC 고시 PDF) 관리 · 성취기준 보강", expanded=False):
+        stats = get_catalog_summary_stats()
+        st.caption(
+            "기본적으로 2022 교육부 고시(제2022-33호) 공식 과목 편제표가 내장되어 있으며, "
+            "국가교육과정정보센터(ncic.re.kr)의 [별책 7(사회) / 별책 8(수학) / 별책 9(과학)] PDF를 올리면 "
+            "공식 성취기준 코드가 기준표에 누적되어 태깅 할루시네이션 검증이 한층 엄격해집니다."
+        )
+        m1, m2, m3 = st.columns(3)
+        m1.metric("수학 기준표", f"{stats['수학']['subjects']}과목", f"성취기준 {stats['수학']['standards']}개")
+        m2.metric("사회 기준표", f"{stats['사회']['subjects']}과목", f"성취기준 {stats['사회']['standards']}개")
+        m3.metric("과학 기준표", f"{stats['과학']['subjects']}과목", f"성취기준 {stats['과학']['standards']}개")
+
+        nc1, nc2 = st.columns([2, 1])
+        with nc1:
+            ncic_pdf = st.file_uploader(
+                "NCIC 2022 교육과정 고시 PDF 업로드 (별책 7/8/9)",
+                type=["pdf"],
+                key=f"{key_prefix}_ncic_pdf",
+            )
+        with nc2:
+            ncic_cat_hint = st.selectbox(
+                "기본 교과 대분류",
+                options=["과학", "수학", "사회"],
+                key=f"{key_prefix}_ncic_cat",
+            )
+        if ncic_pdf is not None and st.button("📥 NCIC 고시 PDF 성취기준 추출·반영", key=f"{key_prefix}_ncic_apply"):
+            with st.spinner("NCIC 고시 원문 PDF에서 2022 성취기준 코드 추출 중..."):
+                extracted = parse_ncic_curriculum_pdf(
+                    ncic_pdf.getvalue(),
+                    subject_category_hint=ncic_cat_hint,
+                )
+            if not extracted:
+                st.warning("PDF에서 `[10...]` / `[12...]` 형식의 2022 성취기준 코드를 찾지 못했습니다. 텍스트 레이어가 있는 공식 NCIC 원문 PDF인지 확인해 주세요.")
+            else:
+                res = merge_ncic_standards_to_catalog(extracted)
+                st.success(
+                    f"✅ 성취기준 {len(extracted)}개 추출 완료! (신규 {res['added']}개 추가 · 기존 {res['updated']}개 갱신)"
+                )
+                st.rerun()
 
 
 creds = resolve_credentials()
@@ -2348,8 +2521,9 @@ with tab1:
                     key=lambda r: r.q_num,
                 )
                 for rec in saved_records:
+                    review_badge = "⚠️ 검토 필요 · " if getattr(rec, "needs_review", False) else "✅ "
                     with st.expander(
-                        f"✅ {rec.q_num}번 · [{rec.curriculum_subject}] {rec.unit_name} (고{rec.min_grade} · 정답: {rec.answer})"
+                        f"{review_badge}{rec.q_num}번 · [{rec.curriculum_subject}] {rec.unit_name} (고{rec.min_grade} · 정답: {rec.answer})"
                     ):
                         c_img, c_info = st.columns([1, 1.3])
                         with c_img:
@@ -2361,12 +2535,12 @@ with tab1:
                             if b:
                                 st.image(b, width="stretch")
                         with c_info:
-                            st.markdown("**본질적 풀이 원리 (`core_principles`)**")
-                            render_chips(rec.core_principles, variant="blue")
-                            st.markdown("**표면 전문 용어·단위 (`required_terms`)**")
-                            render_chips(rec.required_terms, variant="amber")
-                            st.write(f"**단일 개념 여부:** {'예 (단일 원리)' if rec.is_single_concept else '아니오 (복합 원리)'}")
-                            st.write(f"**공식 해설 요약:** {rec.official_explanation}")
+                            _render_question_tag_details(
+                                rec,
+                                storage=storage,
+                                key_prefix="stage2_saved",
+                                allow_delete=False,
+                            )
 
     # 저장된 DB 조회 및 과목·회차별 관리
     st.markdown("---")
@@ -2618,8 +2792,9 @@ with tab1:
 
                         with st.expander(f"📋 '{exam_name}' 문항 상세 보기 ({len(exam_recs)}문항)", expanded=False):
                             for rec in exam_recs:
+                                warn_prefix = "⚠️ 검토 필요 · " if getattr(rec, "needs_review", False) else ""
                                 st.markdown(
-                                    f"**{rec.q_num}번** · `{rec.curriculum_subject}` · {rec.unit_name} "
+                                    f"{warn_prefix}**{rec.q_num}번** · `{rec.curriculum_subject}` · {rec.unit_name} "
                                     f"(고{rec.min_grade}, {'단일 원리' if rec.is_single_concept else '복합 원리'}, 정답 `{rec.answer}`)"
                                 )
                                 col_a, col_b = st.columns([1, 1.3])
@@ -2632,17 +2807,12 @@ with tab1:
                                     if img_b:
                                         st.image(img_b, width="stretch")
                                 with col_b:
-                                    st.markdown("**본질 원리 (`core_principles`)**")
-                                    render_chips(rec.core_principles, variant="blue")
-                                    st.markdown("**표면 용어 (`required_terms`)**")
-                                    render_chips(rec.required_terms, variant="amber")
-                                    st.write(f"**공식 해설:** {rec.official_explanation}")
-                                    if st.button(
-                                        "이 문항 삭제",
-                                        key=f"del_q_search_{rec.id}",
-                                    ):
-                                        storage.delete_question(rec.id)
-                                        st.rerun()
+                                    _render_question_tag_details(
+                                        rec,
+                                        storage=storage,
+                                        key_prefix="db_search",
+                                        allow_delete=True,
+                                    )
                                 st.markdown("---")
 
 
@@ -3231,6 +3401,7 @@ with tab2:
 # TAB 3: 관리자 / Pro 전용 공용 개념서·교과서 DB 구축 및 관리
 # ===========================================================================
 with tab3:
+    _render_ncic_curriculum_manager(key_prefix="tab3")
     _render_concept_book_builder_section(key_prefix="tab3")
 
 if admin_tab is not None:

@@ -6,7 +6,7 @@ import json
 import random
 import re
 import time
-from typing import Any, Callable, TypeVar
+from typing import Any, Callable, Sequence, TypeVar
 
 from google import genai
 from google.genai import types
@@ -14,6 +14,10 @@ from PIL import Image
 from pydantic import BaseModel, Field
 
 from src.config import DEFAULT_MODEL, HYDROGEN_MODEL, resolve_api_model_name
+from src.curriculum_2022 import (
+    build_tagging_grounding_context,
+    validate_and_normalize_extracted_tag,
+)
 from src.models import (
     AutoConceptPageDetectionOutput,
     AutoConceptRangeItem,
@@ -22,6 +26,7 @@ from src.models import (
     BatchQuestionTagItem,
     ConceptBookCoverMetadata,
     ConceptBookExtractionOutput,
+    ConceptBookRecord,
     ConceptUnit,
     ConceptWhitelist,
     ExamHeaderMetadata,
@@ -423,10 +428,12 @@ def analyze_question_with_gemini(
     answer_pdf_part: Any | None = None,
     answer_text_hint: str = "",
     status_callback: Callable[[str], None] | None = None,
+    concept_books: Sequence[ConceptBookRecord] | None = None,
+    grounding_context: str = "",
 ) -> QuestionExtractionOutput:
     """
-    크롭된 문항 PNG(가로 최대 1200px 리사이즈)와 해설지 정보(스니펫 또는 PDF)를 Gemini에 전달해
-    2022 개정 교육과정 기준 본질적 원리(core_principles)와 표면 용어(required_terms)를 빠르게 추출한다.
+    크롭된 문항 PNG(가로 최대 1200px 리사이즈), 해설지 정보, 2022 공식 기준표 및 개념서 DB를 Gemini에 전달해
+    성취기준 앵커링·원리/용어 분리·최저 학년 근거를 추출하고 후처리 검증한다.
     """
     client = _build_client(api_key, timeout_seconds=DEFAULT_API_TIMEOUT_SECONDS)
     if status_callback is not None:
@@ -434,17 +441,24 @@ def analyze_question_with_gemini(
     opt_png = optimize_image_for_vision(crop_png_bytes)
     img_part = types.Part.from_bytes(data=opt_png, mime_type="image/png")
 
+    eff_grounding = grounding_context or build_tagging_grounding_context(
+        subject_category=subject_category,
+        exam_name=exam_name,
+        concept_books=concept_books,
+    )
+
     system_inst = (
         "당신은 대한민국 2022 개정 교육과정(수학·사회·과학) 전문 기출 문항 분석가입니다. "
-        "반드시 '본질적 풀이 원리(core_principles)'와 '문제에 사용된 표면적 전문 용어·단위(required_terms)'를 "
-        "명확히 분리하여 태깅해야 합니다.\n"
-        "- core_principles: 상위 과목의 포장된 용어를 걷어내고, 이 문제를 실제로 풀기 위해 필요한 근본적 원리/법칙을 "
-        "간결한 한국어 개념구로 나열하세요. (예: '몰농도' 문제를 비례식과 질량 보존으로 풀 수 있다면 '비례 관계', '질량 보존 법칙' 등을 포함)\n"
-        "- required_terms: 실제 문제 지문, 그림, 표, 보기에 등장하는 전문 용어·기호·단위를 빠짐없이 적으세요. "
-        "(예: ['mol', '몰농도', 'M'], ['한계효용', '무차별곡선'], ['정적분', '도함수'])\n"
-        "- min_grade: 이 문항의 core_principles를 2022 개정 교육과정에서 처음 학습하는 최저 학년 (반드시 1, 2, 3 정수: 1=고1, 2=고2, 3=고3). "
-        "용어가 고2/고3 수준이더라도 본질 원리가 고1 통합과학·통합사회·공통수학에서 해결 가능하면 min_grade=1로 판정할 수 있습니다.\n"
-        "- answer: 해설지 참고 내용이나 첨부된 해설지 PDF에서 해당 문항 번호의 공식 정답을 정확히 찾고, 객관식은 '1'~'5' 숫자만, 주관식은 값만 적으세요."
+        "반드시 아래 순서와 기준표에 따라 추측(할루시네이션) 없이 정확히 태깅하세요.\n"
+        "1) [과목/단원/성취기준 앵커링]: 제공된 [2022 공식 기준표 및 개념서 DB] 안에서만 가장 정확한 2022 공식 `curriculum_subject`(2015 개정 명칭 금지)와 `unit_name`을 정하고, "
+        "기준표에 성취기준 코드가 있으면 `standard_code`에 적으세요(목록에 없는 코드를 지어내지 마세요).\n"
+        "2) [본질 원리 추출(`core_principles`)]: 상위 과목의 포장 용어를 걷어내고, 이 문제를 실제로 풀기 위해 필요한 근본적 풀이 원리·법칙을 간결한 한국어 개념구로 나열하세요.\n"
+        "3) [용어 이중 분리(`advanced_terms` vs `basic_terms`)]: '그림/표/보기/값/cm/g/s' 등 일상어와 기초 단위는 제외하세요.\n"
+        "   - `advanced_terms`: 고2~3 선택과목 등 상위 과정에서 도입되어 하위 학년 학생에게는 낯선 전문 용어·기호(예: '몰농도', 'mol', '한계효용', '도함수')\n"
+        "   - `basic_terms`: `min_grade` 수준에서 이미 배워 당연한 교과 기본 용어(예: '속력', '질량', '이차방정식', '인권')\n"
+        "   - `required_terms`: 문제 지문·보기에 등장하는 핵심 전문 용어 통합 목록(`advanced_terms` + 주요 `basic_terms`)\n"
+        "4) [최저 학년(`min_grade`) 및 근거(`grade_evidence`)]: `core_principles`를 2022 개정 교육과정에서 처음 배우는 최저 학년(1=고1, 2=고2, 3=고3)과 1줄 판정 근거를 `grade_evidence`에 명시하세요.\n"
+        "5) [정답/해설]: 해설지 참고 내용이나 첨부된 해설지 PDF에서 해당 문항의 공식 정답(객관식은 '1'~'5', 주관식은 값)과 핵심 풀이 요약을 추출하세요."
     )
 
     hint_block = (
@@ -452,12 +466,14 @@ def analyze_question_with_gemini(
         if answer_text_hint and answer_text_hint.strip()
         else ""
     )
+    grounding_block = f"\n{eff_grounding}\n" if eff_grounding else ""
     prompt = (
         f"시험 회차: {exam_name}\n"
         f"대분류 과목: {subject_category}\n"
         f"문항 번호: {q_num}번\n"
+        f"{grounding_block}"
         f"{hint_block}\n"
-        "위 이미지의 문항을 분석하고 공식 정답·해설을 참고하여 JSON 스키마에 맞게 간결히 추출하세요."
+        "위 이미지의 문항을 기준표에 대조해 분석하고 JSON 스키마에 맞게 추출하세요."
     )
 
     contents: list[Any] = [img_part]
@@ -479,8 +495,13 @@ def analyze_question_with_gemini(
         status_callback=status_callback,
     )
     if status_callback is not None:
-        status_callback(f"{q_num}번 응답 파싱 중...")
-    return _parse_structured(resp, QuestionExtractionOutput)
+        status_callback(f"{q_num}번 응답 파싱 및 2022 기준 검증 중...")
+    parsed = _parse_structured(resp, QuestionExtractionOutput)
+    return validate_and_normalize_extracted_tag(
+        parsed,
+        subject_category=subject_category,
+        concept_books=concept_books,
+    )
 
 
 def analyze_exam_pdf_batch_with_gemini(
@@ -493,10 +514,12 @@ def analyze_exam_pdf_batch_with_gemini(
     answer_snippets: dict[int, str] | None = None,
     answer_pdf_part: Any | None = None,
     status_callback: Callable[[str], None] | None = None,
+    concept_books: Sequence[ConceptBookRecord] | None = None,
+    grounding_context: str = "",
 ) -> dict[int, BatchQuestionTagItem]:
     """
-    전체 모의고사 문제지 PDF(및 해설지)를 한 번에 Gemini에 전달해
-    요청된 전체 문항 번호(target_q_nums)의 원리·용어·정답·해설을 일괄 태깅한다.
+    전체 모의고사 문제지 PDF(및 해설지) + 2022 공식 기준표/개념서 DB를 한 번에 Gemini에 전달해
+    요청된 전체 문항 번호(target_q_nums)를 일괄 태깅하고 후처리 검증한다.
     """
     ordered_q = sorted({int(q) for q in target_q_nums})
     if not ordered_q:
@@ -512,17 +535,22 @@ def analyze_exam_pdf_batch_with_gemini(
         display_name=f"{exam_name}_problem.pdf",
     )
 
+    eff_grounding = grounding_context or build_tagging_grounding_context(
+        subject_category=subject_category,
+        exam_name=exam_name,
+        concept_books=concept_books,
+    )
+
     system_inst = (
         "당신은 대한민국 2022 개정 교육과정(수학·사회·과학) 전문 기출 문항 분석가입니다. "
-        "첨부된 전체 모의고사 문제지 PDF에서 요청된 모든 문항 번호를 빠짐없이 찾아, "
-        "각 문항마다 '본질적 풀이 원리(core_principles)'와 '표면적 전문 용어·단위(required_terms)'를 "
-        "명확히 분리하여 JSON 배열(questions)로 한 번에 반환하세요.\n"
+        "첨부된 전체 모의고사 PDF에서 요청된 모든 문항 번호를 빠짐없이 찾아, "
+        "제공된 [2022 공식 기준표 및 개념서 DB]를 근거로 JSON 배열(questions)을 반환하세요.\n"
         "- q_num: 문항 번호 정수 (요청된 문항 번호를 1개도 누락하지 마세요)\n"
-        "- core_principles: 상위 과목의 포장된 용어를 걷어내고 문제를 실제로 풀기 위해 필요한 근본적 원리/법칙을 간결한 한국어 개념구로 나열\n"
-        "- required_terms: 실제 문제 지문, 그림, 표, 보기에 등장하는 전문 용어·기호·단위 목록\n"
-        "- min_grade: core_principles를 2022 개정 교육과정에서 처음 배우는 최저 학년 (반드시 1, 2, 3 정수: 1=고1, 2=고2, 3=고3)\n"
-        "- answer: 해설지 참고 내용이나 첨부된 해설지 PDF의 공식 정답 (객관식은 '1'~'5' 숫자 문자열만, 주관식은 값만)\n"
-        "- official_explanation: 핵심 풀이 요약 (1~2문장으로 간결하게 작성해 전체 문항이 응답 토큰 안에 모두 들어가도록 하세요)"
+        "- curriculum_subject / unit_name / standard_code: 기준표의 2022 공식 과목명(2015 명칭 금지)과 단원을 먼저 매핑하고, 기준표에 코드가 있으면 standard_code에 적되 목록에 없는 코드를 지어내지 마세요\n"
+        "- core_principles: 상위 과목 포장 용어를 걷어내고 문제를 푸는 데 필요한 근본적 풀이 원리·법칙을 간결한 한국어 개념구로 나열\n"
+        "- advanced_terms vs basic_terms vs required_terms: 일상어('그림','표','보기') 및 기초 측정단위('cm','g','s')는 제외하고, 상위 과정에서 새로 도입된 낯선 전문 용어는 advanced_terms, min_grade 시점 기본 용어는 basic_terms, 통합 핵심 용어는 required_terms에 기록\n"
+        "- min_grade / grade_evidence: core_principles를 2022 개정 교육과정에서 처음 배우는 최저 학년(1=고1, 2=고2, 3=고3)과 1줄 근거 작성\n"
+        "- answer / official_explanation: 해설지 기준 공식 정답(객관식 '1'~'5', 주관식은 값)과 1~2문장 핵심 풀이 요약"
     )
 
     snippets_map = answer_snippets or {}
@@ -537,13 +565,15 @@ def analyze_exam_pdf_batch_with_gemini(
         if snippet_lines
         else ""
     )
+    grounding_section = f"\n{eff_grounding}\n" if eff_grounding else ""
     q_list_str = ", ".join(str(q) for q in ordered_q)
     prompt = (
         f"시험 회차: {exam_name}\n"
         f"대분류 과목: {subject_category}\n"
         f"태깅 대상 문항 번호(총 {len(ordered_q)}문항): {q_list_str}\n"
+        f"{grounding_section}"
         f"{hint_section}\n"
-        "위 문제지 PDF 전체에서 지정된 모든 문항 번호를 한 번에 분석해 JSON 스키마(questions)로 반환하세요."
+        "위 문제지 PDF 전체에서 지정된 모든 문항 번호를 기준표와 대조해 한 번에 분석하고 JSON 스키마(questions)로 반환하세요."
     )
 
     contents: list[Any] = [prob_part]
@@ -552,7 +582,7 @@ def analyze_exam_pdf_batch_with_gemini(
     contents.append(prompt)
 
     if status_callback is not None:
-        status_callback(f"⚡ {model_name} 모델로 전체 PDF({len(ordered_q)}문항) 한 번에 태깅 중...")
+        status_callback(f"⚡ {model_name} 모델로 전체 PDF({len(ordered_q)}문항) 2022 기준 일괄 태깅 중...")
 
     resp = _generate_content_with_fallback(
         client=client,
@@ -572,6 +602,11 @@ def analyze_exam_pdf_batch_with_gemini(
     out: dict[int, BatchQuestionTagItem] = {}
     for item in parsed.questions:
         if item.q_num in ordered_q and item.q_num not in out:
+            validate_and_normalize_extracted_tag(
+                item,
+                subject_category=subject_category,
+                concept_books=concept_books,
+            )
             out[item.q_num] = item
     return out
 

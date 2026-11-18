@@ -39,7 +39,31 @@ class QuestionRecord(BaseModel):
     )
     required_terms: list[str] = Field(
         default_factory=list,
-        description="문제 지문과 보기에 등장하는 전문 용어·단위 리스트",
+        description="문제 지문과 보기에 등장하는 핵심 전문 용어·단위 리스트 (상위+기본 통합)",
+    )
+    advanced_terms: list[str] = Field(
+        default_factory=list,
+        description="상위 학년/선택과목에서 도입되는 낯선 전문 용어·기호 리스트",
+    )
+    basic_terms: list[str] = Field(
+        default_factory=list,
+        description="해당 최저 학년(min_grade) 수준에서 이미 학습해 당연한 기본 용어·기호 리스트",
+    )
+    standard_code: str = Field(
+        default="",
+        description="매칭된 2022 개정 성취기준 코드 또는 공용 개념서 기준 단원 식별자",
+    )
+    grade_evidence: str = Field(
+        default="",
+        description="최저 학년(min_grade) 판정 근거 요약",
+    )
+    needs_review: bool = Field(
+        default=False,
+        description="2022 기준표 대조 시 과목-학년 모순 또는 근거 부족으로 검토가 필요한지 여부",
+    )
+    review_notes: list[str] = Field(
+        default_factory=list,
+        description="할루시네이션·모순 검사에서 감지된 검토 사유 목록",
     )
     is_single_concept: bool = Field(
         ...,
@@ -82,7 +106,31 @@ class QuestionExtractionOutput(BaseModel):
     )
     required_terms: list[str] = Field(
         ...,
-        description="실제 문제 지문, 그림, 보기에 등장하는 전문 용어·기호·단위 목록 (예: ['mol', '몰농도', 'pH'])",
+        description="실제 문제 지문, 그림, 보기에 등장하는 핵심 전문 용어·기호 목록 (일상어 및 단순 길이/질량 단위 제외)",
+    )
+    advanced_terms: list[str] = Field(
+        default_factory=list,
+        description="고2~3 선택과목 등 상위 과정에서 도입되어 하위 학년 학생에게는 낯선 전문 용어·기호 목록 (예: ['mol', '몰농도', '한계효용', '도함수'])",
+    )
+    basic_terms: list[str] = Field(
+        default_factory=list,
+        description="min_grade 수준에서 이미 학습해 당연한 기본 교과 용어·기호 목록 (예: ['속력', '이차방정식', '인권'])",
+    )
+    standard_code: str = Field(
+        default="",
+        description="참고 기준표에 성취기준 코드가 있으면 해당 공식 코드(예: '10통과1-02-01'), 없으면 비우거나 개념서 단원명 기록",
+    )
+    grade_evidence: str = Field(
+        default="",
+        description="왜 이 최저 학년(min_grade)과 과목으로 판정했는지 2022 개정 교육과정 기준 1줄 근거",
+    )
+    needs_review: bool = Field(
+        default=False,
+        description="자동 검증기 전용 플래그 (기본 False)",
+    )
+    review_notes: list[str] = Field(
+        default_factory=list,
+        description="자동 검증기 전용 메모 (기본 빈 리스트)",
     )
     is_single_concept: bool = Field(
         ...,
