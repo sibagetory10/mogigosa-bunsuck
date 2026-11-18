@@ -43,6 +43,25 @@ def inject_responsive_css() -> None:
             line-height: 1.45;
         }
 
+        /* 사이드바 메트릭 3자리 이상 숫자 잘림(12...) 방지 */
+        [data-testid="stSidebar"] [data-testid="stMetric"] {
+            padding: 0.35rem 0.25rem !important;
+        }
+        [data-testid="stSidebar"] [data-testid="stMetricLabel"],
+        [data-testid="stSidebar"] [data-testid="stMetricLabel"] p {
+            font-size: 0.78rem !important;
+            white-space: nowrap !important;
+            overflow: visible !important;
+        }
+        [data-testid="stSidebar"] [data-testid="stMetricValue"],
+        [data-testid="stSidebar"] [data-testid="stMetricValue"] > div {
+            font-size: clamp(1.02rem, 1.3vw, 1.24rem) !important;
+            line-height: 1.25 !important;
+            white-space: nowrap !important;
+            overflow: visible !important;
+            text-overflow: unset !important;
+        }
+
         /* 카드 UI */
         .info-card {
             background: #FFFFFF;
@@ -53,30 +72,188 @@ def inject_responsive_css() -> None:
             color: #0F172A;
             box-shadow: 0 2px 8px rgba(15, 23, 42, 0.04);
         }
-        .rewritten-card {
-            background: #F8FAFC;
+
+        /* 모드 B 상단 성적표 카드 */
+        .score-report-card {
+            background: linear-gradient(135deg, #EFF6FF 0%, #F8FAFC 60%, #F0FDF4 100%);
             border: 1.5px solid #93C5FD;
-            border-left: 6px solid #2563EB;
-            border-radius: 12px;
-            padding: clamp(0.9rem, 2vw, 1.25rem);
-            margin: 0.65rem 0;
+            border-radius: 14px;
+            padding: 1rem 1.2rem;
+            margin: 0.6rem 0 1.1rem 0;
+            box-shadow: 0 4px 14px rgba(37, 99, 235, 0.08);
             color: #0F172A;
-            line-height: 1.65;
+        }
+        .score-report-top {
+            display: flex;
+            flex-wrap: wrap;
+            justify-content: space-between;
+            align-items: baseline;
+            gap: 0.6rem;
+            margin-bottom: 0.55rem;
+        }
+        .score-big {
+            font-size: clamp(1.25rem, 2.2vw, 1.65rem);
+            font-weight: 800;
+            color: #1E3A8A;
+        }
+        .score-bar-track {
+            width: 100%;
+            height: 8px;
+            background: #E2E8F0;
+            border-radius: 999px;
+            overflow: hidden;
+            margin-bottom: 0.7rem;
+        }
+        .score-bar-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #2563EB, #16A34A);
+            border-radius: 999px;
+        }
+        .score-ox-row {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+        }
+        .score-ox-pill {
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            padding: 0.22rem 0.55rem;
+            border-radius: 999px;
+            font-size: 0.8rem;
+            font-weight: 700;
+        }
+        .score-ox-ok { background: #DCFCE7; color: #166534; border: 1px solid #86EFAC; }
+        .score-ox-no { background: #FEE2E2; color: #991B1B; border: 1px solid #FCA5A5; }
+
+        /* 모던 학습지 스타일 문항 카드 */
+        .q-badge-row {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: center;
+            gap: 8px;
+            margin-bottom: 0.35rem;
+        }
+        .q-num-pill {
+            display: inline-block;
+            background: linear-gradient(135deg, #1E3A8A, #2563EB);
+            color: #FFFFFF;
+            font-size: 0.9rem;
+            font-weight: 800;
+            letter-spacing: 0.04em;
+            padding: 0.25rem 0.72rem;
+            border-radius: 8px;
+        }
+        .rewritten-card {
+            background: #FFFFFF;
+            border: 1.5px solid #CBD5E1;
+            border-top: 4px solid #2563EB;
+            border-radius: 12px;
+            padding: clamp(1rem, 2.2vw, 1.45rem);
+            margin: 0.7rem 0;
+            color: #0F172A;
+            line-height: 1.8;
+            box-shadow: 0 4px 16px rgba(15, 23, 42, 0.05);
         }
         .rewritten-stem {
-            font-size: clamp(0.94rem, 1.5vw, 1.03rem);
+            font-size: clamp(0.96rem, 1.45vw, 1.05rem);
+            line-height: 1.8;
             color: #0F172A;
             white-space: pre-wrap;
             word-break: keep-all;
+            margin-bottom: 0.7rem;
+        }
+        .data-box {
+            background: #F8FAFC;
+            border: 1px solid #CBD5E1;
+            border-left: 4px solid #475569;
+            border-radius: 8px;
+            padding: 0.85rem 1rem;
+            margin: 0.75rem 0;
+            font-size: clamp(0.93rem, 1.35vw, 1rem);
+            line-height: 1.75;
+            color: #1E293B;
+        }
+        .data-box-title {
+            font-size: 0.8rem;
+            font-weight: 800;
+            color: #334155;
+            letter-spacing: 0.06em;
+            margin-bottom: 0.35rem;
+        }
+        .bogi-box {
+            position: relative;
+            background: #FFFFFF;
+            border: 1.5px solid #334155;
+            border-radius: 8px;
+            padding: 1.05rem 1rem 0.75rem 1rem;
+            margin: 1rem 0 0.85rem 0;
+            font-size: clamp(0.94rem, 1.4vw, 1.02rem);
+            line-height: 1.75;
+            color: #0F172A;
+        }
+        .bogi-title {
+            position: absolute;
+            top: -0.72rem;
+            left: 50%;
+            transform: translateX(-50%);
+            background: #FFFFFF;
+            padding: 0 0.75rem;
+            font-size: 0.86rem;
+            font-weight: 800;
+            letter-spacing: 0.22em;
+            color: #0F172A;
+            white-space: nowrap;
+        }
+        .bogi-item {
+            display: grid;
+            grid-template-columns: 1.7rem 1fr;
+            gap: 0.35rem;
+            align-items: start;
+            margin-bottom: 0.38rem;
+            word-break: keep-all;
+        }
+        .bogi-item:last-child { margin-bottom: 0; }
+        .bogi-marker { font-weight: 800; color: #1E3A8A; }
+        .rewritten-choices-wrap {
+            margin-top: 0.85rem;
+            display: flex;
+            flex-direction: column;
+            gap: 0.45rem;
         }
         .rewritten-choice {
-            margin-top: 0.42rem;
-            padding: 0.38rem 0.65rem;
-            background: #FFFFFF;
-            border: 1px solid #E2E8F0;
-            border-radius: 8px;
-            font-size: clamp(0.9rem, 1.4vw, 0.98rem);
+            padding: 0.55rem 0.85rem;
+            background: #F8FAFC;
+            border: 1px solid #CBD5E1;
+            border-radius: 9px;
+            font-size: clamp(0.92rem, 1.38vw, 1rem);
+            line-height: 1.65;
             color: #1E293B;
+            transition: border-color 0.15s ease, background-color 0.15s ease;
+        }
+        .rewritten-choice:hover {
+            border-color: #3B82F6;
+            background: #EFF6FF;
+        }
+        .visual-term-note {
+            background: #FFFBEB;
+            border: 1px solid #FDE68A;
+            border-left: 4px solid #D97706;
+            border-radius: 8px;
+            padding: 0.55rem 0.85rem;
+            margin: 0.45rem 0 0.7rem 0;
+            font-size: 0.88rem;
+            font-weight: 600;
+            color: #92400E;
+        }
+        .omr-row .stButton > button {
+            border-radius: 999px !important;
+            border: 1.5px solid #CBD5E1 !important;
+            font-weight: 700 !important;
+        }
+        .omr-row .stButton > button[kind="primary"] {
+            border-color: #1D4ED8 !important;
+            box-shadow: 0 2px 8px rgba(37, 99, 235, 0.25) !important;
         }
 
         /* 배지 & 칩 */

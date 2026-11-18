@@ -56,6 +56,7 @@ from src.curriculum_2022 import (
 from src.ebsi_fetcher import attempt_ebsi_pdf_fetch
 from src.exporters import build_exam_ai_jsonl, build_exam_html, build_exam_markdown
 from src.gemini_service import (
+    ForbiddenTermRemainingError,
     analyze_exam_pdf_batch_with_gemini,
     analyze_question_with_gemini,
     build_gemini_client,
@@ -99,6 +100,11 @@ from src.pdf_parser import (
     render_pdf_page_png,
 )
 from src.storage import StorageManager
+from src.text_formatter import (
+    format_chemical_scripts,
+    has_visual_reference,
+    split_stem_blocks,
+)
 from src.ui_styles import inject_responsive_css, render_chips
 
 st.set_page_config(
@@ -1014,6 +1020,42 @@ st.markdown(
 )
 
 
+def _render_rewritten_card_html(rw: RewrittenQuestion) -> str:
+    """개조 문항의 <자료>·<보기> 분리 박스, 화학식 첨자, 선지 HTML을 모던 학습지 스타일로 조립한다."""
+    blocks = split_stem_blocks(rw.rewritten_stem)
+    body_parts: list[str] = []
+    for kind, content in blocks:
+        if kind == "data":
+            data_html = _html.escape(str(content)).replace("\n", "<br/>")
+            body_parts.append(
+                f"<div class='data-box'><div class='data-box-title'>&lt; 자 료 &gt;</div><div>{data_html}</div></div>"
+            )
+        elif kind == "bogi":
+            bogi_rows = "".join(
+                f"<div class='bogi-item'><span class='bogi-marker'>{_html.escape(mk)}</span>"
+                f"<span>{_html.escape(txt).replace(chr(10), '<br/>')}</span></div>"
+                for mk, txt in content
+            )
+            body_parts.append(
+                f"<div class='bogi-box'><div class='bogi-title'>〈 보 기 〉</div>{bogi_rows}</div>"
+            )
+        else:
+            p_html = _html.escape(str(content)).replace("\n", "<br/>")
+            body_parts.append(f"<div class='rewritten-stem'>{p_html}</div>")
+
+    choices_html = ""
+    if rw.rewritten_choices:
+        choice_divs = []
+        for ci, c_text in enumerate(rw.rewritten_choices):
+            sym = CIRCLED_MAP.get(str(ci + 1), f"{ci + 1})")
+            formatted_choice = format_chemical_scripts(c_text.strip())
+            c_html = _html.escape(formatted_choice).replace("\n", "<br/>")
+            choice_divs.append(f"<div class='rewritten-choice'><b>{sym}</b> {c_html}</div>")
+        choices_html = f"<div class='rewritten-choices-wrap'>{''.join(choice_divs)}</div>"
+
+    return f"<div class='rewritten-card'>{''.join(body_parts)}{choices_html}</div>"
+
+
 @st.fragment
 def _render_mode_b_solve_fragment(
     matched_items: list[dict[str, Any]],
@@ -1021,23 +1063,46 @@ def _render_mode_b_solve_fragment(
     active_gemini_key: str,
     active_key_label: str,
     selected_model: str,
+    rewrite_model: str | None = None,
 ) -> None:
-    """모드 B(웹에서 바로 풀기 & 자동 채점 + AI 자동 해설/채팅) 전용 프래그먼트."""
+    """모드 B(웹에서 바로 풀기 & 자동 채점 + AI 자동 해설/채팅 + 문항별 개별 재변환) 전용 프래그먼트."""
     st.markdown("#### ✏️ 실전 풀이 & 자동 채점 + 개념서 기반 AI 자동 해설")
 
-    # 채점 완료 시 상단 성적표 배너
+    # 채점 완료 시 상단 성적표 카드 UI
     if st.session_state.get("graded"):
         correct_cnt = 0
-        for item in matched_items:
+        ox_pills: list[str] = []
+        for idx_g, item in enumerate(matched_items, start=1):
             q: QuestionRecord = item["question"]
             rw: RewrittenQuestion | None = item.get("rewritten")
             truth = rw.preserved_answer if rw else q.answer
             user_val = st.session_state["user_answers"].get(q.id, "")
-            if normalize_answer(user_val) == normalize_answer(truth) and normalize_answer(user_val) != "":
+            is_ok = normalize_answer(user_val) == normalize_answer(truth) and normalize_answer(user_val) != ""
+            if is_ok:
                 correct_cnt += 1
+                ox_pills.append(f"<span class='score-ox-pill score-ox-ok'>Q{idx_g:02d} ⭕</span>")
+            else:
+                ox_pills.append(f"<span class='score-ox-pill score-ox-no'>Q{idx_g:02d} ❌</span>")
         total_q = len(matched_items)
         score_pct = round((correct_cnt / max(1, total_q)) * 100, 1)
-        st.success(f"📊 **채점 결과: {total_q}문항 중 {correct_cnt}문항 정답 ({score_pct}점)**")
+        st.markdown(
+            f"""
+            <div class="score-report-card">
+              <div class="score-report-top">
+                <div class="score-big">📊 채점 성적표: {score_pct}점</div>
+                <div style="font-size:0.95rem; font-weight:700; color:#334155;">
+                  총 {total_q}문항 중 <span style="color:#16A34A;">{correct_cnt}문항 정답</span> ·
+                  <span style="color:#DC2626;">{total_q - correct_cnt}문항 오답</span>
+                </div>
+              </div>
+              <div class="score-bar-track"><div class="score-bar-fill" style="width:{score_pct}%;"></div></div>
+              <div class="score-ox-row">{''.join(ox_pills)}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    eff_rewrite_model = rewrite_model or st.session_state.get("active_rewrite_model") or selected_model
 
     for seq_num, item in enumerate(matched_items, start=1):
         q = item["question"]
@@ -1053,41 +1118,69 @@ def _render_mode_b_solve_fragment(
         )
 
         with st.container(border=True):
-            # 카드 상단 헤더 + 배지
-            hdr_col1, hdr_col2 = st.columns([3, 1])
+            # 카드 상단 헤더 + 번호 배지
+            hdr_col1, hdr_col2 = st.columns([3.2, 1])
             with hdr_col1:
-                st.markdown(f"### 문제 {seq_num}번")
-                st.caption(
-                    f"출처: {q.exam_name} {q.q_num}번 · {q.curriculum_subject} ({q.unit_name}) · 본질 원리: {', '.join(q.core_principles)}"
-                )
-            with hdr_col2:
-                if rw is not None:
-                    st.markdown("<span class='chip chip-blue'>✨ 개념서 기준 개조 문항</span>", unsafe_allow_html=True)
-                else:
-                    st.markdown("<span class='chip chip-green'>📌 원문 그대로 출제</span>", unsafe_allow_html=True)
-
-            # 문제 본문 표시
-            if rw is not None:
-                stem_html = _html.escape(rw.rewritten_stem).replace("\n", "<br/>")
-                choices_html = "".join(
-                    f"<div class='rewritten-choice'><b>{CIRCLED_MAP.get(str(ci + 1), f'{ci+1})')}</b> "
-                    f"{_html.escape(rw.rewritten_choices[ci]).replace(chr(10), '<br/>')}</div>"
-                    for ci in range(len(rw.rewritten_choices))
-                )
                 st.markdown(
                     f"""
-                    <div class="rewritten-card">
-                      <div class="rewritten-stem">{stem_html}</div>
-                      {choices_html}
+                    <div class="q-badge-row">
+                      <span class="q-num-pill">Q{seq_num:02d}</span>
+                      <span style="font-size:0.9rem; font-weight:700; color:#1E293B;">
+                        {_html.escape(q.curriculum_subject)} · {_html.escape(q.unit_name)}
+                      </span>
                     </div>
                     """,
                     unsafe_allow_html=True,
                 )
+                st.caption(
+                    f"출처: {q.exam_name} {q.q_num}번 · 본질 원리: {', '.join(q.core_principles)}"
+                )
+            with hdr_col2:
+                if rw is not None:
+                    st.markdown(
+                        "<div style='text-align:right;'><span class='chip chip-blue'>✨ 개념서 기준 개조 문항</span></div>",
+                        unsafe_allow_html=True,
+                    )
+                else:
+                    st.markdown(
+                        "<div style='text-align:right;'><span class='chip chip-green'>📌 원문 그대로 출제</span></div>",
+                        unsafe_allow_html=True,
+                    )
+
+            # 문제 본문 표시
+            if rw is not None:
+                st.markdown(_render_rewritten_card_html(rw), unsafe_allow_html=True)
+
+                vis_term_note = (getattr(rw, "visual_term_note", "") or "").strip()
+                needs_visual_display = bool(crop_b) and (
+                    has_visual_reference(rw.rewritten_stem)
+                    or has_visual_reference(" ".join(rw.rewritten_choices or []))
+                    or has_visual_reference(getattr(q, "question_text", ""))
+                    or bool(vis_term_note)
+                )
+
+                if needs_visual_display and crop_b:
+                    st.image(
+                        crop_b,
+                        caption=f"📊 원본 그림·도표 참고 ({q.exam_name} {q.q_num}번)",
+                        width="stretch",
+                    )
+                if vis_term_note:
+                    st.markdown(
+                        f"<div class='visual-term-note'>📌 <b>[그림 용어 안내]</b> {_html.escape(format_chemical_scripts(vis_term_note))}</div>",
+                        unsafe_allow_html=True,
+                    )
+
                 if rw.replaced_terms_map:
                     render_chips(rw.replaced_terms_map, variant="purple")
 
-                with st.expander("🖼️ 원본 문제 이미지 & 개조 검증 내역 보기", expanded=False):
-                    if crop_b:
+                exp_title = (
+                    "🔍 개조 검증 & 치환 내역 보기"
+                    if needs_visual_display
+                    else "🖼️ 원본 문제 이미지 & 개조 검증 내역 보기"
+                )
+                with st.expander(exp_title, expanded=False):
+                    if crop_b and not needs_visual_display:
                         st.image(crop_b, caption=f"원본 ({q.exam_name} {q.q_num}번)", width="stretch")
                     st.info(f"**자가 검증:** {rw.self_verification_note}")
             else:
@@ -1149,13 +1242,13 @@ def _render_mode_b_solve_fragment(
 
                 with st.expander("📖 빠른 정답 해설 보기", expanded=not is_correct):
                     if rw is not None:
-                        st.markdown(rw.pdf_grounded_explanation)
+                        st.markdown(format_chemical_scripts(rw.pdf_grounded_explanation))
                     else:
                         st.markdown(q.official_explanation)
                     st.caption(concept_ref_str)
 
-            # ✨ AI 자동 해설 버튼 & 추가 질문 채팅
-            ai_col1, ai_col2 = st.columns([1, 2])
+            # ✨ AI 자동 해설 버튼 & 🔄 이 문제 다시 변환 버튼
+            ai_col1, ai_col2, _ = st.columns([1.15, 1.25, 1.4])
             with ai_col1:
                 if st.button("✨ AI 자동 해설", key=f"ai_btn_{q.id}", width="stretch"):
                     if not active_gemini_key:
@@ -1179,6 +1272,41 @@ def _render_mode_b_solve_fragment(
                                 st.session_state["ai_explanations"][q.id] = exp_md
                             except Exception as exc:
                                 st.error(f"AI 해설 생성 실패: {exc}")
+
+            with ai_col2:
+                if st.button("🔄 이 문제 다시 변환", key=f"re_rw_btn_{q.id}", width="stretch"):
+                    if not active_gemini_key:
+                        st.error(f"사용 가능한 Gemini API 키({active_key_label})가 설정되지 않았습니다.")
+                    elif whitelist is None:
+                        st.error("개념서 화이트리스트가 필요합니다.")
+                    else:
+                        with st.spinner("이전 변환의 미흡 용어를 보완해 이 문항만 다시 변환 중..."):
+                            try:
+                                target_oos = list(
+                                    getattr(j, "out_of_scope_terms", [])
+                                    or getattr(q, "advanced_terms", [])
+                                    or []
+                                )
+                                new_rw = rewrite_question_for_pdf(
+                                    api_key=active_gemini_key,
+                                    model_name=eff_rewrite_model,
+                                    question=q,
+                                    crop_png_bytes=crop_b,
+                                    whitelist=whitelist,
+                                    out_of_scope_terms=target_oos,
+                                    sliced_text=st.session_state.get("concept_sliced_text", ""),
+                                    previous_attempt=rw,
+                                )
+                                st.session_state["matched_items"][seq_num - 1]["rewritten"] = new_rw
+                                st.session_state["ai_explanations"].pop(q.id, None)
+                                st.session_state["ai_chats"].pop(q.id, None)
+                                st.session_state["generated_exam_pdf"] = None
+                                st.session_state["generated_exam_pdf_sig"] = ""
+                                st.rerun(scope="fragment")
+                            except ForbiddenTermRemainingError as fexc:
+                                st.warning(f"⛔ 재변환 후에도 금지 용어가 남아 반영하지 않았습니다: {fexc}")
+                            except Exception as exc:
+                                st.error(f"문항 재변환 실패: {exc}")
 
             if q.id in st.session_state["ai_explanations"]:
                 st.info("✨ **개념서 범위 기준 AI 맞춤 해설**")
@@ -3128,6 +3256,7 @@ with tab2:
                     f"(주간 고급 모델 남은 횟수: **{pro_rem_weekly} / {PRO_WEEKLY_PREMIUM_LIMIT}회**)"
                     + (f" — {rewrite_notice}" if rewrite_notice else "")
                 )
+        st.session_state["active_rewrite_model"] = rewrite_model
 
         with st.container(border=True):
             opt_c1, opt_c2, opt_c3 = st.columns(3)
@@ -3281,6 +3410,9 @@ with tab2:
                                         done_cnt += 1
                                         try:
                                             rewritten_results[idx] = fut.result()
+                                        except ForbiddenTermRemainingError as fexc:
+                                            failed_indices.add(idx)
+                                            st.warning(f"⛔ {q_done.id} 금지 용어 잔존으로 제외: {fexc}")
                                         except Exception as exc:
                                             failed_indices.add(idx)
                                             st.error(f"{q_done.id} 개조 실패 (원본 제외): {exc}")
@@ -3392,6 +3524,23 @@ with tab2:
                             value=True,
                         )
 
+                    items_sig = hashlib.sha256(
+                        json.dumps(
+                            [
+                                (
+                                    it["question"].id,
+                                    getattr(it.get("rewritten"), "rewritten_stem", ""),
+                                    getattr(it.get("rewritten"), "rewritten_choices", []),
+                                    pdf_title.strip(),
+                                    layout_choice,
+                                    include_orig_fig,
+                                )
+                                for it in matched_items
+                            ],
+                            ensure_ascii=False,
+                        ).encode("utf-8")
+                    ).hexdigest()[:16]
+
                     if st.button("🛠️ 맞춤형 시험지 PDF 생성하기", type="primary"):
                         with st.spinner("PDF 조판 및 뒷장 정답·해설 페이지 생성 중..."):
                             pdf_bytes = generate_custom_exam_pdf(
@@ -3403,9 +3552,13 @@ with tab2:
                                 include_original_for_rewritten=include_orig_fig,
                             )
                             st.session_state["generated_exam_pdf"] = pdf_bytes
+                            st.session_state["generated_exam_pdf_sig"] = items_sig
                         st.success("✅ 시험지 PDF(뒷장 정답·개념서 맞춤 해설 포함)가 생성되었습니다!")
 
-                    if st.session_state.get("generated_exam_pdf"):
+                    if (
+                        st.session_state.get("generated_exam_pdf")
+                        and st.session_state.get("generated_exam_pdf_sig", items_sig) == items_sig
+                    ):
                         dl_bytes = st.session_state["generated_exam_pdf"]
                         st.download_button(
                             label=f"⬇️ 맞춤형 시험지 PDF 다운로드 ({len(dl_bytes) // 1024} KB)",
@@ -3424,6 +3577,7 @@ with tab2:
                 active_gemini_key=active_gemini_key,
                 active_key_label=active_key_label,
                 selected_model=selected_model,
+                rewrite_model=st.session_state.get("active_rewrite_model") or selected_model,
             )
 
 # ===========================================================================

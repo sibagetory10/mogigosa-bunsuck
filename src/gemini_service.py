@@ -38,6 +38,15 @@ from src.models import (
     TocUnitItem,
 )
 from src.pdf_parser import extract_specific_pages_slice
+from src.text_formatter import (
+    find_forbidden_terms_in_text,
+    format_chemical_scripts,
+    normalize_exam_layout_text,
+)
+
+
+class ForbiddenTermRemainingError(ValueError):
+    """개조 후처리 검증에서 범위 외 금지 용어가 재개조 후에도 잔존할 때 발생하는 오류."""
 
 T = TypeVar("T")
 
@@ -1298,21 +1307,25 @@ def match_questions_to_whitelist(
     candidates: list[QuestionRecord],
     whitelist: ConceptWhitelist,
 ) -> list[QuestionMatchJudgment]:
-    """후보 기출 문항들의 core_principles가 PDF pdf_concepts 범위만으로 해결 가능한지 엄격히 판정한다."""
+    """후보 기출 문항들의 단원과 core_principles가 사용자가 선택한 개념서 단원·pdf_concepts 범위만으로 해결 가능한지 엄격히 판정한다."""
     if not candidates:
         return []
 
     client = _build_client(api_key)
+    selected_unit_names = [u.unit_name for u in whitelist.units if u.unit_name]
     system_inst = (
-        "당신은 기출 문항과 개념서 PDF 범위의 정합성을 판정하는 엄격한 심사관입니다.\n"
-        "판정 규칙:\n"
-        "1. is_solvable_by_pdf_only: 문항의 core_principles와 실제 풀이(official_explanation)가 "
-        "업로드된 개념서/공용 DB의 pdf_concepts 범위(및 초중등 기초 연산·독해)만으로 **100% 완전히 해결 가능**할 때만 True로 판정하세요. "
-        "개념서에 없는 다른 단원의 원리가 하나라도 필요하면 반드시 False로 판정하세요.\n"
-        "2. out_of_scope_terms: 문항의 required_terms 중 pdf_vocabulary에 없는 상위/범위 외 전문 용어·단위를 적으세요. "
-        "(기초 일상어나 '개', '%', '초', 'm', 'g' 등 보편적 기초 단위는 제외 가능하나, 상위 전공 용어나 기호는 반드시 포함)\n"
-        "3. needs_rewriting: is_solvable_by_pdf_only가 True이고 out_of_scope_terms가 1개 이상이면 True, "
-        "용어까지 모두 개념서 범위 안이면 False입니다.\n"
+        "당신은 기출 문항과 개념서 PDF 범위의 정합성을 판정하는 매우 엄격한 교육과정 심사관입니다.\n"
+        "억지 매칭·억지 개조를 차단하기 위해 아래 규칙을 반드시 지키세요:\n"
+        "1. is_solvable_by_pdf_only (엄격 일치 필수):\n"
+        "   - 후보 문항의 **단원(unit_name)**과 **본질 원리(core_principles)**, 그리고 **실제 풀이(official_explanation)**가 "
+        "사용자가 선택한 개념서 단원 목록(`whitelist.units`)의 핵심 주제 및 `pdf_concepts`와 **직접 일치**하고, "
+        "해당 범위(+ 초중등 기초 연산·독해)만으로 **100% 완전히 해결 가능할 때만 True**로 판정하세요.\n"
+        "   - **반드시 False로 제외해야 하는 경우:**\n"
+        "     (a) 선택한 단원과 무관한 다른 단원 문항 (예: '산, 염기와 중화 반응' 단원을 선택했는데 '동적 평형', '가역 반응', '물 분자의 이온화' 단원 문항이 섞인 경우)\n"
+        "     (b) 개념서 범위를 벗어나는 상위 실험 기법·계산 원리 (예: 고1 통합과학 범위를 벗어난 '중화 적정 실험', '피펫 분취 및 희석 계산', '이상기체 상태방정식' 등)를 말장난식 용어 치환으로 우회해야만 풀리는 문항\n"
+        "     (c) 개념서에 없는 상위 원리·공식이 하나라도 필수인 문항\n"
+        "2. out_of_scope_terms: 문항의 required_terms 중 pdf_vocabulary에 없는 상위/범위 외 전문 용어·단위(`M`, `몰농도`, `mol`, `몰수`, `분자량`, `화학식량`, `엔탈피` 등)를 빠짐없이 적으세요.\n"
+        "3. needs_rewriting: is_solvable_by_pdf_only가 True이고 out_of_scope_terms가 1개 이상이면 True, 용어까지 모두 개념서 범위 안이면 False입니다.\n"
         "4. matched_unit_name 및 matched_page_range: is_solvable_by_pdf_only가 True인 경우, "
         "제공된 [개념서 단원별 상세 목록] 중 이 문항의 핵심 원리가 수록된 가장 정확한 단원명(`unit_name`)과 페이지 범위(`page_range`, 예: 'p.184~189')를 그대로 적으세요."
     )
@@ -1320,10 +1333,10 @@ def match_questions_to_whitelist(
     units_block = ""
     if whitelist.units:
         unit_lines = [
-            f"- 단원명: {u.unit_name} | 페이지: {u.page_range} | 핵심 개념: {u.core_concepts[:15]}"
+            f"- 단원명: {u.unit_name} | 페이지: {u.page_range} | 핵심 개념: {u.core_concepts[:15]} | 허용 용어: {u.allowed_terms_and_units[:20]}"
             for u in whitelist.units
         ]
-        units_block = "[개념서 단원별 상세 목록]\n" + "\n".join(unit_lines) + "\n\n"
+        units_block = "[개념서 단원별 상세 목록 — 이 단원 외 타 단원 문항은 모두 제외]\n" + "\n".join(unit_lines) + "\n\n"
 
     all_judgments: list[QuestionMatchJudgment] = []
     batch_size = 25
@@ -1349,6 +1362,7 @@ def match_questions_to_whitelist(
 
         prompt = (
             f"[참고 교재명] {whitelist.book_title or '업로드 개념서 PDF'}\n"
+            f"[선택된 단원명 목록] {selected_unit_names or [whitelist.subject_guess]}\n"
             f"[개념서 범위 요약]\n{whitelist.pdf_summary}\n\n"
             f"{units_block}"
             f"[허용 개념·원리 (pdf_concepts)]\n{whitelist.pdf_concepts}\n\n"
@@ -1381,11 +1395,13 @@ def rewrite_question_for_pdf(
     whitelist: ConceptWhitelist,
     out_of_scope_terms: list[str],
     sliced_text: str = "",
+    previous_attempt: RewrittenQuestion | None = None,
+    extra_feedback: str = "",
 ) -> RewrittenQuestion:
     """
     풀이 원리는 PDF 범위 안이지만 상위 과목 용어(out_of_scope_terms)가 포함된 문항을
-    업로드된 PDF에 실제로 존재하는 용어와 개념 표현만 사용해 자연스럽게 개조한다.
-    문제의 논리와 정답은 원본과 100% 동일하게 유지한다.
+    업로드된 PDF 허용 용어만 사용해 개조하고, 금지 용어 잔존 여부를 후처리 정규식으로 검증한다.
+    잔존 시 누락 용어를 명시해 1회 자동 재개조하며, 재개조 후에도 잔존 시 ForbiddenTermRemainingError를 발생시킨다.
     """
     client = _build_client(api_key)
 
@@ -1393,11 +1409,13 @@ def rewrite_question_for_pdf(
         "당신은 고난도 교육과정 기반 문항 리라이터(PDF-Grounded Rewriter)입니다.\n"
         "다음 절대 원칙을 반드시 지키세요:\n"
         "1. 업로드된 개념서 PDF에 있는 개념(pdf_concepts)과 용어(pdf_vocabulary), 그리고 일반 일상 한국어만 사용하세요.\n"
-        "2. 범위 외 상위 용어 목록(out_of_scope_terms)에 포함된 단어나 기호는 개조된 지문, <조건>, 선지, 해설 어디에도 절대 남기지 마세요.\n"
-        "3. 문제의 수학적·논리적 구조, 수치 조건, 정답의 참/거짓 판정 로직은 원본과 **100% 동일하게** 유지하세요.\n"
-        "4. preserved_answer는 반드시 원본 정답과 동일해야 합니다.\n"
-        "5. 그림이나 표에 있던 필수 수치가 있다면 지문 또는 <조건>에 PDF 허용 용어로 빠짐없이 명시해 텍스트만 읽어도 풀 수 있게 하세요.\n"
-        "6. rewritten_choices는 객관식이면 5개 항목 리스트(선지 번호 ①~⑤는 빼고 내용만), 주관식이면 빈 리스트 []로 반환하세요."
+        "2. 범위 외 상위 용어 목록(out_of_scope_terms) 및 개념서에 없는 상위 단위/용어(`M`, `몰 농도`, `몰농도`, `mol`, `몰수`, `분자량`, `화학식량`, `엔탈피` 등)는 개조된 지문, <자료>, <보기>, 선지 어디에도 절대 남기지 마세요.\n"
+        "3. **핵심 원리 억지 동어반복 치환 금지**: 개념서 범위를 벗어나는 실험/원리 개념 자체를 동어반복 문장으로 어색하게 풀어쓰지 말고, 개념서 허용 용어와 구체적 수치·입자 수 비율로 논리가 온전히 성립되게 표현하세요.\n"
+        "4. **자연스러운 국문 문장 구조 유지**: 용어 치환 후 문장 끝이 어색하게 끊기지 않도록(예: `'질량: x g x는?'` 금지 → `'질량을 x g이라 할 때, x는?'`) 조사와 어미를 매끄러운 시험지 문체로 다듬으세요.\n"
+        "5. **구조화 줄바꿈**: `<자료>`와 `<보기>`는 반드시 독립된 줄로 분리하고, `<보기>` 내 `ㄱ.`, `ㄴ.`, `ㄷ.` 항목은 각각 별도의 줄에 적으세요.\n"
+        "6. **그림·그래프 시각 자료 안내(`visual_term_note`)**: 원본 그림·표·그래프의 축이나 범례에 상위 단위(예: `mol`, `M`)가 그려져 있다면, `visual_term_note`에 예: `그림 속 'mol'은 본문의 '입자 수'와 같은 의미로 해석합니다`처럼 학생용 안내 문구를 작성하세요(시각 자료에 상위 용어가 없으면 빈 문자열 `\"\"`).\n"
+        "7. 문제의 수학적·논리적 구조, 수치 조건, 정답의 참/거짓 판정 로직은 원본과 **100% 동일하게** 유지하며 `preserved_answer`도 원본 정답과 동일해야 합니다.\n"
+        "8. `rewritten_choices`는 객관식이면 5개 항목 리스트(선지 번호 ①~⑤ 제외하고 내용만), 주관식이면 빈 리스트 []로 반환하세요."
     )
 
     q_text = (getattr(question, "question_text", "") or "").strip()
@@ -1409,40 +1427,98 @@ def rewrite_question_for_pdf(
 
     context_excerpt = sliced_text[:6000] if sliced_text else ""
     q_text_block = f"[원본 문항 텍스트]\n{q_text}\n\n" if q_text else ""
-    prompt = (
-        f"[원본 문항 정보]\n"
-        f"- ID: {question.id} ({question.exam_name} {question.q_num}번)\n"
-        f"- 본질 원리: {question.core_principles}\n"
-        f"- 원본 정답: {question.answer}\n"
-        f"- 원본 공식 해설 요약: {question.official_explanation}\n"
-        f"- 반드시 제거·치환해야 할 범위 외 상위 용어: {out_of_scope_terms}\n\n"
-        f"{q_text_block}"
-        f"[업로드된 PDF 허용 개념 (pdf_concepts)]\n{whitelist.pdf_concepts}\n\n"
-        f"[업로드된 PDF 허용 용어 (pdf_vocabulary)]\n{whitelist.pdf_vocabulary}\n\n"
-        f"[업로드된 PDF 본문 참고 발췌]\n{context_excerpt}\n\n"
-        "위 원본 문항을 보고, 범위 외 상위 용어를 PDF 내부 표현으로 자연스럽게 치환한 '변형 문제 카드'와 'PDF 맞춤 해설'을 작성하세요."
+
+    def _invoke_rewrite(correction_note: str = "") -> RewrittenQuestion:
+        prev_block = ""
+        if previous_attempt is not None:
+            prev_block = (
+                "\n[직전 개조 결과 참고 (개선·재변환 필요)]\n"
+                f"- 직전 지문: {previous_attempt.rewritten_stem}\n"
+                f"- 직전 선지: {previous_attempt.rewritten_choices}\n"
+            )
+        feedback_block = f"\n[재변환 강화 지시]\n{correction_note}\n" if correction_note else ""
+
+        prompt = (
+            f"[원본 문항 정보]\n"
+            f"- ID: {question.id} ({question.exam_name} {question.q_num}번)\n"
+            f"- 본질 원리: {question.core_principles}\n"
+            f"- 원본 정답: {question.answer}\n"
+            f"- 원본 공식 해설 요약: {question.official_explanation}\n"
+            f"- 반드시 제거·치환해야 할 범위 외 상위 용어: {out_of_scope_terms}\n\n"
+            f"{q_text_block}"
+            f"{prev_block}"
+            f"{feedback_block}"
+            f"[업로드된 PDF 허용 개념 (pdf_concepts)]\n{whitelist.pdf_concepts}\n\n"
+            f"[업로드된 PDF 허용 용어 (pdf_vocabulary)]\n{whitelist.pdf_vocabulary}\n\n"
+            f"[업로드된 PDF 본문 참고 발췌]\n{context_excerpt}\n\n"
+            "위 원본 문항을 보고, 범위 외 상위 용어를 PDF 내부 표현으로 완전히 치환한 '변형 문제 카드'와 'PDF 맞춤 해설'을 작성하세요."
+        )
+
+        contents: list[Any] = []
+        if need_image and crop_png_bytes:
+            contents.append(types.Part.from_bytes(data=optimize_image_for_vision(crop_png_bytes), mime_type="image/png"))
+        contents.append(prompt)
+
+        resp = _generate_content_with_fallback(
+            client=client,
+            model_name=model_name,
+            contents=contents,
+            config=types.GenerateContentConfig(
+                system_instruction=system_inst,
+                response_mime_type="application/json",
+                response_schema=RewrittenQuestion,
+                temperature=0.2,
+            ),
+            fast_mode=True,
+        )
+        rw = _parse_structured(resp, RewrittenQuestion)
+        rw.preserved_answer = question.answer
+        rw.rewritten_stem = normalize_exam_layout_text(rw.rewritten_stem)
+        rw.rewritten_choices = [format_chemical_scripts(c.strip()) for c in (rw.rewritten_choices or []) if c.strip()]
+        rw.pdf_grounded_explanation = format_chemical_scripts(rw.pdf_grounded_explanation)
+        return rw
+
+    initial_note = extra_feedback.strip()
+    if previous_attempt is not None:
+        prev_residuals = find_forbidden_terms_in_text(
+            [previous_attempt.rewritten_stem, *previous_attempt.rewritten_choices],
+            out_of_scope_terms=out_of_scope_terms,
+            allowed_vocab=whitelist.pdf_vocabulary,
+        )
+        if prev_residuals:
+            add_msg = (
+                f"이전 변환 결과에 아직 상위 용어 {prev_residuals}가 남아 있습니다. "
+                "개념서 허용 용어와 구체적 수치 환산으로 100% 완전히 치환하고, "
+                "어색한 조사·문장 끊김도 자연스러운 국문으로 다시 다듬으세요."
+            )
+            initial_note = f"{initial_note}\n{add_msg}".strip()
+        elif not initial_note:
+            initial_note = "이전 변환 결과의 문장을 더 자연스러운 국문 시험지 문체로 다듬고, 개념서 허용 용어만 사용해 완전히 재변환하세요."
+
+    rewritten = _invoke_rewrite(correction_note=initial_note)
+    residual_terms = find_forbidden_terms_in_text(
+        [rewritten.rewritten_stem, *rewritten.rewritten_choices],
+        out_of_scope_terms=out_of_scope_terms,
+        allowed_vocab=whitelist.pdf_vocabulary,
     )
 
-    contents: list[Any] = []
-    if need_image and crop_png_bytes:
-        contents.append(types.Part.from_bytes(data=optimize_image_for_vision(crop_png_bytes), mime_type="image/png"))
-    contents.append(prompt)
+    if residual_terms:
+        retry_note = (
+            f"후처리 검증 결과 개조 지문/선지에 범위 외 금지 용어 {residual_terms}가 여전히 남아 있습니다! "
+            "해당 용어나 단위를 발문, <자료>, <보기>, 선지에서 단 한 글자도 남기지 말고 "
+            "개념서 허용 용어(pdf_vocabulary) 및 구체적 수치/입자 수 표현으로 100% 치환해 다시 작성하세요."
+        )
+        rewritten = _invoke_rewrite(correction_note=retry_note)
+        residual_after_retry = find_forbidden_terms_in_text(
+            [rewritten.rewritten_stem, *rewritten.rewritten_choices],
+            out_of_scope_terms=out_of_scope_terms,
+            allowed_vocab=whitelist.pdf_vocabulary,
+        )
+        if residual_after_retry:
+            raise ForbiddenTermRemainingError(
+                f"재개조 후에도 범위 외 금지 용어({', '.join(residual_after_retry)})가 잔존하여 문항을 제외했습니다."
+            )
 
-    resp = _generate_content_with_fallback(
-        client=client,
-        model_name=model_name,
-        contents=contents,
-        config=types.GenerateContentConfig(
-            system_instruction=system_inst,
-            response_mime_type="application/json",
-            response_schema=RewrittenQuestion,
-            temperature=0.2,
-        ),
-        fast_mode=True,
-    )
-    rewritten = _parse_structured(resp, RewrittenQuestion)
-    # 정답 보존 강제 검증
-    rewritten.preserved_answer = question.answer
     return rewritten
 
 

@@ -332,6 +332,10 @@ class RewrittenQuestion(BaseModel):
         ...,
         description="범위 외 용어 제거 및 정답/논리 일치 여부 자가 검증 결과",
     )
+    visual_term_note: str = Field(
+        default="",
+        description="원본 그림·그래프·표 속에 범위 외 상위 용어/단위(예: mol, M)가 포함되어 있을 때 본문 허용 용어와 연결해 주는 안내 문구 (없으면 빈 문자열)",
+    )
 
 
 class ExamHeaderMetadata(BaseModel):

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import html
 import io
+import re
 from datetime import datetime
 from typing import Any
 
@@ -9,106 +10,312 @@ import pymupdf
 from PIL import Image
 
 from src.models import ConceptWhitelist, QuestionRecord, RewrittenQuestion
+from src.text_formatter import (
+    format_chemical_scripts,
+    split_stem_blocks,
+    unicode_scripts_to_html_tags,
+)
 
 CIRCLED_NUMS = ["①", "②", "③", "④", "⑤"]
 
 EXAM_CSS = """
 body {
-    font-family: sans-serif;
-    font-size: 9.6pt;
-    line-height: 1.48;
-    color: #111827;
+    font-family: "NanumGothic", "Malgun Gothic", sans-serif;
+    font-size: 9.4pt;
+    line-height: 1.52;
+    color: #0F172A;
     margin: 0;
     padding: 0;
 }
+sub {
+    font-size: 72%;
+    vertical-align: sub;
+}
+sup {
+    font-size: 72%;
+    vertical-align: super;
+}
+.exam-banner {
+    border: 1.2pt solid #1E293B;
+    border-radius: 4pt;
+    padding: 7pt 10pt;
+    background-color: #F8FAFC;
+}
+.exam-banner-sub {
+    font-size: 8.2pt;
+    font-weight: bold;
+    color: #1D4ED8;
+    letter-spacing: 0.04em;
+}
+.exam-banner-title {
+    font-size: 14.5pt;
+    font-weight: bold;
+    color: #0F172A;
+    margin-top: 2pt;
+}
+.student-box {
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: 5pt;
+    font-size: 8.4pt;
+    background-color: #FFFFFF;
+}
+.student-box td {
+    border: 0.7pt solid #475569;
+    padding: 3pt 6pt;
+    color: #1E293B;
+}
+.double-rule-top {
+    border-top: 2pt solid #0F172A;
+    margin-top: 6pt;
+}
+.double-rule-bot {
+    border-top: 0.7pt solid #334155;
+    margin-top: 2pt;
+}
+.q-wrap {
+    margin-bottom: 6pt;
+}
 .q-header {
     margin-bottom: 4pt;
-    font-size: 9.8pt;
+    font-size: 9.2pt;
     color: #0F172A;
 }
 .q-num {
     font-weight: bold;
-    font-size: 11pt;
-    color: #1D4ED8;
+    font-size: 11.2pt;
+    color: #1E3A8A;
 }
 .badge {
     background-color: #DBEAFE;
     color: #1E40AF;
-    font-size: 7.8pt;
-    padding: 1pt 4pt;
+    font-size: 7.4pt;
+    padding: 1pt 4.5pt;
+    border-radius: 3pt;
+    font-weight: bold;
+}
+.badge-orig {
+    background-color: #DCFCE7;
+    color: #166534;
+    font-size: 7.4pt;
+    padding: 1pt 4.5pt;
     border-radius: 3pt;
     font-weight: bold;
 }
 .meta {
     color: #475569;
-    font-size: 8pt;
+    font-size: 7.8pt;
 }
-.stem {
-    margin-top: 3pt;
-    margin-bottom: 5pt;
+.stem-p {
+    margin-top: 2pt;
+    margin-bottom: 4pt;
     word-break: keep-all;
+}
+.pdf-data-box {
+    border: 0.8pt solid #94A3B8;
+    border-left: 2.6pt solid #334155;
+    background-color: #F8FAFC;
+    padding: 5pt 7pt;
+    margin: 5pt 0;
+    border-radius: 3pt;
+    font-size: 8.9pt;
+    line-height: 1.48;
+}
+.pdf-data-title {
+    font-size: 7.8pt;
+    font-weight: bold;
+    color: #334155;
+    margin-bottom: 2pt;
+}
+.pdf-bogi-box {
+    border: 1pt solid #1E293B;
+    padding: 5pt 7pt;
+    margin: 5pt 0;
+    background-color: #FFFFFF;
+}
+.pdf-bogi-title {
+    text-align: center;
+    font-weight: bold;
+    font-size: 8.6pt;
+    letter-spacing: 0.25em;
+    color: #0F172A;
+    border-bottom: 0.6pt solid #CBD5E1;
+    padding-bottom: 2.5pt;
+    margin-bottom: 4pt;
+}
+.bogi-tbl {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 9pt;
+    line-height: 1.48;
+}
+.bogi-tbl td {
+    vertical-align: top;
+    padding: 1.2pt 0;
+}
+.bogi-mk {
+    width: 16pt;
+    font-weight: bold;
+    color: #1E3A8A;
 }
 .choices {
     margin-top: 4pt;
-    margin-left: 6pt;
+    margin-left: 4pt;
 }
 .choice-item {
     margin-bottom: 2.5pt;
+    word-break: keep-all;
+}
+.choice-grid {
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: 4pt;
+    font-size: 9.1pt;
+}
+.choice-grid td {
+    padding: 2pt 4pt 2pt 0;
+    vertical-align: top;
+    word-break: keep-all;
 }
 .ref-note {
     margin-top: 4pt;
-    color: #64748B;
-    font-size: 7.8pt;
+    color: #1E40AF;
+    font-weight: bold;
+    font-size: 7.6pt;
+}
+.vis-note {
+    margin-top: 2pt;
+    padding: 3pt 5pt;
+    background-color: #FFFBEB;
+    border-left: 2pt solid #D97706;
+    color: #92400E;
+    font-size: 7.6pt;
 }
 .ans-table {
     width: 100%;
     border-collapse: collapse;
-    margin-top: 6pt;
-    margin-bottom: 12pt;
-    font-size: 9pt;
+    margin-top: 4pt;
+    margin-bottom: 10pt;
+    font-size: 8.5pt;
 }
 .ans-table th, .ans-table td {
-    border: 0.7pt solid #CBD5E1;
-    padding: 4pt 6pt;
+    border: 0.65pt solid #94A3B8;
+    padding: 3.5pt 5pt;
     text-align: center;
 }
 .ans-table th {
     background-color: #EFF6FF;
     color: #1E3A8A;
+    font-weight: bold;
 }
 .exp-card {
-    border: 0.7pt solid #E2E8F0;
+    border: 0.7pt solid #CBD5E1;
     background-color: #F8FAFC;
-    padding: 6pt 8pt;
-    margin-bottom: 8pt;
+    padding: 6pt 7pt;
+    margin-bottom: 6pt;
     border-radius: 4pt;
+    font-size: 8.7pt;
+    line-height: 1.48;
 }
 .exp-title {
     font-weight: bold;
-    font-size: 9.8pt;
+    font-size: 9.2pt;
     color: #0F172A;
     margin-bottom: 3pt;
+    border-bottom: 0.5pt solid #E2E8F0;
+    padding-bottom: 2pt;
 }
 .exp-ans {
     color: #DC2626;
     font-weight: bold;
 }
 .exp-sub {
-    font-size: 8.4pt;
+    font-size: 8pt;
     color: #1D4ED8;
     margin-bottom: 3pt;
 }
 """
 
 
-def _esc_nl(text: str) -> str:
-    return html.escape(text or "").replace("\n", "<br/>")
+def _esc_pdf(text: str) -> str:
+    formatted = format_chemical_scripts(text or "")
+    escaped = html.escape(formatted).replace("\n", "<br/>")
+    return unicode_scripts_to_html_tags(escaped)
 
 
 def _format_answer_badge(ans: str) -> str:
     cleaned = (ans or "").strip()
     mapping = {"1": "①", "2": "②", "3": "③", "4": "④", "5": "⑤"}
     return mapping.get(cleaned, cleaned)
+
+
+def _extract_short_page_ref(concept_ref: str) -> str:
+    if not concept_ref:
+        return "-"
+    m = re.search(r"\(([^()]+)\)\s*$", concept_ref.strip())
+    if m:
+        return m.group(1).strip()
+    cleaned = concept_ref.replace("📖 참고 개념:", "").strip()
+    return cleaned[:24] if cleaned else "-"
+
+
+def _build_stem_blocks_html(stem_text: str) -> str:
+    blocks = split_stem_blocks(stem_text)
+    parts: list[str] = []
+    for kind, content in blocks:
+        if kind == "data":
+            parts.append(
+                f"""
+                <div class="pdf-data-box">
+                  <div class="pdf-data-title">&lt; 자 료 &gt;</div>
+                  <div>{_esc_pdf(str(content))}</div>
+                </div>
+                """
+            )
+        elif kind == "bogi":
+            rows = "".join(
+                f"<tr><td class='bogi-mk'>{html.escape(mk)}</td><td>{_esc_pdf(txt)}</td></tr>"
+                for mk, txt in content
+            )
+            parts.append(
+                f"""
+                <div class="pdf-bogi-box">
+                  <div class="pdf-bogi-title">〈 보 기 〉</div>
+                  <table class="bogi-tbl">{rows}</table>
+                </div>
+                """
+            )
+        else:
+            parts.append(f"<div class='stem-p'>{_esc_pdf(str(content))}</div>")
+    return "".join(parts)
+
+
+def _build_choices_html(choices: list[str]) -> str:
+    if not choices:
+        return ""
+    capped = choices[:5]
+    formatted_items = [format_chemical_scripts(c.strip()) for c in capped]
+    max_len = max((len(c) for c in formatted_items), default=0)
+    total_len = sum(len(c) + 4 for c in formatted_items)
+
+    def _cell(i: int, txt: str) -> str:
+        sym = CIRCLED_NUMS[i] if i < len(CIRCLED_NUMS) else f"{i + 1})"
+        return f"<td><b>{sym}</b> {_esc_pdf(txt)}</td>"
+
+    # 짧은 선지는 평가원 모의고사처럼 1줄 또는 2줄(3+2) 가로 배열
+    if len(capped) <= 5 and total_len <= 28 and all("\n" not in c for c in formatted_items):
+        cells = "".join(_cell(i, c) for i, c in enumerate(formatted_items))
+        return f"<table class='choice-grid'><tr>{cells}</tr></table>"
+    if len(capped) == 5 and max_len <= 13 and all("\n" not in c for c in formatted_items):
+        row1 = "".join(_cell(i, formatted_items[i]) for i in range(3))
+        row2 = "".join(_cell(i, formatted_items[i]) for i in range(3, 5)) + "<td></td>"
+        return f"<table class='choice-grid'><tr>{row1}</tr><tr>{row2}</tr></table>"
+
+    rows = []
+    for i, c in enumerate(formatted_items):
+        sym = CIRCLED_NUMS[i] if i < len(CIRCLED_NUMS) else f"{i + 1})"
+        rows.append(f"<div class='choice-item'><b>{sym}</b> {_esc_pdf(c)}</div>")
+    return f"<div class='choices'>{''.join(rows)}</div>"
 
 
 def _measure_html_height(html_str: str, width: float, max_h: float = 760.0) -> float:
@@ -129,14 +336,14 @@ def _measure_html_height(html_str: str, width: float, max_h: float = 760.0) -> f
         scratch_doc.close()
 
 
-def _draw_page_footer(page: pymupdf.Page, page_num: int, two_column: bool) -> None:
+def _draw_page_footer(page: pymupdf.Page, page_num: int, two_column: bool, top_line_y: float = 38.0) -> None:
     w, h = page.rect.width, page.rect.height
     if two_column:
         page.draw_line(
-            pymupdf.Point(w / 2.0, 42.0),
+            pymupdf.Point(w / 2.0, top_line_y),
             pymupdf.Point(w / 2.0, h - 38.0),
-            color=(0.82, 0.85, 0.90),
-            width=0.6,
+            color=(0.76, 0.80, 0.86),
+            width=0.65,
         )
     page.insert_htmlbox(
         pymupdf.Rect(30, h - 30, w - 30, h - 10),
@@ -154,18 +361,25 @@ def _draw_first_page_banner(
     w = page.rect.width
     today = datetime.now().strftime("%Y.%m.%d")
     banner_html = f"""
-    <div style="border-bottom: 1.8pt solid #1E3A8A; padding-bottom: 6pt;">
-      <div style="font-size: 8.5pt; color: #2563EB; font-weight: bold;">2022 개정 교육과정 개념서 범위 엄격 준수 맞춤형 시험지</div>
-      <div style="font-size: 14.5pt; font-weight: bold; color: #0F172A; margin-top: 2pt;">{html.escape(exam_title)}</div>
-      <div style="font-size: 8.4pt; color: #475569; margin-top: 3pt;">
-        출제 범위: {html.escape(source_label)} &nbsp;|&nbsp; 총 {total_count}문항 &nbsp;|&nbsp; 생성일: {today}
-        &nbsp;&nbsp;&nbsp; 성명: ______________ &nbsp; 점수: _____ / {total_count}
+    <div>
+      <div class="exam-banner">
+        <div class="exam-banner-sub">2022 개정 교육과정 맞춤형 기출 · 개념서 범위 엄격 준수</div>
+        <div class="exam-banner-title">{html.escape(exam_title)}</div>
+        <table class="student-box">
+          <tr>
+            <td style="width:44%;"><b>기준 개념서:</b> {html.escape(source_label)}</td>
+            <td style="width:20%;"><b>총 {total_count}문항</b> ({today})</td>
+            <td style="width:36%;"><b>학년:</b> ____ &nbsp;<b>반:</b> ____ &nbsp;<b>번호:</b> ____ &nbsp;<b>이름:</b> _________</td>
+          </tr>
+        </table>
       </div>
+      <div class="double-rule-top"></div>
+      <div class="double-rule-bot"></div>
     </div>
     """
-    banner_h = _measure_html_height(banner_html, w - 64.0, max_h=140.0)
-    page.insert_htmlbox(pymupdf.Rect(32, 24, w - 32, 24 + banner_h + 6.0), banner_html, css=EXAM_CSS)
-    return 24.0 + banner_h + 10.0
+    banner_h = _measure_html_height(banner_html, w - 60.0, max_h=170.0)
+    page.insert_htmlbox(pymupdf.Rect(30, 22, w - 30, 22 + banner_h + 4.0), banner_html, css=EXAM_CSS)
+    return 22.0 + banner_h + 10.0
 
 
 def generate_custom_exam_pdf(
@@ -177,23 +391,17 @@ def generate_custom_exam_pdf(
     include_original_for_rewritten: bool = True,
 ) -> bytes:
     """
-    추출 및 개조된 문항들을 모의고사 스타일 PDF로 병합 생성하고,
-    마지막 페이지에 정답 및 개념서 용어 기준 해설 페이지를 부착한다.
-
-    items 각 원소 기대 키:
-      - question: QuestionRecord
-      - crop_png_bytes: bytes | None
-      - rewritten: RewrittenQuestion | None
+    추출 및 개조된 문항들을 평가원·교육청 모의고사 스타일 PDF로 조판하고,
+    뒷장에 [빠른 정답 한눈에 보기] 표와 2단 맞춤 해설 페이지를 부착한다.
     """
     doc = pymupdf.open()
     page_w, page_h = 595.0, 842.0  # A4
-    margin_x = 30.0
-    margin_bottom = 40.0
-    col_gap = 20.0
+    margin_x = 28.0
+    margin_bottom = 42.0
+    col_gap = 22.0
 
-    def get_col_rects(top_y: float) -> list[tuple[float, float, float]]:
-        # returns list of (x0, x1, start_y)
-        if two_column:
+    def get_col_rects(top_y: float, is_two_col: bool) -> list[tuple[float, float, float]]:
+        if is_two_col:
             col_w = (page_w - 2 * margin_x - col_gap) / 2.0
             return [
                 (margin_x, margin_x + col_w, top_y),
@@ -204,19 +412,22 @@ def generate_custom_exam_pdf(
     # 1) 문제지 페이지 생성
     page = doc.new_page(width=page_w, height=page_h)
     first_top = _draw_first_page_banner(page, exam_title, source_label, len(items))
-    col_rects = get_col_rects(first_top)
+    first_divider_y = first_top - 2.0
+    cur_divider_y = first_divider_y
+    col_rects = get_col_rects(first_top, two_column)
     col_idx = 0
     cur_y = col_rects[0][2]
 
     def advance_column() -> None:
-        nonlocal page, col_rects, col_idx, cur_y
+        nonlocal page, col_rects, col_idx, cur_y, cur_divider_y
         if col_idx + 1 < len(col_rects):
             col_idx += 1
             cur_y = col_rects[col_idx][2]
         else:
-            _draw_page_footer(page, doc.page_count, two_column)
+            _draw_page_footer(page, doc.page_count, two_column, top_line_y=cur_divider_y)
             page = doc.new_page(width=page_w, height=page_h)
-            col_rects = get_col_rects(36.0)
+            cur_divider_y = 34.0
+            col_rects = get_col_rects(36.0, two_column)
             col_idx = 0
             cur_y = col_rects[0][2]
 
@@ -226,7 +437,7 @@ def generate_custom_exam_pdf(
         rewritten: RewrittenQuestion | None = item.get("rewritten")
         concept_ref: str = str(item.get("concept_reference") or "").strip()
         ref_html = (
-            f"<div class='ref-note' style='color:#1E40AF; font-weight:bold; margin-top:4pt;'>{html.escape(concept_ref)}</div>"
+            f"<div class='ref-note'>{html.escape(concept_ref)}</div>"
             if concept_ref
             else ""
         )
@@ -236,29 +447,22 @@ def generate_custom_exam_pdf(
         max_col_h = (page_h - margin_bottom) - col_rects[col_idx][2]
 
         if rewritten is not None:
-            choices_html = ""
-            if rewritten.rewritten_choices:
-                rows = []
-                for c_idx, c_text in enumerate(rewritten.rewritten_choices[:5]):
-                    num_sym = CIRCLED_NUMS[c_idx] if c_idx < len(CIRCLED_NUMS) else f"{c_idx + 1})"
-                    rows.append(
-                        f"<div class='choice-item'>{num_sym} {_esc_nl(c_text)}</div>"
-                    )
-                choices_html = f"<div class='choices'>{''.join(rows)}</div>"
+            stem_body_html = _build_stem_blocks_html(rewritten.rewritten_stem)
+            choices_html = _build_choices_html(rewritten.rewritten_choices)
 
             card_html = f"""
-            <div>
+            <div class="q-wrap">
               <div class="q-header">
                 <span class="q-num">{idx}.</span>
                 <span class="badge">PDF 맞춤 개조</span>
                 <span class="meta">{html.escape(q.curriculum_subject)} · 원본 {html.escape(q.exam_name)} {q.q_num}번</span>
               </div>
-              <div class="stem">{_esc_nl(rewritten.rewritten_stem)}</div>
+              {stem_body_html}
               {choices_html}
               {ref_html}
             </div>
             """
-            text_h = _measure_html_height(card_html, col_w, max_h=720.0)
+            text_h = _measure_html_height(card_html, col_w, max_h=735.0)
 
             img_draw_h = 0.0
             img_draw_w = col_w
@@ -266,15 +470,22 @@ def generate_custom_exam_pdf(
                 with Image.open(io.BytesIO(crop_bytes)) as im:
                     iw, ih = im.size
                 ratio = ih / max(1, iw)
-                # 개조 문항 아래 참고 원본 도표는 적정 높이로 제한
-                img_draw_w = min(col_w, col_w * 0.92)
+                img_draw_w = min(col_w, col_w * 0.94)
                 img_draw_h = min(img_draw_w * ratio, 175.0)
                 if img_draw_w * ratio > 175.0:
                     img_draw_w = 175.0 / max(0.01, ratio)
 
-            note_h = 16.0 if img_draw_h > 0 else 0.0
-            total_needed = text_h + note_h + img_draw_h + 14.0
+            vis_term_note = (getattr(rewritten, "visual_term_note", "") or "").strip()
+            vis_note_html = (
+                f"<div class='vis-note'><b>[그림 용어 안내]</b> {_esc_pdf(vis_term_note)}</div>"
+                if vis_term_note
+                else ""
+            )
+            vis_note_h = _measure_html_height(vis_note_html, col_w, max_h=60.0) if vis_note_html else 0.0
+            note_h = 15.0 if img_draw_h > 0 else 0.0
 
+            # 한 문항의 지문·선지가 칼럼 경계에서 잘리지 않도록 통째로 공간 확인
+            total_needed = text_h + note_h + img_draw_h + vis_note_h + 12.0
             if cur_y + total_needed > page_h - margin_bottom and cur_y > col_rects[col_idx][2] + 5.0:
                 advance_column()
                 col_x0, col_x1, _ = col_rects[col_idx]
@@ -288,30 +499,37 @@ def generate_custom_exam_pdf(
             cur_y += text_h + 2.0
 
             if img_draw_h > 0 and crop_bytes:
-                # 남은 공간이 이미지보다 작으면 다음 컬럼으로 이동해 이미지 짤림 방지
-                if cur_y + note_h + img_draw_h > page_h - margin_bottom:
+                if cur_y + note_h + img_draw_h + vis_note_h > page_h - margin_bottom and cur_y > col_rects[col_idx][2] + 5.0:
                     advance_column()
                     col_x0, col_x1, _ = col_rects[col_idx]
                 page.insert_htmlbox(
                     pymupdf.Rect(col_x0, cur_y, col_x1, cur_y + 15.0),
-                    "<div class='ref-note'>[참고용 원본 문항 도표/이미지]</div>",
+                    "<div class='meta'>[참고용 원본 문항 도표/이미지]</div>",
                     css=EXAM_CSS,
                 )
-                cur_y += 14.0
+                cur_y += 13.0
                 page.insert_image(
                     pymupdf.Rect(col_x0, cur_y, col_x0 + img_draw_w, cur_y + img_draw_h),
                     stream=crop_bytes,
                     keep_proportion=True,
                 )
-                cur_y += img_draw_h + 8.0
+                cur_y += img_draw_h + 3.0
+                if vis_note_html:
+                    page.insert_htmlbox(
+                        pymupdf.Rect(col_x0, cur_y, col_x1, min(page_h - margin_bottom, cur_y + vis_note_h + 3.0)),
+                        vis_note_html,
+                        css=EXAM_CSS,
+                    )
+                    cur_y += vis_note_h + 4.0
 
-            cur_y += 10.0
+            cur_y += 12.0
 
         else:
             header_html = f"""
             <div class="q-header">
               <span class="q-num">{idx}.</span>
-              <span class="meta">[{html.escape(q.curriculum_subject)} · {html.escape(q.unit_name)}] (원본 {html.escape(q.exam_name)} {q.q_num}번)</span>
+              <span class="badge-orig">원문 출제</span>
+              <span class="meta">{html.escape(q.curriculum_subject)} · {html.escape(q.unit_name)} ({html.escape(q.exam_name)} {q.q_num}번)</span>
               {ref_html}
             </div>
             """
@@ -330,7 +548,7 @@ def generate_custom_exam_pdf(
                     img_draw_h = max_allowed_img_h
                     img_draw_w = img_draw_w * scale_f
 
-            total_needed = header_h + img_draw_h + 14.0
+            total_needed = header_h + img_draw_h + 16.0
             if cur_y + total_needed > page_h - margin_bottom and cur_y > col_rects[col_idx][2] + 5.0:
                 advance_column()
                 col_x0, col_x1, _ = col_rects[col_idx]
@@ -348,62 +566,101 @@ def generate_custom_exam_pdf(
                     stream=crop_bytes,
                     keep_proportion=True,
                 )
-                cur_y += img_draw_h + 12.0
+                cur_y += img_draw_h + 14.0
             else:
                 cur_y += 20.0
 
-    _draw_page_footer(page, doc.page_count, two_column)
+    _draw_page_footer(page, doc.page_count, two_column, top_line_y=cur_divider_y)
 
-    # 2) 맨 뒷장: 정답 및 업로드한 개념서 용어 기준 해설 페이지
+    # 2) 뒷장: [빠른 정답 한눈에 보기] 표 + 2단 맞춤 해설
     ans_page = doc.new_page(width=page_w, height=page_h)
     ans_header = f"""
-    <div style="border-bottom: 1.5pt solid #1D4ED8; padding-bottom: 5pt; margin-bottom: 8pt;">
-      <div style="font-size: 13pt; font-weight: bold; color: #0F172A;">정답 및 개념서 용어 기준 맞춤 해설</div>
-      <div style="font-size: 8.5pt; color: #475569; margin-top: 2pt;">
-        시험지: {html.escape(exam_title)} &nbsp;|&nbsp; 기준 개념서: {html.escape(source_label)}
-      </div>
+    <div class="exam-banner" style="padding:6pt 9pt;">
+      <div class="exam-banner-sub">정답 및 개념서 용어 기준 맞춤 해설</div>
+      <div class="exam-banner-title" style="font-size:12.5pt;">{html.escape(exam_title)}</div>
+      <div class="meta" style="margin-top:2pt;">기준 개념서: {html.escape(source_label)} &nbsp;|&nbsp; 총 {len(items)}문항</div>
     </div>
     """
-    ah = _measure_html_height(ans_header, page_w - 64.0, max_h=120.0)
-    ans_page.insert_htmlbox(pymupdf.Rect(32, 28, page_w - 32, 28 + ah + 4.0), ans_header, css=EXAM_CSS)
-    ay = 28.0 + ah + 8.0
+    ah = _measure_html_height(ans_header, page_w - 2 * margin_x, max_h=120.0)
+    ans_page.insert_htmlbox(pymupdf.Rect(margin_x, 24, page_w - margin_x, 24 + ah + 4.0), ans_header, css=EXAM_CSS)
+    ay = 24.0 + ah + 8.0
 
-    # 빠른 정답표 (5개씩 묶어 행 출력)
-    table_rows = []
-    chunk_size = 5
-    for start in range(0, len(items), chunk_size):
-        chunk = items[start : start + chunk_size]
-        ths = "".join(f"<th>{start + j + 1}번</th>" for j in range(len(chunk)))
-        tds = "".join(
-            f"<td><b>{html.escape(_format_answer_badge(it['rewritten'].preserved_answer if it.get('rewritten') else it['question'].answer))}</b></td>"
-            for it in chunk
+    # [빠른 정답 한눈에 보기] 요약 표 (문항 번호 · 정답 · 참고 개념서 페이지)
+    quick_title_html = "<div style='font-size:9.8pt; font-weight:bold; color:#1E3A8A; margin-bottom:3pt;'>[빠른 정답 한눈에 보기]</div>"
+    qth = _measure_html_height(quick_title_html, page_w - 2 * margin_x, max_h=30.0)
+    ans_page.insert_htmlbox(pymupdf.Rect(margin_x, ay, page_w - margin_x, ay + qth), quick_title_html, css=EXAM_CSS)
+    ay += qth + 2.0
+
+    half = (len(items) + 1) // 2 if len(items) > 6 else len(items)
+    summary_rows: list[str] = []
+    if len(items) > 6:
+        for r_i in range(half):
+            left_it = items[r_i]
+            l_ans = _format_answer_badge(left_it["rewritten"].preserved_answer if left_it.get("rewritten") else left_it["question"].answer)
+            l_pg = _extract_short_page_ref(str(left_it.get("concept_reference") or ""))
+            right_cells = "<td></td><td></td><td></td>"
+            if r_i + half < len(items):
+                right_it = items[r_i + half]
+                r_ans = _format_answer_badge(right_it["rewritten"].preserved_answer if right_it.get("rewritten") else right_it["question"].answer)
+                r_pg = _extract_short_page_ref(str(right_it.get("concept_reference") or ""))
+                right_cells = (
+                    f"<td><b>{r_i + half + 1}번</b></td>"
+                    f"<td style='color:#DC2626; font-weight:bold;'>{html.escape(r_ans)}</td>"
+                    f"<td>{html.escape(r_pg)}</td>"
+                )
+            summary_rows.append(
+                f"<tr><td><b>{r_i + 1}번</b></td><td style='color:#DC2626; font-weight:bold;'>{html.escape(l_ans)}</td><td>{html.escape(l_pg)}</td>{right_cells}</tr>"
+            )
+        ans_table_html = (
+            "<table class='ans-table'>"
+            "<tr><th>문항 번호</th><th>정답</th><th>참고 개념서 페이지</th>"
+            "<th>문항 번호</th><th>정답</th><th>참고 개념서 페이지</th></tr>"
+            + "".join(summary_rows)
+            + "</table>"
         )
-        table_rows.append(f"<tr>{ths}</tr><tr>{tds}</tr>")
-
-    ans_table_html = f"<table class='ans-table'>{''.join(table_rows)}</table>"
-    th = _measure_html_height(ans_table_html, page_w - 64.0, max_h=400.0)
-    ans_page.insert_htmlbox(pymupdf.Rect(32, ay, page_w - 32, ay + th + 4.0), ans_table_html, css=EXAM_CSS)
-    ay += th + 10.0
-
-    if whitelist and whitelist.pdf_vocabulary:
-        vocab_preview = ", ".join(whitelist.pdf_vocabulary[:28])
-        if len(whitelist.pdf_vocabulary) > 28:
-            vocab_preview += f" 외 {len(whitelist.pdf_vocabulary) - 28}개"
-        scope_note = (
-            f"<div style='font-size:8pt; color:#475569; margin-bottom:8pt;'>"
-            f"<b>적용된 개념서 허용 용어 일부:</b> {html.escape(vocab_preview)}</div>"
+    else:
+        for r_i, it in enumerate(items, start=1):
+            a_disp = _format_answer_badge(it["rewritten"].preserved_answer if it.get("rewritten") else it["question"].answer)
+            pg_disp = _extract_short_page_ref(str(it.get("concept_reference") or ""))
+            summary_rows.append(
+                f"<tr><td><b>{r_i}번</b></td><td style='color:#DC2626; font-weight:bold;'>{html.escape(a_disp)}</td><td>{html.escape(pg_disp)}</td></tr>"
+            )
+        ans_table_html = (
+            "<table class='ans-table'>"
+            "<tr><th>문항 번호</th><th>정답</th><th>참고 개념서 페이지</th></tr>"
+            + "".join(summary_rows)
+            + "</table>"
         )
-        sh = _measure_html_height(scope_note, page_w - 64.0, max_h=100.0)
-        ans_page.insert_htmlbox(pymupdf.Rect(32, ay, page_w - 32, ay + sh + 2.0), scope_note, css=EXAM_CSS)
-        ay += sh + 4.0
 
-    # 문항별 해설 카드
+    th = _measure_html_height(ans_table_html, page_w - 2 * margin_x, max_h=460.0)
+    ans_page.insert_htmlbox(pymupdf.Rect(margin_x, ay, page_w - margin_x, ay + th + 4.0), ans_table_html, css=EXAM_CSS)
+    ay += th + 8.0
+
+    # 아래부터 2단 구성으로 맞춤 해설 배치
+    ans_div_top = ay
+    ans_col_rects = get_col_rects(ay + 4.0, True)
+    ans_col_idx = 0
+    ans_y = ans_col_rects[0][2]
+
+    def advance_ans_col() -> None:
+        nonlocal ans_page, ans_col_rects, ans_col_idx, ans_y, ans_div_top
+        if ans_col_idx + 1 < len(ans_col_rects):
+            ans_col_idx += 1
+            ans_y = ans_col_rects[ans_col_idx][2]
+        else:
+            _draw_page_footer(ans_page, doc.page_count, True, top_line_y=ans_div_top)
+            ans_page = doc.new_page(width=page_w, height=page_h)
+            ans_div_top = 34.0
+            ans_col_rects = get_col_rects(36.0, True)
+            ans_col_idx = 0
+            ans_y = ans_col_rects[0][2]
+
     for idx, item in enumerate(items, start=1):
         q = item["question"]
         rewritten = item.get("rewritten")
         concept_ref = str(item.get("concept_reference") or "").strip()
         exp_ref_html = (
-            f"<div style='margin-top:4pt; font-size:8.2pt; color:#1E40AF; font-weight:bold;'>{html.escape(concept_ref)}</div>"
+            f"<div class='ref-note'>{html.escape(concept_ref)}</div>"
             if concept_ref
             else ""
         )
@@ -414,46 +671,48 @@ def generate_custom_exam_pdf(
             if rewritten.replaced_terms_map:
                 swap_info = (
                     "<div class='exp-sub'><b>용어 치환:</b> "
-                    + html.escape(" / ".join(rewritten.replaced_terms_map))
+                    + _esc_pdf(" / ".join(rewritten.replaced_terms_map))
                     + "</div>"
                 )
-            exp_body = _esc_nl(rewritten.pdf_grounded_explanation)
-            badge = "[PDF 맞춤 개조 해설]"
+            exp_body = _esc_pdf(rewritten.pdf_grounded_explanation)
+            badge = "PDF 맞춤 개조"
         else:
             ans_disp = _format_answer_badge(q.answer)
             swap_info = (
                 "<div class='exp-sub'><b>핵심 원리:</b> "
-                + html.escape(", ".join(q.core_principles))
+                + _esc_pdf(", ".join(q.core_principles))
                 + "</div>"
             )
-            exp_body = _esc_nl(q.official_explanation)
-            badge = "[원본 기출 해설]"
+            exp_body = _esc_pdf(q.official_explanation)
+            badge = "원본 기출 해설"
 
         exp_html = f"""
         <div class="exp-card">
           <div class="exp-title">
             {idx}번 &nbsp; 정답: <span class="exp-ans">{html.escape(ans_disp)}</span>
-            &nbsp; <span class="meta">{badge} · {html.escape(q.exam_name)} {q.q_num}번</span>
+            <span class="meta">({badge} · {html.escape(q.exam_name)} {q.q_num}번)</span>
           </div>
           {swap_info}
           <div>{exp_body}</div>
           {exp_ref_html}
         </div>
         """
-        eh = _measure_html_height(exp_html, page_w - 64.0, max_h=720.0)
-        if ay + eh > page_h - 42.0 and ay > 60.0:
-            _draw_page_footer(ans_page, doc.page_count, False)
-            ans_page = doc.new_page(width=page_w, height=page_h)
-            ay = 34.0
+        ac_x0, ac_x1, _ = ans_col_rects[ans_col_idx]
+        ac_w = ac_x1 - ac_x0
+        eh = _measure_html_height(exp_html, ac_w, max_h=720.0)
+        if ans_y + eh > page_h - margin_bottom and ans_y > ans_col_rects[ans_col_idx][2] + 5.0:
+            advance_ans_col()
+            ac_x0, ac_x1, _ = ans_col_rects[ans_col_idx]
+            ac_w = ac_x1 - ac_x0
 
         ans_page.insert_htmlbox(
-            pymupdf.Rect(32, ay, page_w - 32, min(page_h - 38.0, ay + eh + 4.0)),
+            pymupdf.Rect(ac_x0, ans_y, ac_x1, min(page_h - margin_bottom, ans_y + eh + 4.0)),
             exp_html,
             css=EXAM_CSS,
         )
-        ay += eh + 6.0
+        ans_y += eh + 6.0
 
-    _draw_page_footer(ans_page, doc.page_count, False)
+    _draw_page_footer(ans_page, doc.page_count, True, top_line_y=ans_div_top)
 
     try:
         doc.subset_fonts()
