@@ -1691,6 +1691,14 @@ def _render_concept_book_builder_section(key_prefix: str = "tab3") -> None:
                                 "intervals": detected_intervals,
                             }
 
+                        failed_chunks_list = list(getattr(detected_out, "failed_chunks", []) or [])
+                        if failed_chunks_list:
+                            st.warning(
+                                "⚠️ **일부 PDF 페이지 구간 판별에 실패했습니다** (자동 재시도 후 누락 방지를 위해 표시):\n- "
+                                + "\n- ".join(failed_chunks_list)
+                                + "\n\n해당 구간이 필요하다면 **[✍️ 수동 추출]**에서 직접 범위를 추가해 보완해 주세요."
+                            )
+
                         if not detected_intervals:
                             status_box.empty()
                             st.warning(
@@ -1716,14 +1724,24 @@ def _render_concept_book_builder_section(key_prefix: str = "tab3") -> None:
                         st.error(f"AI 자동 추출 실패: {exc}")
 
             saved_preview = st.session_state.get(preview_state_key)
-            if saved_preview and saved_preview.get("intervals"):
+            if saved_preview and (
+                saved_preview.get("intervals")
+                or getattr(saved_preview.get("detected_out"), "failed_chunks", None)
+            ):
                 det_out = saved_preview["detected_out"]
-                det_ints = saved_preview["intervals"]
+                det_ints = saved_preview.get("intervals") or []
+                det_failed = list(getattr(det_out, "failed_chunks", []) or [])
                 det_spec = ", ".join(f"p.{s}~p.{e}" if s != e else f"p.{s}" for s, e in det_ints)
-                with st.expander(
-                    f"🤖 AI가 자동 판별한 개념 구간 ({det_spec} · {sum(e - s + 1 for s, e in det_ints)}쪽)",
-                    expanded=True,
-                ):
+                exp_label = (
+                    f"🤖 AI가 자동 판별한 개념 구간 ({det_spec} · {sum(e - s + 1 for s, e in det_ints)}쪽)"
+                    if det_ints
+                    else "⚠️ AI 개념 구간 자동 판별 결과 (일부 구간 실패)"
+                )
+                with st.expander(exp_label, expanded=True):
+                    if det_failed:
+                        st.warning(
+                            "⚠️ **자동 판별에 실패한 청크 구간:** " + " / ".join(det_failed)
+                        )
                     if getattr(det_out, "toc_units", None):
                         st.caption(
                             f"📑 **목차 분석 기준 단원 ({len(det_out.toc_units)}개):** "

@@ -388,6 +388,7 @@ def extract_concept_pages_by_ranges(
         sliced_doc = pymupdf.open()
         for p_num in kept_pages:
             sliced_doc.insert_pdf(doc, from_page=p_num - 1, to_page=p_num - 1)
+            _stamp_actual_pdf_page_badge(sliced_doc[-1], p_num)
         sliced_bytes = sliced_doc.tobytes(deflate=True)
         sliced_doc.close()
 
@@ -401,6 +402,41 @@ def extract_concept_pages_by_ranges(
             ),
         }
         return sliced_bytes, "\n\n".join(mapped_blocks), stats
+
+
+def _stamp_actual_pdf_page_badge(page: pymupdf.Page, actual_page_num: int) -> None:
+    """스캔 PDF 슬라이스 페이지 상단 여백에 실제 원본 PDF 페이지 라벨을 직접 각인한다."""
+    rect = page.rect
+    w = float(rect.width or 595.0)
+    h = float(rect.height or 842.0)
+    badge_w = min(max(185.0, w * 0.34), max(120.0, w - 20.0))
+    badge_h = min(22.0, max(16.0, h * 0.032))
+    box = pymupdf.Rect(
+        rect.x0 + 10.0,
+        rect.y0 + 6.0,
+        min(rect.x1 - 10.0, rect.x0 + 10.0 + badge_w),
+        min(rect.y1 - 6.0, rect.y0 + 6.0 + badge_h),
+    )
+    try:
+        page.clean_contents()
+    except Exception:
+        pass
+    page.draw_rect(
+        box,
+        color=(0.75, 0.05, 0.05),
+        fill=(1.0, 0.98, 0.78),
+        width=1.0,
+        overlay=True,
+    )
+    font_size = max(9.5, min(12.0, badge_h * 0.56))
+    page.insert_text(
+        pymupdf.Point(box.x0 + 6.0, box.y0 + box.height * 0.72),
+        f"[ACTUAL_PDF_PAGE: {actual_page_num}]",
+        fontsize=font_size,
+        fontname="helv",
+        color=(0.7, 0.0, 0.0),
+        overlay=True,
+    )
 
 
 def extract_pdf_page_catalog(
@@ -440,10 +476,12 @@ def extract_pdf_page_catalog(
 def extract_specific_pages_slice(
     pdf_bytes: bytes,
     page_numbers: list[int],
+    stamp_actual_page: bool = True,
 ) -> tuple[bytes, str]:
     """
     지정된 1-based 페이지 번호 리스트만 순서를 유지해 별도 PDF 바이트와 페이지 매핑 텍스트로 추출한다.
-    대용량 개념서 청크(Chunk) 처리에 사용한다.
+    stamp_actual_page=True이면 각 페이지 상단 여백에 `[ACTUAL_PDF_PAGE: X]` 라벨을 각인해
+    스캔 PDF Vision 판별 시 슬라이스 내부 쪽수 혼동을 원천 차단한다.
     """
     with pymupdf.open(stream=pdf_bytes, filetype="pdf") as doc:
         total = doc.page_count
@@ -452,6 +490,8 @@ def extract_specific_pages_slice(
         blocks: list[str] = []
         for p_num in valid_pages:
             sliced_doc.insert_pdf(doc, from_page=p_num - 1, to_page=p_num - 1)
+            if stamp_actual_page:
+                _stamp_actual_pdf_page_badge(sliced_doc[-1], p_num)
             raw_txt = (doc[p_num - 1].get_text("text") or "").strip()
             cleaned_txt, _ = _clean_and_classify_concept_page(raw_txt)
             use_txt = cleaned_txt or raw_txt

@@ -209,6 +209,11 @@ class TocUnitItem(BaseModel):
 class TocExtractionOutput(BaseModel):
     """개념서·교과서 앞부분 목차 분석 결과."""
 
+    last_toc_page: int = Field(
+        default=0,
+        ge=0,
+        description="표지·교재 구성 안내·차례(목차)가 모두 끝나는 마지막 실제 PDF 페이지 번호 (1-based, 미확인 시 0)",
+    )
     toc_units: list[TocUnitItem] = Field(
         default_factory=list,
         description="목차 순서대로 추출한 전체 대단원/중단원 목록",
@@ -216,7 +221,7 @@ class TocExtractionOutput(BaseModel):
 
 
 class AutoConceptPageDetectionOutput(BaseModel):
-    """AI가 개념서 PDF 전체를 훑어 목차·정답·문제풀이를 제외하고 개념 페이지만 추출한 결과."""
+    """AI가 개념서 PDF 전체를 훑어 목차·정답·대단원 종합문제를 제외하고 개념 페이지만 추출한 결과."""
 
     toc_units: list[str] = Field(
         default_factory=list,
@@ -224,11 +229,15 @@ class AutoConceptPageDetectionOutput(BaseModel):
     )
     detected_ranges: list[AutoConceptRangeItem] = Field(
         default_factory=list,
-        description="순수 개념/원리/이론 설명이 수록된 PDF 페이지 구간 목록",
+        description="순수 개념/원리/이론/탐구/확인퀴즈가 수록된 PDF 페이지 구간 목록",
     )
     excluded_summary: str = Field(
         default="",
-        description="제외된 구간 요약 (예: p.1~3 표지/목차, p.26~33 실전문제, p.180~210 정답·해설)",
+        description="제외된 구간 요약 (예: p.1~7 표지/목차, p.26~33 대단원 종합문제, p.180~210 정답·해설)",
+    )
+    failed_chunks: list[str] = Field(
+        default_factory=list,
+        description="재시도 후에도 판별에 실패한 페이지 구간 요약 목록 (예: ['p.21~p.40 (429 Rate Limit)'])",
     )
 
 
