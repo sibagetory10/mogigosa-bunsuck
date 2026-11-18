@@ -125,8 +125,10 @@ Google Drive 용량 제한(403 `storageQuotaExceeded`)이나 Streamlit Cloud 슬
    bash scripts/oracle_ubuntu_setup.sh
    ```
    - Drive 관련 키(`GOOGLE_DRIVE_FOLDER_ID`, `GCP_SERVICE_ACCOUNT`, `GOOGLE_OAUTH`)를 비워두면 **로컬 디스크 영구 저장 모드**(`threading.RLock` + 원자적 `.tmp` 교체)로 안전하게 동작합니다.
-   - `scripts/oracle_ubuntu_setup.sh`가 `python3-venv`, `fonts-nanum`, `requirements.txt`, `iptables` 8501 포트 개방 및 단일 프로세스 `mogigosa.service`(`systemd`) 등록까지 한 번에 완료합니다.
-3. **코드 업데이트 반영 방법 (서버에서 1줄 실행)**
+   - `scripts/oracle_ubuntu_setup.sh`가 `python3-venv`, `fonts-nanum`, `requirements.txt`, `iptables` 8501 포트 개방, 단일 프로세스 `mogigosa.service` 및 **1분 주기 GitHub 자동 업데이트·재시작 타이머(`mogigosa-autoupdate.timer`)** 등록까지 한 번에 완료합니다.
+3. **자동 업데이트 동작 방식 (수동 반영 불필요)**
+   - `mogigosa-autoupdate.timer`가 1분마다 `origin/main`의 새 커밋 여부를 확인하고, 변경이 있을 때만 `git pull --ff-only origin main` + (`requirements.txt` 변경 시 패키지 설치) + `mogigosa.service` 재시작을 자동으로 수행합니다.
+   - 즉시 수동으로 반영하고 싶을 때만 아래 1줄을 실행하면 됩니다:
    ```bash
    cd ~/mogigosa-bunsuck && git pull origin main && sudo systemctl restart mogigosa
    ```
