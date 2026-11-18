@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import io
+import os
 import re
+import unicodedata
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Sequence
 
 import pymupdf
 from PIL import Image
@@ -955,3 +957,165 @@ def extract_answer_snippets_from_pdf(pdf_bytes: bytes, max_chars_per_q: int = 12
         if merged:
             out[q_num] = merged[:max_chars_per_q]
     return out, True
+
+
+_FILENAME_ROLE_SUFFIX_RE = re.compile(
+    r"(?:정답\s*[및과]\s*해설|문제\s*[및과]\s*해설|문제\s*[및과]\s*정답|"
+    r"정답해설|문제지|해설지|정답지|시험지|해설|정답|풀이|문제)"
+    r"(?=$|[\s_.\-\(\)\[\]])"
+)
+_FILENAME_ROLE_TOKENS = frozenset(
+    {
+        "문제",
+        "문제지",
+        "시험지",
+        "해설",
+        "해설지",
+        "정답",
+        "정답지",
+        "정답해설",
+        "정답및해설",
+        "정답과해설",
+        "풀이",
+        "오답",
+        "problem",
+        "problems",
+        "prob",
+        "question",
+        "questions",
+        "answer",
+        "answers",
+        "ans",
+        "solution",
+        "solutions",
+        "sol",
+        "key",
+        "copy",
+        "사본",
+    }
+)
+_ANS_ONLY_HINT_RE = re.compile(r"(?:해설지?|정답지?|정답\s*[및과]\s*해설|풀이|\banswers?\b|\bsolutions?\b|\bans\b|\bsol\b)", re.I)
+_PROB_ONLY_HINT_RE = re.compile(r"(?:문제지?|시험지|\bproblems?\b|\bprobs?\b|\bquestions?\b)", re.I)
+_YEAR_TOKEN_RE = re.compile(r"^(?:19|20)\d{2}$")
+_MONTH_TOKEN_RE = re.compile(r"^(?:1[0-2]|[1-9])월$|^수능$")
+_GRADE_TOKEN_RE = re.compile(r"^고[123]$")
+
+
+def is_likely_answer_filename(filename: str) -> bool:
+    """파일명만 보고 해설/정답지 PDF인지 판별한다."""
+    base = unicodedata.normalize("NFC", os.path.basename((filename or "").replace("\\", "/")))
+    stem = re.sub(r"\.pdf$", "", base, flags=re.I)
+    return bool(_ANS_ONLY_HINT_RE.search(stem)) and not bool(_PROB_ONLY_HINT_RE.search(stem))
+
+
+def _tokenize_exam_filename(filename: str) -> list[str]:
+    base = unicodedata.normalize("NFC", os.path.basename((filename or "").replace("\\", "/")))
+    stem = re.sub(r"\.pdf$", "", base, flags=re.I).lower()
+    # 로마자 표기(Ⅰ/Ⅱ/I/II)를 아라비아 숫자로 통일해 물리학I <-> 물리학1 매칭 지원
+    stem = stem.replace("ⅱ", "2").replace("ⅰ", "1").replace("Ⅱ", "2").replace("Ⅰ", "1")
+    stem = re.sub(r"([가-힣])ii(?=$|[\s_.\-\(\)\[\]])", r"\g<1>2", stem)
+    stem = re.sub(r"([가-힣])i(?=$|[\s_.\-\(\)\[\]])", r"\g<1>1", stem)
+    stem = _FILENAME_ROLE_SUFFIX_RE.sub(" ", stem)
+    stem = re.sub(r"(?:^|(?<=[\s_.\-\(\)\[\]]))20(\d{2})(?=년)", lambda m: f"20{m.group(1)}", stem)
+    raw_tokens = re.split(r"[\s_.\-\(\)\[\]/,+]+", stem)
+    tokens: list[str] = []
+    for tok in raw_tokens:
+        cleaned = tok.strip()
+        if not cleaned or cleaned in _FILENAME_ROLE_TOKENS:
+            continue
+        if cleaned.endswith("년") and _YEAR_TOKEN_RE.match(cleaned[:-1]):
+            cleaned = cleaned[:-1]
+        tokens.append(cleaned)
+    return tokens
+
+
+def normalize_exam_filename_stem(filename: str) -> str:
+    """문제지/해설지 역할 키워드를 제거한 정규화 파일명 식별 문자열을 반환한다."""
+    return " ".join(_tokenize_exam_filename(filename))
+
+
+def _score_prob_ans_pair(p_tokens: list[str], a_tokens: list[str]) -> int:
+    if not p_tokens or not a_tokens:
+        return -1
+    if p_tokens == a_tokens:
+        return 1000
+
+    p_years = {t for t in p_tokens if _YEAR_TOKEN_RE.match(t)}
+    a_years = {t for t in a_tokens if _YEAR_TOKEN_RE.match(t)}
+    if p_years and a_years and p_years.isdisjoint(a_years):
+        return -1
+
+    p_months = {t for t in p_tokens if _MONTH_TOKEN_RE.match(t)}
+    a_months = {t for t in a_tokens if _MONTH_TOKEN_RE.match(t)}
+    if p_months and a_months and p_months.isdisjoint(a_months):
+        return -1
+
+    p_grades = {t for t in p_tokens if _GRADE_TOKEN_RE.match(t)}
+    a_grades = {t for t in a_tokens if _GRADE_TOKEN_RE.match(t)}
+    if p_grades and a_grades and p_grades.isdisjoint(a_grades):
+        return -1
+
+    p_set = set(p_tokens)
+    a_set = set(a_tokens)
+    p_core = {t for t in p_set if t not in p_years and t not in p_months and t not in p_grades}
+    a_core = {t for t in a_set if t not in a_years and t not in a_months and t not in a_grades}
+
+    shared_core = p_core & a_core
+    # 둘 다 과목 등 핵심 토큰을 갖고 있는데 겹치는 토큰이 전혀 없으면 서로 다른 시험지/과목
+    if p_core and a_core and not shared_core:
+        return -1
+
+    shared_all = p_set & a_set
+    if not shared_all:
+        return -1
+
+    score = 0
+    score += len(p_years & a_years) * 30
+    score += len(p_months & a_months) * 25
+    score += len(p_grades & a_grades) * 15
+    score += len(shared_core) * 40
+    score -= len(p_core ^ a_core) * 5
+
+    # 연도·월만 같고 핵심 토큰이 비어 있는 단일 과목 세트만 최소 기준 통과
+    if not shared_core and not (p_years & a_years and p_months & a_months):
+        return -1
+    return score if score >= 25 else -1
+
+
+def pair_problem_and_answer_files(
+    problem_names: Sequence[str],
+    answer_names: Sequence[str],
+) -> list[int | None]:
+    """문제지 파일명 목록에 가장 잘 대응하는 해설지 인덱스를 1:1 그리디 매칭한다."""
+    n_prob = len(problem_names)
+    n_ans = len(answer_names)
+    matches: list[int | None] = [None] * n_prob
+    if n_prob == 0 or n_ans == 0:
+        return matches
+
+    p_toks = [_tokenize_exam_filename(name) for name in problem_names]
+    a_toks = [_tokenize_exam_filename(name) for name in answer_names]
+
+    candidates: list[tuple[int, int, int]] = []
+    for p_idx in range(n_prob):
+        for a_idx in range(n_ans):
+            sc = _score_prob_ans_pair(p_toks[p_idx], a_toks[a_idx])
+            if sc > 0:
+                candidates.append((sc, -p_idx, -a_idx))
+
+    candidates.sort(reverse=True)
+    used_p: set[int] = set()
+    used_a: set[int] = set()
+    for sc, neg_p, neg_a in candidates:
+        p_idx = -neg_p
+        a_idx = -neg_a
+        if p_idx in used_p or a_idx in used_a:
+            continue
+        matches[p_idx] = a_idx
+        used_p.add(p_idx)
+        used_a.add(a_idx)
+
+    # 단일 문제지 + 단일 해설지 업로드 시 파일명이 달라도 기본 매칭 제공
+    if n_prob == 1 and n_ans == 1 and matches[0] is None:
+        matches[0] = 0
+    return matches

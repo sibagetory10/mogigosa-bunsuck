@@ -4,10 +4,11 @@ import concurrent.futures
 import hashlib
 import html as _html
 import json
+import os
 import re
 import time
 from datetime import datetime
-from typing import Any
+from typing import Any, Callable
 
 import streamlit as st
 
@@ -84,6 +85,8 @@ from src.pdf_parser import (
     extract_pdf_page_catalog,
     get_page_text_lengths,
     get_pdf_page_count,
+    is_likely_answer_filename,
+    pair_problem_and_answer_files,
     parse_exam_pdf,
     parse_page_ranges_spec,
     render_pdf_page_png,
@@ -224,6 +227,354 @@ def _build_cached_exam_exports(
         ai_jsonl_str.encode("utf-8"),
         json_str.encode("utf-8"),
     )
+
+
+def _pdf_display_basename(raw_name: str) -> str:
+    """폴더 업로드 시 포함된 상대 경로를 제거해 순수 파일명만 반환한다."""
+    return os.path.basename((raw_name or "").replace("\\", "/")) or (raw_name or "exam.pdf")
+
+
+def _detect_single_exam_cover(
+    prob_bytes: bytes,
+    prob_name: str,
+    api_key: str,
+) -> tuple[dict[str, str], bool, bool]:
+    """단일 문제지 PDF의 1페이지 표지 메타데이터를 1차 PyMuPDF + 2차 AI Vision으로 교차 판독한다."""
+    parsed_local: dict[str, str] = {
+        "year": "",
+        "month": "",
+        "grade": "",
+        "subject": "",
+        "exam_title": "",
+    }
+    has_p1_text = False
+    ai_verified = False
+    try:
+        parsed_local, has_p1_text = extract_exam_metadata_fast(prob_bytes, filename=prob_name)
+    except Exception:
+        has_p1_text = False
+
+    if api_key:
+        try:
+            p1_text, p1_png = extract_first_page_for_metadata(prob_bytes, dpi=140)
+            if p1_png is None:
+                p1_png = render_pdf_page_png(prob_bytes, 1, dpi=140)
+            ai_meta = extract_exam_header_metadata(
+                api_key=api_key,
+                model_name=EXAM_TAGGING_MODEL,
+                first_page_text=p1_text,
+                first_page_png_bytes=p1_png,
+                filename=prob_name,
+            )
+            merged_year = (ai_meta.year or parsed_local.get("year") or "").strip().rstrip("년")
+            merged_month = (ai_meta.month or parsed_local.get("month") or "").strip()
+            if merged_month and not merged_month.endswith("월"):
+                merged_month = f"{merged_month}월"
+            merged_grade = (ai_meta.grade or parsed_local.get("grade") or "").strip()
+            merged_subject = (ai_meta.subject or parsed_local.get("subject") or "").strip()
+            if merged_year and merged_month and merged_grade and merged_subject:
+                merged_title = f"{merged_year}년 {merged_month} {merged_grade} {merged_subject}"
+            else:
+                merged_title = (ai_meta.exam_title or parsed_local.get("exam_title") or "").strip()
+            parsed_local = {
+                "year": merged_year,
+                "month": merged_month,
+                "grade": merged_grade,
+                "subject": merged_subject,
+                "exam_title": merged_title,
+            }
+            ai_verified = True
+        except Exception:
+            ai_verified = False
+
+    return parsed_local, has_p1_text, ai_verified
+
+
+def _crop_single_exam_pdf(
+    prob_bytes: bytes,
+    use_vision_fallback: bool,
+    api_key: str,
+    status_cb: Callable[[str], None] | None = None,
+    progress_cb: Callable[[float], None] | None = None,
+) -> tuple[list[CroppedQuestion], int, bool]:
+    """단일 문제지 PDF를 2단 편집 기준으로 크롭하고, 스캔 페이지는 순차 Vision 보완한다."""
+    crops, has_text = parse_exam_pdf(prob_bytes, dpi=220)
+    total_p = get_pdf_page_count(prob_bytes)
+
+    if use_vision_fallback and api_key:
+        page_text_lens = get_page_text_lengths(prob_bytes)
+        cropped_pages = {c.page_num for c in crops}
+        if not crops or not has_text:
+            target_vision_pages = list(range(1, total_p + 1))
+        else:
+            target_vision_pages = [
+                idx + 1
+                for idx, tlen in enumerate(page_text_lens)
+                if tlen < 40 and (idx + 1) not in cropped_pages
+            ]
+
+        if target_vision_pages:
+            if status_cb:
+                status_cb(
+                    f"텍스트가 부족한 {len(target_vision_pages)}개 페이지를 "
+                    f"{MODEL_LABELS.get(EXAM_TAGGING_MODEL, EXAM_TAGGING_MODEL)} Vision으로 1페이지씩 순차 탐지합니다..."
+                )
+            existing_by_q: dict[int, CroppedQuestion] = {c.q_num: c for c in crops}
+            for step_i, p_num in enumerate(target_vision_pages, start=1):
+                page_png = render_pdf_page_png(prob_bytes, p_num, dpi=180)
+                boxes = detect_scanned_question_boxes(api_key, EXAM_TAGGING_MODEL, page_png)
+                boxes.sort(key=lambda b: (0 if b.xmin < 500 else 1, b.ymin, b.xmin))
+                for b in boxes:
+                    if b.q_num in existing_by_q:
+                        continue
+                    png_b, pw, ph = crop_normalized_box(
+                        prob_bytes,
+                        p_num,
+                        b.ymin,
+                        b.xmin,
+                        b.ymax,
+                        b.xmax,
+                        dpi=250,
+                    )
+                    existing_by_q[b.q_num] = CroppedQuestion(
+                        q_num=b.q_num,
+                        page_num=p_num,
+                        png_bytes=png_b,
+                        width=pw,
+                        height=ph,
+                        extracted_text="",
+                    )
+                if progress_cb:
+                    progress_cb(step_i / max(1, len(target_vision_pages)))
+            crops = sorted(existing_by_q.values(), key=lambda x: x.q_num)
+
+    return crops, total_p, has_text
+
+
+def _tag_and_save_single_exam(
+    storage: StorageManager,
+    api_key: str,
+    meta: dict[str, Any],
+    parsed_crops: list[CroppedQuestion],
+    target_q_nums: list[int],
+    is_retry: bool = False,
+    push_status: Callable[[str], None] | None = None,
+    append_log: Callable[[str], None] | None = None,
+    on_progress: Callable[[float], None] | None = None,
+    on_warning: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
+    """단일 시험지 PDF와 해설지를 일괄 태깅·크롭 저장·DB 반영·Drive 동기화한다."""
+    safe_exam = sanitize_id_part(meta["exam_name"])
+    tagging_model = EXAM_TAGGING_MODEL
+    tagging_model_label = MODEL_LABELS.get(tagging_model, tagging_model)
+
+    def _status(msg: str) -> None:
+        if push_status:
+            push_status(msg)
+
+    def _log(msg: str) -> None:
+        if append_log:
+            append_log(msg)
+
+    def _prog(val: float) -> None:
+        if on_progress:
+            on_progress(val)
+
+    pending_pdf_files: list[str] = []
+    pending_crop_files: list[str] = []
+    if not is_retry:
+        if meta.get("prob_bytes"):
+            prob_fn = f"{safe_exam}__문제지.pdf"
+            storage.save_pdf_file(
+                prob_fn,
+                meta["prob_bytes"],
+                subject_category=meta["subject_category"],
+                exam_name=meta["exam_name"],
+                sync_drive=False,
+            )
+            pending_pdf_files.append(prob_fn)
+        if meta.get("ans_bytes"):
+            ans_fn = f"{safe_exam}__해설지.pdf"
+            storage.save_pdf_file(
+                ans_fn,
+                meta["ans_bytes"],
+                subject_category=meta["subject_category"],
+                exam_name=meta["exam_name"],
+                sync_drive=False,
+            )
+            pending_pdf_files.append(ans_fn)
+
+    answer_snippets: dict[int, str] = {}
+    answer_pdf_part = None
+    if meta.get("ans_bytes"):
+        _status("📄 해설지 PDF 분석 중 (텍스트 스니펫 우선 추출)...")
+        try:
+            answer_snippets, ans_has_text = extract_answer_snippets_from_pdf(meta["ans_bytes"])
+            if ans_has_text:
+                _log(f"📄 해설지 텍스트 스니펫 추출 완료 ({len(answer_snippets)}개 문항 매칭 · 경량 전송)")
+            else:
+                tmp_client = build_gemini_client(api_key, timeout_seconds=30)
+                answer_pdf_part = prepare_pdf_part(
+                    tmp_client,
+                    meta["ans_bytes"],
+                    display_name=f"{safe_exam}_answer.pdf",
+                )
+                _log("📄 스캔 해설지 PDF 파트 준비 완료 (30초 타임아웃)")
+        except Exception as exc:
+            warn_msg = f"해설지 첨부 준비 중 경고 (문제 이미지만으로 진행): {exc}"
+            if on_warning:
+                on_warning(warn_msg)
+            _log(f"⚠️ 해설지 준비 경고: {exc}")
+
+    target_set = set(target_q_nums)
+    target_crops = sorted(
+        [c for c in parsed_crops if c.q_num in target_set],
+        key=lambda c: c.q_num,
+    )
+    existing_records = storage.load_db()
+    rec_map = {r.id: r for r in existing_records}
+
+    _prog(0.05)
+    newly_saved: list[QuestionRecord] = []
+    failed_q_nums: list[int] = []
+    errors: list[str] = []
+
+    batch_t0 = time.perf_counter()
+    extracted_by_q: dict[int, Any] = {}
+
+    if meta.get("prob_bytes"):
+        _status(f"⚡ 전체 문제지 PDF({len(target_crops)}문항) 한 번에 태깅 중 (모델: {tagging_model_label})...")
+        try:
+            batch_map = analyze_exam_pdf_batch_with_gemini(
+                api_key=api_key,
+                model_name=tagging_model,
+                prob_pdf_bytes=meta["prob_bytes"],
+                target_q_nums=[c.q_num for c in target_crops],
+                subject_category=meta["subject_category"],
+                exam_name=meta["exam_name"],
+                answer_snippets=answer_snippets,
+                answer_pdf_part=answer_pdf_part,
+                status_callback=_status,
+            )
+            extracted_by_q.update(batch_map)
+            _log(
+                f"⚡ 전체 PDF 일괄 태깅 완료: {len(batch_map)}/{len(target_crops)}문항 "
+                f"({time.perf_counter() - batch_t0:.1f}초 · {tagging_model_label})"
+            )
+        except Exception as exc:
+            _log(f"⚠️ 전체 PDF 일괄 태깅 실패 → 개별 보완 모드로 전환: {exc}")
+
+    _prog(0.65)
+
+    missing_crops = [c for c in target_crops if c.q_num not in extracted_by_q]
+    if missing_crops:
+        _status(f"🔁 누락된 {len(missing_crops)}개 문항 보완 태깅 중 ({tagging_model_label})...")
+
+        def _analyze_worker(cq_item: CroppedQuestion) -> tuple[CroppedQuestion, Any, float]:
+            t_start = time.perf_counter()
+            extracted_out = analyze_question_with_gemini(
+                api_key=api_key,
+                model_name=tagging_model,
+                crop_png_bytes=cq_item.png_bytes,
+                q_num=cq_item.q_num,
+                subject_category=meta["subject_category"],
+                exam_name=meta["exam_name"],
+                answer_pdf_part=answer_pdf_part,
+                answer_text_hint=answer_snippets.get(cq_item.q_num, ""),
+                status_callback=None,
+            )
+            return cq_item, extracted_out, time.perf_counter() - t_start
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+            future_to_cq = {executor.submit(_analyze_worker, cq): cq for cq in missing_crops}
+            for fut in concurrent.futures.as_completed(future_to_cq):
+                cq = future_to_cq[fut]
+                try:
+                    _, extracted, elapsed_s = fut.result()
+                    extracted_by_q[cq.q_num] = extracted
+                    _log(f"✅ {cq.q_num}번 보완 태깅 완료 ({elapsed_s:.1f}초)")
+                except Exception as exc:
+                    err_msg = f"{cq.q_num}번 오류 (건너뜀): {exc}"
+                    failed_q_nums.append(cq.q_num)
+                    errors.append(err_msg)
+                    _log(f"❌ {err_msg}")
+
+    _prog(0.85)
+
+    _status("💾 전체 문항 크롭 이미지 및 DB 한 번에 저장 중...")
+    now_iso = datetime.now().isoformat(timespec="seconds")
+    for cq in target_crops:
+        extracted = extracted_by_q.get(cq.q_num)
+        if extracted is None:
+            continue
+        q_id = f"{safe_exam}__Q{cq.q_num:02d}"
+        img_filename = f"{q_id}.png"
+        storage.save_crop_png(
+            img_filename,
+            cq.png_bytes,
+            subject_category=meta["subject_category"],
+            exam_name=meta["exam_name"],
+            sync_drive=False,
+        )
+        pending_crop_files.append(img_filename)
+
+        record = QuestionRecord(
+            id=q_id,
+            exam_name=meta["exam_name"],
+            q_num=cq.q_num,
+            subject_category=meta["subject_category"],
+            curriculum_subject=extracted.curriculum_subject,
+            unit_name=extracted.unit_name,
+            min_grade=extracted.min_grade,
+            core_principles=extracted.core_principles,
+            required_terms=extracted.required_terms,
+            is_single_concept=extracted.is_single_concept,
+            answer=extracted.answer,
+            official_explanation=extracted.official_explanation,
+            question_text=re.sub(r"\s+", " ", (cq.extracted_text or "")).strip(),
+            image_filename=img_filename,
+            source_pdf=f"{safe_exam}__문제지.pdf",
+            answer_pdf=f"{safe_exam}__해설지.pdf" if meta.get("ans_bytes") else "",
+            created_at=now_iso,
+        )
+        rec_map[q_id] = record
+        newly_saved.append(record)
+
+    newly_saved.sort(key=lambda r: r.q_num)
+    sorted_all_records = sorted(rec_map.values(), key=lambda r: (r.exam_name, r.q_num))
+    pending_crop_files.sort()
+
+    storage.save_db(
+        sorted_all_records,
+        sync_organized_drive=False,
+        sync_db_drive=False,
+        sync_local_organized=False,
+    )
+
+    _status(
+        "☁️ 전체 문항 로컬 저장 및 Google Drive 일괄 동기화 중... "
+        "('Google Drive 동기화 완료'가 뜰 때까지 창을 유지해 주세요)"
+    )
+    sync_err = storage.sync_exam_batch(
+        subject_category=meta["subject_category"],
+        exam_name=meta["exam_name"],
+        records=sorted_all_records,
+        crop_filenames=pending_crop_files,
+        pdf_filenames=pending_pdf_files,
+        include_organized_exports=True,
+    )
+    if newly_saved:
+        _build_cached_exam_exports.clear()
+    _prog(1.0)
+    total_batch_s = time.perf_counter() - batch_t0
+    _log(f"🏁 전체 PDF 태깅 및 일괄 저장·동기화 완료 ({len(newly_saved)}문항 · 총 {total_batch_s:.1f}초)")
+    return {
+        "newly_saved": newly_saved,
+        "failed_q_nums": sorted(set(failed_q_nums)),
+        "errors": errors,
+        "sync_err": sync_err or "",
+        "elapsed_s": total_batch_s,
+    }
 
 
 creds = resolve_credentials()
@@ -1347,296 +1698,505 @@ with tab1:
                     st.info("👉 아래 [수동 업로드] 영역에 내려받은 문제지·해설지 PDF를 직접 올려주세요.")
 
     with st.container(border=True):
+        upload_mode_label = st.radio(
+            "업로드 방식 선택",
+            options=["📄 파일 선택 (1개 또는 여러 개)", "📁 폴더 통째로 업로드 (하위 폴더 포함)"],
+            horizontal=True,
+            key="tab1_upload_mode",
+            help="여러 개의 PDF를 드래그/다중 선택하거나, 모의고사 폴더 자체를 선택해 한 번에 대기열에 넣을 수 있습니다. 분석·태깅·저장은 PDF 1개씩 순차 진행됩니다.",
+        )
+        is_dir_upload = "폴더" in upload_mode_label
+        accept_mode: bool | str = "directory" if is_dir_upload else True
+        prob_up_label = (
+            "문제지 폴더 업로드 (폴더 내 모든 PDF 자동 수집)"
+            if is_dir_upload
+            else "문제지 PDF 업로드 (1개 또는 여러 개 선택 가능)"
+        )
+        ans_up_label = (
+            "해설지 폴더 업로드 (권장 · 파일명 기준 자동 1:1 매칭)"
+            if is_dir_upload
+            else "해설지 PDF 업로드 (권장 · 여러 개 선택 시 파일명 기준 자동 매칭)"
+        )
+
         col_up1, col_up2 = st.columns(2)
         with col_up1:
-            prob_file = st.file_uploader("문제지 PDF 업로드 (올리는 즉시 1페이지 자동 인식)", type=["pdf"], key="tab1_prob_pdf")
+            raw_prob_uploads = st.file_uploader(
+                prob_up_label,
+                type=["pdf"],
+                accept_multiple_files=accept_mode,
+                key="tab1_prob_pdf_dir" if is_dir_upload else "tab1_prob_pdf_files",
+            )
         with col_up2:
-            ans_file = st.file_uploader(
-                "해설지 PDF 업로드 (권장)", type=["pdf"], key="tab1_ans_pdf"
+            raw_ans_uploads = st.file_uploader(
+                ans_up_label,
+                type=["pdf"],
+                accept_multiple_files=accept_mode,
+                key="tab1_ans_pdf_dir" if is_dir_upload else "tab1_ans_pdf_files",
             )
 
-        active_prob_bytes: bytes | None = (
-            prob_file.getvalue() if prob_file is not None else st.session_state.get("ebsi_problem_bytes")
+        raw_prob_files = sorted(
+            [f for f in (raw_prob_uploads or []) if f.name.lower().endswith(".pdf")],
+            key=lambda f: f.name,
         )
-        active_prob_name: str = (
-            prob_file.name if prob_file is not None else st.session_state.get("ebsi_problem_name", "problem.pdf")
-        )
-        active_ans_bytes: bytes | None = (
-            ans_file.getvalue() if ans_file is not None else st.session_state.get("ebsi_answer_bytes")
-        )
-        active_ans_name: str = (
-            ans_file.name if ans_file is not None else st.session_state.get("ebsi_answer_name", "answer.pdf")
+        raw_ans_files = sorted(
+            [f for f in (raw_ans_uploads or []) if f.name.lower().endswith(".pdf")],
+            key=lambda f: f.name,
         )
 
-        if st.session_state.get("ebsi_problem_bytes") and prob_file is None:
-            st.caption(f"🔗 EBSi에서 가져온 문제지 대기 중: `{active_prob_name}`")
-        if st.session_state.get("ebsi_answer_bytes") and ans_file is None:
-            st.caption(f"🔗 EBSi에서 가져온 해설지 대기 중: `{active_ans_name}`")
+        prob_files = list(raw_prob_files)
+        ans_files = list(raw_ans_files)
 
-        # 업로드 즉시 fitz + re 기반 0.05초 로컬 파싱 (API 호출 없음, file.name + file.size 변경 감지 시 강제 덮어쓰기)
-        file_sig = (
-            f"{prob_file.name}:{prob_file.size}"
-            if prob_file is not None
-            else (f"{active_prob_name}:{len(active_prob_bytes)}" if active_prob_bytes else "")
-        )
-
-        if not file_sig:
-            st.session_state["tab1_last_loaded_sig"] = ""
-            st.session_state["tab1_meta_status"] = ""
-        elif file_sig != st.session_state.get("tab1_last_loaded_sig"):
-            parsed_local: dict[str, str] = {
-                "year": "",
-                "month": "",
-                "grade": "",
-                "subject": "",
-                "exam_title": "",
-            }
-            has_p1_text = False
-            ai_verified = False
-            if active_prob_bytes:
-                # 1차: 기존 PyMuPDF 텍스트 정규식 즉시 파싱
-                try:
-                    parsed_local, has_p1_text = extract_exam_metadata_fast(
-                        active_prob_bytes,
-                        filename=active_prob_name,
-                    )
-                except Exception:
-                    parsed_local = {
-                        "year": "",
-                        "month": "",
-                        "grade": "",
-                        "subject": "",
-                        "exam_title": "",
-                    }
-                    has_p1_text = False
-
-                # 2차: 다른 방식(1페이지 이미지 + Gemini 3.5 Flash-Lite Vision)으로 빠르게 한 번 더 교차 판독
-                if active_gemini_key:
-                    try:
-                        with st.spinner("🔍 1차 텍스트 파싱 + 2차 AI 비전 표지 교차 검증 중..."):
-                            p1_text, p1_png = extract_first_page_for_metadata(active_prob_bytes, dpi=140)
-                            if p1_png is None:
-                                p1_png = render_pdf_page_png(active_prob_bytes, 1, dpi=140)
-                            ai_meta = extract_exam_header_metadata(
-                                api_key=active_gemini_key,
-                                model_name=EXAM_TAGGING_MODEL,
-                                first_page_text=p1_text,
-                                first_page_png_bytes=p1_png,
-                                filename=active_prob_name,
-                            )
-                            merged_year = (ai_meta.year or parsed_local.get("year") or "").strip().rstrip("년")
-                            merged_month = (ai_meta.month or parsed_local.get("month") or "").strip()
-                            if merged_month and not merged_month.endswith("월"):
-                                merged_month = f"{merged_month}월"
-                            merged_grade = (ai_meta.grade or parsed_local.get("grade") or "").strip()
-                            merged_subject = (ai_meta.subject or parsed_local.get("subject") or "").strip()
-                            if merged_year and merged_month and merged_grade and merged_subject:
-                                merged_title = f"{merged_year}년 {merged_month} {merged_grade} {merged_subject}"
-                            else:
-                                merged_title = (
-                                    ai_meta.exam_title
-                                    or parsed_local.get("exam_title")
-                                    or ""
-                                ).strip()
-                            parsed_local = {
-                                "year": merged_year,
-                                "month": merged_month,
-                                "grade": merged_grade,
-                                "subject": merged_subject,
-                                "exam_title": merged_title,
-                            }
-                            ai_verified = True
-                    except Exception:
-                        ai_verified = False
-
-            st.session_state["meta_year"] = parsed_local.get("year", "")
-            st.session_state["meta_month"] = parsed_local.get("month", "")
-            st.session_state["meta_grade"] = parsed_local.get("grade", "")
-            st.session_state["meta_subject"] = parsed_local.get("subject", "")
-            st.session_state["meta_title"] = parsed_local.get("exam_title", "")
-            st.session_state["tab1_subject_cat"] = infer_subject_category(parsed_local.get("subject", ""))
-            st.session_state["tab1_last_loaded_sig"] = file_sig
-
-            if ai_verified and parsed_local.get("exam_title"):
-                st.session_state["tab1_meta_status"] = "verified_ai"
-            elif not has_p1_text and not parsed_local.get("exam_title"):
-                st.session_state["tab1_meta_status"] = "scanned"
-            elif parsed_local.get("exam_title"):
-                st.session_state["tab1_meta_status"] = "parsed"
-            else:
-                st.session_state["tab1_meta_status"] = "partial_empty"
-
-        meta_status = st.session_state.get("tab1_meta_status", "")
-        if file_sig:
-            if meta_status == "verified_ai":
-                st.success(
-                    f"🎯 1차 텍스트 + 2차 AI 비전 표지 교차 검증 완료: **{st.session_state.get('meta_title', '')}** (필요 시 아래에서 수정 가능)"
+        # 문제지 업로드 목록/폴더 안에 해설·정답 PDF가 함께 들어있고 해설지 업로더가 비어있을 때 자동 분리 옵션 제공
+        if not raw_ans_files and len(raw_prob_files) >= 2:
+            split_ans = [f for f in raw_prob_files if is_likely_answer_filename(f.name)]
+            split_prob = [f for f in raw_prob_files if not is_likely_answer_filename(f.name)]
+            if split_ans and split_prob:
+                auto_split_ans = st.checkbox(
+                    f"📁 문제지 업로드 목록에서 해설/정답 PDF {len(split_ans)}개를 해설지로 자동 분리 매칭 "
+                    f"(문제지 {len(split_prob)}개 + 해설지 {len(split_ans)}개)",
+                    value=True,
+                    key="tab1_auto_split_ans",
                 )
-            elif meta_status == "parsed":
-                st.success(
-                    f"⚡ 1페이지 즉시 자동 인식 완료: **{st.session_state.get('meta_title', '')}** (필요 시 아래에서 바로 수정하세요)"
+                if auto_split_ans:
+                    prob_files = split_prob
+                    ans_files = split_ans
+
+        is_batch_queue_mode = len(prob_files) >= 2
+
+        if is_batch_queue_mode:
+            auto_matches = pair_problem_and_answer_files(
+                [f.name for f in prob_files],
+                [f.name for f in ans_files],
+            )
+            matched_cnt = sum(1 for m in auto_matches if m is not None)
+            st.info(
+                f"📦 **총 {len(prob_files)}개 문제지 PDF**가 대기열에 등록되었습니다 "
+                f"(해설지 자동 매칭 {matched_cnt}/{len(prob_files)}개). "
+                "시작 버튼을 누르면 **PDF 1개씩 순서대로** 표지 인식 → 문항 크롭 → Gemini 원리·용어 태깅 → DB/Drive 저장을 실행합니다."
+            )
+
+            ans_option_indices: list[int | None] = [None] + list(range(len(ans_files)))
+            selected_ans_indices: list[int | None] = []
+            with st.expander(f"📋 대기열 목록 및 해설지 1:1 매칭 확인 ({len(prob_files)}개)", expanded=len(prob_files) <= 12):
+                for q_idx, pf in enumerate(prob_files):
+                    c_left, c_right = st.columns([1.2, 1.0])
+                    p_base = _pdf_display_basename(pf.name)
+                    with c_left:
+                        st.markdown(f"**{q_idx + 1}. `{p_base}`**")
+                        if p_base != pf.name:
+                            st.caption(f"경로: `{pf.name}`")
+                    with c_right:
+                        default_ans = auto_matches[q_idx]
+                        default_opt_pos = (
+                            ans_option_indices.index(default_ans)
+                            if default_ans in ans_option_indices
+                            else 0
+                        )
+                        chosen_ans_idx = st.selectbox(
+                            f"해설지 #{q_idx + 1}",
+                            options=ans_option_indices,
+                            index=default_opt_pos,
+                            format_func=lambda idx: (
+                                "(해설지 없음)"
+                                if idx is None
+                                else _pdf_display_basename(ans_files[idx].name)
+                            ),
+                            key=f"batch_ans_map_{q_idx}_{pf.name}",
+                            label_visibility="collapsed",
+                        )
+                        selected_ans_indices.append(chosen_ans_idx)
+
+            b_opt1, b_opt2 = st.columns(2)
+            with b_opt1:
+                batch_vision_chk = st.checkbox(
+                    "스캔(이미지) PDF인 경우 Gemini Vision 좌표 탐지 보조 사용",
+                    value=True,
+                    key="tab1_batch_vision_chk",
                 )
-            elif meta_status == "scanned":
-                st.info("🖼️ 텍스트가 없는 스캔 PDF입니다. 아래 [시행 년도 / 시행 월 / 학년 / 과목 / 회차명]을 직접 입력해 주세요.")
-            elif meta_status == "partial_empty":
-                st.info("📄 1페이지 헤더 정보가 일부만 확인되어 빈칸으로 두었습니다. 아래 입력칸을 직접 채워 주세요.")
+            with b_opt2:
+                batch_skip_dup_chk = st.checkbox(
+                    "이미 DB에 등록된 회차명 자동 건너뛰기 (중복 방지)",
+                    value=True,
+                    key="tab1_batch_skip_dup_chk",
+                )
 
-        # 분석 성공 여부와 관계없이 5개 입력칸(+대분류)은 항상 즉시 렌더링
-        col_m1, col_m2, col_m3, col_m4 = st.columns(4)
-        with col_m1:
-            exam_year_input = st.text_input("시행 년도", key="meta_year", placeholder="예: 2026")
-        with col_m2:
-            exam_month_input = st.text_input("시행 월", key="meta_month", placeholder="예: 9월")
-        with col_m3:
-            exam_grade_input = st.text_input("학년", key="meta_grade", placeholder="예: 고1")
-        with col_m4:
-            exam_subject_input = st.text_input(
-                "과목",
-                key="meta_subject",
-                placeholder="예: 통합사회",
-            )
-
-        col_meta1, col_meta2 = st.columns([1, 2])
-        with col_meta1:
-            subject_cat = st.selectbox("과목 (대분류)", options=["과학", "수학", "사회"], key="tab1_subject_cat")
-        with col_meta2:
-            exam_name_input = st.text_input(
-                "회차명 (자동 조합)",
-                key="meta_title",
-                placeholder="예: 2026년 9월 고1 통합사회",
-            )
-
-        existing_exam_names = {
-            re.sub(r"\s+", " ", r.exam_name.strip())
-            for r in storage.load_db()
-            if r.exam_name
-        }
-        norm_input_exam = re.sub(r"\s+", " ", exam_name_input.strip())
-        is_duplicate_exam = bool(norm_input_exam and norm_input_exam in existing_exam_names)
-        if is_duplicate_exam:
-            st.error(
-                f"🚫 **'{norm_input_exam}'** 모의고사는 이미 DB에 등록되어 있습니다. "
-                "중복 수집 방지를 위해 크롭 버튼이 비활성화되었습니다."
-            )
-
-        parse_col1, parse_col2 = st.columns([1, 1])
-        with parse_col1:
-            run_crop_btn = st.button(
-                "✂️ 1단계: 2단 편집 분석 및 고해상도 문항 크롭",
+            run_batch_btn = st.button(
+                f"🚀 대기열 {len(prob_files)}개 PDF 순차 분석·저장 시작 (하나씩 처리)",
                 type="primary",
                 width="stretch",
-                disabled=is_duplicate_exam,
-            )
-        with parse_col2:
-            vision_fallback_chk = st.checkbox(
-                "스캔(이미지) PDF인 경우 Gemini Vision 좌표 탐지 보조 사용",
-                value=True,
+                key="tab1_run_batch_btn",
             )
 
-        if run_crop_btn and not is_duplicate_exam:
-            if not active_prob_bytes:
-                st.error("문제지 PDF를 업로드하거나 EBSi에서 먼저 추출해 주세요.")
-            elif not exam_name_input.strip():
-                st.error("시험 회차명을 입력해 주세요.")
-            else:
-                with st.spinner("PyMuPDF 2단 편집(좌→우 칼럼) 분석 및 220 DPI PNG 크롭 중..."):
-                    crops, has_text = parse_exam_pdf(active_prob_bytes, dpi=220)
-                    total_p = get_pdf_page_count(active_prob_bytes)
-
-                    # 스캔 PDF 또는 일부 페이지만 이미지(텍스트 부족)인 경우 1페이지씩 순차 Gemini Vision 보완
-                    if vision_fallback_chk and active_gemini_key:
-                        page_text_lens = get_page_text_lengths(active_prob_bytes)
-                        cropped_pages = {c.page_num for c in crops}
-                        if not crops or not has_text:
-                            target_vision_pages = list(range(1, total_p + 1))
-                        else:
-                            target_vision_pages = [
-                                idx + 1
-                                for idx, tlen in enumerate(page_text_lens)
-                                if tlen < 40 and (idx + 1) not in cropped_pages
-                            ]
-
-                        if target_vision_pages:
-                            st.info(
-                                f"텍스트가 부족한 {len(target_vision_pages)}개 페이지를 "
-                                f"{MODEL_LABELS.get(EXAM_TAGGING_MODEL, EXAM_TAGGING_MODEL)} Vision으로 1페이지씩 순차 탐지합니다..."
-                            )
-                            existing_by_q: dict[int, CroppedQuestion] = {c.q_num: c for c in crops}
-                            prog = st.progress(0.0)
-                            for step_i, p_num in enumerate(target_vision_pages, start=1):
-                                page_png = render_pdf_page_png(active_prob_bytes, p_num, dpi=180)
-                                boxes = detect_scanned_question_boxes(
-                                    active_gemini_key, EXAM_TAGGING_MODEL, page_png
-                                )
-                                # 왼쪽 단(xmin < 500) 위->아래, 오른쪽 단(xmin >= 500) 위->아래 순 정렬
-                                boxes.sort(key=lambda b: (0 if b.xmin < 500 else 1, b.ymin, b.xmin))
-                                for b in boxes:
-                                    if b.q_num in existing_by_q:
-                                        continue
-                                    png_b, pw, ph = crop_normalized_box(
-                                        active_prob_bytes,
-                                        p_num,
-                                        b.ymin,
-                                        b.xmin,
-                                        b.ymax,
-                                        b.xmax,
-                                        dpi=250,
-                                    )
-                                    existing_by_q[b.q_num] = CroppedQuestion(
-                                        q_num=b.q_num,
-                                        page_num=p_num,
-                                        png_bytes=png_b,
-                                        width=pw,
-                                        height=ph,
-                                        extracted_text="",
-                                    )
-                                prog.progress(step_i / max(1, len(target_vision_pages)))
-                            crops = sorted(existing_by_q.values(), key=lambda x: x.q_num)
-
-                if not crops:
-                    st.error("문항 번호를 탐지하지 못했습니다. PDF 형식을 확인하거나 Gemini API 키 설정 후 Vision 보조를 활성화해 주세요.")
+            if run_batch_btn:
+                verified_key, verified_key_label = resolve_active_gemini_api_key(
+                    current_user, creds.gemini_api_key
+                )
+                if not verified_key:
+                    st.error(
+                        f"API 키가 설정되지 않았습니다 ({verified_key_label}). "
+                        "ADMIN/PRO/FREE 등급은 `.streamlit/secrets.toml`의 `GEMINI_API_KEY`를, "
+                        "CUSTOM 등급은 사이드바의 개인 Gemini API 키를 확인해 주세요."
+                    )
                 else:
-                    st.session_state["parsed_crops"] = crops
-                    st.session_state["parsed_exam_meta"] = {
-                        "exam_name": exam_name_input.strip(),
-                        "subject_category": subject_cat,
-                        "prob_bytes": active_prob_bytes,
-                        "prob_name": active_prob_name,
-                        "ans_bytes": active_ans_bytes,
-                        "ans_name": active_ans_name,
+                    existing_exam_names = {
+                        re.sub(r"\s+", " ", r.exam_name.strip())
+                        for r in storage.load_db()
+                        if r.exam_name
                     }
-                    st.session_state["stage2_exam_name"] = ""
-                    st.session_state["stage2_saved_q_nums"] = []
-                    st.session_state["stage2_failed_q_nums"] = []
-                    st.session_state["stage2_failed_errors"] = []
-                    st.session_state["stage2_sync_err"] = ""
-                    st.session_state["trigger_retry_failed"] = False
-                    found_nums = sorted({c.q_num for c in crops})
-                    min_q, max_q = found_nums[0], found_nums[-1]
-                    subj_txt = (exam_subject_input or "").strip()
-                    if any(k in subj_txt for k in ("국어", "영어")):
-                        expected_max = 45
-                    elif any(k in subj_txt for k in ("수학", "미적분", "기하", "확률")):
-                        expected_max = 30
-                    elif any(k in subj_txt for k in ("사회", "과학", "물리", "화학", "생명", "지구", "한국사", "윤리", "지리", "경제", "정치", "역사")):
-                        expected_max = 20
-                    else:
-                        expected_max = max_q
+                    total_n = len(prob_files)
+                    overall_prog = st.progress(0.0)
+                    overall_status = st.empty()
+                    item_prog = st.progress(0.0)
+                    item_status = st.empty()
+                    item_log = st.empty()
+                    batch_summary: list[dict[str, Any]] = []
+                    live_logs: list[str] = []
 
-                    range_end = max(max_q, expected_max) if total_p >= 3 else max_q
-                    missing_in_found = [n for n in range(1, max_q + 1) if n not in set(found_nums)]
-                    missing_tail = [n for n in range(max_q + 1, range_end + 1)]
+                    def _append_batch_log(msg: str) -> None:
+                        live_logs.append(msg)
+                        item_log.code("\n".join(live_logs[-18:]), language="text")
 
-                    st.success(f"✅ 총 {len(crops)}개 문항 크롭 완료 ({min_q}번 ~ {max_q}번)")
-                    if missing_in_found or missing_tail:
-                        missing_all = missing_in_found + missing_tail
-                        st.warning(
-                            f"⚠️ 누락된 문항 번호 ({len(missing_all)}개, 1~{range_end}번 기준): "
-                            + ", ".join(f"{n}번" for n in missing_all)
+                    for idx, prob_f in enumerate(prob_files, start=1):
+                        prob_base = _pdf_display_basename(prob_f.name)
+                        matched_ans_i = selected_ans_indices[idx - 1]
+                        ans_f = ans_files[matched_ans_i] if matched_ans_i is not None else None
+                        ans_base = _pdf_display_basename(ans_f.name) if ans_f is not None else ""
+
+                        overall_status.info(
+                            f"📦 **[{idx}/{total_n}]** `{prob_base}` 순차 처리 중..."
+                            + (f" (해설지: `{ans_base}`)" if ans_base else " (해설지 없음)")
+                        )
+                        item_prog.progress(0.05)
+                        _append_batch_log(f"--- [{idx}/{total_n}] {prob_base} 시작 ---")
+
+                        try:
+                            prob_bytes = prob_f.getvalue()
+                            ans_bytes = ans_f.getvalue() if ans_f is not None else None
+
+                            item_status.info("🔍 1단계: 표지 메타데이터 판독 중...")
+                            parsed_local, _, _ = _detect_single_exam_cover(prob_bytes, prob_base, verified_key)
+                            raw_title = (parsed_local.get("exam_title") or "").strip()
+                            if not raw_title:
+                                raw_title = os.path.splitext(prob_base)[0].replace("_", " ").strip()
+                            norm_exam_name = re.sub(r"\s+", " ", raw_title)
+                            subj_cat = infer_subject_category(parsed_local.get("subject") or norm_exam_name)
+                            _append_batch_log(f"🏷️ 회차명: {norm_exam_name} ({subj_cat})")
+
+                            if batch_skip_dup_chk and norm_exam_name in existing_exam_names:
+                                _append_batch_log(f"⏭️ 이미 DB에 등록됨 → 건너뜀: {norm_exam_name}")
+                                batch_summary.append(
+                                    {
+                                        "file": prob_base,
+                                        "exam_name": norm_exam_name,
+                                        "status": "skipped",
+                                        "saved_count": 0,
+                                        "message": "이미 DB에 등록된 회차(건너뜀)",
+                                    }
+                                )
+                                overall_prog.progress(idx / total_n)
+                                continue
+
+                            item_status.info("✂️ 2단계: 2단 편집 분석 및 문항 크롭 중...")
+                            item_prog.progress(0.20)
+                            crops, _, _ = _crop_single_exam_pdf(
+                                prob_bytes,
+                                use_vision_fallback=batch_vision_chk,
+                                api_key=verified_key,
+                                status_cb=lambda m: item_status.info(m),
+                                progress_cb=lambda v: item_prog.progress(0.20 + 0.20 * v),
+                            )
+                            if not crops:
+                                _append_batch_log(f"❌ 문항 번호 탐지 실패 → 건너뜀: {prob_base}")
+                                batch_summary.append(
+                                    {
+                                        "file": prob_base,
+                                        "exam_name": norm_exam_name,
+                                        "status": "failed",
+                                        "saved_count": 0,
+                                        "message": "문항 번호를 탐지하지 못했습니다.",
+                                    }
+                                )
+                                overall_prog.progress(idx / total_n)
+                                continue
+
+                            _append_batch_log(f"✂️ 크롭 완료: {len(crops)}문항")
+                            res = _tag_and_save_single_exam(
+                                storage=storage,
+                                api_key=verified_key,
+                                meta={
+                                    "exam_name": norm_exam_name,
+                                    "subject_category": subj_cat,
+                                    "prob_bytes": prob_bytes,
+                                    "prob_name": prob_base,
+                                    "ans_bytes": ans_bytes,
+                                    "ans_name": ans_base,
+                                },
+                                parsed_crops=crops,
+                                target_q_nums=[c.q_num for c in crops],
+                                is_retry=False,
+                                push_status=lambda m: item_status.info(m),
+                                append_log=_append_batch_log,
+                                on_progress=lambda v: item_prog.progress(0.40 + 0.60 * v),
+                                on_warning=lambda w: _append_batch_log(f"⚠️ {w}"),
+                            )
+                            newly_saved_items = res["newly_saved"]
+                            if newly_saved_items:
+                                existing_exam_names.add(norm_exam_name)
+                                record_exam_upload_for_user(storage, current_user.username)
+                            failed_qs = res["failed_q_nums"]
+                            sync_err = res["sync_err"]
+                            msg_parts = [f"{len(newly_saved_items)}문항 저장 ({res['elapsed_s']:.1f}초)"]
+                            if failed_qs:
+                                msg_parts.append(f"누락 {len(failed_qs)}문항")
+                            if sync_err:
+                                msg_parts.append(f"동기화 경고: {sync_err}")
+                            batch_summary.append(
+                                {
+                                    "file": prob_base,
+                                    "exam_name": norm_exam_name,
+                                    "status": "success" if newly_saved_items else "failed",
+                                    "saved_count": len(newly_saved_items),
+                                    "message": " · ".join(msg_parts),
+                                }
+                            )
+                        except Exception as exc:
+                            _append_batch_log(f"❌ 처리 오류 ({prob_base}): {exc}")
+                            batch_summary.append(
+                                {
+                                    "file": prob_base,
+                                    "exam_name": prob_base,
+                                    "status": "failed",
+                                    "saved_count": 0,
+                                    "message": str(exc),
+                                }
+                            )
+
+                        overall_prog.progress(idx / total_n)
+
+                    overall_status.success(f"🏁 대기열 {total_n}개 PDF 순차 처리 완료!")
+                    item_status.empty()
+                    st.session_state["tab1_batch_summary"] = batch_summary
+
+            saved_batch_summary = st.session_state.get("tab1_batch_summary") or []
+            if saved_batch_summary:
+                ok_cnt = sum(1 for r in saved_batch_summary if r["status"] == "success")
+                skip_cnt = sum(1 for r in saved_batch_summary if r["status"] == "skipped")
+                fail_cnt = sum(1 for r in saved_batch_summary if r["status"] == "failed")
+                st.markdown(
+                    f"#### 📊 순차 처리 결과 요약 — ✅ 완료 **{ok_cnt}건** · ⏭️ 중복 건너뜀 **{skip_cnt}건** · ❌ 실패 **{fail_cnt}건**"
+                )
+                for row in saved_batch_summary:
+                    icon = "✅" if row["status"] == "success" else ("⏭️" if row["status"] == "skipped" else "❌")
+                    st.write(f"{icon} **{row['exam_name']}** (`{row['file']}`) — {row['message']}")
+
+        else:
+            prob_file = prob_files[0] if prob_files else None
+            ans_file = None
+            if ans_files:
+                if prob_file is not None and len(ans_files) > 1:
+                    single_match = pair_problem_and_answer_files(
+                        [prob_file.name],
+                        [f.name for f in ans_files],
+                    )[0]
+                    ans_file = ans_files[single_match] if single_match is not None else ans_files[0]
+                else:
+                    ans_file = ans_files[0]
+
+            active_prob_bytes: bytes | None = (
+                prob_file.getvalue() if prob_file is not None else st.session_state.get("ebsi_problem_bytes")
+            )
+            active_prob_name: str = (
+                _pdf_display_basename(prob_file.name)
+                if prob_file is not None
+                else st.session_state.get("ebsi_problem_name", "problem.pdf")
+            )
+            active_ans_bytes: bytes | None = (
+                ans_file.getvalue() if ans_file is not None else st.session_state.get("ebsi_answer_bytes")
+            )
+            active_ans_name: str = (
+                _pdf_display_basename(ans_file.name)
+                if ans_file is not None
+                else st.session_state.get("ebsi_answer_name", "answer.pdf")
+            )
+
+            if st.session_state.get("ebsi_problem_bytes") and prob_file is None:
+                st.caption(f"🔗 EBSi에서 가져온 문제지 대기 중: `{active_prob_name}`")
+            if st.session_state.get("ebsi_answer_bytes") and ans_file is None:
+                st.caption(f"🔗 EBSi에서 가져온 해설지 대기 중: `{active_ans_name}`")
+
+            # 업로드 즉시 fitz + re 기반 0.05초 로컬 파싱 (API 호출 없음, file.name + file.size 변경 감지 시 강제 덮어쓰기)
+            file_sig = (
+                f"{active_prob_name}:{prob_file.size}"
+                if prob_file is not None
+                else (f"{active_prob_name}:{len(active_prob_bytes)}" if active_prob_bytes else "")
+            )
+
+            if not file_sig:
+                st.session_state["tab1_last_loaded_sig"] = ""
+                st.session_state["tab1_meta_status"] = ""
+            elif file_sig != st.session_state.get("tab1_last_loaded_sig"):
+                parsed_local = {
+                    "year": "",
+                    "month": "",
+                    "grade": "",
+                    "subject": "",
+                    "exam_title": "",
+                }
+                has_p1_text = False
+                ai_verified = False
+                if active_prob_bytes:
+                    with st.spinner("🔍 1차 텍스트 파싱 + 2차 AI 비전 표지 교차 검증 중..."):
+                        parsed_local, has_p1_text, ai_verified = _detect_single_exam_cover(
+                            active_prob_bytes,
+                            active_prob_name,
+                            active_gemini_key,
                         )
 
+                st.session_state["meta_year"] = parsed_local.get("year", "")
+                st.session_state["meta_month"] = parsed_local.get("month", "")
+                st.session_state["meta_grade"] = parsed_local.get("grade", "")
+                st.session_state["meta_subject"] = parsed_local.get("subject", "")
+                st.session_state["meta_title"] = parsed_local.get("exam_title", "")
+                st.session_state["tab1_subject_cat"] = infer_subject_category(parsed_local.get("subject", ""))
+                st.session_state["tab1_last_loaded_sig"] = file_sig
+
+                if ai_verified and parsed_local.get("exam_title"):
+                    st.session_state["tab1_meta_status"] = "verified_ai"
+                elif not has_p1_text and not parsed_local.get("exam_title"):
+                    st.session_state["tab1_meta_status"] = "scanned"
+                elif parsed_local.get("exam_title"):
+                    st.session_state["tab1_meta_status"] = "parsed"
+                else:
+                    st.session_state["tab1_meta_status"] = "partial_empty"
+
+            meta_status = st.session_state.get("tab1_meta_status", "")
+            if file_sig:
+                if meta_status == "verified_ai":
+                    st.success(
+                        f"🎯 1차 텍스트 + 2차 AI 비전 표지 교차 검증 완료: **{st.session_state.get('meta_title', '')}** (필요 시 아래에서 수정 가능)"
+                    )
+                elif meta_status == "parsed":
+                    st.success(
+                        f"⚡ 1페이지 즉시 자동 인식 완료: **{st.session_state.get('meta_title', '')}** (필요 시 아래에서 바로 수정하세요)"
+                    )
+                elif meta_status == "scanned":
+                    st.info("🖼️ 텍스트가 없는 스캔 PDF입니다. 아래 [시행 년도 / 시행 월 / 학년 / 과목 / 회차명]을 직접 입력해 주세요.")
+                elif meta_status == "partial_empty":
+                    st.info("📄 1페이지 헤더 정보가 일부만 확인되어 빈칸으로 두었습니다. 아래 입력칸을 직접 채워 주세요.")
+
+            # 분석 성공 여부와 관계없이 5개 입력칸(+대분류)은 항상 즉시 렌더링
+            col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+            with col_m1:
+                exam_year_input = st.text_input("시행 년도", key="meta_year", placeholder="예: 2026")
+            with col_m2:
+                exam_month_input = st.text_input("시행 월", key="meta_month", placeholder="예: 9월")
+            with col_m3:
+                exam_grade_input = st.text_input("학년", key="meta_grade", placeholder="예: 고1")
+            with col_m4:
+                exam_subject_input = st.text_input(
+                    "과목",
+                    key="meta_subject",
+                    placeholder="예: 통합사회",
+                )
+
+            col_meta1, col_meta2 = st.columns([1, 2])
+            with col_meta1:
+                subject_cat = st.selectbox("과목 (대분류)", options=["과학", "수학", "사회"], key="tab1_subject_cat")
+            with col_meta2:
+                exam_name_input = st.text_input(
+                    "회차명 (자동 조합)",
+                    key="meta_title",
+                    placeholder="예: 2026년 9월 고1 통합사회",
+                )
+
+            existing_exam_names = {
+                re.sub(r"\s+", " ", r.exam_name.strip())
+                for r in storage.load_db()
+                if r.exam_name
+            }
+            norm_input_exam = re.sub(r"\s+", " ", exam_name_input.strip())
+            is_duplicate_exam = bool(norm_input_exam and norm_input_exam in existing_exam_names)
+            if is_duplicate_exam:
+                st.error(
+                    f"🚫 **'{norm_input_exam}'** 모의고사는 이미 DB에 등록되어 있습니다. "
+                    "중복 수집 방지를 위해 크롭 버튼이 비활성화되었습니다."
+                )
+
+            parse_col1, parse_col2 = st.columns([1, 1])
+            with parse_col1:
+                run_crop_btn = st.button(
+                    "✂️ 1단계: 2단 편집 분석 및 고해상도 문항 크롭",
+                    type="primary",
+                    width="stretch",
+                    disabled=is_duplicate_exam,
+                )
+            with parse_col2:
+                vision_fallback_chk = st.checkbox(
+                    "스캔(이미지) PDF인 경우 Gemini Vision 좌표 탐지 보조 사용",
+                    value=True,
+                )
+
+            if run_crop_btn and not is_duplicate_exam:
+                if not active_prob_bytes:
+                    st.error("문제지 PDF를 업로드하거나 EBSi에서 먼저 추출해 주세요.")
+                elif not exam_name_input.strip():
+                    st.error("시험 회차명을 입력해 주세요.")
+                else:
+                    vision_status_ph = st.empty()
+                    vision_prog_ph = st.empty()
+                    with st.spinner("PyMuPDF 2단 편집(좌→우 칼럼) 분석 및 220 DPI PNG 크롭 중..."):
+                        crops, total_p, _ = _crop_single_exam_pdf(
+                            active_prob_bytes,
+                            use_vision_fallback=bool(vision_fallback_chk),
+                            api_key=active_gemini_key,
+                            status_cb=lambda m: vision_status_ph.info(m),
+                            progress_cb=lambda v: vision_prog_ph.progress(v),
+                        )
+
+                    if not crops:
+                        st.error("문항 번호를 탐지하지 못했습니다. PDF 형식을 확인하거나 Gemini API 키 설정 후 Vision 보조를 활성화해 주세요.")
+                    else:
+                        st.session_state["parsed_crops"] = crops
+                        st.session_state["parsed_exam_meta"] = {
+                            "exam_name": exam_name_input.strip(),
+                            "subject_category": subject_cat,
+                            "prob_bytes": active_prob_bytes,
+                            "prob_name": active_prob_name,
+                            "ans_bytes": active_ans_bytes,
+                            "ans_name": active_ans_name,
+                        }
+                        st.session_state["stage2_exam_name"] = ""
+                        st.session_state["stage2_saved_q_nums"] = []
+                        st.session_state["stage2_failed_q_nums"] = []
+                        st.session_state["stage2_failed_errors"] = []
+                        st.session_state["stage2_sync_err"] = ""
+                        st.session_state["trigger_retry_failed"] = False
+                        found_nums = sorted({c.q_num for c in crops})
+                        min_q, max_q = found_nums[0], found_nums[-1]
+                        subj_txt = (exam_subject_input or "").strip()
+                        if any(k in subj_txt for k in ("국어", "영어")):
+                            expected_max = 45
+                        elif any(k in subj_txt for k in ("수학", "미적분", "기하", "확률")):
+                            expected_max = 30
+                        elif any(k in subj_txt for k in ("사회", "과학", "물리", "화학", "생명", "지구", "한국사", "윤리", "지리", "경제", "정치", "역사")):
+                            expected_max = 20
+                        else:
+                            expected_max = max_q
+
+                        range_end = max(max_q, expected_max) if total_p >= 3 else max_q
+                        missing_in_found = [n for n in range(1, max_q + 1) if n not in set(found_nums)]
+                        missing_tail = [n for n in range(max_q + 1, range_end + 1)]
+
+                        st.success(f"✅ 총 {len(crops)}개 문항 크롭 완료 ({min_q}번 ~ {max_q}번)")
+                        if missing_in_found or missing_tail:
+                            missing_all = missing_in_found + missing_tail
+                            st.warning(
+                                f"⚠️ 누락된 문항 번호 ({len(missing_all)}개, 1~{range_end}번 기준): "
+                                + ", ".join(f"{n}번" for n in missing_all)
+                            )
+
     parsed_crops: list[CroppedQuestion] = st.session_state.get("parsed_crops") or []
-    if parsed_crops:
+    if (not is_batch_queue_mode) and parsed_crops:
         meta = st.session_state["parsed_exam_meta"]
         st.markdown(f"### 2️⃣ 크롭 문항 확인 & 2022 원리·용어 분해 태깅 (`{meta['exam_name']}`)")
 
@@ -1675,9 +2235,7 @@ with tab1:
                 st.warning("태깅할 문항을 최소 1개 이상 선택해 주세요.")
                 return
 
-            safe_exam = sanitize_id_part(meta["exam_name"])
-            tagging_model = EXAM_TAGGING_MODEL
-            tagging_model_label = MODEL_LABELS.get(tagging_model, tagging_model)
+            tagging_model_label = MODEL_LABELS.get(EXAM_TAGGING_MODEL, EXAM_TAGGING_MODEL)
             sync_notice = (
                 st.warning(
                     "☁️ **\"Google Drive 동기화 완료\"** 문구가 뜰 때까지 브라우저 창을 닫지 말고 유지해 주세요. "
@@ -1701,200 +2259,25 @@ with tab1:
 
             mode_label = "누락/실패 문항 재분석" if is_retry else "전체 PDF 일괄 태깅"
             _push_status(f"🔑 API 키 검증 완료 ({verified_key_label}) · {mode_label} 준비 중 (모델: {tagging_model_label})...")
-            pending_pdf_files: list[str] = []
-            pending_crop_files: list[str] = []
-            if not is_retry:
-                if meta.get("prob_bytes"):
-                    prob_fn = f"{safe_exam}__문제지.pdf"
-                    storage.save_pdf_file(
-                        prob_fn,
-                        meta["prob_bytes"],
-                        subject_category=meta["subject_category"],
-                        exam_name=meta["exam_name"],
-                        sync_drive=False,
-                    )
-                    pending_pdf_files.append(prob_fn)
-                if meta.get("ans_bytes"):
-                    ans_fn = f"{safe_exam}__해설지.pdf"
-                    storage.save_pdf_file(
-                        ans_fn,
-                        meta["ans_bytes"],
-                        subject_category=meta["subject_category"],
-                        exam_name=meta["exam_name"],
-                        sync_drive=False,
-                    )
-                    pending_pdf_files.append(ans_fn)
-
-            # 해설지 경량화: 텍스트 PDF면 문항별 스니펫만 추출(0.05초), 스캔 PDF일 때만 30초 타임아웃 클라이언트로 1회 첨부
-            answer_snippets: dict[int, str] = {}
-            answer_pdf_part = None
-            if meta.get("ans_bytes"):
-                _push_status("📄 해설지 PDF 분석 중 (텍스트 스니펫 우선 추출)...")
-                try:
-                    answer_snippets, ans_has_text = extract_answer_snippets_from_pdf(meta["ans_bytes"])
-                    if ans_has_text:
-                        _append_log(f"📄 해설지 텍스트 스니펫 추출 완료 ({len(answer_snippets)}개 문항 매칭 · 경량 전송)")
-                    else:
-                        tmp_client = build_gemini_client(verified_key, timeout_seconds=30)
-                        answer_pdf_part = prepare_pdf_part(
-                            tmp_client,
-                            meta["ans_bytes"],
-                            display_name=f"{safe_exam}_answer.pdf",
-                        )
-                        _append_log("📄 스캔 해설지 PDF 파트 준비 완료 (30초 타임아웃)")
-                except Exception as exc:
-                    st.warning(f"해설지 첨부 준비 중 경고 (문제 이미지만으로 진행): {exc}")
-                    _append_log(f"⚠️ 해설지 준비 경고: {exc}")
-
-            target_set = set(target_q_nums)
-            target_crops = sorted(
-                [c for c in parsed_crops if c.q_num in target_set],
-                key=lambda c: c.q_num,
-            )
-            existing_records = storage.load_db()
-            rec_map = {r.id: r for r in existing_records}
-
             prog_bar = st.progress(0.05)
-            newly_saved: list[QuestionRecord] = []
-            failed_q_nums: list[int] = []
-            errors: list[str] = []
 
-            batch_t0 = time.perf_counter()
-            extracted_by_q: dict[int, Any] = {}
-
-            # 1) 전체 문제지 PDF를 Gemini 3.5 Flash-Lite로 한 번에 일괄 태깅
-            if meta.get("prob_bytes"):
-                _push_status(
-                    f"⚡ 전체 문제지 PDF({len(target_crops)}문항) 한 번에 태깅 중 "
-                    f"(모델: {tagging_model_label})..."
-                )
-                try:
-                    batch_map = analyze_exam_pdf_batch_with_gemini(
-                        api_key=verified_key,
-                        model_name=tagging_model,
-                        prob_pdf_bytes=meta["prob_bytes"],
-                        target_q_nums=[c.q_num for c in target_crops],
-                        subject_category=meta["subject_category"],
-                        exam_name=meta["exam_name"],
-                        answer_snippets=answer_snippets,
-                        answer_pdf_part=answer_pdf_part,
-                        status_callback=_push_status,
-                    )
-                    extracted_by_q.update(batch_map)
-                    _append_log(
-                        f"⚡ 전체 PDF 일괄 태깅 완료: {len(batch_map)}/{len(target_crops)}문항 "
-                        f"({time.perf_counter() - batch_t0:.1f}초 · {tagging_model_label})"
-                    )
-                except Exception as exc:
-                    _append_log(f"⚠️ 전체 PDF 일괄 태깅 실패 → 개별 보완 모드로 전환: {exc}")
-
-            prog_bar.progress(0.65)
-
-            # 2) 일괄 태깅에서 누락된 문항(또는 prob_bytes가 없는 경우)만 개별 보완
-            missing_crops = [c for c in target_crops if c.q_num not in extracted_by_q]
-            if missing_crops:
-                _push_status(
-                    f"🔁 누락된 {len(missing_crops)}개 문항 보완 태깅 중 ({tagging_model_label})..."
-                )
-
-                def _analyze_worker(cq_item: CroppedQuestion) -> tuple[CroppedQuestion, Any, float]:
-                    t_start = time.perf_counter()
-                    extracted_out = analyze_question_with_gemini(
-                        api_key=verified_key,
-                        model_name=tagging_model,
-                        crop_png_bytes=cq_item.png_bytes,
-                        q_num=cq_item.q_num,
-                        subject_category=meta["subject_category"],
-                        exam_name=meta["exam_name"],
-                        answer_pdf_part=answer_pdf_part,
-                        answer_text_hint=answer_snippets.get(cq_item.q_num, ""),
-                        status_callback=None,
-                    )
-                    return cq_item, extracted_out, time.perf_counter() - t_start
-
-                with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
-                    future_to_cq = {executor.submit(_analyze_worker, cq): cq for cq in missing_crops}
-                    for fut in concurrent.futures.as_completed(future_to_cq):
-                        cq = future_to_cq[fut]
-                        try:
-                            _, extracted, elapsed_s = fut.result()
-                            extracted_by_q[cq.q_num] = extracted
-                            _append_log(f"✅ {cq.q_num}번 보완 태깅 완료 ({elapsed_s:.1f}초)")
-                        except Exception as exc:
-                            err_msg = f"{cq.q_num}번 오류 (건너뜀): {exc}"
-                            failed_q_nums.append(cq.q_num)
-                            errors.append(err_msg)
-                            _append_log(f"❌ {err_msg}")
-
-            prog_bar.progress(0.85)
-
-            # 3) 모든 문항 크롭 이미지 및 DB 레코드를 한 번에 로컬 저장 후 일괄 동기화
-            _push_status("💾 전체 문항 크롭 이미지 및 DB 한 번에 저장 중...")
-            now_iso = datetime.now().isoformat(timespec="seconds")
-            for cq in target_crops:
-                extracted = extracted_by_q.get(cq.q_num)
-                if extracted is None:
-                    continue
-                q_id = f"{safe_exam}__Q{cq.q_num:02d}"
-                img_filename = f"{q_id}.png"
-                storage.save_crop_png(
-                    img_filename,
-                    cq.png_bytes,
-                    subject_category=meta["subject_category"],
-                    exam_name=meta["exam_name"],
-                    sync_drive=False,
-                )
-                pending_crop_files.append(img_filename)
-
-                record = QuestionRecord(
-                    id=q_id,
-                    exam_name=meta["exam_name"],
-                    q_num=cq.q_num,
-                    subject_category=meta["subject_category"],
-                    curriculum_subject=extracted.curriculum_subject,
-                    unit_name=extracted.unit_name,
-                    min_grade=extracted.min_grade,
-                    core_principles=extracted.core_principles,
-                    required_terms=extracted.required_terms,
-                    is_single_concept=extracted.is_single_concept,
-                    answer=extracted.answer,
-                    official_explanation=extracted.official_explanation,
-                    question_text=re.sub(r"\s+", " ", (cq.extracted_text or "")).strip(),
-                    image_filename=img_filename,
-                    source_pdf=f"{safe_exam}__문제지.pdf",
-                    answer_pdf=f"{safe_exam}__해설지.pdf" if meta.get("ans_bytes") else "",
-                    created_at=now_iso,
-                )
-                rec_map[q_id] = record
-                newly_saved.append(record)
-
-            newly_saved.sort(key=lambda r: r.q_num)
-            sorted_all_records = sorted(rec_map.values(), key=lambda r: (r.exam_name, r.q_num))
-            pending_crop_files.sort()
-
-            # 로컬 db.json 1회 일괄 저장
-            storage.save_db(
-                sorted_all_records,
-                sync_organized_drive=False,
-                sync_db_drive=False,
-                sync_local_organized=False,
+            res = _tag_and_save_single_exam(
+                storage=storage,
+                api_key=verified_key,
+                meta=meta,
+                parsed_crops=parsed_crops,
+                target_q_nums=target_q_nums,
+                is_retry=is_retry,
+                push_status=_push_status,
+                append_log=_append_log,
+                on_progress=prog_bar.progress,
+                on_warning=st.warning,
             )
+            newly_saved = res["newly_saved"]
+            failed_q_nums = res["failed_q_nums"]
+            errors = res["errors"]
+            sync_err = res["sync_err"]
 
-            _push_status(
-                "☁️ 전체 문항 로컬 저장 및 Google Drive 일괄 동기화 중... "
-                "('Google Drive 동기화 완료'가 뜰 때까지 창을 유지해 주세요)"
-            )
-            sync_err = storage.sync_exam_batch(
-                subject_category=meta["subject_category"],
-                exam_name=meta["exam_name"],
-                records=sorted_all_records,
-                crop_filenames=pending_crop_files,
-                pdf_filenames=pending_pdf_files,
-                include_organized_exports=True,
-            )
-            prog_bar.progress(1.0)
-            total_batch_s = time.perf_counter() - batch_t0
-            _append_log(f"🏁 전체 PDF 태깅 및 일괄 저장·동기화 완료 ({len(newly_saved)}문항 · 총 {total_batch_s:.1f}초)")
             sync_notice.empty()
             status_placeholder.empty()
 
