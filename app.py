@@ -3030,17 +3030,30 @@ with tab2:
                 )
 
                 st.markdown("**✅ 출제 및 개조 기준으로 사용할 단원을 체크하세요:**")
-                select_all_units = st.checkbox(
+                sel_all_key = f"sel_all_units_{chosen_book.id}"
+
+                def _toggle_all_units(
+                    book_id: str = chosen_book.id,
+                    unit_count: int = len(chosen_book.units),
+                ) -> None:
+                    target_val = bool(st.session_state.get(f"sel_all_units_{book_id}", False))
+                    for idx_u in range(unit_count):
+                        st.session_state[f"unit_chk_{book_id}_{idx_u}"] = target_val
+
+                st.checkbox(
                     "전체 단원 일괄 선택",
-                    value=True,
-                    key=f"sel_all_units_{chosen_book.id}",
+                    value=False,
+                    key=sel_all_key,
+                    on_change=_toggle_all_units,
                 )
                 selected_units_list: list[ConceptUnit] = []
                 for u_i, unit_obj in enumerate(chosen_book.units):
+                    chk_key = f"unit_chk_{chosen_book.id}_{u_i}"
+                    if chk_key not in st.session_state:
+                        st.session_state[chk_key] = False
                     checked = st.checkbox(
                         f"{unit_obj.unit_name} ({unit_obj.page_range}) — 핵심개념 {len(unit_obj.core_concepts)}개 · 허용용어 {len(unit_obj.allowed_terms_and_units)}개",
-                        value=select_all_units,
-                        key=f"unit_chk_{chosen_book.id}_{u_i}",
+                        key=chk_key,
                     )
                     if checked:
                         selected_units_list.append(unit_obj)
