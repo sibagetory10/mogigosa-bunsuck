@@ -61,6 +61,7 @@ from src.gemini_service import (
     analyze_question_with_gemini,
     build_gemini_client,
     chat_followup_with_pdf,
+    classify_mixed_exam_pdfs_with_ai,
     detect_concept_pages_with_ai,
     detect_scanned_question_boxes,
     extract_concept_book_cover_metadata,
@@ -68,6 +69,7 @@ from src.gemini_service import (
     extract_concept_whitelist,
     extract_exam_header_metadata,
     generate_pdf_grounded_explanation,
+    match_problem_and_answer_pdfs_with_ai,
     match_questions_to_whitelist,
     prepare_pdf_part,
     rewrite_question_for_pdf,
@@ -91,6 +93,7 @@ from src.pdf_parser import (
     extract_exam_metadata_fast,
     extract_first_page_for_metadata,
     extract_pdf_page_catalog,
+    extract_pdf_preview_for_pairing,
     get_page_text_lengths,
     get_pdf_page_count,
     is_likely_answer_filename,
@@ -302,6 +305,128 @@ def _detect_single_exam_cover(
             ai_verified = False
 
     return parsed_local, has_p1_text, ai_verified
+
+
+def _compute_pairing_signature(prob_files: list[Any], ans_files: list[Any]) -> tuple[Any, Any]:
+    return (
+        tuple((f.name, int(getattr(f, "size", 0))) for f in prob_files),
+        tuple((f.name, int(getattr(f, "size", 0))) for f in ans_files),
+    )
+
+
+def _compute_pairing_widget_hash(pair_sig: Any, version: int) -> str:
+    return hashlib.md5(f"{pair_sig!r}:{version}".encode("utf-8")).hexdigest()[:10]
+
+
+def _build_pairing_preview_items(uploaded_files: list[Any]) -> list[dict[str, Any]]:
+    """업로드된 PDF 목록의 1페이지 텍스트/저해상도 썸네일을 세션 캐시로 추출한다."""
+    cache: dict[tuple[str, int], dict[str, Any]] = st.session_state.setdefault("tab1_pdf_preview_cache", {})
+    items: list[dict[str, Any]] = []
+    for f in uploaded_files:
+        sig = (f.name, int(getattr(f, "size", 0)))
+        cached = cache.get(sig)
+        if cached is None:
+            p_text, p_png, page_cnt = extract_pdf_preview_for_pairing(f.getvalue())
+            cached = {
+                "name": _pdf_display_basename(f.name),
+                "first_page_text": p_text,
+                "first_page_png": p_png,
+                "page_count": page_cnt,
+            }
+            cache[sig] = cached
+        items.append(cached)
+    return items
+
+
+def _resolve_mixed_pdf_split_with_ai(
+    raw_files: list[Any],
+    api_key: str,
+) -> tuple[list[int], list[int], str]:
+    """단일 업로더에 문제지·해설지가 섞여 들어온 경우 Gemini 3.5 Flash-Lite로 자동 분리한다."""
+    raw_sig = (tuple((f.name, int(getattr(f, "size", 0))) for f in raw_files), bool(api_key))
+    cache: dict[Any, tuple[list[int], list[int], str]] = st.session_state.setdefault("tab1_ai_split_cache", {})
+    if raw_sig in cache:
+        return cache[raw_sig]
+
+    if api_key:
+        try:
+            with st.spinner("🤖 Gemini 3.5 Flash-Lite가 업로드된 PDF 중 문제지·해설지를 자동 구분 중..."):
+                preview_items = _build_pairing_preview_items(raw_files)
+                p_idxs, a_idxs = classify_mixed_exam_pdfs_with_ai(
+                    api_key=api_key,
+                    pdf_items=preview_items,
+                    model_name=EXAM_TAGGING_MODEL,
+                )
+            res = (p_idxs, a_idxs, "ai")
+            cache[raw_sig] = res
+            return res
+        except Exception:
+            pass
+
+    fb_prob = [i for i, f in enumerate(raw_files) if not is_likely_answer_filename(f.name)]
+    fb_ans = [i for i, f in enumerate(raw_files) if is_likely_answer_filename(f.name)]
+    res = (fb_prob, fb_ans, "filename")
+    cache[raw_sig] = res
+    return res
+
+
+def _resolve_auto_answer_matches(
+    prob_files: list[Any],
+    ans_files: list[Any],
+    api_key: str,
+) -> tuple[list[int | None], dict[int, str], str, str]:
+    """
+    업로드된 문제지·해설지 PDF 조합에 대해 Gemini 3.5 Flash-Lite(서버 키) 자동 매칭을 수행하고
+    결과를 세션에 캐시한다. 실패 또는 API 키 미설정 시 로컬 파일명 매칭으로 폴백한다.
+    """
+    n_prob = len(prob_files)
+    if n_prob == 0 or not ans_files:
+        return [None] * n_prob, {}, "none", ""
+    if n_prob == 1 and len(ans_files) == 1:
+        return [0], {0: "단일 문제지·해설지 자동 연결"}, "single", ""
+
+    pair_sig = _compute_pairing_signature(prob_files, ans_files)
+    cache_key = (pair_sig, bool(api_key))
+    cache: dict[Any, tuple[list[int | None], dict[int, str], str, str]] = st.session_state.setdefault(
+        "tab1_ai_pair_cache", {}
+    )
+    if cache_key in cache:
+        return cache[cache_key]
+
+    err_msg = ""
+    if api_key:
+        try:
+            with st.spinner("🤖 Gemini 3.5 Flash-Lite가 문제지·해설지 PDF 1페이지를 비교해 자동 매칭 중..."):
+                prob_items = _build_pairing_preview_items(prob_files)
+                ans_items = _build_pairing_preview_items(ans_files)
+                matches, reasons = match_problem_and_answer_pdfs_with_ai(
+                    api_key=api_key,
+                    problem_items=prob_items,
+                    answer_items=ans_items,
+                    model_name=EXAM_TAGGING_MODEL,
+                )
+            res = (matches, reasons, "ai", "")
+            cache[cache_key] = res
+            return res
+        except Exception as exc:
+            err_msg = str(exc)
+    else:
+        err_msg = "서버 API 키 미설정"
+
+    fb_matches = pair_problem_and_answer_files(
+        [f.name for f in prob_files],
+        [f.name for f in ans_files],
+    )
+    res = (fb_matches, {}, "fallback", err_msg)
+    cache[cache_key] = res
+    return res
+
+
+def _invalidate_auto_pair_cache(pair_sig: Any, api_key: str) -> None:
+    """현재 업로드 조합의 AI 매칭 캐시를 비우고 드롭다운 키 버전을 올려 즉시 재매칭한다."""
+    cache_key = (pair_sig, bool(api_key))
+    st.session_state.get("tab1_ai_pair_cache", {}).pop(cache_key, None)
+    st.session_state["tab1_ai_pair_ver"] = int(st.session_state.get("tab1_ai_pair_ver", 0)) + 1
 
 
 def _expected_max_q_for_subject(subject_hint: str) -> int:
@@ -2153,9 +2278,9 @@ with tab1:
             else "문제지 PDF 업로드 (1개 또는 여러 개 선택 가능)"
         )
         ans_up_label = (
-            "해설지 폴더 업로드 (권장 · 파일명 기준 자동 1:1 매칭)"
+            "해설지 폴더 업로드 (권장 · AI(Gemini 3.5 Flash-Lite) 자동 1:1 매칭)"
             if is_dir_upload
-            else "해설지 PDF 업로드 (권장 · 여러 개 선택 시 파일명 기준 자동 매칭)"
+            else "해설지 PDF 업로드 (권장 · 여러 개 선택 시 AI 자동 매칭)"
         )
 
         col_up1, col_up2 = st.columns(2)
@@ -2186,13 +2311,17 @@ with tab1:
         prob_files = list(raw_prob_files)
         ans_files = list(raw_ans_files)
 
-        # 문제지 업로드 목록/폴더 안에 해설·정답 PDF가 함께 들어있고 해설지 업로더가 비어있을 때 자동 분리 옵션 제공
+        # 문제지 업로드 목록/폴더 안에 해설·정답 PDF가 함께 들어있고 해설지 업로더가 비어있을 때 AI(3.5 Flash-Lite) 자동 분리
         if not raw_ans_files and len(raw_prob_files) >= 2:
-            split_ans = [f for f in raw_prob_files if is_likely_answer_filename(f.name)]
-            split_prob = [f for f in raw_prob_files if not is_likely_answer_filename(f.name)]
-            if split_ans and split_prob:
+            split_prob_idxs, split_ans_idxs, split_source = _resolve_mixed_pdf_split_with_ai(
+                raw_prob_files, upload_gemini_key
+            )
+            if split_ans_idxs and split_prob_idxs:
+                split_prob = [raw_prob_files[i] for i in split_prob_idxs]
+                split_ans = [raw_prob_files[i] for i in split_ans_idxs]
+                split_badge = "🤖 Gemini 3.5 Flash-Lite가 " if split_source == "ai" else "📁 "
                 auto_split_ans = st.checkbox(
-                    f"📁 문제지 업로드 목록에서 해설/정답 PDF {len(split_ans)}개를 해설지로 자동 분리 매칭 "
+                    f"{split_badge}문제지 업로드 목록에서 해설/정답 PDF {len(split_ans)}개를 해설지로 자동 분리 매칭 "
                     f"(문제지 {len(split_prob)}개 + 해설지 {len(split_ans)}개)",
                     value=True,
                     key="tab1_auto_split_ans",
@@ -2204,20 +2333,46 @@ with tab1:
         is_batch_queue_mode = len(prob_files) >= 2
 
         if is_batch_queue_mode:
-            auto_matches = pair_problem_and_answer_files(
-                [f.name for f in prob_files],
-                [f.name for f in ans_files],
+            auto_matches, match_reasons, match_source, match_err = _resolve_auto_answer_matches(
+                prob_files,
+                ans_files,
+                upload_gemini_key,
             )
             matched_cnt = sum(1 for m in auto_matches if m is not None)
+            pair_sig = _compute_pairing_signature(prob_files, ans_files)
+            pair_ver = int(st.session_state.get("tab1_ai_pair_ver", 0))
+            pair_hash = _compute_pairing_widget_hash(pair_sig, pair_ver)
+
+            if match_source == "ai":
+                pair_badge = f"🤖 Gemini 3.5 Flash-Lite 해설지 자동 매칭 **{matched_cnt}/{len(prob_files)}개**"
+            elif ans_files:
+                pair_badge = f"해설지 자동 매칭 **{matched_cnt}/{len(prob_files)}개**"
+            else:
+                pair_badge = "해설지 미업로드"
+
             st.info(
-                f"📦 **총 {len(prob_files)}개 문제지 PDF**가 대기열에 등록되었습니다 "
-                f"(해설지 자동 매칭 {matched_cnt}/{len(prob_files)}개). "
+                f"📦 **총 {len(prob_files)}개 문제지 PDF**가 대기열에 등록되었습니다 ({pair_badge}). "
                 "시작 버튼을 누르면 **PDF 1개씩 순서대로** 표지 인식 → 문항 크롭 → Gemini 원리·용어 태깅 → DB/Drive 저장을 실행합니다."
             )
+            if match_source == "fallback" and match_err and ans_files:
+                st.warning(f"⚠️ AI 자동 매칭 일시 오류로 파일명 기준 매칭을 적용했습니다: `{match_err}`")
 
             ans_option_indices: list[int | None] = [None] + list(range(len(ans_files)))
             selected_ans_indices: list[int | None] = []
             with st.expander(f"📋 대기열 목록 및 해설지 1:1 매칭 확인 ({len(prob_files)}개)", expanded=len(prob_files) <= 12):
+                if ans_files:
+                    hdr_l, hdr_r = st.columns([2.2, 1.0])
+                    with hdr_l:
+                        st.caption("🤖 AI가 파일명과 1페이지 내용을 대조해 해설지를 자동 지정했습니다. 필요 시 드롭다운에서 수동 변경할 수 있습니다.")
+                    with hdr_r:
+                        if st.button(
+                            "🔄 AI(3.5 Flash-Lite) 다시 매칭",
+                            key=f"batch_rematch_{pair_hash}",
+                            width="stretch",
+                        ):
+                            _invalidate_auto_pair_cache(pair_sig, upload_gemini_key)
+                            st.rerun()
+
                 for q_idx, pf in enumerate(prob_files):
                     c_left, c_right = st.columns([1.2, 1.0])
                     p_base = _pdf_display_basename(pf.name)
@@ -2241,9 +2396,11 @@ with tab1:
                                 if idx is None
                                 else _pdf_display_basename(ans_files[idx].name)
                             ),
-                            key=f"batch_ans_map_{q_idx}_{pf.name}",
+                            key=f"batch_ans_map_{pair_hash}_{q_idx}_{pf.name}",
                             label_visibility="collapsed",
                         )
+                        if match_reasons.get(q_idx):
+                            st.caption(f"🤖 {match_reasons[q_idx]}")
                         selected_ans_indices.append(chosen_ans_idx)
 
             b_opt1, b_opt2 = st.columns(2)
@@ -2434,11 +2591,46 @@ with tab1:
             ans_file = None
             if ans_files:
                 if prob_file is not None and len(ans_files) > 1:
-                    single_match = pair_problem_and_answer_files(
-                        [prob_file.name],
-                        [f.name for f in ans_files],
-                    )[0]
-                    ans_file = ans_files[single_match] if single_match is not None else ans_files[0]
+                    s_matches, s_reasons, s_source, s_err = _resolve_auto_answer_matches(
+                        [prob_file],
+                        ans_files,
+                        upload_gemini_key,
+                    )
+                    s_pair_sig = _compute_pairing_signature([prob_file], ans_files)
+                    s_pair_ver = int(st.session_state.get("tab1_ai_pair_ver", 0))
+                    s_pair_hash = _compute_pairing_widget_hash(s_pair_sig, s_pair_ver)
+                    s_options: list[int | None] = [None] + list(range(len(ans_files)))
+                    s_default = s_matches[0]
+                    s_pos = s_options.index(s_default) if s_default in s_options else 0
+
+                    sc_l, sc_r = st.columns([2.2, 1.0])
+                    with sc_l:
+                        chosen_single_idx = st.selectbox(
+                            "🤖 AI 자동 매칭 해설지 (3.5 Flash-Lite · 필요 시 변경 가능)",
+                            options=s_options,
+                            index=s_pos,
+                            format_func=lambda idx: (
+                                "(해설지 없음)"
+                                if idx is None
+                                else _pdf_display_basename(ans_files[idx].name)
+                            ),
+                            key=f"single_ans_map_{s_pair_hash}_{prob_file.name}",
+                        )
+                        if s_reasons.get(0):
+                            st.caption(f"🤖 {s_reasons[0]}")
+                        elif s_source == "fallback" and s_err:
+                            st.caption(f"⚠️ AI 자동 매칭 일시 오류로 파일명 기준 선택됨: {s_err}")
+                    with sc_r:
+                        st.write("")
+                        if st.button(
+                            "🔄 AI 다시 매칭",
+                            key=f"single_rematch_{s_pair_hash}",
+                            width="stretch",
+                        ):
+                            _invalidate_auto_pair_cache(s_pair_sig, upload_gemini_key)
+                            st.rerun()
+
+                    ans_file = ans_files[chosen_single_idx] if chosen_single_idx is not None else None
                 else:
                     ans_file = ans_files[0]
 

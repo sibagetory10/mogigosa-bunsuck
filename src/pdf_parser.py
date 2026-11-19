@@ -65,6 +65,40 @@ def extract_first_page_for_metadata(
         return raw_text, None
 
 
+def extract_pdf_preview_for_pairing(
+    pdf_bytes: bytes,
+    dpi: int = 95,
+    min_text_chars: int = 40,
+    max_text_chars: int = 550,
+) -> tuple[str, bytes | None, int]:
+    """
+    문제지·해설지 자동 매칭 및 역할 분류용으로 PDF 앞부분 텍스트와
+    (스캔 PDF인 경우) 저해상도 1페이지 PNG, 총 페이지 수를 추출한다.
+    """
+    try:
+        with pymupdf.open(stream=pdf_bytes, filetype="pdf") as doc:
+            page_count = int(doc.page_count)
+            if page_count == 0:
+                return "", None, 0
+
+            p1_text = (doc[0].get_text("text") or "").strip()
+            combined_text = p1_text
+            if len(re.sub(r"\s+", "", p1_text)) < 80 and page_count >= 2:
+                p2_text = (doc[1].get_text("text") or "").strip()
+                if p2_text:
+                    combined_text = f"{p1_text}\n[2페이지]\n{p2_text}".strip()
+
+            compact_len = len(re.sub(r"\s+", "", combined_text))
+            png_bytes: bytes | None = None
+            if compact_len < min_text_chars:
+                pix = doc[0].get_pixmap(dpi=dpi, alpha=False)
+                png_bytes = pix.tobytes("png")
+
+            return combined_text[:max_text_chars], png_bytes, page_count
+    except Exception:
+        return "", None, 0
+
+
 _LOCAL_SUBJECT_CANDIDATES: tuple[str, ...] = (
     "통합사회",
     "통합과학",

@@ -359,6 +359,38 @@ class ConceptBookCoverMetadata(BaseModel):
     subject_and_grade: str = Field(..., description="과목 및 학년 (예: '고1 통합과학', '고2 물리학Ⅰ', '고1 공통수학1')")
 
 
+class ProblemAnswerPairItem(BaseModel):
+    """문제지 PDF와 해설지 PDF 간 AI 자동 매칭 단일 항목."""
+
+    problem_index: int = Field(..., ge=0, description="문제지 목록 인덱스 (P0 -> 0, P1 -> 1 ...)")
+    answer_index: int | None = Field(default=None, description="대응하는 해설지 인덱스 (A0 -> 0, 없으면 None)")
+    is_shared_combined_answer: bool = Field(
+        default=False,
+        description="여러 과목/시험지가 합본된 통합 해설지여서 복수 문제지에 공유되는 경우 True",
+    )
+    reason: str = Field(default="", description="매칭 또는 미매칭 근거 1줄 요약 (40자 이내)")
+
+
+class BatchFilePairingOutput(BaseModel):
+    """일괄 업로드된 문제지·해설지 PDF 전체의 1:1(또는 통합 해설지 공유) 자동 매칭 결과."""
+
+    pairs: list[ProblemAnswerPairItem] = Field(default_factory=list)
+
+
+class MixedPdfRoleItem(BaseModel):
+    """혼합 업로드된 단일 PDF의 문제지/해설지 역할 판별 결과."""
+
+    file_index: int = Field(..., ge=0, description="업로드된 PDF 인덱스 (F0 -> 0 ...)")
+    role: Literal["problem", "answer"] = Field(..., description="문제지이면 'problem', 정답·해설지이면 'answer'")
+    exam_summary: str = Field(default="", description="연도·월·학년·과목 간략 요약")
+
+
+class MixedPdfClassificationOutput(BaseModel):
+    """단일 업로더에 혼합 업로드된 PDF들의 역할 분류 결과."""
+
+    items: list[MixedPdfRoleItem] = Field(default_factory=list)
+
+
 def infer_subject_category(subject: str) -> SubjectCategory:
     """세부 과목명을 대분류('수학' | '사회' | '과학')로 매핑한다."""
     s = (subject or "").strip()

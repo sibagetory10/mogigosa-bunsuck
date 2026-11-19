@@ -13,7 +13,7 @@ from google.genai import types
 from PIL import Image
 from pydantic import BaseModel, Field
 
-from src.config import DEFAULT_MODEL, HYDROGEN_MODEL, resolve_api_model_name
+from src.config import DEFAULT_MODEL, EXAM_TAGGING_MODEL, HYDROGEN_MODEL, resolve_api_model_name
 from src.curriculum_2022 import (
     build_tagging_grounding_context,
     validate_and_normalize_extracted_tag,
@@ -22,6 +22,7 @@ from src.models import (
     AutoConceptPageDetectionOutput,
     AutoConceptRangeItem,
     BatchExamExtractionOutput,
+    BatchFilePairingOutput,
     BatchMatchResult,
     BatchQuestionTagItem,
     ConceptBookCoverMetadata,
@@ -30,6 +31,7 @@ from src.models import (
     ConceptUnit,
     ConceptWhitelist,
     ExamHeaderMetadata,
+    MixedPdfClassificationOutput,
     QuestionExtractionOutput,
     QuestionMatchJudgment,
     QuestionRecord,
@@ -1771,3 +1773,202 @@ def extract_concept_book_cover_metadata(
         book_title=meta.book_title.strip(),
         subject_and_grade=meta.subject_and_grade.strip(),
     )
+
+
+MAX_PAIRING_VISION_IMAGES: int = 16
+
+
+def _format_pairing_item_summary(
+    label: str,
+    item: dict[str, Any],
+    max_text_chars: int = 450,
+) -> str:
+    name = str(item.get("name") or "").strip()
+    page_count = int(item.get("page_count") or 0)
+    raw_text = re.sub(r"\s+", " ", str(item.get("first_page_text") or "").strip())
+    excerpt = raw_text[:max_text_chars] if raw_text else "(텍스트 없음 · 첨부 표지 이미지 참조)"
+    page_info = f"{page_count}쪽" if page_count > 0 else "쪽수 미상"
+    return f"- {label} | 파일명: {name} | 분량: {page_info}\n  1페이지 발췌: {excerpt}"
+
+
+def _append_pairing_vision_parts(
+    contents: list[Any],
+    items: Sequence[dict[str, Any]],
+    prefix: str,
+    remaining_slots: int,
+) -> int:
+    """텍스트가 부족한 스캔 PDF의 1페이지 썸네일을 라벨과 함께 Vision 입력에 추가한다."""
+    used = 0
+    for idx, item in enumerate(items):
+        if used >= remaining_slots:
+            break
+        raw_text = re.sub(r"\s+", "", str(item.get("first_page_text") or ""))
+        png_bytes = item.get("first_page_png")
+        if len(raw_text) < 40 and png_bytes:
+            opt_png = optimize_image_for_vision(png_bytes, max_width=640)
+            name = str(item.get("name") or "").strip()
+            contents.append(f"[이미지: {prefix}{idx} - {name}]")
+            contents.append(types.Part.from_bytes(data=opt_png, mime_type="image/png"))
+            used += 1
+    return remaining_slots - used
+
+
+def match_problem_and_answer_pdfs_with_ai(
+    api_key: str,
+    problem_items: Sequence[dict[str, Any]],
+    answer_items: Sequence[dict[str, Any]],
+    model_name: str = EXAM_TAGGING_MODEL,
+) -> tuple[list[int | None], dict[int, str]]:
+    """
+    업로드된 문제지 목록(P0..Pm-1)과 해설지 목록(A0..An-1)의 파일명·1페이지 텍스트·스캔 이미지를
+    Gemini 3.5 Flash-Lite로 비교하여 각 문제지에 대응하는 해설지를 자동 매칭한다.
+    """
+    n_prob = len(problem_items)
+    n_ans = len(answer_items)
+    if n_prob == 0 or n_ans == 0:
+        return [None] * n_prob, {}
+
+    client = _build_client(api_key, timeout_seconds=45)
+    system_inst = (
+        "당신은 한국 중·고등학교 시험지 및 모의고사(평가원·교육청·수능·EBS·학교 기출) PDF 자동 분류·매칭 전문가입니다.\n"
+        "업로드된 [문제지 목록](P0, P1, ...)과 [해설지 목록](A0, A1, ...)의 파일명, 분량, 1페이지 텍스트/이미지를 비교해 "
+        "각 문제지에 가장 정확히 대응하는 해설지 인덱스(`answer_index`)를 1개 지정하세요.\n\n"
+        "[핵심 판별 원칙]\n"
+        "1. 파일명이 `file_1.pdf`, `다운로드.pdf`, 숫자 코드 등으로 무작위여도 1페이지 텍스트/이미지의 "
+        "**시행 연도·월·학년·과목명(통합과학, 화학Ⅰ, 수학, 사회·문화 등)·시험명·1번 문항/해설 내용**을 최우선으로 비교하세요.\n"
+        "2. 연도·월·학년·과목이 서로 다른 해설지는 절대 억지 매칭하지 말고 `answer_index = null`로 남기세요.\n"
+        "3. 단일 과목 해설지는 1:1 매칭이 원칙입니다(같은 단일 해설지를 서로 다른 과목/시험지에 중복 배정 금지).\n"
+        "4. 단, 해설지 1개가 여러 과목이 합본된 **통합 해설지**(예: '과학탐구 정답 및 해설', '사회탐구 정답 및 해설', '전과목 해설지')인 경우에만 "
+        "해당 시험의 여러 과목 문제지에 같은 `answer_index`를 연결하고 `is_shared_combined_answer = true`로 표시하세요.\n"
+        "5. `reason`에는 매칭 또는 미매칭 근거를 40자 이내 한국어 1줄로 적으세요. (예: '2026년 3월 고2 수학 일치', '대응 과목 해설지 없음')"
+    )
+
+    prob_lines = [
+        _format_pairing_item_summary(f"P{idx}", item)
+        for idx, item in enumerate(problem_items)
+    ]
+    ans_lines = [
+        _format_pairing_item_summary(f"A{idx}", item)
+        for idx, item in enumerate(answer_items)
+    ]
+    prompt = (
+        "[문제지 목록]\n"
+        + "\n".join(prob_lines)
+        + "\n\n[해설지 목록]\n"
+        + "\n".join(ans_lines)
+        + f"\n\n총 {n_prob}개의 문제지(P0~P{n_prob - 1}) 각각에 대해 가장 적합한 해설지 인덱스(A0~A{n_ans - 1} 또는 null)를 JSON으로 반환하세요."
+    )
+
+    contents: list[Any] = []
+    remaining_imgs = MAX_PAIRING_VISION_IMAGES
+    remaining_imgs = _append_pairing_vision_parts(contents, problem_items, "P", remaining_imgs)
+    _append_pairing_vision_parts(contents, answer_items, "A", remaining_imgs)
+    contents.append(prompt)
+
+    resp = _generate_content_with_fallback(
+        client=client,
+        model_name=model_name,
+        contents=contents,
+        config=types.GenerateContentConfig(
+            system_instruction=system_inst,
+            response_mime_type="application/json",
+            response_schema=BatchFilePairingOutput,
+            temperature=0.0,
+        ),
+        fast_mode=True,
+    )
+    parsed = _parse_structured(resp, BatchFilePairingOutput)
+
+    matches: list[int | None] = [None] * n_prob
+    reasons: dict[int, str] = {}
+    used_single_ans: set[int] = set()
+    seen_probs: set[int] = set()
+
+    for pair in parsed.pairs:
+        p_idx = pair.problem_index
+        if not (0 <= p_idx < n_prob) or p_idx in seen_probs:
+            continue
+        seen_probs.add(p_idx)
+
+        reason = (pair.reason or "").strip()
+        a_idx = pair.answer_index
+        if a_idx is None or not (0 <= a_idx < n_ans):
+            matches[p_idx] = None
+            if reason:
+                reasons[p_idx] = reason
+            continue
+
+        if a_idx in used_single_ans and not (pair.is_shared_combined_answer or n_ans == 1):
+            matches[p_idx] = None
+            reasons[p_idx] = reason or "다른 문제지에 이미 배정된 단일 해설지"
+            continue
+
+        matches[p_idx] = a_idx
+        if not pair.is_shared_combined_answer:
+            used_single_ans.add(a_idx)
+        if reason:
+            reasons[p_idx] = reason
+
+    return matches, reasons
+
+
+def classify_mixed_exam_pdfs_with_ai(
+    api_key: str,
+    pdf_items: Sequence[dict[str, Any]],
+    model_name: str = EXAM_TAGGING_MODEL,
+) -> tuple[list[int], list[int]]:
+    """
+    단일 업로더에 문제지와 해설지가 섞여 업로드된 경우,
+    파일명과 1페이지 텍스트/이미지를 분석해 문제지('problem')와 해설지('answer') 인덱스를 자동 분리한다.
+    """
+    n_files = len(pdf_items)
+    if n_files == 0:
+        return [], []
+
+    client = _build_client(api_key, timeout_seconds=35)
+    system_inst = (
+        "당신은 한국 모의고사/기출 PDF 파일이 '문제지(problem)'인지 '정답·해설지(answer)'인지 구분하는 분류기입니다.\n"
+        "각 파일(F0, F1, ...)의 파일명과 1페이지 텍스트/이미지를 보고 `role`을 정확히 판별하세요.\n\n"
+        "[판별 기준]\n"
+        "- 'answer': 문서 상단 또는 본문에 '정답 및 해설', '정답과 해설', '빠른 정답', '문항별 해설/풀이', '정답표' 등이 중심인 해설·정답지.\n"
+        "- 'problem': 실제 시험 문항(1번, 2번... 문제와 선택지 ①~⑤)이 실린 시험지·문제지.\n"
+        "- 판별이 모호하거나 시험 문항과 간단한 정답표가 함께 있는 문서는 안전하게 'problem'으로 분류하세요."
+    )
+
+    item_lines = [
+        _format_pairing_item_summary(f"F{idx}", item)
+        for idx, item in enumerate(pdf_items)
+    ]
+    prompt = (
+        "[업로드된 PDF 목록]\n"
+        + "\n".join(item_lines)
+        + f"\n\n총 {n_files}개 파일(F0~F{n_files - 1}) 각각의 role('problem' 또는 'answer')을 JSON으로 반환하세요."
+    )
+
+    contents: list[Any] = []
+    _append_pairing_vision_parts(contents, pdf_items, "F", MAX_PAIRING_VISION_IMAGES)
+    contents.append(prompt)
+
+    resp = _generate_content_with_fallback(
+        client=client,
+        model_name=model_name,
+        contents=contents,
+        config=types.GenerateContentConfig(
+            system_instruction=system_inst,
+            response_mime_type="application/json",
+            response_schema=MixedPdfClassificationOutput,
+            temperature=0.0,
+        ),
+        fast_mode=True,
+    )
+    parsed = _parse_structured(resp, MixedPdfClassificationOutput)
+
+    roles: list[str] = ["problem"] * n_files
+    for item in parsed.items:
+        idx = item.file_index
+        if 0 <= idx < n_files and item.role in ("problem", "answer"):
+            roles[idx] = item.role
+
+    prob_indices = [i for i, r in enumerate(roles) if r == "problem"]
+    ans_indices = [i for i, r in enumerate(roles) if r == "answer"]
+    return prob_indices, ans_indices
