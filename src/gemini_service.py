@@ -2536,15 +2536,96 @@ def _build_english_transform_rule(
     )
 
 
+_AI_META_MONOLOGUE_RE = re.compile(
+    r"(?:wait,\s*let\s*me|let['’]?s\s+(?:rewrite|apply|check|change|fix|try|revise|make|replace|keep)|"
+    r"keep\s+the\s+original\s+text|actually,\s*let['’]?s|i\s+will\s+(?:rewrite|replace|use)|"
+    r"here\s+is\s+the\s+revised|note:\s*i\s+(?:changed|replaced))",
+    re.IGNORECASE,
+)
+_DANGLING_TO_END_RE = re.compile(
+    r"\b(?:has|have|had|want|wants|wanted|able|unable|need|needs|needed|"
+    r"ought|used|going|supposed|expected|likely|unlikely|tend|tends|tended|"
+    r"try|tries|tried|fail|fails|failed|seem|seems|seemed|appear|appears|appeared)\s+to\s*\.",
+    re.IGNORECASE,
+)
+_ORDER_SEQ_RE = re.compile(
+    r"\(?\s*([ABC])\s*\)?\s*(?:-|→|->|–|—)\s*\(?\s*([ABC])\s*\)?\s*(?:-|→|->|–|—)\s*\(?\s*([ABC])\s*\)?"
+)
+
+
+def _reconcile_english_order_answer(rw: RewrittenQuestion) -> None:
+    """글의 순서 유형에서 해설에 명시된 최종 (A)-(B)-(C) 논리 순서와 preserved_answer 선지 인덱스가 어긋나면 자동 보정한다."""
+    choices = rw.rewritten_choices or []
+    exp = rw.pdf_grounded_explanation or ""
+    if len(choices) != 5 or not exp:
+        return
+
+    choice_tuples: list[tuple[str, str, str] | None] = []
+    for ch in choices:
+        letters = re.findall(r"\(([ABC])\)|\b([ABC])\b", ch or "")
+        seq = [a or b for a, b in letters]
+        choice_tuples.append(tuple(seq) if len(seq) == 3 and set(seq) == {"A", "B", "C"} else None)
+
+    matches = [
+        (m.start(), (m.group(1), m.group(2), m.group(3)))
+        for m in _ORDER_SEQ_RE.finditer(exp)
+        if set((m.group(1), m.group(2), m.group(3))) == {"A", "B", "C"}
+    ]
+    if not matches:
+        return
+
+    # '정답'/'순서'/'따라서' 근처의 순서 표기를 우선 선택하고, 없으면 유일/첫 매칭 사용
+    target_seq: tuple[str, str, str] | None = None
+    for pos, seq in matches:
+        ctx = exp[max(0, pos - 24) : pos + 24]
+        if any(kw in ctx for kw in ("정답", "순서", "따라서", "결론", "적절")):
+            target_seq = seq
+            break
+    if target_seq is None:
+        distinct = {seq for _, seq in matches}
+        if len(distinct) == 1:
+            target_seq = matches[0][1]
+        else:
+            return
+
+    ans = _normalize_extracted_answer(rw.preserved_answer)
+    cur_idx = int(ans) - 1 if ans in ("1", "2", "3", "4", "5") else -1
+    if 0 <= cur_idx < len(choice_tuples) and choice_tuples[cur_idx] == target_seq:
+        return
+
+    for idx_c, c_seq in enumerate(choice_tuples):
+        if c_seq == target_seq:
+            rw.preserved_answer = str(idx_c + 1)
+            return
+
+
 def _validate_english_transformed_output(
     rw: RewrittenQuestion,
     target_type: str,
     vocab_style: str,
+    source_passage: str = "",
 ) -> list[str]:
-    """생성된 영어 변형 문항의 필수 태그(<u>, 빈칸, 박스, (A)(B)(C), 선지 5개) 누락 여부를 검증한다."""
+    """생성된 영어 변형 문항의 필수 태그·메타 독백·어휘 실제 교체·미완성 문장 여부를 검증한다."""
     issues: list[str] = []
     stem = rw.rewritten_stem or ""
     t = (target_type or "").strip()
+
+    # 1. AI 영문 독백(메타 발화) 혼입 차단
+    all_text_fields = [stem, *(rw.rewritten_choices or []), rw.pdf_grounded_explanation or ""]
+    for fld in all_text_fields:
+        m_meta = _AI_META_MONOLOGUE_RE.search(fld or "")
+        if m_meta:
+            issues.append(
+                f"AI 내부 사고/자기 수정 메타 문구({m_meta.group(0)!r})가 출력에 혼입되었습니다. 메타 독백 없이 순수 문제와 해설만 반환하세요."
+            )
+            break
+
+    # 4. 문장 끝 단어 탈락 방지 ('has to.', 'able to.' 등)
+    m_to = _DANGLING_TO_END_RE.search(stem)
+    if m_to:
+        issues.append(
+            f"지문 내에 부정사 뒤 동사원형이 탈락한 미완성 문장({m_to.group(0)!r})이 감지되었습니다. 빠진 단어를 복원해 완전한 문장으로 작성하세요."
+        )
 
     ans = _normalize_extracted_answer(rw.preserved_answer)
     if ans not in ("1", "2", "3", "4", "5"):
@@ -2553,10 +2634,44 @@ def _validate_english_transformed_output(
     if len(rw.rewritten_choices or []) != 5:
         issues.append(f"선택지(rewritten_choices)는 정확히 5개여야 합니다 (현재: {len(rw.rewritten_choices or [])}개).")
 
-    u_count = len(re.findall(r"<u\b[^>]*>.*?</u>", stem, flags=re.I | re.S))
+    u_matches = re.findall(r"<u\b[^>]*>(.*?)</u>", stem, flags=re.I | re.S)
+    u_count = len(u_matches)
     if "어법" in t or ("어휘" in t and "선택형" not in vocab_style and "(A)" not in vocab_style):
         if u_count < 5:
             issues.append(f"지문(rewritten_stem) 안에 `① <u>...</u>` ~ `⑤ <u>...</u>` 밑줄 태그 5개가 모두 포함되어야 합니다 (현재 `<u>` {u_count}개).")
+        elif "어휘" in t and ans in ("1", "2", "3", "4", "5"):
+            # 2. 문맥상 어휘 적절성: 해설/치환목록에 적힌 교체 단어가 실제 지문 정답 밑줄에 반영되었는지 확인
+            u_words = [re.sub(r"<[^>]+>", "", w).strip() for w in u_matches]
+            ans_word = u_words[int(ans) - 1]
+            ans_alpha = re.sub(r"[^a-zA-Z\-']", "", ans_word).lower()
+            for entry in rw.replaced_terms_map or []:
+                m_map = re.search(r"([A-Za-z][A-Za-z\-']*)\s*(?:->|→)\s*([A-Za-z][A-Za-z\-']*)", entry or "")
+                if m_map:
+                    orig_w, new_w = m_map.group(1).lower(), m_map.group(2).lower()
+                    if orig_w != new_w and ans_alpha == orig_w:
+                        issues.append(
+                            f"문맥상 어휘 문제에서 정답 {ans}번 밑줄({ans_word!r})이 원문 그대로 남아 있고 "
+                            f"교체 어휘({new_w!r})로 바뀌지 않았습니다. 지문 본문의 정답 밑줄을 실제로 교체하세요."
+                        )
+                        break
+            if source_passage and ans_alpha:
+                # 5개 밑줄 어휘가 모두 원문 지문에 그대로 존재하면 실제 반의어 교체가 누락된 것
+                all_in_source = all(
+                    bool(
+                        re.search(
+                            rf"\b{re.escape(re.sub(r'[^a-zA-Z\-]', '', w).lower())}\b",
+                            source_passage,
+                            flags=re.IGNORECASE,
+                        )
+                    )
+                    for w in u_words[:5]
+                    if re.sub(r"[^a-zA-Z\-]", "", w)
+                )
+                if all_in_source:
+                    issues.append(
+                        f"문맥상 어휘 문제에서 5개 밑줄 단어({u_words[:5]})가 모두 원문 그대로입니다. "
+                        f"반드시 정답 {ans}번 위치의 단어를 문맥상 부적절한 반의어로 지문 본문에서 직접 교체하세요."
+                    )
     elif "함축" in t:
         if u_count < 1:
             issues.append("함축적 의미 추론 지문에는 밑줄 친 표현 `<u>...</u>`가 최소 1개 포함되어야 합니다.")
@@ -2704,8 +2819,15 @@ def generate_english_transformed_question(
             cleaned_choices.append(c_str)
         rw.rewritten_choices = cleaned_choices[:5]
         rw.preserved_answer = _normalize_extracted_answer(rw.preserved_answer)
+        if "순서" in canonical_type:
+            _reconcile_english_order_answer(rw)
 
-        issues = _validate_english_transformed_output(rw, canonical_type, vocab_style)
+        issues = _validate_english_transformed_output(
+            rw,
+            canonical_type,
+            vocab_style,
+            source_passage=clean_passage,
+        )
         if not issues:
             break
         if attempt == 0:
