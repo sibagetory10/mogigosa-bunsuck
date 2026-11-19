@@ -3315,6 +3315,7 @@ def generate_english_transformed_question(
     use_precision_mode: bool = False,
     storage: Any | None = None,
     use_cache: bool = True,
+    username: str = "",
 ) -> RewrittenQuestion:
     """
     원문 영어 독해 지문을 지정된 수능 독해 유형(1개 유형 규칙만 동적 주입)으로 변형·출제한다.
@@ -3342,7 +3343,7 @@ def generate_english_transformed_question(
             vocab_style=vocab_style,
         )
         if use_cache and previous_attempt is None and hasattr(storage, "get_cached_english_question"):
-            cached_rw = storage.get_cached_english_question(cache_key)
+            cached_rw = storage.get_cached_english_question(cache_key, username=username)
             if cached_rw is not None:
                 return cached_rw
 

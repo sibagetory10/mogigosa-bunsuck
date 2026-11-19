@@ -81,6 +81,9 @@ class StorageManager:
         self.db_path = self.local_root / "db.json"
         self.users_path = self.local_root / "users.json"
         self.english_pool_path = self.local_root / "english_question_pool.json"
+        self.user_english_history_path = self.local_root / "user_english_history.json"
+        self.saved_exams_root = self.local_root / "saved_exams"
+        self.saved_exams_pdfs_root = self.saved_exams_root / "pdfs"
 
         self.concept_root = Path(concept_root)
         self.concept_books_path = self.concept_root / "concept_books.json"
@@ -89,6 +92,8 @@ class StorageManager:
         self.pdfs_dir.mkdir(parents=True, exist_ok=True)
         self.crops_dir.mkdir(parents=True, exist_ok=True)
         self.organized_dir.mkdir(parents=True, exist_ok=True)
+        self.saved_exams_root.mkdir(parents=True, exist_ok=True)
+        self.saved_exams_pdfs_root.mkdir(parents=True, exist_ok=True)
         self.concept_root.mkdir(parents=True, exist_ok=True)
 
         self.drive_folder_id = drive_folder_id.strip()
@@ -1227,12 +1232,73 @@ class StorageManager:
             self._save_english_pool_unlocked({})
             return removed
 
+    @staticmethod
+    def build_english_variant_id(cache_key: str, rewritten_stem: str) -> str:
+        """캐시 키와 변형 지문 본문 조합으로 개별 변형 문항 고유 ID를 생성한다."""
+        norm_stem = re.sub(r"\s+", " ", (rewritten_stem or "").strip())
+        return hashlib.sha256(f"{cache_key}||{norm_stem}".encode("utf-8")).hexdigest()[:24]
+
+    def _load_user_english_history_unlocked(self) -> dict[str, list[str]]:
+        if not self.user_english_history_path.exists():
+            return {}
+        try:
+            data = json.loads(self.user_english_history_path.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _save_user_english_history_unlocked(self, history: dict[str, list[str]]) -> None:
+        raw = json.dumps(history, ensure_ascii=False, indent=2)
+        _atomic_write_text(self.user_english_history_path, raw, encoding="utf-8")
+
+    def get_user_seen_english_variants(self, username: str) -> set[str]:
+        """특정 계정이 이미 풀었거나 PDF로 생성한 영어 변형 문항 ID 집합을 반환한다."""
+        uname = (username or "").strip()
+        if not uname:
+            return set()
+        with self._lock:
+            history = self._load_user_english_history_unlocked()
+            items = history.get(uname)
+            return set(str(x) for x in items) if isinstance(items, list) else set()
+
+    def mark_user_seen_english_variants(
+        self,
+        username: str,
+        pairs: list[tuple[str, str]],
+        max_history: int = 5000,
+    ) -> int:
+        """계정별로 PDF 생성 또는 풀이 완료한 영어 변형 문항을 기록해 중복 출제를 방지한다."""
+        uname = (username or "").strip()
+        if not uname or not pairs:
+            return 0
+        with self._lock:
+            history = self._load_user_english_history_unlocked()
+            existing = list(history.get(uname) or [])
+            seen_set = set(existing)
+            added = 0
+            for cache_key, stem in pairs:
+                if not cache_key or not (stem or "").strip():
+                    continue
+                vid = self.build_english_variant_id(cache_key, stem)
+                if vid not in seen_set:
+                    seen_set.add(vid)
+                    existing.append(vid)
+                    added += 1
+            if added == 0:
+                return 0
+            if len(existing) > max_history:
+                existing = existing[-max_history:]
+            history[uname] = existing
+            self._save_user_english_history_unlocked(history)
+            return added
+
     def get_cached_english_question(
         self,
         cache_key: str,
         exclude_stem: str = "",
+        username: str = "",
     ) -> RewrittenQuestion | None:
-        """검증 완료된 영어 변형 풀에서 캐시 히트 시 RewrittenQuestion을 즉시 반환한다."""
+        """검증 완료된 영어 변형 풀에서 계정이 아직 풀거나 PDF로 받지 않은 문항만 즉시 반환한다."""
         if not cache_key:
             return None
         with self._lock:
@@ -1240,9 +1306,21 @@ class StorageManager:
             items = pool.get(cache_key)
             if not isinstance(items, list) or not items:
                 return None
-            candidates = items
-            if exclude_stem and len(items) > 1:
-                filtered = [it for it in items if (it.get("rewritten_stem") or "").strip() != exclude_stem.strip()]
+            candidates = list(items)
+            uname = (username or "").strip()
+            if uname:
+                history = self._load_user_english_history_unlocked()
+                seen_ids = set(str(x) for x in (history.get(uname) or []))
+                if seen_ids:
+                    candidates = [
+                        it
+                        for it in candidates
+                        if self.build_english_variant_id(cache_key, str(it.get("rewritten_stem") or "")) not in seen_ids
+                    ]
+                    if not candidates:
+                        return None
+            if exclude_stem and len(candidates) > 1:
+                filtered = [it for it in candidates if (it.get("rewritten_stem") or "").strip() != exclude_stem.strip()]
                 if filtered:
                     candidates = filtered
             chosen = random.choice(candidates)
@@ -1255,9 +1333,9 @@ class StorageManager:
         self,
         cache_key: str,
         rw: RewrittenQuestion,
-        max_per_key: int = 3,
+        max_per_key: int = 5,
     ) -> None:
-        """파이썬 검증을 통과한 영어 변형 문항을 키당 최대 max_per_key(기본 3)개까지 풀에 저장한다."""
+        """파이썬 검증을 통과한 영어 변형 문항을 키당 최대 max_per_key(기본 5)개까지 풀에 저장한다."""
         if not cache_key or rw is None:
             return
         with self._lock:
@@ -1271,3 +1349,128 @@ class StorageManager:
                 items = items[-max_per_key:]
             pool[cache_key] = items
             self._save_english_pool_unlocked(pool)
+
+    # -----------------------------------------------------------------------
+    # 계정별 나의 시험지 자동 저장 / 조회 / PDF / 삭제
+    # -----------------------------------------------------------------------
+    def _user_saved_exams_path(self, username: str) -> Path:
+        safe_user = re.sub(r"[^a-zA-Z0-9._-]+", "_", (username or "").strip()) or "anonymous"
+        return self.saved_exams_root / f"{safe_user}.json"
+
+    def _load_user_exams_unlocked(self, username: str) -> list[dict[str, Any]]:
+        p = self._user_saved_exams_path(username)
+        if not p.exists():
+            return []
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            return data if isinstance(data, list) else []
+        except Exception:
+            return []
+
+    def _save_user_exams_unlocked(self, username: str, exams: list[dict[str, Any]]) -> None:
+        self.saved_exams_root.mkdir(parents=True, exist_ok=True)
+        p = self._user_saved_exams_path(username)
+        _atomic_write_text(p, json.dumps(exams, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def save_user_exam(
+        self,
+        username: str,
+        exam_record: dict[str, Any],
+        pdf_bytes: bytes | None = None,
+        max_exams_per_user: int = 100,
+    ) -> dict[str, Any]:
+        """계정별 '나의 시험지'에 시험지 데이터와 PDF(선택)를 과목별로 자동 저장한다."""
+        uname = (username or "").strip()
+        if not uname:
+            return exam_record
+        with self._lock:
+            exams = self._load_user_exams_unlocked(uname)
+            exam_id = str(exam_record.get("exam_id") or "").strip()
+            if not exam_id:
+                exam_id = hashlib.sha256(f"{uname}||{time.time()}".encode("utf-8")).hexdigest()[:16]
+            now_str = time.strftime("%Y-%m-%d %H:%M:%S")
+
+            existing_idx = next((i for i, e in enumerate(exams) if e.get("exam_id") == exam_id), None)
+            merged = dict(exams[existing_idx]) if existing_idx is not None else {}
+            merged.update(exam_record)
+            merged["exam_id"] = exam_id
+            merged.setdefault("created_at", now_str)
+            merged["updated_at"] = now_str
+
+            if pdf_bytes:
+                self.saved_exams_pdfs_root.mkdir(parents=True, exist_ok=True)
+                safe_user = re.sub(r"[^a-zA-Z0-9._-]+", "_", uname) or "anonymous"
+                pdf_name = f"{safe_user}__{exam_id}.pdf"
+                _atomic_write_bytes(self.saved_exams_pdfs_root / pdf_name, pdf_bytes)
+                merged["pdf_filename"] = pdf_name
+                merged["has_pdf"] = True
+
+            if existing_idx is not None:
+                exams.pop(existing_idx)
+            exams.insert(0, merged)
+
+            if len(exams) > max_exams_per_user:
+                dropped = exams[max_exams_per_user:]
+                exams = exams[:max_exams_per_user]
+                for d_item in dropped:
+                    p_name = str(d_item.get("pdf_filename") or "")
+                    if p_name:
+                        try:
+                            (self.saved_exams_pdfs_root / p_name).unlink(missing_ok=True)
+                        except Exception:
+                            pass
+
+            self._save_user_exams_unlocked(uname, exams)
+            return merged
+
+    def list_user_exams(self, username: str, subject: str = "전체") -> list[dict[str, Any]]:
+        """계정별로 저장된 시험지 목록을 최신순(선택 시 과목 필터)으로 반환한다."""
+        uname = (username or "").strip()
+        if not uname:
+            return []
+        with self._lock:
+            exams = self._load_user_exams_unlocked(uname)
+            if subject and subject != "전체":
+                return [e for e in exams if str(e.get("subject") or "기타") == subject]
+            return exams
+
+    def get_user_exam_pdf_bytes(self, username: str, exam_id: str) -> bytes | None:
+        """저장된 시험지의 PDF 바이트를 반환한다."""
+        uname = (username or "").strip()
+        if not uname or not exam_id:
+            return None
+        with self._lock:
+            exams = self._load_user_exams_unlocked(uname)
+            target = next((e for e in exams if e.get("exam_id") == exam_id), None)
+            if not target:
+                return None
+            p_name = str(target.get("pdf_filename") or "")
+            if not p_name:
+                return None
+            pdf_path = self.saved_exams_pdfs_root / p_name
+            if not pdf_path.exists():
+                return None
+            try:
+                return pdf_path.read_bytes()
+            except Exception:
+                return None
+
+    def delete_user_exam(self, username: str, exam_id: str) -> bool:
+        """계정의 저장된 시험지 및 연결된 PDF 파일을 삭제한다."""
+        uname = (username or "").strip()
+        if not uname or not exam_id:
+            return False
+        with self._lock:
+            exams = self._load_user_exams_unlocked(uname)
+            target_idx = next((i for i, e in enumerate(exams) if e.get("exam_id") == exam_id), None)
+            if target_idx is None:
+                return False
+            removed = exams.pop(target_idx)
+            p_name = str(removed.get("pdf_filename") or "")
+            if p_name:
+                try:
+                    (self.saved_exams_pdfs_root / p_name).unlink(missing_ok=True)
+                except Exception:
+                    pass
+            self._save_user_exams_unlocked(uname, exams)
+            return True

@@ -90,6 +90,7 @@ from src.models import (
     ConceptBookRecord,
     ConceptUnit,
     ConceptWhitelist,
+    QuestionMatchJudgment,
     QuestionRecord,
     RewrittenQuestion,
     build_whitelist_from_concept_units,
@@ -1936,6 +1937,7 @@ def _render_mode_b_solve_fragment(
                                     use_precision_mode=eng_precision,
                                     storage=storage,
                                     use_cache=False,
+                                    username=current_user.username if current_user is not None else "",
                                 )
                                 _charge_regen_usage(eng_rw_model)
                                 st.session_state["matched_items"][seq_num - 1]["rewritten"] = new_rw
@@ -2043,6 +2045,26 @@ def _render_mode_b_solve_fragment(
     with grade_c1:
         if st.button("📝 채점하기", type="primary", width="stretch"):
             st.session_state["graded"] = True
+            _record_english_seen_for_user(matched_items)
+            correct_cnt = 0
+            for item_g in matched_items:
+                q_g: QuestionRecord = item_g["question"]
+                rw_g: RewrittenQuestion | None = item_g.get("rewritten")
+                truth_g = rw_g.preserved_answer if rw_g else q_g.answer
+                user_val_g = st.session_state["user_answers"].get(q_g.id, "")
+                if normalize_answer(user_val_g) == normalize_answer(truth_g) and normalize_answer(user_val_g) != "":
+                    correct_cnt += 1
+            total_g = len(matched_items)
+            subj_g = _infer_exam_subject(matched_items)
+            _auto_save_current_exam(
+                matched_items,
+                title=f"{subj_g} 실전 풀이 시험지 ({total_g}문항)",
+                score_info={
+                    "correct": correct_cnt,
+                    "total": total_g,
+                    "percent": round((correct_cnt / max(1, total_g)) * 100, 1),
+                },
+            )
             st.rerun(scope="fragment")
     with grade_c2:
         if st.button("🔄 답안 초기화", width="stretch"):
@@ -2275,6 +2297,224 @@ def _render_english_pool_admin_section() -> None:
                     removed = storage.delete_english_pool_entry(ck, idx)
                     if removed > 0:
                         st.success(f"캐시 항목(`{ck}` #{idx + 1})을 삭제했습니다.")
+                    st.rerun()
+
+
+def _record_english_seen_for_user(items: list[dict[str, Any]]) -> None:
+    """현재 계정이 PDF 생성 또는 풀이 채점을 완료한 영어 변형 문항을 기록해 중복 출제를 막는다."""
+    if current_user is None or not items:
+        return
+    pairs: list[tuple[str, str]] = []
+    for it in items:
+        rw_item: RewrittenQuestion | None = it.get("rewritten")
+        eng_meta = it.get("english_meta") or {}
+        if rw_item is None or not eng_meta:
+            continue
+        passage = str(eng_meta.get("source_passage") or "").strip()
+        t_type = str(eng_meta.get("target_type") or rw_item.target_question_type or "").strip()
+        if not passage or not t_type:
+            continue
+        c_key = storage.build_english_pool_key(
+            source_passage=passage,
+            target_type=t_type,
+            difficulty=str(eng_meta.get("difficulty") or ""),
+            blank_unit=str(eng_meta.get("blank_unit") or ""),
+            vocab_style=str(eng_meta.get("vocab_style") or ""),
+        )
+        pairs.append((c_key, str(rw_item.rewritten_stem or "")))
+    if pairs:
+        storage.mark_user_seen_english_variants(current_user.username, pairs)
+
+
+def _infer_exam_subject(items: list[dict[str, Any]]) -> str:
+    subjects: list[str] = []
+    for it in items:
+        q_obj: QuestionRecord = it["question"]
+        rw_obj: RewrittenQuestion | None = it.get("rewritten")
+        if it.get("english_meta") or (rw_obj and getattr(rw_obj, "subject_domain", "") == "영어"):
+            subj = "영어"
+        else:
+            subj = str(getattr(q_obj, "subject_category", "") or "").strip()
+            if not subj:
+                subj = infer_subject_category(getattr(q_obj, "curriculum_subject", "") or getattr(q_obj, "exam_name", ""))
+        if subj and subj not in subjects:
+            subjects.append(subj)
+    if not subjects:
+        return "기타"
+    if len(subjects) == 1:
+        return subjects[0]
+    return "통합"
+
+
+def _build_exam_sig(items: list[dict[str, Any]]) -> str:
+    payload = [
+        (
+            it["question"].id,
+            getattr(it.get("rewritten"), "rewritten_stem", ""),
+            getattr(it.get("rewritten"), "rewritten_choices", []),
+        )
+        for it in items
+    ]
+    return hashlib.sha256(json.dumps(payload, ensure_ascii=False).encode("utf-8")).hexdigest()[:16]
+
+
+def _serialize_matched_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    serialized: list[dict[str, Any]] = []
+    for it in items:
+        q_obj = it.get("question")
+        j_obj = it.get("judgment")
+        rw_obj = it.get("rewritten")
+        serialized.append(
+            {
+                "question": q_obj.model_dump() if hasattr(q_obj, "model_dump") else q_obj,
+                "judgment": j_obj.model_dump() if hasattr(j_obj, "model_dump") else None,
+                "rewritten": rw_obj.model_dump() if hasattr(rw_obj, "model_dump") else None,
+                "concept_reference": str(it.get("concept_reference") or ""),
+                "english_meta": dict(it.get("english_meta") or {}) if it.get("english_meta") else None,
+            }
+        )
+    return serialized
+
+
+def _deserialize_matched_items(raw_items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    restored: list[dict[str, Any]] = []
+    for raw in raw_items:
+        try:
+            q_obj = QuestionRecord.model_validate(raw["question"])
+        except Exception:
+            continue
+        j_obj = None
+        if raw.get("judgment"):
+            try:
+                j_obj = QuestionMatchJudgment.model_validate(raw["judgment"])
+            except Exception:
+                j_obj = None
+        rw_obj = None
+        if raw.get("rewritten"):
+            try:
+                rw_obj = RewrittenQuestion.model_validate(raw["rewritten"])
+            except Exception:
+                rw_obj = None
+        crop_b = storage.get_crop_bytes(q_obj.crop_path) if getattr(q_obj, "crop_path", "") else None
+        restored.append(
+            {
+                "question": q_obj,
+                "judgment": j_obj,
+                "crop_png_bytes": crop_b,
+                "rewritten": rw_obj,
+                "concept_reference": str(raw.get("concept_reference") or ""),
+                "english_meta": raw.get("english_meta"),
+            }
+        )
+    return restored
+
+
+def _auto_save_current_exam(
+    items: list[dict[str, Any]],
+    title: str = "",
+    pdf_bytes: bytes | None = None,
+    score_info: dict[str, Any] | None = None,
+    sig: str = "",
+) -> None:
+    if current_user is None or not items:
+        return
+    exam_id = (sig or _build_exam_sig(items))[:16]
+    subject = _infer_exam_subject(items)
+    record: dict[str, Any] = {
+        "exam_id": exam_id,
+        "title": (title or f"{subject} 맞춤형 시험지 ({len(items)}문항)").strip(),
+        "subject": subject,
+        "question_count": len(items),
+        "items": _serialize_matched_items(items),
+    }
+    if score_info is not None:
+        record["last_score"] = score_info
+    storage.save_user_exam(current_user.username, record, pdf_bytes=pdf_bytes)
+
+
+def _render_my_exams_tab() -> None:
+    st.subheader("📁 나의 시험지 보관함 (과목별 자동 저장)")
+    st.caption(
+        "맞춤형 시험지 PDF를 생성하거나 웹에서 직접 풀고 채점한 시험지는 계정별로 과목에 맞춰 자동 저장됩니다."
+    )
+    if current_user is None:
+        st.info("로그인 후 이용할 수 있습니다.")
+        return
+
+    all_exams = storage.list_user_exams(current_user.username)
+    if not all_exams:
+        st.info("아직 저장된 시험지가 없습니다. **탭 2**에서 PDF를 만들거나 문제를 풀고 채점하면 이곳에 자동 저장됩니다.")
+        return
+
+    subj_counts: dict[str, int] = {}
+    for ex in all_exams:
+        s = str(ex.get("subject") or "기타")
+        subj_counts[s] = subj_counts.get(s, 0) + 1
+
+    subj_options = ["전체"] + sorted(subj_counts.keys())
+    sel_subj = st.radio(
+        "과목별 보기",
+        options=subj_options,
+        format_func=lambda s: f"{s} ({len(all_exams)}건)" if s == "전체" else f"{s} ({subj_counts.get(s, 0)}건)",
+        horizontal=True,
+        key="my_exams_subject_filter",
+    )
+
+    shown_exams = [e for e in all_exams if sel_subj == "전체" or str(e.get("subject") or "기타") == sel_subj]
+    if not shown_exams:
+        st.info(f"'{sel_subj}' 과목에 저장된 시험지가 없습니다.")
+        return
+
+    for ex in shown_exams:
+        ex_id = str(ex.get("exam_id") or "")
+        ex_title = str(ex.get("title") or "맞춤형 시험지")
+        ex_subj = str(ex.get("subject") or "기타")
+        ex_q_cnt = int(ex.get("question_count") or len(ex.get("items") or []))
+        ex_updated = str(ex.get("updated_at") or ex.get("created_at") or "")
+        last_score = ex.get("last_score")
+
+        with st.container(border=True):
+            top_c1, top_c2 = st.columns([4, 1.5])
+            with top_c1:
+                st.markdown(f"**[{ex_subj}] {ex_title}**")
+                meta_parts = [f"총 {ex_q_cnt}문항", f"저장일시: {ex_updated}"]
+                if isinstance(last_score, dict):
+                    meta_parts.append(
+                        f"최근 점수: {last_score.get('percent', 0)}점 ({last_score.get('correct', 0)}/{last_score.get('total', ex_q_cnt)})"
+                    )
+                st.caption(" · ".join(meta_parts))
+            with top_c2:
+                pdf_data = storage.get_user_exam_pdf_bytes(current_user.username, ex_id)
+                if pdf_data:
+                    st.download_button(
+                        label=f"⬇️ PDF ({len(pdf_data) // 1024}KB)",
+                        data=pdf_data,
+                        file_name=f"{sanitize_id_part(ex_title)}.pdf",
+                        mime="application/pdf",
+                        key=f"my_exam_dl_{ex_id}",
+                        width="stretch",
+                    )
+                else:
+                    st.caption("📄 PDF 미생성 (풀이 전용)")
+
+            b_c1, b_c2, b_c3 = st.columns([1.4, 1.2, 3.4])
+            with b_c1:
+                if st.button("✏️ 이 시험지 다시 풀기", key=f"my_exam_load_{ex_id}", width="stretch"):
+                    restored = _deserialize_matched_items(ex.get("items") or [])
+                    if restored:
+                        st.session_state["matched_items"] = restored
+                        st.session_state["user_answers"] = {}
+                        st.session_state["graded"] = False
+                        st.session_state["ai_explanations"] = {}
+                        st.session_state["ai_chats"] = {}
+                        st.session_state["generated_exam_pdf"] = pdf_data
+                        st.session_state["generated_exam_pdf_sig"] = ""
+                        st.success("시험지를 불러왔습니다! 상단 **[탭 2]**로 이동해 바로 풀거나 PDF를 생성하세요.")
+                    else:
+                        st.warning("시험지 문항 데이터를 복원하지 못했습니다.")
+            with b_c2:
+                if st.button("🗑️ 삭제", key=f"my_exam_del_{ex_id}", width="stretch"):
+                    storage.delete_user_exam(current_user.username, ex_id)
                     st.rerun()
 
 
@@ -2755,20 +2995,22 @@ def _render_concept_book_builder_section(key_prefix: str = "tab3") -> None:
 
 
 if is_admin:
-    tab1, tab2, tab3, admin_tab = st.tabs(
+    tab1, tab2, tab3, my_exams_tab, admin_tab = st.tabs(
         [
             "📥 탭 1: 모의고사 수집 & 2022 원리·용어 분해",
             "🎯 탭 2: 개념서 범위 추출 & 상위 문제 개조",
             "📚 탭 3: 공용 개념서·교과서 DB 구축",
+            "📁 나의 시험지",
             "🛡️ 관리자: 회원 등급 관리",
         ]
     )
 else:
-    tab1, tab2, tab3 = st.tabs(
+    tab1, tab2, tab3, my_exams_tab = st.tabs(
         [
             "📥 탭 1: 모의고사 수집 & 2022 원리·용어 분해",
             "🎯 탭 2: 개념서 범위 추출 & 상위 문제 개조",
             "📚 탭 3: 공용 개념서·교과서 DB 구축",
+            "📁 나의 시험지",
         ]
     )
     admin_tab = None
@@ -4147,6 +4389,7 @@ def _execute_english_transform_jobs(
                 use_precision_mode=use_precision_mode,
                 storage=storage,
                 use_cache=True,
+                username=current_user.username if current_user is not None else "",
             ): idx
             for idx, job in enumerate(jobs)
         }
@@ -5277,7 +5520,14 @@ with tab2:
                             )
                             st.session_state["generated_exam_pdf"] = pdf_bytes
                             st.session_state["generated_exam_pdf_sig"] = items_sig
-                        st.success("✅ 시험지 PDF(뒷장 정답·개념서 맞춤 해설 포함)가 생성되었습니다!")
+                            _record_english_seen_for_user(matched_items)
+                            _auto_save_current_exam(
+                                matched_items,
+                                title=pdf_title.strip() or "맞춤형 기출 모의고사",
+                                pdf_bytes=pdf_bytes,
+                                sig=_build_exam_sig(matched_items),
+                            )
+                        st.success("✅ 시험지 PDF(뒷장 정답·개념서 맞춤 해설 포함)가 생성되고 '나의 시험지'에 자동 저장되었습니다!")
 
                     if (
                         st.session_state.get("generated_exam_pdf")
@@ -5310,6 +5560,9 @@ with tab2:
 with tab3:
     _render_ncic_curriculum_manager(key_prefix="tab3")
     _render_concept_book_builder_section(key_prefix="tab3")
+
+with my_exams_tab:
+    _render_my_exams_tab()
 
 if admin_tab is not None:
     with admin_tab:
