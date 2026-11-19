@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import os
+import random
 import re
 import shutil
 import threading
@@ -17,7 +19,7 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
 from src.exporters import build_exam_ai_jsonl, build_exam_html, build_exam_markdown
-from src.models import ConceptBookRecord, QuestionRecord, UserRecord
+from src.models import ConceptBookRecord, QuestionRecord, RewrittenQuestion, UserRecord
 
 DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive"]
 FOLDER_MIME = "application/vnd.google-apps.folder"
@@ -78,6 +80,7 @@ class StorageManager:
         self.organized_dir = self.local_root / "과목별_기출DB"
         self.db_path = self.local_root / "db.json"
         self.users_path = self.local_root / "users.json"
+        self.english_pool_path = self.local_root / "english_question_pool.json"
 
         self.concept_root = Path(concept_root)
         self.concept_books_path = self.concept_root / "concept_books.json"
@@ -1116,6 +1119,8 @@ class StorageManager:
                     removed_local += 1
 
             _atomic_write_text(self.db_path, "[]", encoding="utf-8")
+            if self.english_pool_path.exists():
+                _atomic_write_text(self.english_pool_path, "{}", encoding="utf-8")
             if delete_users and self.users_path.exists():
                 self.users_path.unlink(missing_ok=True)
 
@@ -1146,3 +1151,76 @@ class StorageManager:
                 "trashed_drive": trashed_drive,
                 "drive_error": drive_err,
             }
+
+    @staticmethod
+    def build_english_pool_key(
+        source_passage: str,
+        target_type: str,
+        difficulty: str = "",
+        blank_unit: str = "",
+        vocab_style: str = "",
+    ) -> str:
+        """지문 원문과 변형 옵션 조합으로 영어 변형 풀(Pool) 캐시 키를 생성한다."""
+        norm_p = re.sub(r"\s+", " ", (source_passage or "").strip())
+        t = (target_type or "").strip()
+        opt = blank_unit if "빈칸" in t else (vocab_style if "어휘" in t else "")
+        raw_key = f"{norm_p}||{t}||{(difficulty or '').strip()}||{(opt or '').strip()}"
+        return hashlib.sha256(raw_key.encode("utf-8")).hexdigest()[:24]
+
+    def _load_english_pool_unlocked(self) -> dict[str, list[dict[str, Any]]]:
+        if not self.english_pool_path.exists():
+            return {}
+        try:
+            data = json.loads(self.english_pool_path.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def get_cached_english_question(
+        self,
+        cache_key: str,
+        exclude_stem: str = "",
+    ) -> RewrittenQuestion | None:
+        """검증 완료된 영어 변형 풀에서 캐시 히트 시 RewrittenQuestion을 즉시 반환한다."""
+        if not cache_key:
+            return None
+        with self._lock:
+            pool = self._load_english_pool_unlocked()
+            items = pool.get(cache_key)
+            if not isinstance(items, list) or not items:
+                return None
+            candidates = items
+            if exclude_stem and len(items) > 1:
+                filtered = [it for it in items if (it.get("rewritten_stem") or "").strip() != exclude_stem.strip()]
+                if filtered:
+                    candidates = filtered
+            chosen = random.choice(candidates)
+            try:
+                return RewrittenQuestion.model_validate(chosen)
+            except Exception:
+                return None
+
+    def save_cached_english_question(
+        self,
+        cache_key: str,
+        rw: RewrittenQuestion,
+        max_per_key: int = 3,
+    ) -> None:
+        """파이썬 검증을 통과한 영어 변형 문항을 키당 최대 max_per_key(기본 3)개까지 풀에 저장한다."""
+        if not cache_key or rw is None:
+            return
+        with self._lock:
+            pool = self._load_english_pool_unlocked()
+            items = list(pool.get(cache_key) or [])
+            stem_key = (rw.rewritten_stem or "").strip()
+            if any((it.get("rewritten_stem") or "").strip() == stem_key for it in items):
+                return
+            items.append(rw.model_dump())
+            if len(items) > max_per_key:
+                items = items[-max_per_key:]
+            pool[cache_key] = items
+            _atomic_write_text(
+                self.english_pool_path,
+                json.dumps(pool, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )

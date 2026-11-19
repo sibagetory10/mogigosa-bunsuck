@@ -1933,6 +1933,8 @@ def _render_mode_b_solve_fragment(
                                     source_label=eng_meta.get("source_label") or eng_source_caption,
                                     previous_attempt=rw,
                                     use_precision_mode=eng_precision,
+                                    storage=storage,
+                                    use_cache=False,
                                 )
                                 _charge_regen_usage(eng_rw_model)
                                 st.session_state["matched_items"][seq_num - 1]["rewritten"] = new_rw
@@ -4049,6 +4051,8 @@ def _execute_english_transform_jobs(
                 vocab_style=job["vocab_style"],
                 source_label=job["source_label"],
                 use_precision_mode=use_precision_mode,
+                storage=storage,
+                use_cache=True,
             ): idx
             for idx, job in enumerate(jobs)
         }

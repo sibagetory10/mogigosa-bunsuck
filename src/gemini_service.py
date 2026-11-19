@@ -2405,133 +2405,106 @@ def _build_english_transform_rule(
     blank_unit: str = "구 (3~6단어)",
     vocab_style: str = "밑줄형 (①~⑤)",
 ) -> tuple[str, str]:
-    """입력 토큰 절감을 위해 11개 전체 규칙 대신 지정된 target_type 1개 유형의 규칙만 동적으로 반환한다."""
+    """입력 토큰 절감을 위해 지정된 target_type 1개 유형의 핵심 규칙만 압축해 반환한다."""
     t = (target_type or "").strip()
 
     if "함축" in t:
         return (
             "함축적 의미 추론",
-            "- 한국어 발문: `밑줄 친 부분이 다음 글에서 의미하는 바로 가장 적절한 것은?`\n"
-            "- 지문 규칙: 원문 지문에서 비유적·핵심적 의미를 담은 어구 1곳에만 `<u>...</u>` 태그로 밑줄을 표시하세요. (기존 ①~⑤ 번호나 불필요한 표기는 모두 제거하고 자연스러운 본문으로 정리)\n"
-            "- 선택지(`rewritten_choices`): 밑줄 친 표현이 문맥상 함축하는 의미를 나타낸 **영어 선지 5개**(선지 번호 ①~⑤는 빼고 영어 문장/구 텍스트만 5개)를 작성하세요.",
+            "- 발문: `밑줄 친 부분이 다음 글에서 의미하는 바로 가장 적절한 것은?`\n"
+            "- 출력 절감 규칙: `rewritten_stem`에 지문 전체를 쓰지 말고, 원문에서 비유·핵심 의미를 담은 **유일한 연속 구절 1개(target_phrase)**만 원문 철자 그대로 반환하세요(시스템이 `<u>...</u>` 자동 치환).\n"
+            "- 선지: 밑줄 표현의 문맥상 함축 의미를 담은 **영어 선지 5개**(번호 제외).",
         )
     if "요지" in t:
         return (
             "요지 파악",
-            "- 한국어 발문: `다음 글의 요지로 가장 적절한 것은?`\n"
-            "- 지문 규칙: 원문의 기존 밑줄/빈칸/번호(①~⑤, (A)(B)(C))가 있었다면 자연스러운 완결 영어 지문으로 복원·정리하세요.\n"
-            "- 선택지(`rewritten_choices`): 평가원 표준에 따라 **한국어 완결 문장 선지 5개**(번호 제외)를 작성하세요.",
+            "- 발문: `다음 글의 요지로 가장 적절한 것은?`\n"
+            "- 출력 절감 규칙: 지문은 원문 그대로 쓰이므로 `rewritten_stem`은 **빈 문자열 `\"\"`**로 반환하세요.\n"
+            "- 선지: 평가원 표준 **한국어 완결 문장 선지 5개**(번호 제외).",
         )
     if "주제" in t:
         return (
             "주제 파악",
-            "- 한국어 발문: `다음 글의 주제로 가장 적절한 것은?`\n"
-            "- 지문 규칙: 원문의 기존 밑줄/빈칸/번호를 제거하고 완결된 영어 본문으로 정리하세요.\n"
-            "- 선택지(`rewritten_choices`): 평가원 표준에 따라 **영어 명사구 선지 5개**(번호 제외, 예: `necessity of balancing ...`)를 작성하세요.",
+            "- 발문: `다음 글의 주제로 가장 적절한 것은?`\n"
+            "- 출력 절감 규칙: 지문은 원문 그대로 쓰이므로 `rewritten_stem`은 **빈 문자열 `\"\"`**로 반환하세요.\n"
+            "- 선지: 평가원 표준 **영어 명사구 선지 5개**(번호 제외).",
         )
     if "제목" in t:
         return (
             "제목 추론",
-            "- 한국어 발문: `다음 글의 제목으로 가장 적절한 것은?`\n"
-            "- 지문 규칙: 원문의 기존 밑줄/빈칸/번호를 제거하고 완결된 영어 본문으로 정리하세요.\n"
-            "- 선택지(`rewritten_choices`): 평가원 표준에 따라 **영어 제목 선지 5개**(번호 제외, 첫 글자 대문자 타이틀 형식)를 작성하세요.",
+            "- 발문: `다음 글의 제목으로 가장 적절한 것은?`\n"
+            "- 출력 절감 규칙: 지문은 원문 그대로 쓰이므로 `rewritten_stem`은 **빈 문자열 `\"\"`**로 반환하세요.\n"
+            "- 선지: 평가원 표준 **영어 제목 선지 5개**(번호 제외, 첫 글자 대문자 타이틀 형식).",
         )
     if "어법" in t:
         return (
             "어법상 틀린 것 (밑줄 ①~⑤)",
-            "- 한국어 발문: `다음 글의 밑줄 친 부분 중, 어법상 틀린 것은?`\n"
-            "- 지문 규칙: 원문 지문 안에서 핵심 문법 포인트 5곳을 골라 `① <u>word1</u>` ~ `⑤ <u>word5</u>` 형식으로 표시하세요.\n"
-            "- **실제 문법 비문 생성 강제 (절대 규칙)**: 5개 중 **정확히 1개(정답 번호)**는 반드시 문법 구조 자체가 명백히 틀린 **실제 비문**으로 변형해야 합니다. 아래 5가지 중 1가지를 본문에 직접 삽입하세요:\n"
-            "  1) **수일치 오류** (예: 복수 주어 뒤 단수 동사 `is`/`has`/`makes` 등)\n"
-            "  2) **분사의 능동/수동·준동사/본동사 오류** (예: `causing` ↔ `caused`, 동사 자리에 분사/to부정사 등)\n"
-            "  3) **관계대명사 vs 관계부사/접속사 오류** (예: 완전한 절 앞 `which`, 불완전한 절 앞 `where`/`what` 등)\n"
-            "  4) **병렬 구조 오류** (예: `and`/`or` 전후 문법 형태 불일치)\n"
-            "  5) **대동사 do/be 오류** (예: 일반동사 대동사 자리에 `are`/`is`, be동사 자리에 `do`/`does`)\n"
-            "- **절대 금지**: 원문 그대로인 문법적 정상 표현(예: `could be affected`)을 틀렸다고 주장하거나, 해설에서 '타당하다/적절하다/맞다'고 스스로 모순되게 판정하는 것은 절대 금지합니다. 또한 문법은 멀쩡한데 의미만 반대인 **반의어 교체**(예: `is decreased` → `is increasing`)와, 현재진행형(`is occurring`)을 단순현재형(`occurs`)으로 고쳐야 한다는 식의 **문법적으로 둘 다 맞는 시제·진행형 변형**도 절대 금지합니다. 오직 수일치·분사 능동/수동·관계사·병렬 구조·대동사·접속사(`what`/`that`) 등 문법적 정오가 100% 명확한 비문 1개만 출제하세요.\n"
-            "- 선택지(`rewritten_choices`): `[\"①\", \"②\", \"③\", \"④\", \"⑤\"]` 5개를 반환하세요.",
+            "- 발문: `다음 글의 밑줄 친 부분 중, 어법상 틀린 것은?`\n"
+            "- 규칙: 원문 내 문법 포인트 5곳에 `① <u>word1</u>` ~ `⑤ <u>word5</u>` 표시. 정확히 1개(정답)만 실제 비문(수일치·분사 능/수동·관계사/접속사 what/that·병렬·대동사 do/be 중 1가지)으로 변형하고, 나머지 4개는 100% 올바른 어법 유지.\n"
+            "- 금지: 원문 정상 표현을 틀렸다고 우기기, 해설 자체 모순('타당하다/적절하다'), 의미만 반대인 반의어 교체, 문법상 둘 다 맞는 시제·진행형(`is occurring`↔`occurs`) 변형 절대 금지.\n"
+            "- 선지: `[\"①\", \"②\", \"③\", \"④\", \"⑤\"]` 5개.",
         )
     if "어휘" in t:
         if "선택형" in vocab_style or "(A)" in vocab_style:
             return (
                 "문맥상 어휘 적절성 (선택형 (A)(B)(C))",
-                "- 한국어 발문: `(A), (B), (C)의 각 네모 안에서 문맥에 맞는 낱말로 가장 적절한 것은?`\n"
-                "- 지문 규칙: **기존 원문 지문 본문 안에 이미 존재하는** 문맥상 핵심 어휘 3곳을 골라 `(A) [word1 / word2]`, `(B) [word3 / word4]`, `(C) [word5 / word6]`(원문 단어와 자연스러운 반의어 쌍)으로 본문 안에 표시하세요. **지문 끝에 새 문장을 억지로 덧붙이거나 어색한 연어 조합(예: `severe encouragement`)을 새로 만들어 넣지 마세요.**\n"
-                "- **어법 오류 출제 절대 금지**: 동사 형태·수일치·시제·준동사 변형(예: `makes` vs `making`) 같은 문법 오류를 섞지 말고, **문법적 형태·품사는 100% 동일·올바르지만 의미가 반대인 어휘 쌍**으로만 출제하세요.\n"
-                "- 선택지(`rewritten_choices`): `\"(A) word1 — (B) word3 — (C) word5\"` 형식의 5개 영어 어휘 조합을 작성하세요.",
+                "- 발문: `(A), (B), (C)의 각 네모 안에서 문맥에 맞는 낱말로 가장 적절한 것은?`\n"
+                "- 규칙: 기존 본문 내 핵심 어휘 3곳을 `(A) [w1 / w2]`, `(B) [w3 / w4]`, `(C) [w5 / w6]`(원문 단어와 반의어 쌍)으로 표시. 지문 끝에 새 문장 추가·어색한 연어(`severe encouragement`)·어법 변형(`makes`↔`making`) 절대 금지.\n"
+                "- 선지: `\"(A) w1 — (B) w3 — (C) w5\"` 형식 5개.",
             )
         return (
             "문맥상 어휘 적절성 (밑줄 ①~⑤)",
-            "- 한국어 발문: `다음 글의 밑줄 친 부분 중, 문맥상 낱말의 쓰임이 적절하지 않은 것은?`\n"
-            "- 지문 규칙: **기존 원문 지문 본문 안에 이미 있는** 논리·문맥상 핵심 어휘(동사·형용사·부사·명사) 5곳을 골라 `① <u>word1</u>` ~ `⑤ <u>word5</u>` 형식으로 본문 안에 표시하세요.\n"
-            "- **본문 내 교체 우선 & 억지 추가 금지**: 지문 맨 끝에 새 문장을 억지로 덧붙이거나 비문맥적·어색한 연어 조합(예: `severe encouragement`)을 생성하지 마세요. 반드시 기존 본문 단어 5개 중 **정확히 1개(정답 번호)만** 문맥 흐름상 정반대 의미의 자연스러운 반의어로 교체하고, 나머지 4개는 원문 단어 그대로 유지하세요.\n"
-            "- **어법 오류 출제 절대 금지**: `makes` → `making`, `cause` → `causing`, 수일치·태 변형 같은 **문법적 오류는 절대 내지 마세요.** 정답 번호의 밑줄 어휘는 반드시 **문법적 형태·품사·수일치·태가 100% 올바르지만 의미만 문맥과 정반대인 반의어/오용 어휘**여야 합니다.\n"
-            "- 선택지(`rewritten_choices`): 밑줄 친 5개 어휘 리스트(예: `[\"<u>word1</u>\", ...]`)를 순서대로 반환하세요.",
+            "- 발문: `다음 글의 밑줄 친 부분 중, 문맥상 낱말의 쓰임이 적절하지 않은 것은?`\n"
+            "- 규칙: 기존 본문 내 핵심 어휘 5곳에 `① <u>w1</u>` ~ `⑤ <u>w5</u>` 표시. 지문 끝에 새 문장 추가 절대 금지(문장 수 동일 유지). 정확히 1개(정답)만 문법 형태·품사가 100% 동일한 자연스러운 반의어로 교체.\n"
+            "- 금지: 어법 오류(`makes`→`making` 등)·어색한 연어 생성 금지.\n"
+            "- 선지: 밑줄 친 5개 어휘 리스트.",
         )
     if "빈칸" in t:
         b_u = (blank_unit or "").strip()
         if b_u.startswith("절") or ("절(" in b_u or "절 (" in b_u):
-            unit_desc = "주어+술어 또는 접속사가 포함된 **절(6~12단어)**"
+            unit_desc = "주어+술어 포함 **절(6~12단어)**"
             short_u = "절"
         elif b_u.startswith("단어") or ("단어" in b_u and not b_u.startswith("구")):
-            unit_desc = "핵심 추상 명사/동사 **단어(1~2단어)**"
+            unit_desc = "핵심 **단어(1~2단어)**"
             short_u = "단어"
         else:
-            unit_desc = "핵심 의미를 압축한 **구(3~6단어)**"
+            unit_desc = "핵심 **구(3~6단어)**"
             short_u = "구"
         return (
             f"빈칸 추론 ({short_u})",
-            "- 한국어 발문: `다음 빈칸에 들어갈 말로 가장 적절한 것은?`\n"
-            f"- 지문 규칙: 지문의 주제문 또는 핵심 추론 구간을 골라 {unit_desc} 분량을 `___________`(언더스코어 10개)으로 비우세요.\n"
-            "- **문장 삽입 기호 절대 금지**: 지문 본문에 문장 삽입용 번호 기호인 `( ① )`, `( ② )`, `( ③ )`, `( ④ )`, `( ⑤ )` 또는 `①`~`⑤`를 절대 넣지 마세요. 원문에 해당 기호나 다른 빈칸이 있었다면 모두 제거·복원한 뒤 새 빈칸 `___________` 1개만 남기세요.\n"
-            f"- 선택지(`rewritten_choices`): 빈칸 단위에 정확히 맞고 문법적으로 호응하는 **영어 선지 5개**({unit_desc} 길이·품사 통일, 정답 1개 + 지문 키워드를 교묘히 비튼 매력적 오답 4개)를 작성하세요.",
+            "- 발문: `다음 빈칸에 들어갈 말로 가장 적절한 것은?`\n"
+            f"- 출력 절감 규칙: `rewritten_stem`에 지문 전체를 쓰지 말고, 주제문/핵심 구간에서 빈칸으로 뚫을 **{unit_desc} 분량의 유일한 원문 구절 1개(target_phrase)**만 원문 철자 그대로 반환하세요(시스템이 `___________`로 자동 치환).\n"
+            "- 제약: 빈칸 앞뒤 2단어와 정답 선지 시작/끝 2단어 중복 금지, 문장 내 동사 통째 삭제 금지, `(①)~(⑤)` 기호 금지.\n"
+            f"- 선지: {unit_desc} 길이·품사에 맞는 **영어 선지 5개**(정답 1개 + 매력적 오답 4개).",
         )
     if "무관" in t:
         return (
             "전체 흐름과 무관한 문장",
-            "- 한국어 발문: `다음 글에서 전체 흐름과 관계없는 문장은?`\n"
-            "- 지문 규칙: 첫 1~2문장(주제 도입문) 뒤에 이어지는 본문 문장들에 `①`, `②`, `③`, `④`, `⑤` 번호를 붙이세요.\n"
-            "- **원문 삭제 금지 & 무관한 새 문장 삽입 강제**: 원문 지문의 정상 문장들을 삭제한 뒤 정상 문장을 정답으로 우기지 마세요. 원문 본문 문장들은 그대로 보존하고, **지문의 핵심 주장·요지를 지지하거나 요약하는 문장은 절대 넣지 말고, 지문의 핵심 소재(키워드)만 공유하면서 글의 중심 논리 흐름과 방향이 어긋나는 오답 문장 1개만 정답 번호 위치에 새로 작성해 삽입**하세요. 나머지 4개 번호의 문장은 모두 글의 흐름에 자연스럽게 이어지는 원문 문장이어야 합니다.\n"
-            "- 선택지(`rewritten_choices`): `[\"①\", \"②\", \"③\", \"④\", \"⑤\"]` 5개를 반환하세요.",
+            "- 발문: `다음 글에서 전체 흐름과 관계없는 문장은?`\n"
+            "- 규칙: 첫 1~2문장(도입문) 뒤 문장들에 `①`~`⑤` 부여. 원문 문장을 1개도 삭제하지 말고, 핵심 주장·요지를 지지/요약하지 않으면서 키워드만 공유하고 논리 방향이 어긋나는 **새 영어 문장 1개만** 정답 위치에 삽입(총 문장 수 = 원문 + 1).\n"
+            "- 선지: `[\"①\", \"②\", \"③\", \"④\", \"⑤\"]` 5개.",
         )
     if "순서" in t:
         return (
             "글의 순서 ((A)-(B)-(C))",
-            "- 한국어 발문: `주어진 글 다음에 이어질 글의 순서로 가장 적절한 것은?`\n"
-            "- 지문 규칙: 도입부 1~2문장을 `[주어진 글]` 섹션으로 분리하고, 나머지 본문을 지시어(this, these, such)·연결어(However, For example, Therefore)·대명사 연결 고리가 명확한 3개 단락 `(A)`, `(B)`, `(C)`로 나눈 뒤 `(A)-(B)-(C)` 단순 순서가 아닌 평가원 표준 오순(예: `(B)-(A)-(C)`, `(C)-(A)-(B)` 등)으로 배치하세요.\n"
-            "- 형식 예시:\n"
-            "  `주어진 글 다음에 이어질 글의 순서로 가장 적절한 것은?`\n"
-            "  `[주어진 글]`\n"
-            "  `도입 영어 문장...`\n\n"
-            "  `(A) 단락...`\n"
-            "  `(B) 단락...`\n"
-            "  `(C) 단락...`\n"
-            "- 선택지(`rewritten_choices`): 반드시 `[\"(A) - (C) - (B)\", \"(B) - (A) - (C)\", \"(B) - (C) - (A)\", \"(C) - (A) - (B)\", \"(C) - (B) - (A)\"]` 5개 표준 조합을 사용하고 정답 조합이 유일하도록 구성하세요.",
+            "- 발문: `주어진 글 다음에 이어질 글의 순서로 가장 적절한 것은?`\n"
+            "- 규칙: 도입 1~2문장을 `[주어진 글]`로 분리하고 나머지 원문 문장을 누락·추가 없이 3단락 `(A)`, `(B)`, `(C)`로 나눈 뒤 `(A)-(B)-(C)` 정순이 아닌 오순(예: `(B)-(A)-(C)`)으로 배치.\n"
+            "- 선지: `[\"(A) - (C) - (B)\", \"(B) - (A) - (C)\", \"(B) - (C) - (A)\", \"(C) - (A) - (B)\", \"(C) - (B) - (A)\"]` 5개.",
         )
     if "삽입" in t:
         return (
             "주어진 문장 삽입",
-            "- 한국어 발문: `글의 흐름으로 보아, 주어진 문장이 들어가기에 가장 적절한 곳은?`\n"
-            "- 지문 규칙: 지문 중 논리적 전환점이나 지시어·연결어 단서가 뚜렷한 핵심 문장 1개를 빼내어 `[주어진 문장]` 섹션에 배치하고, 본문 내 5곳의 문장 경계에 `( ① )`, `( ② )`, `( ③ )`, `( ④ )`, `( ⑤ )`를 표시하세요. 정답 위치는 반드시 `①`~`⑤` 중 유일해야 합니다.\n"
-            "- 형식 예시:\n"
-            "  `글의 흐름으로 보아, 주어진 문장이 들어가기에 가장 적절한 곳은?`\n"
-            "  `[주어진 문장]`\n"
-            "  `삽입할 영어 문장...`\n\n"
-            "  `본문 첫 문장... ( ① ) 다음 문장... ( ② ) ... ( ⑤ ) 마지막 문장...`\n"
-            "- 선택지(`rewritten_choices`): `[\"①\", \"②\", \"③\", \"④\", \"⑤\"]` 5개를 반환하세요.",
+            "- 발문: `글의 흐름으로 보아, 주어진 문장이 들어가기에 가장 적절한 곳은?`\n"
+            "- 출력 절감 규칙: 원문이 6문장 이상이면 `rewritten_stem`에 지문 전체를 쓰지 말고 원문에서 뽑아낼 **핵심 문장 1개만 원문 그대로** 반환하세요(시스템이 `( ① )~( ⑤ )`와 정답을 자동 배치). 5문장 이하일 때만 `[주어진 문장]`과 본문 `( ① )~( ⑤ )`를 출력하세요.\n"
+            "- 선지: `[\"①\", \"②\", \"③\", \"④\", \"⑤\"]` 5개.",
         )
     # 기본: 요약문 완성
     return (
         "요약문 완성 ((A), (B))",
-        "- 한국어 발문: `다음 글의 내용을 한 문장으로 요약하고자 한다. 빈칸 (A), (B)에 들어갈 말로 가장 적절한 것은?`\n"
-        "- 지문 규칙: 원문 영어 본문 아래에 `[요약문]` 섹션을 추가하고, 글 전체의 핵심 인과·대조·요지를 한 문장으로 압축하되 핵심 어휘 2곳을 `(A) ________`와 `(B) ________`로 비운 영어 요약문을 작성하세요.\n"
-        "- **정답 노출 금지 (패러프레이징 필수)**: 빈칸 `(A)`, `(B)`의 정답 어휘는 원문 영어 지문 본문에 **동일한 단어 또는 동일 어근(어형 변화 포함)으로 그대로 노출되지 않도록** 반드시 동의어·상위어·패러프레이징된 어휘를 사용하세요.\n"
-        "- **선지 중복 작성 금지**: `rewritten_stem` 안에는 `[요약문]` 문장까지만 작성하고 `[선지]` 블록이나 ①~⑤ 선택지를 절대 포함하지 마세요 (`rewritten_choices`에만 작성).\n"
-        "- 형식 예시:\n"
-        "  `다음 글의 내용을 한 문장으로 요약하고자 한다. 빈칸 (A), (B)에 들어갈 말로 가장 적절한 것은?`\n"
-        "  `영어 본문...`\n\n"
-        "  `[요약문]`\n"
-        "  `... (A) ________ ... (B) ________ ...`\n"
-        "- 선택지(`rewritten_choices`): `\"(A) word1 — (B) word2\"` 형식의 영어 어휘 쌍 선지 5개를 작성하세요.",
+        "- 발문: `다음 글의 내용을 한 문장으로 요약하고자 한다. 빈칸 (A), (B)에 들어갈 말로 가장 적절한 것은?`\n"
+        "- 출력 절감 규칙: `rewritten_stem`에 지문 본문·`[선지]`·①~⑤를 절대 쓰지 말고, 오직 **`(A) ________`와 `(B) ________`가 포함된 영어 요약문 1문장만** 반환하세요(원문은 시스템이 자동 결합).\n"
+        "- 제약: `(A)`, `(B)` 정답 어휘는 원문과 동일 단어/동일 어근 노출 금지(패러프레이징 필수).\n"
+        "- 선지: `\"(A) word1 — (B) word2\"` 형식 5개.",
     )
 
 
@@ -3106,6 +3079,94 @@ def _validate_english_transformed_output(
     return issues
 
 
+def _assemble_english_slim_stem(
+    rw: RewrittenQuestion,
+    canonical_type: str,
+    clean_passage: str,
+) -> None:
+    """
+    지문 전체 재출력 생략 유형(요지·주제·제목·요약문·문장 삽입·빈칸·함축)에서
+    AI가 반환한 경량 결과(빈 문자열 / 요약 1문장 / 추출 1문장 / target_phrase)를
+    원문(clean_passage)에 직접 결합·치환해 완성된 rewritten_stem을 조립한다.
+    이미 전체 지문 형태로 출력된 경우(폴백 재시도 등)는 그대로 보존한다.
+    """
+    raw_stem = (rw.rewritten_stem or "").strip()
+    t = canonical_type or ""
+
+    if "요지" in t:
+        if len(raw_stem) < max(60, int(len(clean_passage) * 0.55)):
+            rw.rewritten_stem = f"다음 글의 요지로 가장 적절한 것은?\n{clean_passage}"
+        return
+    if "주제" in t:
+        if len(raw_stem) < max(60, int(len(clean_passage) * 0.55)):
+            rw.rewritten_stem = f"다음 글의 주제로 가장 적절한 것은?\n{clean_passage}"
+        return
+    if "제목" in t:
+        if len(raw_stem) < max(60, int(len(clean_passage) * 0.55)):
+            rw.rewritten_stem = f"다음 글의 제목으로 가장 적절한 것은?\n{clean_passage}"
+        return
+
+    if "요약" in t:
+        # 이미 원문+요약문 전체가 들어있으면 그대로 두고, 요약문 1문장만 반환된 경우 원문과 결합
+        if len(raw_stem) < max(120, int(len(clean_passage) * 0.65)):
+            s_line = strip_english_embedded_choices(normalize_english_exam_text(raw_stem))
+            s_line = re.sub(r"^[^\n]*가장\s*적절한\s*것은\??\s*", "", s_line).strip()
+            s_line = re.sub(r"^\[?요약문\]?\s*", "", s_line).strip()
+            if s_line:
+                rw.rewritten_stem = (
+                    "다음 글의 내용을 한 문장으로 요약하고자 한다. 빈칸 (A), (B)에 들어갈 말로 가장 적절한 것은?\n"
+                    f"{clean_passage}\n\n"
+                    "[요약문]\n"
+                    f"{s_line}"
+                )
+        return
+
+    if "삽입" in t:
+        # 6문장 이상에서 추출 문장 1개만 반환된 경우 [주어진 문장] 헤더로 감싸 기계적 마커 배치로 넘김
+        if (
+            len(_split_english_sentences(clean_passage)) >= 6
+            and "[주어진 문장]" not in raw_stem
+            and len(raw_stem) < max(80, int(len(clean_passage) * 0.55))
+        ):
+            ext_s = re.sub(r"^[^\n]*가장\s*적절한\s*곳은\??\s*", "", raw_stem).strip()
+            if ext_s:
+                rw.rewritten_stem = f"[주어진 문장]\n{ext_s}"
+        return
+
+    if "빈칸" in t or "함축" in t:
+        is_full_stem = len(raw_stem) >= max(80, int(len(clean_passage) * 0.6)) and (
+            ("빈칸" in t and "____" in raw_stem) or ("함축" in t and "<u" in raw_stem.lower())
+        )
+        if is_full_stem or not raw_stem:
+            return
+
+        phrase = re.sub(r"</?u\b[^>]*>", "", raw_stem, flags=re.IGNORECASE).strip()
+        phrase = re.sub(r"^[^\n]*가장\s*적절한\s*것은\??\s*", "", phrase).strip()
+        phrase = phrase.strip("`\"'“”‘’")
+        if not phrase:
+            return
+
+        exact_cnt = clean_passage.count(phrase)
+        matched_span: tuple[int, int, str] | None = None
+        if exact_cnt == 1:
+            pos = clean_passage.index(phrase)
+            matched_span = (pos, pos + len(phrase), phrase)
+        elif exact_cnt == 0:
+            ci_matches = list(re.finditer(re.escape(phrase), clean_passage, flags=re.IGNORECASE))
+            if len(ci_matches) == 1:
+                m_ci = ci_matches[0]
+                matched_span = (m_ci.start(), m_ci.end(), m_ci.group(0))
+
+        if matched_span is not None:
+            st_i, en_i, orig_seg = matched_span
+            if "빈칸" in t:
+                replaced_body = f"{clean_passage[:st_i]}___________{clean_passage[en_i:]}"
+                rw.rewritten_stem = f"다음 빈칸에 들어갈 말로 가장 적절한 것은?\n{replaced_body}"
+            else:
+                replaced_body = f"{clean_passage[:st_i]}<u>{orig_seg}</u>{clean_passage[en_i:]}"
+                rw.rewritten_stem = f"밑줄 친 부분이 다음 글에서 의미하는 바로 가장 적절한 것은?\n{replaced_body}"
+
+
 def generate_english_transformed_question(
     api_key: str,
     model_name: str,
@@ -3117,11 +3178,13 @@ def generate_english_transformed_question(
     source_label: str = "",
     previous_attempt: RewrittenQuestion | None = None,
     use_precision_mode: bool = False,
+    storage: Any | None = None,
+    use_cache: bool = True,
 ) -> RewrittenQuestion:
     """
     원문 영어 독해 지문을 지정된 수능 독해 유형(1개 유형 규칙만 동적 주입)으로 변형·출제한다.
-    Thinking 토큰 최소화(기본 MINIMAL, 정밀 모드 시 LOW) 및 2줄 이내 핵심 정답 근거만 지연 생성 전제로 출력해
-    토큰 과금을 절감한 뒤 RewrittenQuestion 호환 객체로 반환한다.
+    비변형 유형(요지·주제·제목·요약·삽입·빈칸·함축)은 지문 재출력을 생략하고 파이썬이 원문을 조립하며,
+    검증 통과 문항은 storage DB 풀(Pool)에 캐싱해 동일 요청 시 0원으로 즉시 반환한다.
     """
     clean_passage = _preprocess_english_source_passage(source_passage)
     if not clean_passage:
@@ -3133,6 +3196,21 @@ def generate_english_transformed_question(
         blank_unit=blank_unit,
         vocab_style=vocab_style,
     )
+
+    cache_key = ""
+    if storage is not None and hasattr(storage, "build_english_pool_key"):
+        cache_key = storage.build_english_pool_key(
+            source_passage=clean_passage,
+            target_type=canonical_type,
+            difficulty=difficulty,
+            blank_unit=blank_unit,
+            vocab_style=vocab_style,
+        )
+        if use_cache and previous_attempt is None and hasattr(storage, "get_cached_english_question"):
+            cached_rw = storage.get_cached_english_question(cache_key)
+            if cached_rw is not None:
+                return cached_rw
+
     target_thinking_level = (
         types.ThinkingLevel.LOW
         if (use_precision_mode and not _is_flash_lite_model(eff_model))
@@ -3141,19 +3219,16 @@ def generate_english_transformed_question(
 
     client = _build_client(api_key, timeout_seconds=90)
     system_inst = (
-        "당신은 대한민국 수능·평가원 영어 영역 출제위원입니다.\n"
-        "원문 지문의 논리와 문법성을 유지하면서 지정된 **[목표 유형 1개]**에 맞춰 `RewrittenQuestion` JSON 1건을 생성하세요.\n\n"
-        f"[목표 유형: {canonical_type} | 목표 난이도: {difficulty}]\n"
+        "수능·평가원 영어 출제위원으로서 지정된 **[목표 유형 1개]**에 맞춰 `RewrittenQuestion` JSON 1건을 생성하세요.\n\n"
+        f"[유형: {canonical_type} | 난이도: {difficulty}]\n"
         f"{type_rule_block}\n\n"
-        "[출제 조판 및 출력 토큰 절감 규칙]\n"
-        "1. `rewritten_stem`: 첫 줄에 한국어 발문을 적고 줄바꿈 후 지문(및 필요한 `[주어진 문장]`/`[주어진 글]`/`[요약문]` 섹션)을 배치하세요.\n"
-        "2. 밑줄이 필요한 유형(어법, 어휘 밑줄형, 함축적 의미)은 반드시 HTML `<u>...</u>` 태그를 사용하세요.\n"
-        "3. `rewritten_choices`: 정확히 5개 선지 리스트를 반환하세요(번호 ①~⑤ 제외, 번호형만 `['①','②','③','④','⑤']`).\n"
-        "4. `preserved_answer`: 유일한 정답 번호 `'1'`, `'2'`, `'3'`, `'4'`, `'5'` 중 단일 숫자 문자열 1개만 기록하세요.\n"
-        "5. `pdf_grounded_explanation`: 출력 토큰 절감을 위해 구문 분석이나 ①~⑤ 전체 오답 분석을 절대 작성하지 말고, 왜 정답 번호가 정답인지 **2줄 이내(150자 이내)의 핵심 정답 근거만** 간결하게 작성하세요. (상세 구문 및 선지별 오답 해설은 사용자가 별도 버튼 클릭 시 지연 생성됩니다.)\n"
-        "6. `replaced_terms_map`: 핵심 어휘 2~3개만 `'영단어 → 뜻'` 형태로 간결히 적으세요.\n"
-        "7. `self_verification_note`: 1줄(40자 이내)로만 간결히 적으세요.\n"
-        "8. 원문 보존 원칙: 변형 포인트(빈칸·밑줄·삽입·순서 등)를 제외한 나머지 원문 문장의 핵심 단어나 구절을 임의로 생략·축약하지 말고 원문 텍스트 그대로 보존하세요."
+        "[출력 및 토큰 절감 규칙]\n"
+        "1. `rewritten_stem`: 위 '출력 절감 규칙'이 지정된 유형은 원문 재출력 없이 지정값만 반환하고, 지문 변형 유형만 발문+지문을 반환하세요.\n"
+        "2. `rewritten_choices`: 정확히 5개 선지 반환(번호 ①~⑤ 제외).\n"
+        "3. `preserved_answer`: 유일한 정답 `'1'`~`'5'` 단일 숫자 문자열.\n"
+        "4. `pdf_grounded_explanation`: 정답 근거와 오답 핵심만 담아 **2문장(공백 포함 120자) 이내**로 작성.\n"
+        "5. `replaced_terms_map`: 핵심 어휘 2개만 `'영단어 → 뜻'` 형식으로 기록.\n"
+        "6. `self_verification_note`: 20자 이내 단문."
     )
 
     prev_feedback_block = ""
@@ -3216,6 +3291,7 @@ def generate_english_transformed_question(
             cleaned_choices.append(c_str)
         rw.rewritten_choices = cleaned_choices[:5]
         rw.preserved_answer = _normalize_extracted_answer(rw.preserved_answer)
+        _assemble_english_slim_stem(rw, canonical_type, clean_passage)
         if "순서" in canonical_type:
             _reconcile_english_order_answer(rw)
         elif "삽입" in canonical_type:
@@ -3233,10 +3309,14 @@ def generate_english_transformed_question(
         if not issues:
             break
         if attempt == 0:
+            fallback_hint = ""
+            if "빈칸" in canonical_type or "함축" in canonical_type:
+                fallback_hint = "\n- 구절 치환 매칭 실패 시 이번 재시도에서는 지문 전체와 빈칸/밑줄을 직접 완성해 `rewritten_stem`에 반환하세요."
             prompt = (
                 base_prompt
                 + "\n\n[⚠️ 직전 출력 형식 오류 — 반드시 아래 누락 사항을 모두 수정하여 다시 생성하세요]\n"
                 + "\n".join(f"- {iss}" for iss in issues)
+                + fallback_hint
             )
 
     assert rw is not None
@@ -3253,6 +3333,13 @@ def generate_english_transformed_question(
             rw.rewritten_choices.append(default_syms[len(rw.rewritten_choices)])
     rw.target_question_type = canonical_type
     rw.subject_domain = "영어"
+    if (
+        not issues
+        and cache_key
+        and storage is not None
+        and hasattr(storage, "save_cached_english_question")
+    ):
+        storage.save_cached_english_question(cache_key, rw, max_per_key=3)
     return rw
 
 
