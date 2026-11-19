@@ -37,9 +37,25 @@ _VISUAL_REF_RE = re.compile(
     r"모식도|실험\s*장치|회로\s*(?:는|에서|와|과))"
 )
 
-_SECTION_TAG_RE = re.compile(r"([<〈\[]\s*(?:자료|보\s*기)\s*[>〉\]])")
-_BOGI_MARKER_INLINE_RE = re.compile(r"(?<!\n)[ \t]+(?=([ㄱㄴㄷㄹㅁ])\.\s)")
-_BOGI_LINE_RE = re.compile(r"^([ㄱㄴㄷㄹㅁ])\.\s*(.+)$")
+_CANONICAL_DATA_TITLES: dict[str, str] = {
+    "<자료>": "< 자 료 >",
+    "<조건>": "< 조 건 >",
+    "<실험>": "< 실 험 >",
+    "<실험 과정>": "< 실 험 과 정 >",
+    "<실험 결과>": "< 실 험 결 과 >",
+}
+
+_SECTION_TAG_RE = re.compile(
+    r"(?<![가-힣A-Za-z0-9])[<〈\[]\s*(자료|조\s*건|실\s*험\s*과\s*정|실\s*험\s*결\s*과|실\s*험|보\s*기)\s*[>〉\]](?![가-힣])[ \t]*"
+)
+_INLINE_BULLET_RE = re.compile(r"(?<![\n \t])[ \t]+(?=[◦•○●▪▸▹▶※])")
+_INLINE_STEP_KOR_RE = re.compile(r"(?<=[.?!:;>\]])\s+(?=\((?:가|나|다|라|마)\)\s)")
+_INLINE_DAN_RE = re.compile(r"(?<=[.?!\)])\s+(?=\(?단,\s)")
+_INLINE_LEADIN_Q_RE = re.compile(
+    r"(?<=[.?!\)])\s+(?=(?:이에\s*대한|위\s*(?:자료|실험|그림|표|그래프)에\s*대한|이\s*자료에\s*대한))"
+)
+_BOGI_MARKER_INLINE_RE = re.compile(r"(?<![\n \t])[ \t]+(?=[ㄱㄴㄷㄹㅁ][.)]\s)")
+_BOGI_LINE_RE = re.compile(r"^([ㄱㄴㄷㄹㅁ])[.)]\s*(.+)$")
 _QUESTION_END_RE = re.compile(
     r"(?:것은\s*\??|고른\s*것은\s*\??|고르시오\.?|구하시오\.?|구하면\s*\??|값은\s*\??|쓰시오\.?)$"
 )
@@ -139,29 +155,84 @@ def unicode_scripts_to_html_tags(escaped_html: str) -> str:
     return out
 
 
+def _unescape_newlines(text: str) -> str:
+    return re.sub(r"\\n(?![A-Za-z])", "\n", (text or "").replace("\r\n", "\n").replace("\r", "\n"))
+
+
 def normalize_exam_layout_text(text: str) -> str:
-    """<자료>, <보기>, ㄱ/ㄴ/ㄷ 항목의 줄바꿈을 강제해 시험지 가독성을 정돈한다."""
+    """<자료>·<조건>·<실험 과정>·<실험 결과>·<보기>·불릿·(단, ...)·ㄱ/ㄴ/ㄷ 항목의 줄바꿈을 강제한다."""
     if not text:
         return ""
-    cleaned = format_chemical_scripts(text).replace("\r\n", "\n").replace("\r", "\n")
+    cleaned = format_chemical_scripts(_unescape_newlines(text))
 
     def _norm_tag(m: re.Match[str]) -> str:
         raw = re.sub(r"\s+", "", m.group(1))
-        if "자료" in raw:
+        if raw == "자료":
             return "\n\n<자료>\n"
+        if raw == "조건":
+            return "\n\n<조건>\n"
+        if raw == "실험과정":
+            return "\n\n<실험 과정>\n"
+        if raw == "실험결과":
+            return "\n\n<실험 결과>\n"
+        if raw == "실험":
+            return "\n\n<실험>\n"
         return "\n\n<보기>\n"
 
     cleaned = _SECTION_TAG_RE.sub(_norm_tag, cleaned)
+    cleaned = _INLINE_STEP_KOR_RE.sub("\n", cleaned)
+    cleaned = _INLINE_BULLET_RE.sub("\n", cleaned)
+    cleaned = _INLINE_DAN_RE.sub("\n", cleaned)
+    cleaned = _INLINE_LEADIN_Q_RE.sub("\n\n", cleaned)
     cleaned = _BOGI_MARKER_INLINE_RE.sub("\n", cleaned)
-    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
-    return cleaned.strip()
+
+    lines = [re.sub(r"^([ㄱㄴㄷㄹㅁ])\)\s+", r"\1. ", ln.strip()) for ln in cleaned.split("\n")]
+
+    # <보기> 헤더 없이 질문 뒤에 ㄱ. ㄴ. 목록이 바로 이어지면 자동으로 <보기> 섹션을 삽입
+    if "<보기>" not in lines:
+        has_g = any(ln.startswith("ㄱ. ") for ln in lines)
+        has_n = any(ln.startswith("ㄴ. ") for ln in lines)
+        if has_g and has_n:
+            patched_lines: list[str] = []
+            inserted = False
+            for idx_l, ln in enumerate(lines):
+                if not inserted and ln.startswith("ㄱ. "):
+                    prev_nonempty = next((lines[j] for j in range(idx_l - 1, -1, -1) if lines[j]), "")
+                    if prev_nonempty and (_QUESTION_END_RE.search(prev_nonempty) or "?" in prev_nonempty):
+                        if patched_lines and patched_lines[-1] != "":
+                            patched_lines.append("")
+                        patched_lines.append("<보기>")
+                        inserted = True
+                patched_lines.append(ln)
+            lines = patched_lines
+
+    out = "\n".join(lines)
+    out = re.sub(r"\n{3,}", "\n\n", out)
+    return out.strip()
+
+
+def format_explanation_text(text: str, for_markdown: bool = False) -> str:
+    """맞춤 해설·단계별 풀이 텍스트의 번호·기호·접속어 줄바꿈을 강제하고 마크다운 줄바꿈을 보존한다."""
+    if not text:
+        return ""
+    out = format_chemical_scripts(_unescape_newlines(text))
+    out = re.sub(r"(?<=[.?!:;\)])\s+(?=\d{1,2}\.\s+[가-힣A-Za-z\(\[])", "\n", out)
+    out = re.sub(r"(?<![\n \t])[ \t]+(?=[◦•○●▪※▶])", "\n", out)
+    out = re.sub(r"(?<=[.?!:;])[ \t]+(?=[①②③④⑤])", "\n", out)
+    out = re.sub(r"(?<![\n \t])[ \t]+(?=[ㄱㄴㄷㄹㅁ][.)]\s)", "\n", out)
+    out = re.sub(r"(?<=[.?!\)])\s+(?=(?:따라서|결론적으로|그러므로|정답은|\[참고)\s?)", "\n", out)
+    out = "\n".join(ln.rstrip() for ln in out.split("\n"))
+    out = re.sub(r"\n{3,}", "\n\n", out).strip()
+    if for_markdown:
+        out = re.sub(r"(?<!\n)\n(?!\n)", "  \n", out)
+    return out
 
 
 def split_stem_blocks(text: str) -> list[tuple[str, Any]]:
     """
     정돈된 발문 텍스트를 순차 블록 리스트로 분해한다:
       - ('text', str)
-      - ('data', str)
+      - ('data', {'title': str, 'body': str})
       - ('bogi', list[tuple[str, str]])
     """
     norm = normalize_exam_layout_text(text)
@@ -170,11 +241,12 @@ def split_stem_blocks(text: str) -> list[tuple[str, Any]]:
 
     blocks: list[tuple[str, Any]] = []
     mode = "text"
+    data_title = "< 자 료 >"
     buf_lines: list[str] = []
     bogi_items: list[tuple[str, str]] = []
 
     def _flush() -> None:
-        nonlocal buf_lines, bogi_items, mode
+        nonlocal buf_lines, bogi_items
         if mode == "text":
             joined = "\n".join(buf_lines).strip()
             if joined:
@@ -183,7 +255,7 @@ def split_stem_blocks(text: str) -> list[tuple[str, Any]]:
         elif mode == "data":
             joined = "\n".join(buf_lines).strip()
             if joined:
-                blocks.append(("data", joined))
+                blocks.append(("data", {"title": data_title, "body": joined}))
             buf_lines = []
         elif mode == "bogi":
             if bogi_items:
@@ -195,9 +267,10 @@ def split_stem_blocks(text: str) -> list[tuple[str, Any]]:
 
     for raw_ln in norm.split("\n"):
         ln = raw_ln.strip()
-        if ln == "<자료>":
+        if ln in _CANONICAL_DATA_TITLES:
             _flush()
             mode = "data"
+            data_title = _CANONICAL_DATA_TITLES[ln]
             continue
         if ln == "<보기>":
             _flush()
@@ -211,9 +284,8 @@ def split_stem_blocks(text: str) -> list[tuple[str, Any]]:
                 continue
             if not ln:
                 if bogi_items:
-                    # 빈 줄 뒤에 <보기> 바깥 질문이 이어질 수 있으므로 유지하되 다음 비어있지 않은 줄에서 판별
                     continue
-            elif _QUESTION_END_RE.search(ln):
+            elif _QUESTION_END_RE.search(ln) or re.match(r"^\(?단,\s", ln):
                 _flush()
                 mode = "text"
                 buf_lines.append(ln)
@@ -225,20 +297,19 @@ def split_stem_blocks(text: str) -> list[tuple[str, Any]]:
             else:
                 buf_lines.append(ln)
         elif mode == "data":
-            if not ln and buf_lines:
-                # 빈 줄 이후 질문 문장이 나오면 자료 블록 종료 여부는 다음 줄로 미루되 빈 줄 유지
-                buf_lines.append("")
+            if not ln:
+                if buf_lines and buf_lines[-1] != "":
+                    buf_lines.append("")
                 continue
             if _QUESTION_END_RE.search(ln) and (
-                "이에 대한 설명" in ln or "고른 것" in ln or "옳은 것" in ln or len(buf_lines) >= 1
+                "이에 대한" in ln or "고른 것" in ln or "옳은 것" in ln or len(buf_lines) >= 1
             ):
-                if len(ln) <= 95 and ("설명" in ln or "고른 것" in ln or "옳은 것" in ln or ln.endswith("?")):
+                if len(ln) <= 105 and ("설명" in ln or "고른 것" in ln or "옳은 것" in ln or ln.endswith("?")):
                     _flush()
                     mode = "text"
                     buf_lines.append(ln)
                     continue
-            if ln:
-                buf_lines.append(ln)
+            buf_lines.append(ln)
         else:
             if not ln:
                 if buf_lines and buf_lines[-1] != "":

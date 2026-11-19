@@ -12,6 +12,7 @@ from PIL import Image
 from src.models import ConceptWhitelist, QuestionRecord, RewrittenQuestion
 from src.text_formatter import (
     format_chemical_scripts,
+    format_explanation_text,
     split_stem_blocks,
     unicode_scripts_to_html_tags,
 )
@@ -111,6 +112,14 @@ sup {
     margin-bottom: 4pt;
     word-break: keep-all;
 }
+.stem-line {
+    margin-bottom: 2.5pt;
+}
+.stem-line:last-child { margin-bottom: 0; }
+.data-line {
+    margin-bottom: 2.2pt;
+}
+.data-line:last-child { margin-bottom: 0; }
 .pdf-data-box {
     border: 0.8pt solid #94A3B8;
     border-left: 2.6pt solid #334155;
@@ -264,11 +273,23 @@ def _build_stem_blocks_html(stem_text: str) -> str:
     parts: list[str] = []
     for kind, content in blocks:
         if kind == "data":
+            if isinstance(content, dict):
+                d_title = str(content.get("title") or "< 자 료 >")
+                d_body = str(content.get("body") or "")
+            else:
+                d_title = "< 자 료 >"
+                d_body = str(content)
+            body_lines = "".join(
+                "<div style='height:3pt;'></div>"
+                if not ln.strip()
+                else f"<div class='data-line'>{_esc_pdf(ln.strip())}</div>"
+                for ln in d_body.split("\n")
+            )
             parts.append(
                 f"""
                 <div class="pdf-data-box">
-                  <div class="pdf-data-title">&lt; 자 료 &gt;</div>
-                  <div>{_esc_pdf(str(content))}</div>
+                  <div class="pdf-data-title">{html.escape(d_title)}</div>
+                  <div>{body_lines}</div>
                 </div>
                 """
             )
@@ -286,7 +307,13 @@ def _build_stem_blocks_html(stem_text: str) -> str:
                 """
             )
         else:
-            parts.append(f"<div class='stem-p'>{_esc_pdf(str(content))}</div>")
+            stem_lines = "".join(
+                "<div style='height:3pt;'></div>"
+                if not ln.strip()
+                else f"<div class='stem-line'>{_esc_pdf(ln.strip())}</div>"
+                for ln in str(content).split("\n")
+            )
+            parts.append(f"<div class='stem-p'>{stem_lines}</div>")
     return "".join(parts)
 
 
@@ -674,7 +701,9 @@ def generate_custom_exam_pdf(
                     + _esc_pdf(" / ".join(rewritten.replaced_terms_map))
                     + "</div>"
                 )
-            exp_body = _esc_pdf(rewritten.pdf_grounded_explanation)
+            exp_body = _esc_pdf(
+                format_explanation_text(rewritten.pdf_grounded_explanation, for_markdown=False)
+            )
             badge = "PDF 맞춤 개조"
         else:
             ans_disp = _format_answer_badge(q.answer)
@@ -683,7 +712,9 @@ def generate_custom_exam_pdf(
                 + _esc_pdf(", ".join(q.core_principles))
                 + "</div>"
             )
-            exp_body = _esc_pdf(q.official_explanation)
+            exp_body = _esc_pdf(
+                format_explanation_text(q.official_explanation, for_markdown=False)
+            )
             badge = "원본 기출 해설"
 
         exp_html = f"""

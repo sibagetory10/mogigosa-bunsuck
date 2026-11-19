@@ -159,10 +159,13 @@ def inject_responsive_css() -> None:
             font-size: clamp(0.96rem, 1.45vw, 1.05rem);
             line-height: 1.8;
             color: #0F172A;
-            white-space: pre-wrap;
             word-break: keep-all;
             margin-bottom: 0.7rem;
         }
+        .stem-line {
+            margin-bottom: 0.4rem;
+        }
+        .stem-line:last-child { margin-bottom: 0; }
         .data-box {
             background: #F8FAFC;
             border: 1px solid #CBD5E1;
@@ -174,6 +177,10 @@ def inject_responsive_css() -> None:
             line-height: 1.75;
             color: #1E293B;
         }
+        .data-line {
+            margin-bottom: 0.35rem;
+        }
+        .data-line:last-child { margin-bottom: 0; }
         .data-box-title {
             font-size: 0.8rem;
             font-weight: 800;

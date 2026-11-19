@@ -102,6 +102,7 @@ from src.pdf_parser import (
 from src.storage import StorageManager
 from src.text_formatter import (
     format_chemical_scripts,
+    format_explanation_text,
     has_visual_reference,
     split_stem_blocks,
 )
@@ -1119,9 +1120,20 @@ def _render_rewritten_card_html(rw: RewrittenQuestion) -> str:
     body_parts: list[str] = []
     for kind, content in blocks:
         if kind == "data":
-            data_html = _html.escape(str(content)).replace("\n", "<br/>")
+            if isinstance(content, dict):
+                d_title = str(content.get("title") or "< 자 료 >")
+                d_body = str(content.get("body") or "")
+            else:
+                d_title = "< 자 료 >"
+                d_body = str(content)
+            line_divs = "".join(
+                "<div style='height:0.35rem;'></div>"
+                if not ln.strip()
+                else f"<div class='data-line'>{_html.escape(ln.strip())}</div>"
+                for ln in d_body.split("\n")
+            )
             body_parts.append(
-                f"<div class='data-box'><div class='data-box-title'>&lt; 자 료 &gt;</div><div>{data_html}</div></div>"
+                f"<div class='data-box'><div class='data-box-title'>{_html.escape(d_title)}</div><div>{line_divs}</div></div>"
             )
         elif kind == "bogi":
             bogi_rows = "".join(
@@ -1133,8 +1145,13 @@ def _render_rewritten_card_html(rw: RewrittenQuestion) -> str:
                 f"<div class='bogi-box'><div class='bogi-title'>〈 보 기 〉</div>{bogi_rows}</div>"
             )
         else:
-            p_html = _html.escape(str(content)).replace("\n", "<br/>")
-            body_parts.append(f"<div class='rewritten-stem'>{p_html}</div>")
+            stem_divs = "".join(
+                "<div style='height:0.35rem;'></div>"
+                if not ln.strip()
+                else f"<div class='stem-line'>{_html.escape(ln.strip())}</div>"
+                for ln in str(content).split("\n")
+            )
+            body_parts.append(f"<div class='rewritten-stem'>{stem_divs}</div>")
 
     choices_html = ""
     if rw.rewritten_choices:
@@ -1335,9 +1352,9 @@ def _render_mode_b_solve_fragment(
 
                 with st.expander("📖 빠른 정답 해설 보기", expanded=not is_correct):
                     if rw is not None:
-                        st.markdown(format_chemical_scripts(rw.pdf_grounded_explanation))
+                        st.markdown(format_explanation_text(rw.pdf_grounded_explanation, for_markdown=True))
                     else:
-                        st.markdown(q.official_explanation)
+                        st.markdown(format_explanation_text(q.official_explanation, for_markdown=True))
                     st.caption(concept_ref_str)
 
             # ✨ AI 자동 해설 버튼 & 🔄 이 문제 다시 변환 버튼

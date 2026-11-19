@@ -41,6 +41,7 @@ from src.pdf_parser import extract_specific_pages_slice
 from src.text_formatter import (
     find_forbidden_terms_in_text,
     format_chemical_scripts,
+    format_explanation_text,
     normalize_exam_layout_text,
 )
 
@@ -1412,7 +1413,7 @@ def rewrite_question_for_pdf(
         "2. 범위 외 상위 용어 목록(out_of_scope_terms) 및 개념서에 없는 상위 단위/용어(`M`, `몰 농도`, `몰농도`, `mol`, `몰수`, `분자량`, `화학식량`, `엔탈피` 등)는 개조된 지문, <자료>, <보기>, 선지 어디에도 절대 남기지 마세요.\n"
         "3. **핵심 원리 억지 동어반복 치환 금지**: 개념서 범위를 벗어나는 실험/원리 개념 자체를 동어반복 문장으로 어색하게 풀어쓰지 말고, 개념서 허용 용어와 구체적 수치·입자 수 비율로 논리가 온전히 성립되게 표현하세요.\n"
         "4. **자연스러운 국문 문장 구조 유지**: 용어 치환 후 문장 끝이 어색하게 끊기지 않도록(예: `'질량: x g x는?'` 금지 → `'질량을 x g이라 할 때, x는?'`) 조사와 어미를 매끄러운 시험지 문체로 다듬으세요.\n"
-        "5. **구조화 줄바꿈**: `<자료>`와 `<보기>`는 반드시 독립된 줄로 분리하고, `<보기>` 내 `ㄱ.`, `ㄴ.`, `ㄷ.` 항목은 각각 별도의 줄에 적으세요.\n"
+        "5. **구조화 줄바꿈 (필수)**: 한 문단으로 뭉치지 않도록 도입 발문 / `<자료>`·`<조건>`·`<실험 과정>` / 질문 문장 / `<보기>` / `(단, ...)` 사이는 빈 줄(`\\n\\n`)로 띄우고, 자료 안의 각 항목(`◦`, `(가)`, `(나)`)과 `<보기>`의 `ㄱ.`, `ㄴ.`, `ㄷ.` 및 `pdf_grounded_explanation`의 풀이 단계(`1.`, `2.`, `ㄱ.`, `ㄴ.`)는 반드시 각각 줄바꿈(`\\n`)해 별도의 줄에 적으세요.\n"
         "6. **그림·그래프 시각 자료 안내(`visual_term_note`)**: 원본 그림·표·그래프의 축이나 범례에 상위 단위(예: `mol`, `M`)가 그려져 있다면, `visual_term_note`에 예: `그림 속 'mol'은 본문의 '입자 수'와 같은 의미로 해석합니다`처럼 학생용 안내 문구를 작성하세요(시각 자료에 상위 용어가 없으면 빈 문자열 `\"\"`).\n"
         "7. 문제의 수학적·논리적 구조, 수치 조건, 정답의 참/거짓 판정 로직은 원본과 **100% 동일하게** 유지하며 `preserved_answer`도 원본 정답과 동일해야 합니다.\n"
         "8. `rewritten_choices`는 객관식이면 5개 항목 리스트(선지 번호 ①~⑤ 제외하고 내용만), 주관식이면 빈 리스트 []로 반환하세요."
@@ -1475,7 +1476,7 @@ def rewrite_question_for_pdf(
         rw.preserved_answer = question.answer
         rw.rewritten_stem = normalize_exam_layout_text(rw.rewritten_stem)
         rw.rewritten_choices = [format_chemical_scripts(c.strip()) for c in (rw.rewritten_choices or []) if c.strip()]
-        rw.pdf_grounded_explanation = format_chemical_scripts(rw.pdf_grounded_explanation)
+        rw.pdf_grounded_explanation = format_explanation_text(rw.pdf_grounded_explanation, for_markdown=False)
         return rw
 
     initial_note = extra_feedback.strip()
