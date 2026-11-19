@@ -586,6 +586,11 @@ def _tag_and_save_single_exam(
         if on_progress:
             on_progress(val)
 
+    if not meta.get("ans_bytes"):
+        raise ValueError(
+            "해설지 PDF가 첨부되지 않아 태깅을 진행할 수 없습니다. 문제지와 해설지 PDF를 함께 업로드해 주세요."
+        )
+
     pending_pdf_files: list[str] = []
     pending_crop_files: list[str] = []
     if not is_retry:
@@ -612,6 +617,7 @@ def _tag_and_save_single_exam(
 
     answer_snippets: dict[int, str] = {}
     answer_pdf_part = None
+    ans_prep_err = ""
     if meta.get("ans_bytes"):
         _status("📄 해설지 PDF 분석 중 (텍스트 스니펫 우선 추출)...")
         try:
@@ -633,10 +639,17 @@ def _tag_and_save_single_exam(
                 else:
                     _log("📄 스캔/통합 해설지 PDF 파트 준비 완료 (30초 타임아웃)")
         except Exception as exc:
-            warn_msg = f"해설지 첨부 준비 중 경고 (문제 이미지만으로 진행): {exc}"
+            ans_prep_err = str(exc)
+            warn_msg = f"해설지 첨부 준비 오류: {exc}"
             if on_warning:
                 on_warning(warn_msg)
-            _log(f"⚠️ 해설지 준비 경고: {exc}")
+            _log(f"❌ {warn_msg}")
+
+    if not answer_snippets and answer_pdf_part is None:
+        detail = f" ({ans_prep_err})" if ans_prep_err else ""
+        raise ValueError(
+            f"해설지 PDF를 읽지 못해 태깅을 중단했습니다. 해설지 PDF 파일을 확인해 주세요.{detail}"
+        )
 
     target_set = set(target_q_nums)
     target_crops = sorted(
@@ -2329,9 +2342,9 @@ with tab1:
             else "문제지 PDF 업로드 (1개 또는 여러 개 선택 가능)"
         )
         ans_up_label = (
-            "해설지 폴더 업로드 (권장 · AI(Gemini 3.5 Flash-Lite) 자동 1:1 매칭)"
+            "해설지 폴더 업로드 (필수 · AI(Gemini 3.5 Flash-Lite) 자동 1:1 매칭)"
             if is_dir_upload
-            else "해설지 PDF 업로드 (권장 · 여러 개 선택 시 AI 자동 매칭)"
+            else "해설지 PDF 업로드 (필수 · 여러 개 선택 시 AI 자동 매칭)"
         )
 
         col_up1, col_up2 = st.columns(2)
@@ -2468,14 +2481,32 @@ with tab1:
                     key="tab1_batch_skip_dup_chk",
                 )
 
+            matched_queue_count = sum(1 for x in selected_ans_indices if x is not None)
+            unmatched_queue_count = len(prob_files) - matched_queue_count
+            if matched_queue_count == 0:
+                st.error(
+                    "🚫 해설지가 매칭된 문제지가 없습니다. 해설지 PDF를 함께 업로드해야 태깅을 시작할 수 있습니다."
+                )
+            elif unmatched_queue_count > 0:
+                st.warning(
+                    f"⚠️ 해설지가 매칭되지 않은 문제지 **{unmatched_queue_count}개**는 자동 건너뛰기되며, "
+                    f"해설지가 연결된 **{matched_queue_count}개**만 순차 태깅합니다."
+                )
+
+            batch_btn_label = (
+                f"🚀 대기열 {len(prob_files)}개 PDF 순차 분석·저장 시작 (하나씩 처리)"
+                if unmatched_queue_count == 0
+                else f"🚀 해설지 매칭된 {matched_queue_count}/{len(prob_files)}개 PDF 순차 분석·저장 시작 (미매칭 {unmatched_queue_count}개 건너뜀)"
+            )
             run_batch_btn = st.button(
-                f"🚀 대기열 {len(prob_files)}개 PDF 순차 분석·저장 시작 (하나씩 처리)",
+                batch_btn_label,
                 type="primary",
                 width="stretch",
                 key="tab1_run_batch_btn",
+                disabled=(matched_queue_count == 0),
             )
 
-            if run_batch_btn:
+            if run_batch_btn and matched_queue_count > 0:
                 verified_key, verified_key_label = resolve_active_gemini_api_key(
                     current_user, creds.gemini_api_key, force_server_key=True
                 )
@@ -2509,9 +2540,22 @@ with tab1:
                         ans_f = ans_files[matched_ans_i] if matched_ans_i is not None else None
                         ans_base = _pdf_display_basename(ans_f.name) if ans_f is not None else ""
 
+                        if ans_f is None:
+                            _append_batch_log(f"⏭️ [{idx}/{total_n}] {prob_base} — 해설지 미매칭 → 건너뜀")
+                            batch_summary.append(
+                                {
+                                    "file": prob_base,
+                                    "exam_name": os.path.splitext(prob_base)[0].replace("_", " ").strip(),
+                                    "status": "skipped",
+                                    "saved_count": 0,
+                                    "message": "해설지 미첨부(건너뜀 · 해설지 필수)",
+                                }
+                            )
+                            overall_prog.progress(idx / total_n)
+                            continue
+
                         overall_status.info(
-                            f"📦 **[{idx}/{total_n}]** `{prob_base}` 순차 처리 중..."
-                            + (f" (해설지: `{ans_base}`)" if ans_base else " (해설지 없음)")
+                            f"📦 **[{idx}/{total_n}]** `{prob_base}` 순차 처리 중... (해설지: `{ans_base}`)"
                         )
                         item_prog.progress(0.05)
                         _append_batch_log(f"--- [{idx}/{total_n}] {prob_base} 시작 ---")
@@ -2805,13 +2849,19 @@ with tab1:
                     "중복 수집 방지를 위해 크롭 버튼이 비활성화되었습니다."
                 )
 
+            is_missing_answer_single = not bool(active_ans_bytes)
+            if active_prob_bytes and is_missing_answer_single:
+                st.warning(
+                    "🚫 **해설지 PDF가 필요합니다.** 정답 정확도를 위해 해설지 PDF를 함께 업로드(또는 매칭)해야 1단계 크롭과 태깅을 진행할 수 있습니다."
+                )
+
             parse_col1, parse_col2 = st.columns([1, 1])
             with parse_col1:
                 run_crop_btn = st.button(
                     "✂️ 1단계: 2단 편집 분석 및 고해상도 문항 크롭",
                     type="primary",
                     width="stretch",
-                    disabled=is_duplicate_exam,
+                    disabled=is_duplicate_exam or is_missing_answer_single,
                 )
             with parse_col2:
                 vision_fallback_chk = st.checkbox(
@@ -2819,9 +2869,11 @@ with tab1:
                     value=True,
                 )
 
-            if run_crop_btn and not is_duplicate_exam:
+            if run_crop_btn and not is_duplicate_exam and not is_missing_answer_single:
                 if not active_prob_bytes:
                     st.error("문제지 PDF를 업로드하거나 EBSi에서 먼저 추출해 주세요.")
+                elif not active_ans_bytes:
+                    st.error("해설지 PDF가 필요합니다. 해설지 PDF를 함께 업로드해 주세요.")
                 elif not exam_name_input.strip():
                     st.error("시험 회차명을 입력해 주세요.")
                 else:
@@ -2904,6 +2956,12 @@ with tab1:
         )
 
         def _run_stage2_extraction(target_q_nums: list[int], is_retry: bool = False) -> None:
+            if not meta.get("ans_bytes"):
+                st.error(
+                    "🚫 해설지 PDF가 첨부되지 않아 태깅을 실행할 수 없습니다. "
+                    "상단에서 해설지 PDF를 업로드한 뒤 1단계 크롭부터 다시 진행해 주세요."
+                )
+                return
             # 탭 1 업로드·태깅 전체는 CUSTOM 포함 모든 등급 서버 공용 API 키 사용
             verified_key, verified_key_label = resolve_active_gemini_api_key(
                 current_user, creds.gemini_api_key, force_server_key=True
@@ -3291,112 +3349,118 @@ with tab1:
                                     subject_category=subj_cat,
                                     exam_name=exam_name,
                                 )
-                                saved_crops_by_q = {
-                                    r.q_num: CroppedQuestion(
-                                        q_num=r.q_num,
-                                        page_num=1,
-                                        png_bytes=(
-                                            storage.get_crop_bytes(
-                                                r.image_filename,
-                                                subject_category=subj_cat,
-                                                exam_name=exam_name,
-                                            )
-                                            or b""
-                                        )
-                                        if r.image_filename
-                                        else b"",
-                                        width=0,
-                                        height=0,
-                                        extracted_text=r.question_text or "",
-                                    )
-                                    for r in exam_recs
-                                }
-
-                                retag_status = st.empty()
-                                retag_prog = st.progress(0.05)
-                                retag_log = st.empty()
-                                retag_logs: list[str] = []
-
-                                def _append_retag_log(msg: str) -> None:
-                                    retag_logs.append(msg)
-                                    retag_log.code("\n".join(retag_logs[-15:]), language="text")
-
-                                if retag_prob_bytes:
-                                    retag_status.info(
-                                        "✂️ 1단계: 원본 문제지 PDF에서 누락 문항 포함 전체 문항 재크롭 중 (PyMuPDF + Vision 누락 복구)..."
-                                    )
-                                    fresh_crops, _, _ = _crop_single_exam_pdf(
-                                        retag_prob_bytes,
-                                        use_vision_fallback=True,
-                                        api_key=verified_key,
-                                        subject_hint=f"{subj_cat} {exam_name}",
-                                        status_cb=retag_status.info,
-                                        progress_cb=lambda v: retag_prog.progress(0.05 + 0.35 * v),
-                                    )
-                                    merged_by_q: dict[int, CroppedQuestion] = {
-                                        c.q_num: c for c in fresh_crops
-                                    }
-                                    for q_n, old_cq in saved_crops_by_q.items():
-                                        if q_n not in merged_by_q and old_cq.png_bytes:
-                                            merged_by_q[q_n] = old_cq
-                                    retag_crops = sorted(merged_by_q.values(), key=lambda c: c.q_num)
-                                    _append_retag_log(
-                                        f"✂️ 원본 PDF 재크롭 완료: 기존 {len(exam_recs)}문항 → 확보 {len(retag_crops)}문항 "
-                                        f"(신규 복구 {max(0, len(retag_crops) - len(exam_recs))}문항)"
-                                    )
-                                else:
-                                    retag_crops = sorted(saved_crops_by_q.values(), key=lambda c: c.q_num)
-
-                                if not retag_crops or (
-                                    not retag_prob_bytes and all(not c.png_bytes for c in retag_crops)
-                                ):
-                                    retag_status.empty()
+                                if not retag_ans_bytes:
                                     st.error(
-                                        "원본 문제지 PDF와 저장된 크롭 이미지를 모두 찾을 수 없어 다시 태깅할 수 없습니다."
+                                        f"🚫 **'{exam_name}'** 회차에 저장된 해설지 PDF가 없어 다시 태깅할 수 없습니다. "
+                                        "기존 회차를 삭제한 뒤 문제지·해설지 PDF를 함께 다시 업로드해 주세요."
                                     )
                                 else:
-                                    existing_q_set = {r.q_num for r in exam_recs}
-                                    res = _tag_and_save_single_exam(
-                                        storage=storage,
-                                        api_key=verified_key,
-                                        meta={
-                                            "exam_name": exam_name,
-                                            "subject_category": subj_cat,
-                                            "prob_bytes": retag_prob_bytes,
-                                            "prob_name": retag_prob_name if retag_prob_bytes else "",
-                                            "ans_bytes": retag_ans_bytes,
-                                            "ans_name": retag_ans_name if retag_ans_bytes else "",
-                                            "source_pdf": (
-                                                retag_prob_name
-                                                if retag_prob_bytes
-                                                else next((r.source_pdf for r in exam_recs if r.source_pdf), "")
-                                            ),
-                                            "answer_pdf": (
-                                                retag_ans_name
-                                                if retag_ans_bytes
-                                                else next((r.answer_pdf for r in exam_recs if r.answer_pdf), "")
-                                            ),
-                                            "skip_crop_save": False,
-                                        },
-                                        parsed_crops=retag_crops,
-                                        target_q_nums=[c.q_num for c in retag_crops],
-                                        is_retry=True,
-                                        push_status=retag_status.info,
-                                        append_log=_append_retag_log,
-                                        on_progress=lambda v: retag_prog.progress(0.40 + 0.60 * v),
-                                        on_warning=st.warning,
-                                    )
-                                    saved_q_set = {r.q_num for r in res["newly_saved"]}
-                                    st.session_state["tab1_retag_notice"] = {
-                                        "exam_name": exam_name,
-                                        "prev_count": len(exam_recs),
-                                        "saved": len(res["newly_saved"]),
-                                        "recovered": len(saved_q_set - existing_q_set),
-                                        "failed": res["failed_q_nums"],
-                                        "elapsed": res["elapsed_s"],
-                                        "sync_err": res["sync_err"],
+                                    saved_crops_by_q = {
+                                        r.q_num: CroppedQuestion(
+                                            q_num=r.q_num,
+                                            page_num=1,
+                                            png_bytes=(
+                                                storage.get_crop_bytes(
+                                                    r.image_filename,
+                                                    subject_category=subj_cat,
+                                                    exam_name=exam_name,
+                                                )
+                                                or b""
+                                            )
+                                            if r.image_filename
+                                            else b"",
+                                            width=0,
+                                            height=0,
+                                            extracted_text=r.question_text or "",
+                                        )
+                                        for r in exam_recs
                                     }
-                                    st.rerun()
+
+                                    retag_status = st.empty()
+                                    retag_prog = st.progress(0.05)
+                                    retag_log = st.empty()
+                                    retag_logs: list[str] = []
+
+                                    def _append_retag_log(msg: str) -> None:
+                                        retag_logs.append(msg)
+                                        retag_log.code("\n".join(retag_logs[-15:]), language="text")
+
+                                    if retag_prob_bytes:
+                                        retag_status.info(
+                                            "✂️ 1단계: 원본 문제지 PDF에서 누락 문항 포함 전체 문항 재크롭 중 (PyMuPDF + Vision 누락 복구)..."
+                                        )
+                                        fresh_crops, _, _ = _crop_single_exam_pdf(
+                                            retag_prob_bytes,
+                                            use_vision_fallback=True,
+                                            api_key=verified_key,
+                                            subject_hint=f"{subj_cat} {exam_name}",
+                                            status_cb=retag_status.info,
+                                            progress_cb=lambda v: retag_prog.progress(0.05 + 0.35 * v),
+                                        )
+                                        merged_by_q: dict[int, CroppedQuestion] = {
+                                            c.q_num: c for c in fresh_crops
+                                        }
+                                        for q_n, old_cq in saved_crops_by_q.items():
+                                            if q_n not in merged_by_q and old_cq.png_bytes:
+                                                merged_by_q[q_n] = old_cq
+                                        retag_crops = sorted(merged_by_q.values(), key=lambda c: c.q_num)
+                                        _append_retag_log(
+                                            f"✂️ 원본 PDF 재크롭 완료: 기존 {len(exam_recs)}문항 → 확보 {len(retag_crops)}문항 "
+                                            f"(신규 복구 {max(0, len(retag_crops) - len(exam_recs))}문항)"
+                                        )
+                                    else:
+                                        retag_crops = sorted(saved_crops_by_q.values(), key=lambda c: c.q_num)
+
+                                    if not retag_crops or (
+                                        not retag_prob_bytes and all(not c.png_bytes for c in retag_crops)
+                                    ):
+                                        retag_status.empty()
+                                        st.error(
+                                            "원본 문제지 PDF와 저장된 크롭 이미지를 모두 찾을 수 없어 다시 태깅할 수 없습니다."
+                                        )
+                                    else:
+                                        existing_q_set = {r.q_num for r in exam_recs}
+                                        res = _tag_and_save_single_exam(
+                                            storage=storage,
+                                            api_key=verified_key,
+                                            meta={
+                                                "exam_name": exam_name,
+                                                "subject_category": subj_cat,
+                                                "prob_bytes": retag_prob_bytes,
+                                                "prob_name": retag_prob_name if retag_prob_bytes else "",
+                                                "ans_bytes": retag_ans_bytes,
+                                                "ans_name": retag_ans_name if retag_ans_bytes else "",
+                                                "source_pdf": (
+                                                    retag_prob_name
+                                                    if retag_prob_bytes
+                                                    else next((r.source_pdf for r in exam_recs if r.source_pdf), "")
+                                                ),
+                                                "answer_pdf": (
+                                                    retag_ans_name
+                                                    if retag_ans_bytes
+                                                    else next((r.answer_pdf for r in exam_recs if r.answer_pdf), "")
+                                                ),
+                                                "skip_crop_save": False,
+                                            },
+                                            parsed_crops=retag_crops,
+                                            target_q_nums=[c.q_num for c in retag_crops],
+                                            is_retry=True,
+                                            push_status=retag_status.info,
+                                            append_log=_append_retag_log,
+                                            on_progress=lambda v: retag_prog.progress(0.40 + 0.60 * v),
+                                            on_warning=st.warning,
+                                        )
+                                        saved_q_set = {r.q_num for r in res["newly_saved"]}
+                                        st.session_state["tab1_retag_notice"] = {
+                                            "exam_name": exam_name,
+                                            "prev_count": len(exam_recs),
+                                            "saved": len(res["newly_saved"]),
+                                            "recovered": len(saved_q_set - existing_q_set),
+                                            "failed": res["failed_q_nums"],
+                                            "elapsed": res["elapsed_s"],
+                                            "sync_err": res["sync_err"],
+                                        }
+                                        st.rerun()
 
                         # 회차별 정리 파일 & 원본 PDF 다운로드 바 (캐싱 적용)
                         records_sig = f"{len(exam_recs)}:{','.join(r.id for r in exam_recs)}"
