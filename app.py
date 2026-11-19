@@ -527,20 +527,43 @@ def _tag_and_save_single_exam(
 
     _status("💾 전체 문항 크롭 이미지 및 DB 한 번에 저장 중...")
     now_iso = datetime.now().isoformat(timespec="seconds")
+    existing_by_qnum = {
+        r.q_num: r for r in existing_records if r.exam_name == meta["exam_name"]
+    }
+    skip_crop_save = bool(meta.get("skip_crop_save", False))
     for cq in target_crops:
         extracted = extracted_by_q.get(cq.q_num)
         if extracted is None:
             continue
-        q_id = f"{safe_exam}__Q{cq.q_num:02d}"
-        img_filename = f"{q_id}.png"
-        storage.save_crop_png(
-            img_filename,
-            cq.png_bytes,
-            subject_category=meta["subject_category"],
-            exam_name=meta["exam_name"],
-            sync_drive=False,
+        old_rec = existing_by_qnum.get(cq.q_num)
+        q_id = old_rec.id if old_rec is not None else f"{safe_exam}__Q{cq.q_num:02d}"
+        img_filename = (
+            old_rec.image_filename
+            if (old_rec is not None and old_rec.image_filename)
+            else f"{q_id}.png"
         )
-        pending_crop_files.append(img_filename)
+        if cq.png_bytes and (old_rec is None or not skip_crop_save):
+            storage.save_crop_png(
+                img_filename,
+                cq.png_bytes,
+                subject_category=meta["subject_category"],
+                exam_name=meta["exam_name"],
+                sync_drive=False,
+            )
+            pending_crop_files.append(img_filename)
+
+        eff_source_pdf = (
+            meta.get("source_pdf")
+            or (old_rec.source_pdf if (old_rec is not None and old_rec.source_pdf) else f"{safe_exam}__문제지.pdf")
+        )
+        eff_answer_pdf = (
+            meta.get("answer_pdf")
+            or (
+                old_rec.answer_pdf
+                if (old_rec is not None and old_rec.answer_pdf)
+                else (f"{safe_exam}__해설지.pdf" if meta.get("ans_bytes") else "")
+            )
+        )
 
         record = QuestionRecord(
             id=q_id,
@@ -564,8 +587,8 @@ def _tag_and_save_single_exam(
             official_explanation=extracted.official_explanation,
             question_text=re.sub(r"\s+", " ", (cq.extracted_text or "")).strip(),
             image_filename=img_filename,
-            source_pdf=f"{safe_exam}__문제지.pdf",
-            answer_pdf=f"{safe_exam}__해설지.pdf" if meta.get("ans_bytes") else "",
+            source_pdf=eff_source_pdf,
+            answer_pdf=eff_answer_pdf,
             created_at=now_iso,
         )
         rec_map[q_id] = record
@@ -2842,30 +2865,166 @@ with tab1:
             if not matched_keys:
                 st.warning("선택한 조건(시행 년도·시행 월·학년·과목)에 일치하는 기출 회차가 없습니다.")
             else:
+                can_retag_exam = bool(
+                    current_user is not None and current_user.tier in ("PRO", "ULTRA", "ADMIN")
+                )
+                retag_notice = st.session_state.pop("tab1_retag_notice", None)
+                if retag_notice:
+                    st.success(
+                        f"🔄 `{retag_notice['exam_name']}` 다시 태깅 완료! "
+                        f"({retag_notice['saved']}문항 갱신 · {retag_notice['elapsed']:.1f}초)"
+                    )
+                    if retag_notice.get("failed"):
+                        st.warning(
+                            "⚠️ 재태깅 누락 문항: "
+                            + ", ".join(f"{n}번" for n in retag_notice["failed"])
+                        )
+                    if retag_notice.get("sync_err"):
+                        st.warning(retag_notice["sync_err"])
+
                 st.success(f"검색 결과: 총 **{len(matched_keys)}개** 모의고사 회차를 불러왔습니다.")
                 for subj_cat, exam_name in matched_keys:
                     exam_recs = sorted(exam_groups[(subj_cat, exam_name)], key=lambda r: r.q_num)
                     safe_fn_prefix = sanitize_id_part(exam_name)
 
                     with st.container(border=True):
-                        head_col1, head_col2 = st.columns([3, 1])
-                        with head_col1:
-                            units_preview = sorted({r.unit_name for r in exam_recs if r.unit_name})
-                            st.markdown(f"#### 📘 {exam_name}")
-                            st.caption(
-                                f"과목: **{subj_cat}** · 저장 문항: **{len(exam_recs)}문항** · 단원: {', '.join(units_preview[:4])}"
-                                + (" 등" if len(units_preview) > 4 else "")
+                        retag_clicked = False
+                        units_preview = sorted({r.unit_name for r in exam_recs if r.unit_name})
+                        if can_retag_exam:
+                            head_col1, head_col2, head_col3 = st.columns([2.5, 1.0, 0.9])
+                            with head_col1:
+                                st.markdown(f"#### 📘 {exam_name}")
+                                st.caption(
+                                    f"과목: **{subj_cat}** · 저장 문항: **{len(exam_recs)}문항** · 단원: {', '.join(units_preview[:4])}"
+                                    + (" 등" if len(units_preview) > 4 else "")
+                                )
+                            with head_col2:
+                                retag_clicked = st.button(
+                                    "🔄 다시 태깅",
+                                    key=f"retag_exam_search_{subj_cat}_{safe_fn_prefix}",
+                                    width="stretch",
+                                    help="PRO · ULTRA · ADMIN 전용 — 현재 2022 개정 기준표와 공용 개념서 DB 기준으로 이 회차 전체 문항을 다시 태깅합니다.",
+                                )
+                            with head_col3:
+                                if st.button(
+                                    "🗑️ 회차 삭제",
+                                    key=f"del_exam_search_{subj_cat}_{safe_fn_prefix}",
+                                    width="stretch",
+                                ):
+                                    cnt = storage.delete_exam(exam_name)
+                                    _build_cached_exam_exports.clear()
+                                    st.success(f"'{exam_name}' ({cnt}문항) 삭제 완료")
+                                    st.rerun()
+                        else:
+                            head_col1, head_col2 = st.columns([3, 1])
+                            with head_col1:
+                                st.markdown(f"#### 📘 {exam_name}")
+                                st.caption(
+                                    f"과목: **{subj_cat}** · 저장 문항: **{len(exam_recs)}문항** · 단원: {', '.join(units_preview[:4])}"
+                                    + (" 등" if len(units_preview) > 4 else "")
+                                )
+                            with head_col2:
+                                if st.button(
+                                    "🗑️ 회차 삭제",
+                                    key=f"del_exam_search_{subj_cat}_{safe_fn_prefix}",
+                                    width="stretch",
+                                ):
+                                    cnt = storage.delete_exam(exam_name)
+                                    _build_cached_exam_exports.clear()
+                                    st.success(f"'{exam_name}' ({cnt}문항) 삭제 완료")
+                                    st.rerun()
+
+                        if retag_clicked and can_retag_exam:
+                            verified_key, verified_key_label = resolve_active_gemini_api_key(
+                                current_user, creds.gemini_api_key
                             )
-                        with head_col2:
-                            if st.button(
-                                "🗑️ 회차 삭제",
-                                key=f"del_exam_search_{subj_cat}_{safe_fn_prefix}",
-                                width="stretch",
-                            ):
-                                cnt = storage.delete_exam(exam_name)
-                                _build_cached_exam_exports.clear()
-                                st.success(f"'{exam_name}' ({cnt}문항) 삭제 완료")
-                                st.rerun()
+                            if not verified_key:
+                                st.error(f"API 키가 설정되지 않았습니다 ({verified_key_label}).")
+                            else:
+                                retag_prob_name = next((r.source_pdf for r in exam_recs if r.source_pdf), "")
+                                retag_ans_name = next((r.answer_pdf for r in exam_recs if r.answer_pdf), "")
+                                retag_prob_bytes = (
+                                    storage.get_pdf_bytes(
+                                        retag_prob_name,
+                                        subject_category=subj_cat,
+                                        exam_name=exam_name,
+                                    )
+                                    if retag_prob_name
+                                    else None
+                                )
+                                retag_ans_bytes = (
+                                    storage.get_pdf_bytes(
+                                        retag_ans_name,
+                                        subject_category=subj_cat,
+                                        exam_name=exam_name,
+                                    )
+                                    if retag_ans_name
+                                    else None
+                                )
+                                retag_crops = [
+                                    CroppedQuestion(
+                                        q_num=r.q_num,
+                                        page_num=1,
+                                        png_bytes=(
+                                            storage.get_crop_bytes(
+                                                r.image_filename,
+                                                subject_category=subj_cat,
+                                                exam_name=exam_name,
+                                            )
+                                            or b""
+                                        )
+                                        if r.image_filename
+                                        else b"",
+                                        width=0,
+                                        height=0,
+                                        extracted_text=r.question_text or "",
+                                    )
+                                    for r in exam_recs
+                                ]
+                                if not retag_prob_bytes and all(not c.png_bytes for c in retag_crops):
+                                    st.error(
+                                        "원본 문제지 PDF와 저장된 크롭 이미지를 모두 찾을 수 없어 다시 태깅할 수 없습니다."
+                                    )
+                                else:
+                                    retag_status = st.empty()
+                                    retag_prog = st.progress(0.05)
+                                    retag_log = st.empty()
+                                    retag_logs: list[str] = []
+
+                                    def _append_retag_log(msg: str) -> None:
+                                        retag_logs.append(msg)
+                                        retag_log.code("\n".join(retag_logs[-15:]), language="text")
+
+                                    res = _tag_and_save_single_exam(
+                                        storage=storage,
+                                        api_key=verified_key,
+                                        meta={
+                                            "exam_name": exam_name,
+                                            "subject_category": subj_cat,
+                                            "prob_bytes": retag_prob_bytes,
+                                            "prob_name": retag_prob_name,
+                                            "ans_bytes": retag_ans_bytes,
+                                            "ans_name": retag_ans_name,
+                                            "source_pdf": retag_prob_name,
+                                            "answer_pdf": retag_ans_name,
+                                            "skip_crop_save": True,
+                                        },
+                                        parsed_crops=retag_crops,
+                                        target_q_nums=[c.q_num for c in retag_crops],
+                                        is_retry=True,
+                                        push_status=retag_status.info,
+                                        append_log=_append_retag_log,
+                                        on_progress=retag_prog.progress,
+                                        on_warning=st.warning,
+                                    )
+                                    st.session_state["tab1_retag_notice"] = {
+                                        "exam_name": exam_name,
+                                        "saved": len(res["newly_saved"]),
+                                        "failed": res["failed_q_nums"],
+                                        "elapsed": res["elapsed_s"],
+                                        "sync_err": res["sync_err"],
+                                    }
+                                    st.rerun()
 
                         # 회차별 정리 파일 & 원본 PDF 다운로드 바 (캐싱 적용)
                         records_sig = f"{len(exam_recs)}:{','.join(r.id for r in exam_recs)}"
