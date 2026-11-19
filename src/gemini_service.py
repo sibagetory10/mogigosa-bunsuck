@@ -2447,7 +2447,7 @@ def _build_english_transform_rule(
             "  3) **관계대명사 vs 관계부사/접속사 오류** (예: 완전한 절 앞 `which`, 불완전한 절 앞 `where`/`what` 등)\n"
             "  4) **병렬 구조 오류** (예: `and`/`or` 전후 문법 형태 불일치)\n"
             "  5) **대동사 do/be 오류** (예: 일반동사 대동사 자리에 `are`/`is`, be동사 자리에 `do`/`does`)\n"
-            "- **절대 금지**: 원문 그대로인 문법적 정상 표현(예: `could be affected`)을 틀렸다고 주장하거나, 해설에서 '타당하다/적절하다/맞다'고 스스로 모순되게 판정하는 것은 절대 금지합니다. 또한 문법은 멀쩡한데 의미만 반대인 **반의어 교체**(예: `is decreased` → `is increasing`)도 금지합니다. 나머지 4개는 100% 올바른 어법이어야 합니다.\n"
+            "- **절대 금지**: 원문 그대로인 문법적 정상 표현(예: `could be affected`)을 틀렸다고 주장하거나, 해설에서 '타당하다/적절하다/맞다'고 스스로 모순되게 판정하는 것은 절대 금지합니다. 또한 문법은 멀쩡한데 의미만 반대인 **반의어 교체**(예: `is decreased` → `is increasing`)와, 현재진행형(`is occurring`)을 단순현재형(`occurs`)으로 고쳐야 한다는 식의 **문법적으로 둘 다 맞는 시제·진행형 변형**도 절대 금지합니다. 오직 수일치·분사 능동/수동·관계사·병렬 구조·대동사·접속사(`what`/`that`) 등 문법적 정오가 100% 명확한 비문 1개만 출제하세요.\n"
             "- 선택지(`rewritten_choices`): `[\"①\", \"②\", \"③\", \"④\", \"⑤\"]` 5개를 반환하세요.",
         )
     if "어휘" in t:
@@ -2569,6 +2569,104 @@ def _preprocess_english_source_passage(passage: str) -> str:
     txt = re.sub(r"\n{3,}", "\n\n", txt)
     txt = re.sub(r"[ \t]{2,}", " ", txt)
     return txt.strip()
+
+
+_COMMON_ENG_VERBS: frozenset[str] = frozenset(
+    {
+        "is", "are", "was", "were", "am", "be", "been", "being",
+        "has", "have", "had", "do", "does", "did",
+        "can", "could", "will", "would", "shall", "should", "may", "might", "must",
+        "make", "makes", "made", "take", "takes", "took", "give", "gives", "gave",
+        "show", "shows", "showed", "get", "gets", "got", "go", "goes", "went",
+        "come", "comes", "came", "see", "sees", "saw", "know", "knows", "knew",
+        "think", "thinks", "thought", "use", "uses", "used", "find", "finds", "found",
+        "tell", "tells", "told", "ask", "asks", "asked", "work", "works", "worked",
+        "seem", "seems", "seemed", "feel", "feels", "felt", "try", "tries", "tried",
+        "leave", "leaves", "left", "call", "calls", "called", "keep", "keeps", "kept",
+        "let", "lets", "begin", "begins", "began", "help", "helps", "helped",
+        "turn", "turns", "turned", "start", "starts", "started", "play", "plays", "played",
+        "run", "runs", "ran", "move", "moves", "moved", "like", "likes", "liked",
+        "live", "lives", "lived", "believe", "believes", "believed", "hold", "holds", "held",
+        "bring", "brings", "brought", "happen", "happens", "happened", "write", "writes", "wrote",
+        "provide", "provides", "provided", "sit", "sits", "sat", "stand", "stands", "stood",
+        "lose", "loses", "lost", "pay", "pays", "paid", "meet", "meets", "met",
+        "include", "includes", "included", "continue", "continues", "continued",
+        "learn", "learns", "learned", "change", "changes", "changed", "lead", "leads", "led",
+        "understand", "understands", "understood", "watch", "watches", "watched",
+        "follow", "follows", "followed", "stop", "stops", "stopped", "create", "creates", "created",
+        "speak", "speaks", "spoke", "read", "reads", "allow", "allows", "allowed",
+        "add", "adds", "added", "spend", "spends", "spent", "grow", "grows", "grew",
+        "open", "opens", "opened", "offer", "offers", "offered", "remember", "remembers",
+        "consider", "considers", "considered", "appear", "appears", "appeared",
+        "serve", "serves", "served", "send", "sends", "sent", "expect", "expects", "expected",
+        "build", "builds", "built", "stay", "stays", "stayed", "fall", "falls", "fell",
+        "reach", "reaches", "reached", "remain", "remains", "remained", "suggest", "suggests",
+        "raise", "raises", "raised", "pass", "passes", "passed", "require", "requires", "required",
+        "report", "reports", "reported", "decide", "decides", "decided", "mean", "means", "meant",
+        "become", "becomes", "became", "cause", "causes", "caused", "enable", "enables", "enabled",
+        "reduce", "reduces", "reduced", "increase", "increases", "increased", "improve", "improves",
+        "affect", "affects", "affected", "depend", "depends", "depended", "tend", "tends", "tended",
+        "fail", "fails", "failed", "exist", "exists", "existed", "occur", "occurs", "occurred",
+        "need", "needs", "needed", "want", "wants", "wanted", "aim", "aims", "aimed",
+        "reveal", "reveals", "revealed", "explain", "explains", "explained",
+        "cannot", "can't", "don't", "doesn't", "didn't", "won't", "wouldn't", "isn't", "aren't",
+    }
+)
+
+
+def _sentence_has_english_verb(sentence_without_blank: str) -> bool:
+    """빈칸을 제외한 문장에 영문 동사/조동사가 최소 1개 이상 남아있는지 판별한다."""
+    toks = re.findall(r"[A-Za-z]+(?:'[A-Za-z]+)?", (sentence_without_blank or "").lower())
+    for tok in toks:
+        if tok in _COMMON_ENG_VERBS:
+            return True
+        if len(tok) >= 5 and tok.endswith(("ed", "ize", "ise", "ify", "ate")):
+            return True
+        if len(tok) >= 5 and tok.endswith("ing") and tok not in ("thing", "morning", "evening", "nothing", "something", "anything", "everything", "meaning", "feeling", "during"):
+            return True
+    return False
+
+
+def _is_order_abc_canonical(stem: str, source_passage: str) -> bool:
+    """(A), (B), (C) 단락이 원문 등장 순서((A)-(B)-(C) 정순) 그대로 배열되었는지 판별한다."""
+    src_sents = _split_english_sentences(source_passage)
+    if len(src_sents) < 3:
+        return False
+
+    after_given = re.split(r"\[주어진\s*글\]", stem or "", maxsplit=1)[-1]
+    parts = re.split(r"(?:^|\n|\s)\(([ABC])\)\s+", after_given)
+    chunk_map: dict[str, str] = {}
+    for i in range(1, len(parts) - 1, 2):
+        lbl = parts[i]
+        txt = parts[i + 1].strip()
+        if lbl in ("A", "B", "C") and txt:
+            chunk_map[lbl] = txt
+
+    if len(chunk_map) != 3:
+        return False
+
+    src_tok_sets = [set(re.findall(r"[a-z0-9]+", s.lower())) for s in src_sents]
+    matched_idx: dict[str, int] = {}
+    for lbl in ("A", "B", "C"):
+        c_sents = _split_english_sentences(chunk_map[lbl])
+        first_s = c_sents[0] if c_sents else chunk_map[lbl]
+        c_set = set(re.findall(r"[a-z0-9]+", first_s.lower()))
+        if not c_set:
+            return False
+        best_i = -1
+        best_sc = 0.0
+        for i, s_set in enumerate(src_tok_sets):
+            if not s_set:
+                continue
+            sc = len(c_set & s_set) / max(1, len(c_set | s_set))
+            if sc > best_sc:
+                best_sc = sc
+                best_i = i
+        if best_i == -1 or best_sc < 0.45:
+            return False
+        matched_idx[lbl] = best_i
+
+    return matched_idx["A"] < matched_idx["B"] < matched_idx["C"]
 
 
 def _split_english_sentences(text: str) -> list[str]:
@@ -2914,8 +3012,23 @@ def _validate_english_transformed_output(
         if "____" not in stem:
             issues.append("빈칸 추론 지문에는 `___________` 빈칸 표기가 반드시 포함되어야 합니다.")
         else:
-            # 3. 빈칸 앞뒤 2단어와 정답 선지의 시작/끝 2단어 중복 차단
+            # 2. 빈칸 포함 문장에서 빈칸을 제외했을 때 영문 동사가 하나도 남지 않는 불완전 문장 차단
             m_blk = re.search(r"_{4,}", stem)
+            if m_blk:
+                pre_txt = stem[: m_blk.start()]
+                post_txt = stem[m_blk.end() :]
+                s_start = max(pre_txt.rfind("\n"), pre_txt.rfind(". "), pre_txt.rfind("? "), pre_txt.rfind("! "))
+                sent_left = pre_txt[s_start + 1 :] if s_start != -1 else pre_txt
+                m_end = re.search(r"[.?!](?=\s|$|[\"'”’\)])|\n", post_txt)
+                sent_right = post_txt[: m_end.start()] if m_end else post_txt
+                rem_sentence = f"{sent_left} {sent_right}".strip()
+                if not _sentence_has_english_verb(rem_sentence):
+                    issues.append(
+                        f"빈칸이 포함된 문장({rem_sentence!r})에서 빈칸을 제외하면 영문 동사가 전혀 남지 않습니다. "
+                        "문장 전체(동사 포함)를 비우지 말고 주어·동사가 유지된 상태에서 핵심 목적어/보어/구만 빈칸으로 비우세요."
+                    )
+
+            # 3. 빈칸 앞뒤 2단어와 정답 선지의 시작/끝 2단어 중복 차단
             if m_blk and ans in ("1", "2", "3", "4", "5") and len(rw.rewritten_choices or []) >= int(ans):
                 before_toks = re.findall(r"[a-zA-Z\-']+", stem[: m_blk.start()].lower())
                 after_toks = re.findall(r"[a-zA-Z\-']+", stem[m_blk.end() :].lower())
@@ -2962,6 +3075,11 @@ def _validate_english_transformed_output(
                 issues.append(
                     f"글의 순서 문제에서 원문 문장 수({src_cnt}개)와 [주어진 글]+(A)+(B)+(C) 합계 문장 수({gen_cnt}개)가 다릅니다. "
                     "원문 문장을 누락하거나 새 문장을 임의로 추가하지 말고 원문 그대로 배치하세요."
+                )
+            elif _is_order_abc_canonical(stem, source_passage):
+                issues.append(
+                    "글의 순서 문제에서 (A), (B), (C)가 원문 등장 순서 그대로((A)-(B)-(C) 정순) 배열되었습니다. "
+                    "수능 5지선다에는 (A)-(B)-(C)가 없으므로 반드시 (B)-(A)-(C), (C)-(B)-(A) 등 단락 순서를 섞어 다시 출제하세요."
                 )
     elif "삽입" in t:
         if "[주어진 문장]" not in stem and "주어진 문장" not in stem:
