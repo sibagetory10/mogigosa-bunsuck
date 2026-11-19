@@ -402,20 +402,6 @@ class StorageManager:
                         if not target.exists() or (remote_size > 0 and target.stat().st_size != remote_size):
                             target.write_bytes(self._download_file_bytes(item["id"]))
 
-                # 1-d) 영어 변형 풀 캐시 (english_question_pool.json) 동기화
-                if "english_question_pool.json" in root_files_by_name:
-                    ep_bytes = self._download_file_bytes(root_files_by_name["english_question_pool.json"]["id"])
-                    _atomic_write_bytes(self.english_pool_path, ep_bytes)
-                    result["english_pool_synced"] = True
-                elif self.english_pool_path.exists():
-                    self._upsert_drive_file(
-                        self.drive_folder_id,
-                        "english_question_pool.json",
-                        self.english_pool_path.read_bytes(),
-                        "application/json",
-                    )
-                    result["english_pool_synced"] = True
-
                 if not sync_media:
                     return result
 
@@ -1190,20 +1176,9 @@ class StorageManager:
         except Exception:
             return {}
 
-    def _save_english_pool_unlocked(self, pool: dict[str, list[dict[str, Any]]]) -> str | None:
+    def _save_english_pool_unlocked(self, pool: dict[str, list[dict[str, Any]]]) -> None:
         raw = json.dumps(pool, ensure_ascii=False, indent=2)
         _atomic_write_text(self.english_pool_path, raw, encoding="utf-8")
-        if self.drive_connected and self.drive_service:
-            try:
-                self._upsert_drive_file(
-                    self.drive_folder_id,
-                    "english_question_pool.json",
-                    raw.encode("utf-8"),
-                    "application/json",
-                )
-            except Exception as exc:
-                return f"Google Drive 동기화 실패 (로컬 저장은 완료됨): {exc}"
-        return None
 
     def load_english_pool(self) -> dict[str, list[dict[str, Any]]]:
         """저장된 영어 변형 풀(Pool) 전체를 안전하게 조회한다."""
@@ -1219,15 +1194,15 @@ class StorageManager:
         self,
         cache_key: str,
         item_idx: int | None = None,
-    ) -> tuple[int, str | None]:
+    ) -> int:
         """특정 캐시 키 전체 또는 해당 키 내 특정 인덱스 변형 문항 1개를 삭제한다."""
         if not cache_key:
-            return 0, None
+            return 0
         with self._lock:
             pool = self._load_english_pool_unlocked()
             items = pool.get(cache_key)
             if not isinstance(items, list) or not items:
-                return 0, None
+                return 0
             if item_idx is None:
                 removed = len(items)
                 pool.pop(cache_key, None)
@@ -1240,17 +1215,17 @@ class StorageManager:
                 else:
                     pool.pop(cache_key, None)
             else:
-                return 0, None
-            drive_err = self._save_english_pool_unlocked(pool)
-            return removed, drive_err
+                return 0
+            self._save_english_pool_unlocked(pool)
+            return removed
 
-    def clear_english_pool(self) -> tuple[int, str | None]:
+    def clear_english_pool(self) -> int:
         """영어 변형 풀(Pool) 캐시만 전체 비운다 (기출 DB 및 회원 DB는 유지)."""
         with self._lock:
             pool = self._load_english_pool_unlocked()
             removed = sum(len(v) for v in pool.values() if isinstance(v, list))
-            drive_err = self._save_english_pool_unlocked({})
-            return removed, drive_err
+            self._save_english_pool_unlocked({})
+            return removed
 
     def get_cached_english_question(
         self,

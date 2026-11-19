@@ -2191,8 +2191,8 @@ def _render_english_pool_admin_section() -> None:
     st.divider()
     st.subheader("🔤 영어 변형 문제 풀(Pool) 캐시 관리")
     st.caption(
-        "파이썬 검증을 통과한 영어 변형 문항은 `./exam_db/english_question_pool.json`에 "
-        "지문·유형·옵션 해시별로 최대 3개씩 저장되며 Google Drive 연동 시 자동 동기화됩니다."
+        "파이썬 검증을 통과한 영어 변형 문항은 서버의 `./exam_db/english_question_pool.json`에 "
+        "지문·유형·옵션 해시별로 최대 3개씩 저장됩니다."
     )
 
     pool = storage.load_english_pool()
@@ -2232,11 +2232,8 @@ def _render_english_pool_admin_section() -> None:
             width="stretch",
             key="admin_clear_eng_pool_btn",
         ):
-            removed_cnt, drive_err = storage.clear_english_pool()
-            if drive_err:
-                st.warning(f"로컬 캐시 {removed_cnt}문항 삭제 완료 / {drive_err}")
-            else:
-                st.success(f"🧹 영어 변형 캐시 {removed_cnt}문항을 모두 비웠습니다.")
+            removed_cnt = storage.clear_english_pool()
+            st.success(f"🧹 영어 변형 캐시 {removed_cnt}문항을 모두 비웠습니다.")
             st.rerun()
 
     with st.expander(f"📋 저장된 영어 변형 캐시 상세 조회 / 개별 삭제 ({total_items}문항)", expanded=False):
@@ -2275,10 +2272,8 @@ def _render_english_pool_admin_section() -> None:
                     st.caption(f"{stem_preview}...")
             with r_col2:
                 if st.button("🗑️ 삭제", key=f"del_eng_pool_{ck}_{idx}", width="stretch"):
-                    removed, d_err = storage.delete_english_pool_entry(ck, idx)
-                    if d_err:
-                        st.warning(d_err)
-                    elif removed > 0:
+                    removed = storage.delete_english_pool_entry(ck, idx)
+                    if removed > 0:
                         st.success(f"캐시 항목(`{ck}` #{idx + 1})을 삭제했습니다.")
                     st.rerun()
 
