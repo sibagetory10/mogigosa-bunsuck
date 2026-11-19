@@ -1104,6 +1104,35 @@ class StorageManager:
             self.save_db(remaining, sync_organized_drive=False)
             return len(to_delete)
 
+    def rename_exam(self, old_exam_name: str, new_exam_name: str) -> int:
+        """기존 DB에 저장된 회차명을 일괄 변경하고 로컬 정리 폴더도 이동한다."""
+        old_n = (old_exam_name or "").strip()
+        new_n = re.sub(r"\s+", " ", (new_exam_name or "").strip())
+        if not old_n or not new_n or old_n == new_n:
+            return 0
+        with self._lock:
+            records = self.load_db()
+            changed = 0
+            subj_cats: set[str] = set()
+            for idx, rec in enumerate(records):
+                if rec.exam_name == old_n:
+                    subj_cats.add(rec.subject_category)
+                    records[idx] = rec.model_copy(update={"exam_name": new_n})
+                    changed += 1
+            if changed == 0:
+                return 0
+            for subj in subj_cats:
+                old_dir = self.organized_dir / _safe_segment(subj) / _safe_segment(old_n)
+                new_dir = self.organized_dir / _safe_segment(subj) / _safe_segment(new_n)
+                if old_dir.exists() and not new_dir.exists():
+                    try:
+                        new_dir.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.move(str(old_dir), str(new_dir))
+                    except Exception:
+                        pass
+            self.save_db(records, sync_organized_drive=False)
+            return changed
+
     def reset_exam_database(self, delete_users: bool = False) -> dict[str, Any]:
         """로컬 및 Google Drive에 누적된 기출 DB·이미지·PDF 파일을 모두 삭제(초기화)한다."""
         with self._lock:

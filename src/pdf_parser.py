@@ -10,6 +10,8 @@ from typing import Any, Sequence
 import pymupdf
 from PIL import Image
 
+from src.models import normalize_exam_year
+
 QUESTION_START_RE = re.compile(r"^(\d{1,2})\s*\.(?!\d)\s*(.*)$")
 SHARED_PASSAGE_RE = re.compile(r"^[\[\【]\s*(\d{1,2})\s*[~\-～–—]\s*(\d{1,2})\s*(?:번)?\s*[\]\】]")
 
@@ -194,6 +196,14 @@ def parse_exam_header_locally(first_page_text: str, filename: str = "") -> dict[
             if s_cand in combined:
                 subject = s_cand
                 break
+
+    year = normalize_exam_year(
+        year,
+        text=header_text,
+        filename=fname_clean,
+        month=month,
+        grade=grade,
+    )
 
     found_count = sum(bool(v) for v in (year, month, grade, subject))
     if found_count == 0:

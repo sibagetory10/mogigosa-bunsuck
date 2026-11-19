@@ -96,6 +96,8 @@ from src.models import (
     build_whitelist_from_concept_units,
     infer_subject_category,
     normalize_english_group_id,
+    normalize_exam_title_year,
+    normalize_exam_year,
     resolve_question_concept_reference,
 )
 from src.pdf_generator import generate_custom_exam_pdf
@@ -299,16 +301,28 @@ def _detect_single_exam_cover(
                 first_page_png_bytes=p1_png,
                 filename=prob_name,
             )
-            merged_year = (ai_meta.year or parsed_local.get("year") or "").strip().rstrip("년")
+            raw_merged_year = (ai_meta.year or parsed_local.get("year") or "").strip().rstrip("년")
             merged_month = (ai_meta.month or parsed_local.get("month") or "").strip()
             if merged_month and not merged_month.endswith("월"):
                 merged_month = f"{merged_month}월"
             merged_grade = (ai_meta.grade or parsed_local.get("grade") or "").strip()
             merged_subject = (ai_meta.subject or parsed_local.get("subject") or "").strip()
+            merged_year = normalize_exam_year(
+                raw_merged_year,
+                text=p1_text,
+                filename=prob_name,
+                exam_title=ai_meta.exam_title or "",
+                month=merged_month,
+                grade=merged_grade,
+            )
             if merged_year and merged_month and merged_grade and merged_subject:
                 merged_title = f"{merged_year}년 {merged_month} {merged_grade} {merged_subject}"
             else:
-                merged_title = (ai_meta.exam_title or parsed_local.get("exam_title") or "").strip()
+                merged_title = normalize_exam_title_year(
+                    (ai_meta.exam_title or parsed_local.get("exam_title") or "").strip(),
+                    text=p1_text,
+                    filename=prob_name,
+                )
             parsed_local = {
                 "year": merged_year,
                 "month": merged_month,
@@ -3473,7 +3487,7 @@ with tab1:
                             raw_title = (parsed_local.get("exam_title") or "").strip()
                             if not raw_title:
                                 raw_title = os.path.splitext(prob_base)[0].replace("_", " ").strip()
-                            norm_exam_name = re.sub(r"\s+", " ", raw_title)
+                            norm_exam_name = normalize_exam_title_year(raw_title, filename=prob_base)
                             subj_cat = infer_subject_category(parsed_local.get("subject", ""), exam_title=norm_exam_name)
                             _append_batch_log(f"🏷️ 회차명: {norm_exam_name} ({subj_cat})")
 
@@ -3761,7 +3775,7 @@ with tab1:
                 for r in db_snapshot
                 if r.exam_name
             }
-            norm_input_exam = re.sub(r"\s+", " ", exam_name_input.strip())
+            norm_input_exam = normalize_exam_title_year(exam_name_input.strip(), filename=active_prob_name)
             norm_input_id = _normalize_exam_identity(norm_input_exam)
             is_duplicate_exam = bool(
                 norm_input_exam
@@ -3818,7 +3832,7 @@ with tab1:
                     else:
                         st.session_state["parsed_crops"] = crops
                         st.session_state["parsed_exam_meta"] = {
-                            "exam_name": exam_name_input.strip(),
+                            "exam_name": norm_input_exam or exam_name_input.strip(),
                             "subject_category": subject_cat,
                             "prob_bytes": active_prob_bytes,
                             "prob_name": active_prob_name,
@@ -4255,7 +4269,32 @@ with tab1:
                                     st.success(f"'{exam_name}' ({cnt}문항) 삭제 완료")
                                     st.rerun()
 
+                        if can_retag_exam:
+                            with st.expander("✏️ 회차명 수정 (잘못 저장된 연도/과목명 교정)", expanded=False):
+                                rn_c1, rn_c2 = st.columns([3.2, 1])
+                                with rn_c1:
+                                    edited_exam_name = st.text_input(
+                                        "새 회차명",
+                                        value=normalize_exam_title_year(exam_name),
+                                        key=f"rename_input_{subj_cat}_{safe_fn_prefix}",
+                                        label_visibility="collapsed",
+                                    )
+                                with rn_c2:
+                                    if st.button("💾 회차명 저장", key=f"rename_btn_{subj_cat}_{safe_fn_prefix}", width="stretch"):
+                                        new_en = re.sub(r"\s+", " ", (edited_exam_name or "").strip())
+                                        if new_en and new_en != exam_name:
+                                            rn_cnt = storage.rename_exam(exam_name, new_en)
+                                            _build_cached_exam_exports.clear()
+                                            st.success(f"회차명을 '{new_en}'(으)로 변경했습니다 ({rn_cnt}문항 반영).")
+                                            st.rerun()
+                                        else:
+                                            st.info("변경할 회차명이 기존과 같습니다.")
+
                         if retag_clicked and can_retag_exam:
+                            corrected_en = normalize_exam_title_year(exam_name)
+                            if corrected_en and corrected_en != exam_name:
+                                storage.rename_exam(exam_name, corrected_en)
+                                exam_name = corrected_en
                             subj_cat = infer_subject_category("", exam_title=exam_name, default=subj_cat)
                             verified_key, verified_key_label = resolve_active_gemini_api_key(
                                 current_user, creds.gemini_api_key, force_server_key=True
