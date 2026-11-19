@@ -41,6 +41,7 @@ from src.config import (
     CONCEPT_DB_BUILD_MODEL,
     CONCEPT_SCOPE_MODEL,
     DEFAULT_MODEL,
+    EXAM_NO_ANSWER_SOLVER_MODEL,
     EXAM_TAGGING_MODEL,
     MODEL_LABELS,
     REWRITE_MODEL,
@@ -570,6 +571,8 @@ def _tag_and_save_single_exam(
     safe_exam = sanitize_id_part(meta["exam_name"])
     tagging_model = EXAM_TAGGING_MODEL
     tagging_model_label = MODEL_LABELS.get(tagging_model, tagging_model)
+    solver_model = EXAM_NO_ANSWER_SOLVER_MODEL
+    solver_model_label = MODEL_LABELS.get(solver_model, solver_model)
 
     def _status(msg: str) -> None:
         if push_status:
@@ -613,16 +616,22 @@ def _tag_and_save_single_exam(
         _status("📄 해설지 PDF 분석 중 (텍스트 스니펫 우선 추출)...")
         try:
             answer_snippets, ans_has_text = extract_answer_snippets_from_pdf(meta["ans_bytes"])
-            if ans_has_text:
+            missing_ans_q = [q for q in target_q_nums if q not in answer_snippets]
+            if ans_has_text and answer_snippets:
                 _log(f"📄 해설지 텍스트 스니펫 추출 완료 ({len(answer_snippets)}개 문항 매칭 · 경량 전송)")
-            else:
+            if not ans_has_text or not answer_snippets or missing_ans_q:
                 tmp_client = build_gemini_client(api_key, timeout_seconds=30)
                 answer_pdf_part = prepare_pdf_part(
                     tmp_client,
                     meta["ans_bytes"],
                     display_name=f"{safe_exam}_answer.pdf",
                 )
-                _log("📄 스캔 해설지 PDF 파트 준비 완료 (30초 타임아웃)")
+                if ans_has_text and answer_snippets and missing_ans_q:
+                    _log(
+                        f"📄 해설지 스니펫 미탐지 문항({len(missing_ans_q)}개) 대비 원본 해설지 PDF 파트도 함께 준비"
+                    )
+                else:
+                    _log("📄 스캔/통합 해설지 PDF 파트 준비 완료 (30초 타임아웃)")
         except Exception as exc:
             warn_msg = f"해설지 첨부 준비 중 경고 (문제 이미지만으로 진행): {exc}"
             if on_warning:
@@ -652,66 +661,108 @@ def _tag_and_save_single_exam(
         concept_books=concept_books,
     )
 
-    if meta.get("prob_bytes"):
-        _status(f"⚡ 전체 문제지 PDF({len(target_crops)}문항) 한 번에 태깅 중 (모델: {tagging_model_label})...")
-        try:
-            batch_map = analyze_exam_pdf_batch_with_gemini(
-                api_key=api_key,
-                model_name=tagging_model,
-                prob_pdf_bytes=meta["prob_bytes"],
-                target_q_nums=[c.q_num for c in target_crops],
-                subject_category=meta["subject_category"],
-                exam_name=meta["exam_name"],
-                answer_snippets=answer_snippets,
-                answer_pdf_part=answer_pdf_part,
-                status_callback=_status,
-                concept_books=concept_books,
-                grounding_context=grounding_ctx,
-            )
-            extracted_by_q.update(batch_map)
-            _log(
-                f"⚡ 전체 PDF 일괄 태깅 완료: {len(batch_map)}/{len(target_crops)}문항 "
-                f"({time.perf_counter() - batch_t0:.1f}초 · {tagging_model_label})"
-            )
-        except Exception as exc:
-            _log(f"⚠️ 전체 PDF 일괄 태깅 실패 → 개별 보완 모드로 전환: {exc}")
-
-    _prog(0.65)
+    has_answer_sheet = bool(answer_snippets or answer_pdf_part is not None)
+    if has_answer_sheet:
+        if meta.get("prob_bytes"):
+            _status(f"⚡ 전체 문제지 PDF({len(target_crops)}문항) 한 번에 태깅 중 (모델: {tagging_model_label})...")
+            try:
+                batch_map = analyze_exam_pdf_batch_with_gemini(
+                    api_key=api_key,
+                    model_name=tagging_model,
+                    prob_pdf_bytes=meta["prob_bytes"],
+                    target_q_nums=[c.q_num for c in target_crops],
+                    subject_category=meta["subject_category"],
+                    exam_name=meta["exam_name"],
+                    answer_snippets=answer_snippets,
+                    answer_pdf_part=answer_pdf_part,
+                    status_callback=_status,
+                    concept_books=concept_books,
+                    grounding_context=grounding_ctx,
+                )
+                extracted_by_q.update(batch_map)
+                _log(
+                    f"⚡ 전체 PDF 일괄 태깅 완료: {len(batch_map)}/{len(target_crops)}문항 "
+                    f"({time.perf_counter() - batch_t0:.1f}초 · {tagging_model_label})"
+                )
+            except Exception as exc:
+                _log(f"⚠️ 전체 PDF 일괄 태깅 실패 → 개별 보완 모드로 전환: {exc}")
+        _prog(0.65)
+    else:
+        crops_no_img = [c for c in target_crops if not c.png_bytes]
+        if crops_no_img and meta.get("prob_bytes"):
+            try:
+                batch_map = analyze_exam_pdf_batch_with_gemini(
+                    api_key=api_key,
+                    model_name=solver_model,
+                    prob_pdf_bytes=meta["prob_bytes"],
+                    target_q_nums=[c.q_num for c in crops_no_img],
+                    subject_category=meta["subject_category"],
+                    exam_name=meta["exam_name"],
+                    answer_snippets=None,
+                    answer_pdf_part=None,
+                    status_callback=_status,
+                    concept_books=concept_books,
+                    grounding_context=grounding_ctx,
+                )
+                extracted_by_q.update(batch_map)
+            except Exception as exc:
+                _log(f"⚠️ 이미지 없는 문항 배치 풀이 경고: {exc}")
+        _log(
+            f"🧠 해설지 미첨부 감지 → 정답 정확도를 위해 {solver_model_label} 문항별 고해상도 직접 풀이·검산 모드 실행 ({len(target_crops)}문항)"
+        )
+        _prog(0.10)
 
     missing_crops = [c for c in target_crops if c.q_num not in extracted_by_q]
     if missing_crops:
-        _status(f"🔁 누락된 {len(missing_crops)}개 문항 보완 태깅 중 ({tagging_model_label})...")
+        if has_answer_sheet:
+            _status(f"🔁 누락된 {len(missing_crops)}개 문항 보완 태깅 중 ({tagging_model_label})...")
+        else:
+            _status(f"🧠 {solver_model_label} 문항별 고해상도 직접 풀이·검산 중 ({len(missing_crops)}문항)...")
 
-        def _analyze_worker(cq_item: CroppedQuestion) -> tuple[CroppedQuestion, Any, float]:
+        def _analyze_worker(cq_item: CroppedQuestion) -> tuple[CroppedQuestion, Any, float, bool]:
             t_start = time.perf_counter()
+            q_ans_hint = answer_snippets.get(cq_item.q_num, "")
+            q_has_answer = bool((q_ans_hint and q_ans_hint.strip()) or answer_pdf_part is not None)
+            worker_model = tagging_model if q_has_answer else solver_model
             extracted_out = analyze_question_with_gemini(
                 api_key=api_key,
-                model_name=tagging_model,
+                model_name=worker_model,
                 crop_png_bytes=cq_item.png_bytes,
                 q_num=cq_item.q_num,
                 subject_category=meta["subject_category"],
                 exam_name=meta["exam_name"],
                 answer_pdf_part=answer_pdf_part,
-                answer_text_hint=answer_snippets.get(cq_item.q_num, ""),
+                answer_text_hint=q_ans_hint,
                 status_callback=None,
                 concept_books=concept_books,
                 grounding_context=grounding_ctx,
+                question_text_hint=cq_item.extracted_text or "",
+                solve_without_answer=not q_has_answer,
             )
-            return cq_item, extracted_out, time.perf_counter() - t_start
+            return cq_item, extracted_out, time.perf_counter() - t_start, q_has_answer
 
+        done_cnt = 0
+        total_missing = len(missing_crops)
+        base_prog = 0.65 if has_answer_sheet else 0.10
+        span_prog = 0.85 - base_prog
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
             future_to_cq = {executor.submit(_analyze_worker, cq): cq for cq in missing_crops}
             for fut in concurrent.futures.as_completed(future_to_cq):
                 cq = future_to_cq[fut]
+                done_cnt += 1
                 try:
-                    _, extracted, elapsed_s = fut.result()
+                    _, extracted, elapsed_s, q_has_answer = fut.result()
                     extracted_by_q[cq.q_num] = extracted
-                    _log(f"✅ {cq.q_num}번 보완 태깅 완료 ({elapsed_s:.1f}초)")
+                    mode_txt = "보완 태깅" if q_has_answer else "직접 풀이·태깅"
+                    _log(f"✅ {cq.q_num}번 {mode_txt} 완료 (정답: {extracted.answer} · {elapsed_s:.1f}초)")
                 except Exception as exc:
                     err_msg = f"{cq.q_num}번 오류 (건너뜀): {exc}"
                     failed_q_nums.append(cq.q_num)
                     errors.append(err_msg)
                     _log(f"❌ {err_msg}")
+                _prog(base_prog + span_prog * (done_cnt / max(1, total_missing)))
+                if not has_answer_sheet:
+                    _status(f"🧠 {solver_model_label} 직접 풀이·검산 진행 중 ({done_cnt}/{total_missing}문항)...")
 
     _prog(0.85)
 

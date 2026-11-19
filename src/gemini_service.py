@@ -278,14 +278,56 @@ def _build_400_recovery_configs(
         recovery_configs.append(config)
         return recovery_configs
 
+    base_cfg = (
+        eff_cfg.model_copy(update={"media_resolution": None})
+        if (is_media_err and eff_cfg is not None)
+        else eff_cfg
+    )
+    if is_media_err and not is_thinking_err and base_cfg is not None:
+        recovery_configs.append(base_cfg)
+
     if is_thinking_err:
         if cand_model == HYDROGEN_MODEL:
+            t_target = base_cfg if base_cfg is not None else config
             recovery_configs.append(
-                _with_thinking_config(config, types.ThinkingConfig(thinking_budget=256))
+                _with_thinking_config(t_target, types.ThinkingConfig(thinking_budget=256))
             )
-        if config is not None or cand_model == HYDROGEN_MODEL:
-            recovery_configs.append(config)
+        elif base_cfg is not None:
+            recovery_configs.append(
+                base_cfg.model_copy(
+                    update={"thinking_config": types.ThinkingConfig(thinking_budget=1024)}
+                )
+            )
+            recovery_configs.append(base_cfg.model_copy(update={"thinking_config": None}))
+
+    if config is not None or cand_model == HYDROGEN_MODEL or eff_cfg is not None:
+        recovery_configs.append(config)
     return recovery_configs
+
+
+_CIRCLED_DIGIT_TO_NUM: dict[str, str] = {
+    "①": "1",
+    "②": "2",
+    "③": "3",
+    "④": "4",
+    "⑤": "5",
+}
+_ANSWER_PREFIX_RE = re.compile(r"^\s*(?:정답|답)\s*[:：]?\s*")
+_CHOICE_NUM_ONLY_RE = re.compile(r"^\(?([1-5])\)?\s*번?$")
+_CHOICE_NUM_PREFIX_RE = re.compile(r"^\(?([1-5])\)?\s*번(?:\s|\(|$)")
+
+
+def _normalize_extracted_answer(raw_answer: str) -> str:
+    """객관식 원문자(①~⑤)나 '정답: 3번' 표기를 '1'~'5'로 정규화하고 주관식 값은 그대로 보존한다."""
+    s = _ANSWER_PREFIX_RE.sub("", (raw_answer or "").strip()).strip()
+    if not s:
+        return ""
+    if s[0] in _CIRCLED_DIGIT_TO_NUM:
+        return _CIRCLED_DIGIT_TO_NUM[s[0]]
+    m = _CHOICE_NUM_ONLY_RE.match(s) or _CHOICE_NUM_PREFIX_RE.match(s)
+    if m:
+        return m.group(1)
+    return s
 
 
 def _generate_content_with_fallback(
@@ -486,15 +528,24 @@ def analyze_question_with_gemini(
     status_callback: Callable[[str], None] | None = None,
     concept_books: Sequence[ConceptBookRecord] | None = None,
     grounding_context: str = "",
+    question_text_hint: str = "",
+    solve_without_answer: bool | None = None,
 ) -> QuestionExtractionOutput:
     """
-    크롭된 문항 PNG(가로 최대 1200px 리사이즈), 해설지 정보, 2022 공식 기준표 및 개념서 DB를 Gemini에 전달해
-    성취기준 앵커링·원리/용어 분리·최저 학년 근거를 추출하고 후처리 검증한다.
+    크롭된 문항 PNG, 해설지 정보(미첨부 시 직접 고해상도 풀이·검산), 2022 공식 기준표 및 개념서 DB를 Gemini에 전달해
+    성취기준 앵커링·원리/용어 분리·정답/해설을 추출하고 후처리 검증한다.
     """
-    client = _build_client(api_key, timeout_seconds=DEFAULT_API_TIMEOUT_SECONDS)
+    has_answer_ref = bool((answer_text_hint and answer_text_hint.strip()) or answer_pdf_part is not None)
+    is_self_solve = (not has_answer_ref) if solve_without_answer is None else bool(solve_without_answer)
+
+    client = _build_client(
+        api_key,
+        timeout_seconds=60 if is_self_solve else DEFAULT_API_TIMEOUT_SECONDS,
+    )
+    max_img_w = 1400 if is_self_solve else MAX_VISION_IMAGE_WIDTH
     if status_callback is not None:
-        status_callback(f"{q_num}번 이미지 최적화 중(≤1200px)...")
-    opt_png = optimize_image_for_vision(crop_png_bytes)
+        status_callback(f"{q_num}번 이미지 최적화 중(≤{max_img_w}px)...")
+    opt_png = optimize_image_for_vision(crop_png_bytes, max_width=max_img_w)
     img_part = types.Part.from_bytes(data=opt_png, mime_type="image/png")
 
     eff_grounding = grounding_context or build_tagging_grounding_context(
@@ -503,8 +554,21 @@ def analyze_question_with_gemini(
         concept_books=concept_books,
     )
 
+    if is_self_solve:
+        rule_5 = (
+            "5) [직접 풀이·검산 및 최종 정답(`official_explanation` → `answer`)]: 해설지가 첨부되지 않았습니다. 절대 답을 찍거나 어림짐작하지 말고 다음 절차를 반드시 지키세요.\n"
+            "   - 먼저 `official_explanation`에 첨부된 고해상도 문항 이미지(및 참고 텍스트) 속 모든 수치·조건·단위·그래프 축·표·`<보기>`(ㄱ, ㄴ, ㄷ 각각의 참/거짓 판정 포함)를 순서대로 직접 풀고 역산·검산한 풀이 과정을 작성하세요.\n"
+            "   - 객관식(`①`~`⑤`)은 계산 결과 또는 참인 `<보기>` 조합을 이미지 속 실제 선지 ①~⑤와 1:1 대조하여 일치하는 선지 번호를 확인한 뒤, `answer`에는 선지 내용·수치가 아닌 선지 번호 숫자 `'1'`~`'5'` 중 하나만 기록하세요.\n"
+            "   - 선지 ①~⑤가 없는 주관식/단답형만 최종 계산값/정답을 `answer`에 정확히 기록하세요."
+        )
+    else:
+        rule_5 = (
+            "5) [해설·정답(`official_explanation` → `answer`)]: 먼저 `official_explanation`에 첨부된 해설지/발췌 기준 핵심 풀이 요약을 작성한 뒤, "
+            "`answer`에 공식 정답(객관식은 '1'~'5' 단일 숫자, 주관식은 정확한 값)을 기록하세요."
+        )
+
     system_inst = (
-        "당신은 대한민국 2022 개정 교육과정(수학·사회·과학) 전문 기출 문항 분석가입니다. "
+        "당신은 대한민국 2022 개정 교육과정(수학·사회·과학) 전문 기출 문항 분석가이자 정확한 문제 풀이 전문가입니다. "
         "반드시 아래 순서와 기준표에 따라 추측(할루시네이션) 없이 정확히 태깅하세요.\n"
         "1) [과목/단원/성취기준 앵커링]: 제공된 [2022 공식 기준표 및 개념서 DB] 안에서만 가장 정확한 2022 공식 `curriculum_subject`(2015 개정 명칭 금지)와 `unit_name`을 정하고, "
         "기준표에 성취기준 코드가 있으면 대표 코드는 `standard_code`, 복합 문항 등 걸치는 모든 코드는 `standard_codes` 배열에 모두 적으세요(목록에 없는 코드를 지어내지 마세요).\n"
@@ -514,12 +578,17 @@ def analyze_question_with_gemini(
         "   - `basic_terms`: `min_grade` 수준에서 이미 배워 당연한 교과 기본 용어(예: '속력', '질량', '이차방정식', '인권')\n"
         "   - `required_terms`: 문제 지문·보기에 등장하는 핵심 전문 용어 통합 목록(`advanced_terms` + 주요 `basic_terms`)\n"
         "4) [최저 학년(`min_grade`) 및 근거(`grade_evidence`)]: `core_principles`를 2022 개정 교육과정에서 처음 배우는 최저 학년(1=고1, 2=고2, 3=고3)과 1줄 판정 근거를 `grade_evidence`에 명시하세요.\n"
-        "5) [정답/해설]: 해설지 참고 내용이나 첨부된 해설지 PDF에서 해당 문항의 공식 정답(객관식은 '1'~'5', 주관식은 값)과 핵심 풀이 요약을 추출하세요."
+        + rule_5
     )
 
     hint_block = (
         f"\n[해설지 {q_num}번 발췌]\n{answer_text_hint.strip()}\n"
         if answer_text_hint and answer_text_hint.strip()
+        else ""
+    )
+    q_text_block = (
+        f"\n[문항 추출 텍스트 (참고용 · 수식/표/그림은 이미지 우선)]\n{question_text_hint.strip()[:1800]}\n"
+        if question_text_hint and question_text_hint.strip()
         else ""
     )
     grounding_block = f"\n{eff_grounding}\n" if eff_grounding else ""
@@ -528,8 +597,13 @@ def analyze_question_with_gemini(
         f"대분류 과목: {subject_category}\n"
         f"문항 번호: {q_num}번\n"
         f"{grounding_block}"
+        f"{q_text_block}"
         f"{hint_block}\n"
-        "위 이미지의 문항을 기준표에 대조해 분석하고 JSON 스키마에 맞게 추출하세요."
+        + (
+            "해설지가 없으므로 위 이미지(및 참고 텍스트)를 직접 끝까지 풀어 official_explanation을 작성·검산한 뒤, 최종 선지 번호 또는 주관식 값을 answer에 반환하세요."
+            if is_self_solve
+            else "위 이미지의 문항을 기준표와 해설에 대조해 분석하고 JSON 스키마에 맞게 추출하세요."
+        )
     )
 
     contents: list[Any] = [img_part]
@@ -537,22 +611,40 @@ def analyze_question_with_gemini(
         contents.append(answer_pdf_part)
     contents.append(prompt)
 
+    if is_self_solve and not _is_flash_lite_model(model_name):
+        gen_config = types.GenerateContentConfig(
+            system_instruction=system_inst,
+            response_mime_type="application/json",
+            response_schema=QuestionExtractionOutput,
+            temperature=0.0,
+            media_resolution=types.MediaResolution.MEDIA_RESOLUTION_HIGH,
+            thinking_config=types.ThinkingConfig(
+                thinking_level=types.ThinkingLevel.MEDIUM,
+                include_thoughts=False,
+            ),
+        )
+        use_fast_mode = False
+    else:
+        gen_config = types.GenerateContentConfig(
+            system_instruction=system_inst,
+            response_mime_type="application/json",
+            response_schema=QuestionExtractionOutput,
+            temperature=0.0 if is_self_solve else 0.1,
+        )
+        use_fast_mode = not is_self_solve
+
     resp = _generate_content_with_fallback(
         client=client,
         model_name=model_name,
         contents=contents,
-        config=types.GenerateContentConfig(
-            system_instruction=system_inst,
-            response_mime_type="application/json",
-            response_schema=QuestionExtractionOutput,
-            temperature=0.1,
-        ),
-        fast_mode=True,
+        config=gen_config,
+        fast_mode=use_fast_mode,
         status_callback=status_callback,
     )
     if status_callback is not None:
         status_callback(f"{q_num}번 응답 파싱 및 2022 기준 검증 중...")
     parsed = _parse_structured(resp, QuestionExtractionOutput)
+    parsed.answer = _normalize_extracted_answer(parsed.answer)
     return validate_and_normalize_extracted_tag(
         parsed,
         subject_category=subject_category,
@@ -597,6 +689,22 @@ def analyze_exam_pdf_batch_with_gemini(
         concept_books=concept_books,
     )
 
+    snippets_map = answer_snippets or {}
+    snippet_lines: list[str] = []
+    for q in ordered_q:
+        sn = (snippets_map.get(q) or "").strip()
+        if sn:
+            snippet_lines.append(f"[{q}번 해설 발췌] {sn[:500]}")
+
+    has_answer_ref = bool(snippet_lines or answer_pdf_part is not None)
+    ans_rule_line = (
+        "- official_explanation / answer: 해설지 기준 핵심 풀이를 official_explanation에 먼저 요약하고, "
+        "answer에 공식 정답(객관식 '1'~'5' 단일 숫자, 주관식은 값)을 기록\n"
+        if has_answer_ref
+        else "- official_explanation / answer: 해설지가 없으므로 추측하지 말고 문항의 조건·보기(ㄱ/ㄴ/ㄷ)·선지 ①~⑤를 직접 풀어 "
+        "official_explanation에 단계별 풀이·검산 과정을 먼저 작성한 뒤, 일치하는 선지 번호('1'~'5') 또는 주관식 최종 값을 answer에 기록\n"
+    )
+
     system_inst = (
         "당신은 대한민국 2022 개정 교육과정(수학·사회·과학) 전문 기출 문항 분석가입니다. "
         "첨부된 전체 모의고사 PDF에서 요청된 모든 문항 번호를 빠짐없이 찾아, "
@@ -606,15 +714,8 @@ def analyze_exam_pdf_batch_with_gemini(
         "- core_principles: 상위 과목 포장 용어를 걷어내고 문제를 푸는 데 필요한 근본적 풀이 원리·법칙을 간결한 한국어 개념구로 나열\n"
         "- advanced_terms vs basic_terms vs required_terms: 일상어('그림','표','보기') 및 기초 측정단위('cm','g','s')는 제외하고, 상위 과정에서 새로 도입된 낯선 전문 용어는 advanced_terms, min_grade 시점 기본 용어는 basic_terms, 통합 핵심 용어는 required_terms에 기록\n"
         "- min_grade / grade_evidence: core_principles를 2022 개정 교육과정에서 처음 배우는 최저 학년(1=고1, 2=고2, 3=고3)과 1줄 근거 작성\n"
-        "- answer / official_explanation: 해설지 기준 공식 정답(객관식 '1'~'5', 주관식은 값)과 1~2문장 핵심 풀이 요약"
+        + ans_rule_line
     )
-
-    snippets_map = answer_snippets or {}
-    snippet_lines: list[str] = []
-    for q in ordered_q:
-        sn = (snippets_map.get(q) or "").strip()
-        if sn:
-            snippet_lines.append(f"[{q}번 해설 발췌] {sn[:500]}")
 
     hint_section = (
         "\n[해설지 문항별 발췌]\n" + "\n".join(snippet_lines) + "\n"
@@ -648,16 +749,17 @@ def analyze_exam_pdf_batch_with_gemini(
             system_instruction=system_inst,
             response_mime_type="application/json",
             response_schema=BatchExamExtractionOutput,
-            temperature=0.1,
+            temperature=0.1 if has_answer_ref else 0.0,
             max_output_tokens=32768,
         ),
-        fast_mode=True,
+        fast_mode=has_answer_ref,
         status_callback=status_callback,
     )
     parsed = _parse_structured(resp, BatchExamExtractionOutput)
     out: dict[int, BatchQuestionTagItem] = {}
     for item in parsed.questions:
         if item.q_num in ordered_q and item.q_num not in out:
+            item.answer = _normalize_extracted_answer(item.answer)
             validate_and_normalize_extracted_tag(
                 item,
                 subject_category=subject_category,

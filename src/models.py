@@ -144,8 +144,14 @@ class QuestionExtractionOutput(BaseModel):
         ...,
         description="단일 핵심 원리만으로 풀리면 True, 여러 원리가 복합되면 False",
     )
-    answer: str = Field(..., description="공식 정답 (객관식은 '1'~'5' 숫자 문자열, 주관식은 정확한 값)")
-    official_explanation: str = Field(..., description="공식 해설의 핵심 풀이 요약")
+    official_explanation: str = Field(
+        ...,
+        description="공식 해설 요약 또는 해설지 미첨부 시 단계별 직접 풀이·검산 과정 및 선지 판정 근거",
+    )
+    answer: str = Field(
+        ...,
+        description="최종 정답 (객관식은 반드시 '1'~'5' 중 단일 숫자 문자열, 주관식/단답형은 정확한 최종 값)",
+    )
 
 
 class BatchQuestionTagItem(QuestionExtractionOutput):
