@@ -41,7 +41,6 @@ from src.models import (
     QuestionRecord,
     RewrittenQuestion,
     TocExtractionOutput,
-    TocUnitItem,
 )
 from src.pdf_parser import extract_specific_pages_slice
 from src.text_formatter import (
@@ -2641,7 +2640,6 @@ def generate_english_transformed_question(
     rw: RewrittenQuestion | None = None
     # 출력에는 지문 전체(+선지)가 포함되므로 지문 길이에 비례해 출력 토큰 상한을 잡는다 (JSON 중간 잘림 방지).
     base_out_tokens = min(8192, max(3072, int(len(clean_passage) / 2.0) + 1800))
-    last_parse_err: Exception | None = None
     for attempt in range(2):
         out_tokens = base_out_tokens if attempt == 0 else min(12288, int(base_out_tokens * 1.6))
         resp = _generate_content_with_fallback(
@@ -2663,8 +2661,7 @@ def generate_english_transformed_question(
         )
         try:
             parsed_rw = _parse_structured(resp, RewrittenQuestion)
-        except Exception as parse_exc:
-            last_parse_err = parse_exc
+        except Exception:
             if attempt == 0:
                 continue
             if rw is not None:

@@ -17,6 +17,7 @@ from src.auth import (
     FREE_MAX_BATCH_QUESTIONS,
     PAID_MAX_BATCH_QUESTIONS,
     PRO_WEEKLY_PREMIUM_LIMIT,
+    ULTRA_WEEKLY_PREMIUM_LIMIT,
     TIER_LABELS,
     VALID_TIERS,
     authenticate_user,
@@ -30,6 +31,7 @@ from src.auth import (
     delete_users_by_usernames,
     get_max_batch_questions,
     get_remaining_pro_weekly_quota,
+    get_weekly_premium_limit,
     get_user_by_username,
     is_premium_model,
     mask_api_key,
@@ -1394,7 +1396,8 @@ with st.sidebar:
         elif tier_code == "ULTRA":
             status_line = (
                 "<div style='font-size:0.83rem; color:#C2410C; font-weight:600; margin-top:0.45rem;'>"
-                "🔥 서버 API · 모든 모델·기능 한도 없이 무제한</div>"
+                f"🔥 서버 API · 기본 모델 무제한 (1회 최대 {PAID_MAX_BATCH_QUESTIONS}문항)<br/>"
+                f"주간 고급 모델(3.8/Hydrogen): <b>{pro_weekly_rem} / {ULTRA_WEEKLY_PREMIUM_LIMIT}문항</b></div>"
             )
         else:
             status_line = (
@@ -1420,8 +1423,8 @@ with st.sidebar:
 
         if tier_code == "FREE":
             st.progress((int(getattr(current_user, "uploaded_exam_count", 0) or 0) % FREE_EXAMS_PER_UNLOCK) / FREE_EXAMS_PER_UNLOCK)
-        elif tier_code == "PRO" and pro_weekly_rem is not None:
-            st.progress(pro_weekly_rem / PRO_WEEKLY_PREMIUM_LIMIT)
+        elif tier_code in ("PRO", "ULTRA") and pro_weekly_rem is not None:
+            st.progress(pro_weekly_rem / max(1, get_weekly_premium_limit(current_user) or 1))
 
         # CUSTOM 개인 API 키 관리 UI
         if tier_code == "FREE":
@@ -1618,6 +1621,23 @@ def _render_rewritten_card_html(rw: RewrittenQuestion) -> str:
         choices_html = f"<div class='rewritten-choices-wrap'>{''.join(choice_divs)}</div>"
 
     return f"<div class='rewritten-card'>{''.join(body_parts)}{choices_html}</div>"
+
+
+def _gate_regen_model(model_name: str) -> str:
+    """재변환 직전 최신 사용자 한도를 확인해 상위 모델 한도 소진 시 3.5 Flash-Lite로 우회시킨다."""
+    if not is_premium_model(model_name):
+        return model_name
+    fresh_user = get_user_by_username(storage, current_user.username) or current_user
+    gated_model, gate_notice = resolve_model_for_user(fresh_user, model_name)
+    if gate_notice:
+        st.warning(gate_notice)
+    return gated_model
+
+
+def _charge_regen_usage(model_name: str) -> None:
+    """재변환에 상위 모델이 실제 사용되었다면 1문항 분량을 주간 한도/해금 크레딧에서 차감한다."""
+    if is_premium_model(model_name):
+        consume_premium_model_usage(storage, current_user.username, model_name, count=1)
 
 
 @st.fragment
@@ -1897,13 +1917,13 @@ def _render_mode_b_solve_fragment(
                             or getattr(q, "passage_text", "")
                             or getattr(q, "question_text", "")
                         )
-                        eng_rw_model = eng_meta.get("rewrite_model") or eff_rewrite_model
+                        eng_rw_model = _gate_regen_model(eng_meta.get("rewrite_model") or eff_rewrite_model)
                         eng_precision = bool(
                             eng_meta.get(
                                 "use_precision_mode",
                                 st.session_state.get("active_eng_precision_mode", False),
                             )
-                        )
+                        ) and is_premium_model(eng_rw_model)
                         eng_rw_key, eng_rw_key_lbl = resolve_active_gemini_api_key(
                             current_user,
                             creds.gemini_api_key,
@@ -1924,6 +1944,7 @@ def _render_mode_b_solve_fragment(
                                     previous_attempt=rw,
                                     use_precision_mode=eng_precision,
                                 )
+                                _charge_regen_usage(eng_rw_model)
                                 st.session_state["matched_items"][seq_num - 1]["rewritten"] = new_rw
                                 st.session_state["ai_explanations"].pop(q.id, None)
                                 st.session_state["ai_chats"].pop(q.id, None)
@@ -1942,9 +1963,10 @@ def _render_mode_b_solve_fragment(
                                     or getattr(q, "advanced_terms", [])
                                     or []
                                 )
+                                math_rw_model = _gate_regen_model(eff_rewrite_model)
                                 new_rw = rewrite_question_for_pdf(
                                     api_key=active_gemini_key,
-                                    model_name=eff_rewrite_model,
+                                    model_name=math_rw_model,
                                     question=q,
                                     crop_png_bytes=crop_b,
                                     whitelist=whitelist,
@@ -1952,6 +1974,7 @@ def _render_mode_b_solve_fragment(
                                     sliced_text=st.session_state.get("concept_sliced_text", ""),
                                     previous_attempt=rw,
                                 )
+                                _charge_regen_usage(math_rw_model)
                                 st.session_state["matched_items"][seq_num - 1]["rewritten"] = new_rw
                                 st.session_state["ai_explanations"].pop(q.id, None)
                                 st.session_state["ai_chats"].pop(q.id, None)
@@ -2198,13 +2221,13 @@ if current_user is None:
             st.markdown("<span class='tier-badge tier-ULTRA'>ULTRA · 4,900원/월</span>", unsafe_allow_html=True)
             st.markdown("#### 무제한 유료")
             st.write("- PRO 모든 혜택 포함")
-            st.write("- 3.8/Hydrogen 포함 **한도 없이 무제한**")
+            st.write(f"- 고급 모델(3.8/Hydrogen) **주간 {ULTRA_WEEKLY_PREMIUM_LIMIT}문항**")
             st.write("- **공용 개념서 DB** 무제한 이용")
     with t_col5:
         with st.container(border=True):
             st.markdown("<span class='tier-badge tier-ADMIN'>ADMIN</span>", unsafe_allow_html=True)
             st.markdown("#### 최고 관리자")
-            st.write("- ULTRA와 동일 (모든 기능 **무제한**)")
+            st.write("- 모든 기능·모델 **무제한** (관리자 전용)")
             st.write("- **공용 개념서 DB** 구축 & 관리")
             st.write("- **회원 등급 관리** 패널 접근")
     st.stop()
@@ -3999,21 +4022,23 @@ def _resolve_tab2_english_rewrite_model(key_suffix: str = "eng") -> tuple[str, b
                 f"(현재 {prog_mod}/{FREE_EXAMS_PER_UNLOCK}회). **Gemini 3.5 Flash-Lite** 기본 모드로 실행합니다."
             )
     else:
-        rw_model, rw_notice = resolve_model_for_user(current_user, REWRITE_MODEL)
+        fresh_user = get_user_by_username(storage, current_user.username) or current_user
+        rw_model, rw_notice = resolve_model_for_user(fresh_user, REWRITE_MODEL)
         use_precision_mode = "flash-lite" not in rw_model.lower()
-        pro_rem_weekly = get_remaining_pro_weekly_quota(current_user)
-        if current_user.tier == "PRO":
+        pro_rem_weekly = get_remaining_pro_weekly_quota(fresh_user)
+        weekly_cap = get_weekly_premium_limit(fresh_user)
+        if fresh_user.tier in ("PRO", "ULTRA"):
             if (pro_rem_weekly or 0) <= 0:
                 rw_model = EXAM_TAGGING_MODEL
                 use_precision_mode = False
                 st.warning(
-                    f"⚠️ **PRO 주간 고급 모델 한도({PRO_WEEKLY_PREMIUM_LIMIT}문항)를 모두 소진**하여 "
+                    f"⚠️ **{fresh_user.tier} 주간 고급 모델 한도({weekly_cap}문항)를 모두 소진**하여 "
                     "**Gemini 3.5 Flash-Lite** 기본 모드로 자동 전환됩니다."
                 )
             else:
                 st.warning(
-                    f"💎 **PRO (1,990원/월)** · 고난도 정밀 생성 활성화: **{MODEL_LABELS.get(rw_model, rw_model)}** "
-                    f"(`Thinking LOW` 제한 · 주간 고급 모델 남은 문항: **{pro_rem_weekly} / {PRO_WEEKLY_PREMIUM_LIMIT}문항**)"
+                    f"💎 **{TIER_LABELS.get(fresh_user.tier, fresh_user.tier)}** · 고난도 정밀 생성 활성화: **{MODEL_LABELS.get(rw_model, rw_model)}** "
+                    f"(`Thinking LOW` 제한 · 주간 고급 모델 남은 문항: **{pro_rem_weekly} / {weekly_cap}문항**)"
                     + (f" — {rw_notice}" if rw_notice else "")
                 )
         else:
@@ -4046,18 +4071,20 @@ def _execute_english_transform_jobs(
         )
         jobs = jobs[:user_max_jobs]
 
-    if current_user.tier == "PRO" and is_premium_model(rewrite_model):
-        pro_rem = get_remaining_pro_weekly_quota(current_user) or 0
+    if current_user.tier in ("PRO", "ULTRA") and is_premium_model(rewrite_model):
+        fresh_user = get_user_by_username(storage, current_user.username) or current_user
+        weekly_cap = get_weekly_premium_limit(fresh_user)
+        pro_rem = get_remaining_pro_weekly_quota(fresh_user) or 0
         if pro_rem <= 0:
             st.warning(
-                f"⚠️ PRO 주간 고급 모델 한도({PRO_WEEKLY_PREMIUM_LIMIT}문항)를 모두 사용하여 "
+                f"⚠️ {fresh_user.tier} 주간 고급 모델 한도({weekly_cap}문항)를 모두 사용하여 "
                 "**Gemini 3.5 Flash-Lite** 기본 모드로 자동 전환해 실행합니다."
             )
             rewrite_model = EXAM_TAGGING_MODEL
             use_precision_mode = False
         elif len(jobs) > pro_rem:
             st.warning(
-                f"⚠️ PRO 주간 고급 모델 잔여 한도(**{pro_rem}문항**)에 맞춰 앞의 {pro_rem}문항만 정밀 생성합니다. "
+                f"⚠️ {fresh_user.tier} 주간 고급 모델 잔여 한도(**{pro_rem}문항**)에 맞춰 앞의 {pro_rem}문항만 정밀 생성합니다. "
                 "(나머지 문항은 기본 모드 3.5 Flash-Lite로 무제한 생성 가능합니다.)"
             )
             jobs = jobs[:pro_rem]
@@ -4170,9 +4197,9 @@ def _execute_english_transform_jobs(
     if updated_u is not None and is_premium_model(rewrite_model):
         if updated_u.tier == "FREE":
             rem_msg = f" | 남은 고급 모델 해금 크레딧: {int(getattr(updated_u, 'premium_unlock_credits', 0) or 0)}회"
-        elif updated_u.tier == "PRO":
+        elif updated_u.tier in ("PRO", "ULTRA"):
             pro_rem = get_remaining_pro_weekly_quota(updated_u)
-            rem_msg = f" | PRO 주간 고급 모델 잔여: {pro_rem}/{PRO_WEEKLY_PREMIUM_LIMIT}문항"
+            rem_msg = f" | {updated_u.tier} 주간 고급 모델 잔여: {pro_rem}/{get_weekly_premium_limit(updated_u)}문항"
 
     st.success(f"🎯 총 **{len(assembled)}문항**의 수능형 영어 변형 문제 출제가 완료되었습니다! 아래 모드 A(시험지 PDF) 또는 모드 B(웹 바로 풀기)에서 확인하세요.{rem_msg}")
 
@@ -4874,10 +4901,10 @@ with tab2:
         else:
             match_model = EXAM_TAGGING_MODEL
             rewrite_model, rewrite_notice = resolve_model_for_user(current_user, REWRITE_MODEL)
-            if current_user.tier == "PRO":
+            if current_user.tier in ("PRO", "ULTRA"):
                 st.info(
-                    f"💎 **PRO (1,990원/월)** · 상위 문제 개조 모델: **{MODEL_LABELS.get(rewrite_model, rewrite_model)}** "
-                    f"(주간 고급 모델 남은 문항: **{pro_rem_weekly} / {PRO_WEEKLY_PREMIUM_LIMIT}문항**)"
+                    f"💎 **{TIER_LABELS.get(current_user.tier, current_user.tier)}** · 상위 문제 개조 모델: **{MODEL_LABELS.get(rewrite_model, rewrite_model)}** "
+                    f"(주간 고급 모델 남은 문항: **{pro_rem_weekly} / {get_weekly_premium_limit(current_user)}문항**)"
                     + (f" — {rewrite_notice}" if rewrite_notice else "")
                 )
         st.session_state["active_rewrite_model"] = rewrite_model
@@ -5105,9 +5132,9 @@ with tab2:
                             if updated_u is not None and is_premium_model(rewrite_model):
                                 if updated_u.tier == "FREE":
                                     rem_msg = f" | 남은 고급 모델 해금 크레딧: {int(getattr(updated_u, 'premium_unlock_credits', 0) or 0)}회"
-                                elif updated_u.tier == "PRO":
+                                elif updated_u.tier in ("PRO", "ULTRA"):
                                     pro_rem = get_remaining_pro_weekly_quota(updated_u)
-                                    rem_msg = f" | PRO 주간 고급 모델 잔여: {pro_rem}/{PRO_WEEKLY_PREMIUM_LIMIT}문항"
+                                    rem_msg = f" | {updated_u.tier} 주간 고급 모델 잔여: {pro_rem}/{get_weekly_premium_limit(updated_u)}문항"
                             st.success(
                                 f"🎯 총 {len(assembled)}문항 추출 완료! "
                                 f"(원문 그대로 {sum(1 for it in assembled if it['rewritten'] is None)}문항 · "

@@ -20,10 +20,14 @@ def _storage_lock(storage: StorageManager | None):
     return getattr(storage, "_lock", None) or nullcontext()
 
 KST = timezone(timedelta(hours=9))
-FREE_DAILY_LIMIT = 5  # 하위 호환용 상수 (개편 후 FREE는 업로드/3.5-lite 무제한)
 FREE_MAX_BATCH_QUESTIONS = 5
 PAID_MAX_BATCH_QUESTIONS = 20
 PRO_WEEKLY_PREMIUM_LIMIT = 50
+ULTRA_WEEKLY_PREMIUM_LIMIT = 200
+WEEKLY_PREMIUM_LIMITS: dict[str, int] = {
+    "PRO": PRO_WEEKLY_PREMIUM_LIMIT,
+    "ULTRA": ULTRA_WEEKLY_PREMIUM_LIMIT,
+}
 FREE_EXAMS_PER_UNLOCK = 3
 PREMIUM_MODEL_IDS: tuple[str, ...] = ("gemini-3.8-flash", "gemini-4-hydrogen")
 VALID_TIERS: tuple[TierType, ...] = ("FREE", "CUSTOM", "PRO", "ULTRA", "ADMIN")
@@ -53,17 +57,36 @@ def is_premium_model(model_name: str | None) -> bool:
     return raw in PREMIUM_MODEL_IDS or "3.8" in raw or "hydrogen" in raw
 
 
+PBKDF2_ITERATIONS = 240_000
+_PBKDF2_PREFIX = "pbkdf2_sha256"
+
+
 def hash_password(password: str, salt: str | None = None) -> str:
-    """SHA-256 + random salt로 비밀번호를 안전하게 해싱한다."""
+    """PBKDF2-HMAC-SHA256(24만 회) + random salt로 비밀번호를 해싱한다. 형식: pbkdf2_sha256$iters$salt$hex"""
     actual_salt = salt or secrets.token_hex(16)
-    digest = hashlib.sha256(f"{actual_salt}:{password}".encode("utf-8")).hexdigest()
-    return f"{actual_salt}${digest}"
+    digest = hashlib.pbkdf2_hmac(
+        "sha256", password.encode("utf-8"), actual_salt.encode("utf-8"), PBKDF2_ITERATIONS
+    ).hex()
+    return f"{_PBKDF2_PREFIX}${PBKDF2_ITERATIONS}${actual_salt}${digest}"
+
+
+def is_legacy_password_hash(stored_hash: str) -> bool:
+    return bool(stored_hash) and not stored_hash.startswith(f"{_PBKDF2_PREFIX}$")
 
 
 def verify_password(password: str, stored_hash: str) -> bool:
-    """저장된 salt$sha256 해시와 입력 비밀번호를 상수 시간 비교로 검증한다."""
-    if "$" not in stored_hash:
+    """PBKDF2 해시(및 기존 salt$sha256 레거시 해시)를 상수 시간 비교로 검증한다."""
+    if not stored_hash or "$" not in stored_hash:
         return False
+    if stored_hash.startswith(f"{_PBKDF2_PREFIX}$"):
+        try:
+            _, iters_s, salt, expected = stored_hash.split("$", 3)
+            candidate = hashlib.pbkdf2_hmac(
+                "sha256", password.encode("utf-8"), salt.encode("utf-8"), int(iters_s)
+            ).hex()
+        except (ValueError, TypeError):
+            return False
+        return hmac.compare_digest(candidate, expected)
     salt, expected_digest = stored_hash.split("$", 1)
     candidate_digest = hashlib.sha256(f"{salt}:{password}".encode("utf-8")).hexdigest()
     return hmac.compare_digest(candidate_digest, expected_digest)
@@ -84,6 +107,7 @@ def mask_api_key(api_key: str) -> str:
 
 
 SESSION_TOKEN_TTL_SECONDS: int = 7 * 24 * 3600
+_PROCESS_FALLBACK_SIGNING_KEY: bytes | None = None
 
 
 def _get_session_signing_key(storage: StorageManager | None = None) -> bytes:
@@ -113,7 +137,11 @@ def _get_session_signing_key(storage: StorageManager | None = None) -> bytes:
         except Exception:
             pass
 
-    return hashlib.sha256(b"mogigosa-local-fallback-secret").digest()
+    # 비밀값이 전혀 설정되지 않은 환경: 코드에 박힌 고정 키 대신 프로세스별 무작위 키 사용 (재시작 시 세션만 만료)
+    global _PROCESS_FALLBACK_SIGNING_KEY
+    if _PROCESS_FALLBACK_SIGNING_KEY is None:
+        _PROCESS_FALLBACK_SIGNING_KEY = secrets.token_bytes(32)
+    return _PROCESS_FALLBACK_SIGNING_KEY
 
 
 def _b64url_encode(data: bytes) -> str:
@@ -280,7 +308,11 @@ def authenticate_user(
             if u.username == norm_id:
                 if not verify_password(password, u.password_hash):
                     return False, "비밀번호가 일치하지 않습니다.", None
-                if _sync_user_state(u, today, admin_names):
+                rehashed = False
+                if is_legacy_password_hash(u.password_hash):
+                    u.password_hash = hash_password(password)
+                    rehashed = True
+                if _sync_user_state(u, today, admin_names) or rehashed:
                     storage.save_users(users)
                 return True, f"{u.nickname}님, 로그인되었습니다.", u
 
@@ -381,9 +413,17 @@ def get_max_batch_questions(user: UserRecord | None) -> int:
     return PAID_MAX_BATCH_QUESTIONS
 
 
+def get_weekly_premium_limit(user: UserRecord | None) -> int | None:
+    """등급별 주간 고급 모델(3.8 / Hydrogen) 생성 문항 한도를 반환한다 (PRO=50, ULTRA=200, 그 외 None)."""
+    if user is None:
+        return None
+    return WEEKLY_PREMIUM_LIMITS.get(user.tier)
+
+
 def get_remaining_pro_weekly_quota(user: UserRecord) -> int | None:
-    """PRO 등급의 이번 주(KST) 남은 고급 모델(3.8 / Hydrogen) 생성 문항 수(주간 50문항)를 반환한다. 타 등급은 None."""
-    if user.tier != "PRO":
+    """PRO/ULTRA 등급의 이번 주(KST) 남은 고급 모델 생성 문항 수를 반환한다. 타 등급은 None."""
+    limit = get_weekly_premium_limit(user)
+    if limit is None:
         return None
     current_week = get_kst_week_str()
     used_week = (
@@ -391,7 +431,7 @@ def get_remaining_pro_weekly_quota(user: UserRecord) -> int | None:
         if getattr(user, "last_used_week", "") == current_week
         else 0
     )
-    return max(0, PRO_WEEKLY_PREMIUM_LIMIT - int(used_week or 0))
+    return max(0, limit - int(used_week or 0))
 
 
 def can_use_premium_features(user: UserRecord) -> bool:
@@ -410,20 +450,20 @@ def resolve_model_for_user(user: UserRecord, requested_model: str) -> tuple[str,
     """
     회원 등급과 잔여 해금/주간 한도에 따라 실제 호출할 Gemini 모델 ID와 안내 메시지를 결정한다.
     - FREE: 기본 추론은 항상 gemini-3.5-flash-lite. 단, 기출 3회 업로드당 1회 해금된 크레딧이 있으면 3.8/Hydrogen 1회 허용.
-    - CUSTOM / ULTRA / ADMIN: 선택한 모든 모델 무제한 허용.
-    - PRO: 3.5 계열 무제한, 3.8/Hydrogen은 주간 20회 이하 허용(소진 시 gemini-3.5-flash로 우회).
+    - CUSTOM / ADMIN: 선택한 모든 모델 무제한 허용 (CUSTOM은 개인 키 사용).
+    - PRO(주간 50문항) / ULTRA(주간 200문항): 3.5 계열 무제한, 3.8/Hydrogen은 주간 문항 한도 내 허용(소진 시 gemini-3.5-flash-lite로 우회).
     """
     req = (requested_model or "").strip() or "gemini-3.5-flash-lite"
-    if user.tier in ("CUSTOM", "ULTRA", "ADMIN"):
+    if user.tier in ("CUSTOM", "ADMIN"):
         return req, ""
 
-    if user.tier == "PRO":
+    if user.tier in ("PRO", "ULTRA"):
         if is_premium_model(req):
             rem = get_remaining_pro_weekly_quota(user) or 0
             if rem <= 0:
                 return (
                     "gemini-3.5-flash-lite",
-                    f"PRO 주간 고급 모델 한도({PRO_WEEKLY_PREMIUM_LIMIT}문항)를 모두 사용해 Gemini 3.5 Flash-Lite로 실행됩니다.",
+                    f"{user.tier} 주간 고급 모델 한도({get_weekly_premium_limit(user)}문항)를 모두 사용해 Gemini 3.5 Flash-Lite로 실행됩니다.",
                 )
         return req, ""
 
@@ -488,8 +528,8 @@ def consume_premium_model_usage(
     """
     고급 모델(3.8 / Hydrogen) 작업 실행 시 등급별 크레딧 또는 주간 문항 사용량을 차감/누적한다.
     - FREE: 실행당 해금 크레딧 1회 차감 (1회 최대 5문항)
-    - PRO: 실제 생성된 문항 수(count)만큼 주간 한도(50문항)에서 차감
-    - CUSTOM / ULTRA / ADMIN 또는 일반(3.5) 모델 실행 시에는 차감하지 않는다.
+    - PRO / ULTRA: 실제 생성된 문항 수(count)만큼 주간 한도(PRO 50 / ULTRA 200문항)에서 차감
+    - CUSTOM / ADMIN 또는 일반(3.5) 모델 실행 시에는 차감하지 않는다.
     """
     if not is_premium_model(used_model):
         return None
@@ -511,7 +551,7 @@ def consume_premium_model_usage(
                     if hasattr(u, "premium_unlock_credits"):
                         u.premium_unlock_credits = cur_credits - 1
                     changed = True
-                elif u.tier == "PRO":
+                elif u.tier in ("PRO", "ULTRA"):
                     if hasattr(u, "weekly_premium_count"):
                         u.weekly_premium_count = int(getattr(u, "weekly_premium_count", 0) or 0) + step_count
                     if hasattr(u, "last_used_week"):
