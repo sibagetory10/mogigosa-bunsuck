@@ -2571,6 +2571,132 @@ def _preprocess_english_source_passage(passage: str) -> str:
     return txt.strip()
 
 
+def _split_english_sentences(text: str) -> list[str]:
+    """약어·소수점을 보존하면서 영어 지문을 문장 단위 리스트로 분할한다."""
+    cleaned_lines: list[str] = []
+    for raw_ln in (text or "").splitlines():
+        ln = raw_ln.strip()
+        if not ln:
+            continue
+        if re.search(r"[가-힣]", ln) and not re.search(r"[A-Za-z]{4,}", ln):
+            continue
+        if ln.startswith("*") and ":" in ln:
+            continue
+        cleaned_lines.append(ln)
+    joined = re.sub(r"\s+", " ", " ".join(cleaned_lines)).strip()
+    if not joined:
+        return []
+
+    stashed: list[str] = []
+
+    def _stash(m: re.Match[str]) -> str:
+        idx = len(stashed)
+        stashed.append(m.group(0))
+        return f"@@SENTTOK_{idx}@@"
+
+    masked = _SENT_ABBREV_RE.sub(_stash, joined)
+    masked = re.sub(r"\b\d+\.\d+\b", _stash, masked)
+    raw_sents = re.split(r"(?<=[.?!])(?:[\"'”’\)]*)\s+(?=[A-Z\"'“‘\(])", masked)
+    out: list[str] = []
+    for s in raw_sents:
+        restored = s
+        for idx, orig in enumerate(stashed):
+            restored = restored.replace(f"@@SENTTOK_{idx}@@", orig)
+        restored = restored.strip()
+        if restored:
+            out.append(restored)
+    return out
+
+
+def _extract_given_sentence_from_insertion_stem(stem: str) -> str:
+    """문장 삽입 변형 출력에서 [주어진 문장] 박스의 추출 문장만 발췌한다."""
+    parts = re.split(r"\[주어진\s*문장\]", stem or "", maxsplit=1)
+    if len(parts) < 2:
+        return ""
+    after_hdr = parts[1].strip()
+    # 빈 줄 이전 또는 첫 ( ① ) 직전까지를 주어진 문장으로 간주
+    block = re.split(r"\n\s*\n", after_hdr, maxsplit=1)[0].strip()
+    block = re.split(r"\(\s*①\s*\)", block, maxsplit=1)[0].strip()
+    sents = _split_english_sentences(block)
+    return sents[0] if sents else block
+
+
+def _rebuild_insertion_stem_from_source(rw: RewrittenQuestion, source_passage: str) -> bool:
+    """
+    원문 문장이 6문장 이상인 경우, AI가 고른 주어진 문장을 source_passage에서 찾아
+    5개 문장 경계에 ( ① )~( ⑤ )를 파이썬으로 직접 배치하고 정확한 preserved_answer를 계산한다.
+    """
+    src_sents = _split_english_sentences(source_passage)
+    if len(src_sents) < 6:
+        return False
+
+    given_cand = _extract_given_sentence_from_insertion_stem(rw.rewritten_stem or "")
+    if not given_cand:
+        return False
+
+    def _norm_toks(s: str) -> list[str]:
+        return re.findall(r"[a-z0-9]+", (s or "").lower())
+
+    g_toks = _norm_toks(given_cand)
+    if len(g_toks) < 3:
+        return False
+    g_set = set(g_toks)
+
+    best_idx = -1
+    best_score = 0.0
+    for idx_s, s in enumerate(src_sents):
+        s_toks = _norm_toks(s)
+        if not s_toks:
+            continue
+        if s_toks == g_toks:
+            best_idx = idx_s
+            best_score = 1.0
+            break
+        s_set = set(s_toks)
+        jaccard = len(g_set & s_set) / max(1, len(g_set | s_set))
+        if jaccard > best_score:
+            best_score = jaccard
+            best_idx = idx_s
+
+    # 첫 문장(idx 0)은 통상 도입문이므로 최소 0.72 이상 일치하고 idx >= 1일 때 기계적 재조립 수행
+    if best_idx < 1 or best_score < 0.72:
+        return False
+
+    given_exact = src_sents[best_idx]
+    remaining = [s for i, s in enumerate(src_sents) if i != best_idx]
+    if len(remaining) < 5:
+        return False
+
+    # remaining의 문장 경계 gap k: 1 <= k <= len(remaining) (k는 remaining[k-1] 뒤 위치)
+    true_gap = best_idx  # match_idx >= 1 이므로 remaining[best_idx - 1] 바로 뒤
+    max_gap = len(remaining) - 1 if true_gap <= len(remaining) - 1 else len(remaining)
+    # 5개 연속 경계 [g_start .. g_start + 4] 안에 true_gap이 포함되도록 설정
+    g_start = max(1, min(true_gap - 2, max_gap - 4))
+    if true_gap < g_start:
+        g_start = true_gap
+    if true_gap > g_start + 4:
+        g_start = true_gap - 4
+
+    markers = ["( ① )", "( ② )", "( ③ )", "( ④ )", "( ⑤ )"]
+    chunks: list[str] = []
+    for pos, sent in enumerate(remaining):
+        chunks.append(sent)
+        gap_idx = pos + 1
+        if g_start <= gap_idx <= g_start + 4:
+            chunks.append(markers[gap_idx - g_start])
+
+    main_body = " ".join(chunks).strip()
+    rw.rewritten_stem = (
+        "글의 흐름으로 보아, 주어진 문장이 들어가기에 가장 적절한 곳은?\n"
+        "[주어진 문장]\n"
+        f"{given_exact}\n\n"
+        f"{main_body}"
+    )
+    rw.rewritten_choices = ["①", "②", "③", "④", "⑤"]
+    rw.preserved_answer = str((true_gap - g_start) + 1)
+    return True
+
+
 def _count_english_sentences(text: str) -> int:
     """영어 지문 본문의 문장 수를 약어/소수점을 제외하고 근사 계산한다."""
     cleaned_lines: list[str] = []
@@ -2733,6 +2859,15 @@ def _validate_english_transformed_output(
 
     u_matches = re.findall(r"<u\b[^>]*>(.*?)</u>", stem, flags=re.I | re.S)
     u_count = len(u_matches)
+    if "어휘" in t and source_passage:
+        src_cnt = _count_english_sentences(source_passage)
+        gen_cnt = _count_english_sentences(stem)
+        if src_cnt >= 3 and gen_cnt != src_cnt:
+            issues.append(
+                f"문맥상 어휘 유형은 원문 문장 수({src_cnt}개)와 동일해야 합니다 (현재 {gen_cnt}문장). "
+                "지문 끝에 새 문장을 추가하거나 기존 문장을 삭제하지 말고 원문 본문 단어만 교체하세요."
+            )
+
     if "어법" in t or ("어휘" in t and "선택형" not in vocab_style and "(A)" not in vocab_style):
         if u_count < 5:
             issues.append(f"지문(rewritten_stem) 안에 `① <u>...</u>` ~ `⑤ <u>...</u>` 밑줄 태그 5개가 모두 포함되어야 합니다 (현재 `<u>` {u_count}개).")
@@ -2778,6 +2913,22 @@ def _validate_english_transformed_output(
     elif "빈칸" in t:
         if "____" not in stem:
             issues.append("빈칸 추론 지문에는 `___________` 빈칸 표기가 반드시 포함되어야 합니다.")
+        else:
+            # 3. 빈칸 앞뒤 2단어와 정답 선지의 시작/끝 2단어 중복 차단
+            m_blk = re.search(r"_{4,}", stem)
+            if m_blk and ans in ("1", "2", "3", "4", "5") and len(rw.rewritten_choices or []) >= int(ans):
+                before_toks = re.findall(r"[a-zA-Z\-']+", stem[: m_blk.start()].lower())
+                after_toks = re.findall(r"[a-zA-Z\-']+", stem[m_blk.end() :].lower())
+                ans_toks = re.findall(r"[a-zA-Z\-']+", (rw.rewritten_choices[int(ans) - 1] or "").lower())
+                if len(ans_toks) >= 2:
+                    if len(before_toks) >= 2 and before_toks[-2:] == ans_toks[:2]:
+                        issues.append(
+                            f"빈칸 직전 구절({' '.join(before_toks[-2:])})과 정답 선지의 시작 2단어가 중복됩니다. 중복을 제거해 다시 생성하세요."
+                        )
+                    elif len(after_toks) >= 2 and after_toks[:2] == ans_toks[-2:]:
+                        issues.append(
+                            f"빈칸 직후 구절({' '.join(after_toks[:2])})과 정답 선지의 끝 2단어가 중복됩니다. 중복을 제거해 다시 생성하세요."
+                        )
         if re.search(r"\(\s*[①②③④⑤]\s*\)|[①②③④⑤]", stem):
             issues.append(
                 "빈칸 추론 지문에는 문장 삽입 번호 기호 `( ① )~( ⑤ )` 또는 `①~⑤`가 포함되면 안 됩니다. 모두 제거하세요."
@@ -2801,6 +2952,17 @@ def _validate_english_transformed_output(
                 issues.append(f"글의 순서 지문에 `{mk}` 단락 표기가 누락되었습니다.")
         if "[주어진 글]" not in stem and "주어진 글" not in stem:
             issues.append("글의 순서 지문에 `[주어진 글]` 섹션 헤더가 누락되었습니다.")
+        if source_passage:
+            # 4. 글의 순서 원문 문장 보존 검증 ([주어진 글] + (A) + (B) + (C) 합계 == 원문 문장 수)
+            order_clean = re.sub(r"\[주어진\s*글\]", " ", stem)
+            order_clean = re.sub(r"\(\s*[ABC]\s*\)", " ", order_clean)
+            src_cnt = _count_english_sentences(source_passage)
+            gen_cnt = _count_english_sentences(order_clean)
+            if src_cnt >= 3 and gen_cnt != src_cnt:
+                issues.append(
+                    f"글의 순서 문제에서 원문 문장 수({src_cnt}개)와 [주어진 글]+(A)+(B)+(C) 합계 문장 수({gen_cnt}개)가 다릅니다. "
+                    "원문 문장을 누락하거나 새 문장을 임의로 추가하지 말고 원문 그대로 배치하세요."
+                )
     elif "삽입" in t:
         if "[주어진 문장]" not in stem and "주어진 문장" not in stem:
             issues.append("문장 삽입 지문에 `[주어진 문장]` 섹션 헤더가 누락되었습니다.")
@@ -2939,7 +3101,8 @@ def generate_english_transformed_question(
         if "순서" in canonical_type:
             _reconcile_english_order_answer(rw)
         elif "삽입" in canonical_type:
-            _reconcile_english_insertion_answer(rw)
+            if not _rebuild_insertion_stem_from_source(rw, clean_passage):
+                _reconcile_english_insertion_answer(rw)
         elif "요약" in canonical_type:
             _reconcile_english_summary_answer(rw)
 
