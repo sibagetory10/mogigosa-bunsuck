@@ -2511,7 +2511,8 @@ def _build_english_transform_rule(
 _AI_META_MONOLOGUE_RE = re.compile(
     r"(?:wait,\s*let\s*me|let['’]?s\s+(?:rewrite|apply|check|change|fix|try|revise|make|replace|keep)|"
     r"keep\s+the\s+original\s+text|actually,\s*let['’]?s|i\s+will\s+(?:rewrite|replace|use)|"
-    r"here\s+is\s+the\s+revised|note:\s*i\s+(?:changed|replaced))",
+    r"here\s+is\s+the\s+revised|note:\s*i\s+(?:changed|replaced)|"
+    r"\[\s*정답[^\]]*\]|예시\s*교정|변형\s*필요|정답\s*처리|수정\s*필요|비문으로\s*만듦)",
     re.IGNORECASE,
 )
 _DANGLING_TO_END_RE = re.compile(
@@ -2667,7 +2668,10 @@ def _split_english_sentences(text: str) -> list[str]:
 
     masked = _SENT_ABBREV_RE.sub(_stash, joined)
     masked = re.sub(r"\b\d+\.\d+\b", _stash, masked)
-    raw_sents = re.split(r"(?<=[.?!])(?:[\"'”’\)]*)\s+(?=[A-Z\"'“‘\(])", masked)
+    raw_sents = re.split(
+        r"(?<=[.?!][\"'”’\)])\s+(?=[A-Z\"'“‘\(])|(?<=[.?!])\s+(?=[A-Z\"'“‘\(])",
+        masked,
+    )
     out: list[str] = []
     for s in raw_sents:
         restored = s
@@ -2764,7 +2768,24 @@ def _rebuild_insertion_stem_from_source(rw: RewrittenQuestion, source_passage: s
         f"{main_body}"
     )
     rw.rewritten_choices = ["①", "②", "③", "④", "⑤"]
-    rw.preserved_answer = str((true_gap - g_start) + 1)
+    ans_num = str((true_gap - g_start) + 1)
+    rw.preserved_answer = ans_num
+    # 파이썬이 확정한 정답 번호와 해설 내 위치 번호가 어긋나지 않도록 동기화
+    num_to_circle = {"1": "①", "2": "②", "3": "③", "4": "④", "5": "⑤"}
+    c_sym = num_to_circle.get(ans_num, "①")
+    if rw.pdf_grounded_explanation:
+        exp_sync = rw.pdf_grounded_explanation
+        exp_sync = re.sub(
+            r"(정답(?:은|:)?\s*)(?:[1-5]\s*번|[①②③④⑤](?:\s*번)?)",
+            rf"\g<1>{c_sym}번",
+            exp_sync,
+        )
+        exp_sync = re.sub(
+            r"(?:[1-5]\s*번|[①②③④⑤](?:\s*번)?)\s*(위치|자리|에\s*들어가|에\s*가장\s*적절)",
+            rf"{c_sym}번 \g<1>",
+            exp_sync,
+        )
+        rw.pdf_grounded_explanation = exp_sync
     return True
 
 
@@ -3010,13 +3031,30 @@ def _validate_english_transformed_output(
     stem = rw.rewritten_stem or ""
     t = (target_type or "").strip()
 
-    # 1. AI 영문 독백(메타 발화) 혼입 차단
+    # 1. AI 영문/한글 독백(메타 발화) 혼입 차단
     all_text_fields = [stem, *(rw.rewritten_choices or []), rw.pdf_grounded_explanation or ""]
     for fld in all_text_fields:
         m_meta = _AI_META_MONOLOGUE_RE.search(fld or "")
         if m_meta:
             issues.append(
                 f"AI 내부 사고/자기 수정 메타 문구({m_meta.group(0)!r})가 출력에 혼입되었습니다. 메타 독백 없이 순수 문제와 해설만 반환하세요."
+            )
+            break
+
+    # 1-b. 영문 지문 본문(발문·섹션 헤더·각주 제외)에 한글 코멘트가 섞였는지 차단
+    for ln_raw in stem.splitlines():
+        ln_s = ln_raw.strip()
+        if not ln_s:
+            continue
+        if re.search(r"가장\s*적절한\s*(?:것은|곳은)\??$", ln_s):
+            continue
+        if re.match(r"^\[(?:주어진\s*글|주어진\s*문장|요약문)\]$", ln_s):
+            continue
+        if ln_s.startswith("*"):
+            continue
+        if re.search(r"[가-힣]{2,}", ln_s) and re.search(r"[A-Za-z]{4,}", ln_s):
+            issues.append(
+                f"영문 지문 본문 안에 한글 설명/메모({ln_s[:40]!r})가 섞였습니다. 지문 본문은 순수 영어만 남기세요."
             )
             break
 
@@ -3046,13 +3084,21 @@ def _validate_english_transformed_output(
             )
 
     if "어법" in t or ("어휘" in t and "선택형" not in vocab_style and "(A)" not in vocab_style):
-        if u_count < 5:
-            issues.append(f"지문(rewritten_stem) 안에 `① <u>...</u>` ~ `⑤ <u>...</u>` 밑줄 태그 5개가 모두 포함되어야 합니다 (현재 `<u>` {u_count}개).")
+        missing_markers = [mk for mk in ("①", "②", "③", "④", "⑤") if stem.count(mk) != 1]
+        if u_count != 5 or missing_markers:
+            issues.append(
+                f"지문(rewritten_stem) 안에 `① <u>...</u>` ~ `⑤ <u>...</u>` 밑줄 5개가 모두 정확히 1개씩 포함되어야 합니다 "
+                f"(현재 `<u>` {u_count}개, 누락/중복 번호: {missing_markers})."
+            )
         elif "어법" in t:
             exp_txt = rw.pdf_grounded_explanation or ""
-            if re.search(r"(?:의미상|문맥상\s*반대|반의어)", exp_txt):
+            if re.search(r"(?:의미상|의미적|문맥상\s*반대|반의어|부정어\s*(?:not|no)\s*(?:이|가)?\s*빠)", exp_txt):
                 issues.append(
-                    "어법 문제 해설에 어휘 뜻풀이('의미상'/'반의어')가 포함되었습니다. 어휘 문제와 혼동하지 말고 명백한 문법 비문 1개만 출제하세요."
+                    "어법 문제 해설에 어휘 뜻풀이('의미상'/'의미적'/'반의어'/'부정어 누락')가 포함되었습니다. 어휘 문제와 혼동하지 말고 명백한 문법 비문 1개만 출제하세요."
+                )
+            elif re.search(r"(?:과거형\s*대신\s*현재형|현재형\s*대신\s*과거형|시제\s*흐름과\s*일치)", exp_txt):
+                issues.append(
+                    "어법 문제에서 단순 과거/현재 시제 차이를 오류로 출제했습니다. 문맥상 가능한 시제 변경 대신 수일치·능동/수동·관계사·분사·준동사 등 명백한 통사 오류 1개만 출제하세요."
                 )
             elif re.search(r"(?:타당|적절|올바르|맞)(?:하다|다|습니다|음)(?!\s*(?:않|못))", exp_txt) and not re.search(
                 r"(?:적절하지\s*않|올바르지\s*않|타당하지\s*않|맞지\s*않)", exp_txt
@@ -3141,6 +3187,20 @@ def _validate_english_transformed_output(
                     issues.append(
                         f"빈칸 바로 앞 단어({before_toks[-1]!r})가 정답 선지 시작 단어와 중복됩니다. 중복을 제거해 다시 생성하세요."
                     )
+                elif (
+                    before_toks
+                    and before_toks[-1] in {"that", "because", "although", "though", "since", "when", "while", "if", "unless"}
+                    and ans_toks
+                    and ans_toks[0] in {"without", "with", "in", "on", "at", "by", "for", "from", "through"}
+                ):
+                    issues.append(
+                        f"접속사({before_toks[-1]!r}) 바로 뒤 빈칸에 전치사구({ans_toks[0]!r} ...)만 들어가면 비문이 됩니다. 주어+동사를 포함한 절 또는 동사구로 출제하세요."
+                    )
+                post_raw = stem[m_blk.end() :]
+                if re.match(r"^[ \t]+[A-Z]", post_raw) and not re.search(r"[.?!]$", pre_txt.rstrip()):
+                    issues.append(
+                        "문장 전체를 빈칸으로 비웠으나 빈칸 뒤에 마침표(.)가 누락되어 다음 문장과 붙었습니다. 문장 종결 부호를 유지하거나 문장 일부만 빈칸 처리하세요."
+                    )
         if re.search(r"\(\s*[①②③④⑤]\s*\)|[①②③④⑤]", stem):
             issues.append(
                 "빈칸 추론 지문에는 문장 삽입 번호 기호 `( ① )~( ⑤ )` 또는 `①~⑤`가 포함되면 안 됩니다. 모두 제거하세요."
@@ -3197,6 +3257,11 @@ def _validate_english_transformed_output(
                 break
         # ( ① )~( ⑤ ) 마커가 문장 경계(. ? ! 뒤)가 아닌 주어·동사 한가운데 삽입되었는지 검증
         ins_body = re.split(r"\[주어진\s*문장\]", stem, maxsplit=1)[-1]
+        ins_body_alpha = re.findall(r"[A-Za-z]+", ins_body)
+        if len(ins_body_alpha) < 25:
+            issues.append(
+                f"문장 삽입 본문 영문 단어가 {len(ins_body_alpha)}개뿐입니다. [주어진 문장] 외에 전체 영어 지문 본문을 빠짐없이 포함하세요."
+            )
         for m_ins in re.finditer(r"\(?\s*([①②③④⑤])\s*\)", ins_body):
             before = ins_body[: m_ins.start()].rstrip()
             if before and not re.search(r"[.?!][\"'”’\)]*$", before):
@@ -3302,6 +3367,68 @@ def _assemble_english_slim_stem(
                 rw.rewritten_stem = f"밑줄 친 부분이 다음 글에서 의미하는 바로 가장 적절한 것은?\n{replaced_body}"
 
 
+_INCOMPLETE_BLANK_RE = re.compile(
+    r"_{2,}|"
+    r"[A-Za-z][ \t]+[.?!](?=\s|$|[\"'”’\)])|"
+    r"\b(?:isn't\s+much|aren't\s+many|has\s+to|have\s+to|had\s+to|want\s+to|need\s+to|"
+    r"able\s+to|going\s+to|ought\s+to|used\s+to|the|a|an|of|in|on|at|for|with|from|into|by|that|which)\s*[.?!]"
+    r"(?=\s|$|[\"'”’\)])",
+    re.IGNORECASE,
+)
+
+
+def _has_incomplete_english_blank(passage: str) -> bool:
+    """원문 영어 지문 자체가 빈칸 기출이어서 비문/누락 문장이 있는지 판별한다."""
+    if not passage:
+        return False
+    if _INCOMPLETE_BLANK_RE.search(passage):
+        return True
+    for sent in _split_english_sentences(passage):
+        words = re.findall(r"[A-Za-z]+", sent)
+        if len(words) >= 4 and not _sentence_has_english_verb(sent):
+            return True
+    return False
+
+
+def _restore_incomplete_source_passage(
+    api_key: str,
+    model_name: str,
+    passage: str,
+) -> str:
+    """빈칸 기출 원문에서 빠진 구절만 문맥에 맞게 복원해 완전한 영어 지문을 만든다."""
+    if not api_key or not _has_incomplete_english_blank(passage):
+        return passage
+    try:
+        client = _build_client(api_key, timeout_seconds=45)
+        prompt = (
+            "Below is an English reading passage extracted from a blank-filling exam question, "
+            "so one phrase or clause is missing (e.g., 'there isn't much .', 'has to .', '____', or a noun phrase without a verb).\n"
+            "Restore ONLY the missing word/phrase/clause naturally so every sentence is grammatically complete. "
+            "Keep ALL other words 100% identical. Output ONLY the restored English passage with no commentary.\n\n"
+            f"{passage}"
+        )
+        resp = _generate_content_with_fallback(
+            client=client,
+            model_name=model_name or EXAM_TAGGING_MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                temperature=0.0,
+                max_output_tokens=2048,
+                thinking_config=types.ThinkingConfig(
+                    thinking_level=types.ThinkingLevel.MINIMAL,
+                    include_thoughts=False,
+                ),
+            ),
+            fast_mode=True,
+        )
+        restored = _preprocess_english_source_passage((resp.text or "").strip())
+        if restored and len(restored) >= int(len(passage) * 0.8) and not _has_incomplete_english_blank(restored):
+            return restored
+    except Exception:
+        pass
+    return passage
+
+
 def generate_english_transformed_question(
     api_key: str,
     model_name: str,
@@ -3327,6 +3454,8 @@ def generate_english_transformed_question(
         raise ValueError("변형할 영어 지문(source_passage)이 비어 있습니다.")
 
     eff_model = (model_name or "").strip() or EXAM_TAGGING_MODEL
+    if _has_incomplete_english_blank(clean_passage):
+        clean_passage = _restore_incomplete_source_passage(api_key, eff_model, clean_passage)
     canonical_type, type_rule_block = _build_english_transform_rule(
         target_type=target_type,
         blank_unit=blank_unit,
@@ -3387,7 +3516,7 @@ def generate_english_transformed_question(
     rw: RewrittenQuestion | None = None
     # 출력에는 지문 전체(+선지)가 포함되므로 지문 길이에 비례해 출력 토큰 상한을 잡는다 (JSON 중간 잘림 방지).
     base_out_tokens = min(8192, max(3072, int(len(clean_passage) / 2.0) + 1800))
-    for attempt in range(2):
+    for attempt in range(3):
         out_tokens = base_out_tokens if attempt == 0 else min(12288, int(base_out_tokens * 1.6))
         resp = _generate_content_with_fallback(
             client=client,
@@ -3444,10 +3573,12 @@ def generate_english_transformed_question(
         )
         if not issues:
             break
-        if attempt == 0:
+        if attempt < 2:
             fallback_hint = ""
             if "빈칸" in canonical_type or "함축" in canonical_type:
                 fallback_hint = "\n- 구절 치환 매칭 실패 시 이번 재시도에서는 지문 전체와 빈칸/밑줄을 직접 완성해 `rewritten_stem`에 반환하세요."
+            elif "요약" in canonical_type:
+                fallback_hint = "\n- `[요약문]` 섹션에는 선지 단어만 나열하지 말고 반드시 `(A) ________ ... (B) ________.` 형태의 완전한 요약문 1문장을 작성하세요."
             prompt = (
                 base_prompt
                 + "\n\n[⚠️ 직전 출력 형식 오류 — 반드시 아래 누락 사항을 모두 수정하여 다시 생성하세요]\n"
@@ -3456,7 +3587,11 @@ def generate_english_transformed_question(
             )
 
     assert rw is not None
-    rw.rewritten_stem = strip_english_embedded_choices(normalize_english_exam_text(rw.rewritten_stem))
+    norm_stem = normalize_english_exam_text(rw.rewritten_stem)
+    if any(k in canonical_type for k in ("어법", "어휘")) and "<u" in norm_stem.lower():
+        rw.rewritten_stem = norm_stem
+    else:
+        rw.rewritten_stem = strip_english_embedded_choices(norm_stem)
     if "빈칸" in canonical_type:
         rw.rewritten_stem = re.sub(r"[ \t]*\(\s*[①②③④⑤]\s*\)[ \t]*", " ", rw.rewritten_stem)
         rw.rewritten_stem = re.sub(r"[ \t]*[①②③④⑤][ \t]*", " ", rw.rewritten_stem)
