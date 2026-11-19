@@ -2447,7 +2447,7 @@ def _build_english_transform_rule(
             "  3) **관계대명사 vs 관계부사/접속사 오류** (예: 완전한 절 앞 `which`, 불완전한 절 앞 `where`/`what` 등)\n"
             "  4) **병렬 구조 오류** (예: `and`/`or` 전후 문법 형태 불일치)\n"
             "  5) **대동사 do/be 오류** (예: 일반동사 대동사 자리에 `are`/`is`, be동사 자리에 `do`/`does`)\n"
-            "- **절대 금지**: 원문 그대로인 문법적 정상 표현(예: `could be affected`)을 틀렸다고 주장하거나, 문법은 멀쩡한데 의미만 반대인 **반의어 교체**(예: `is decreased` → `is increasing`)를 어법 오류로 출제하는 것은 절대 금지합니다. 나머지 4개는 100% 올바른 어법이어야 합니다.\n"
+            "- **절대 금지**: 원문 그대로인 문법적 정상 표현(예: `could be affected`)을 틀렸다고 주장하거나, 해설에서 '타당하다/적절하다/맞다'고 스스로 모순되게 판정하는 것은 절대 금지합니다. 또한 문법은 멀쩡한데 의미만 반대인 **반의어 교체**(예: `is decreased` → `is increasing`)도 금지합니다. 나머지 4개는 100% 올바른 어법이어야 합니다.\n"
             "- 선택지(`rewritten_choices`): `[\"①\", \"②\", \"③\", \"④\", \"⑤\"]` 5개를 반환하세요.",
         )
     if "어휘" in t:
@@ -2550,6 +2550,104 @@ _DANGLING_TO_END_RE = re.compile(
 _ORDER_SEQ_RE = re.compile(
     r"\(?\s*([ABC])\s*\)?\s*(?:-|→|->|–|—)\s*\(?\s*([ABC])\s*\)?\s*(?:-|→|->|–|—)\s*\(?\s*([ABC])\s*\)?"
 )
+_SENT_ABBREV_RE = re.compile(
+    r"\b(?:Mr|Mrs|Ms|Dr|Prof|Sr|Jr|St|Mt|vs|etc|e\.g|i\.e|U\.S|U\.K|No|Fig|Vol|p|pp)\.",
+    re.IGNORECASE,
+)
+
+
+def _preprocess_english_source_passage(passage: str) -> str:
+    """변형 출제 전 원문 지문에 남아 있는 기존 기출 기호((A)(B)(C), (①)~(⑤), <u> 등)를 제거해 순수 영문 지문으로 정규화한다."""
+    txt = (passage or "").strip()
+    if not txt:
+        return ""
+    txt = re.sub(r"</?u\b[^>]*>", "", txt, flags=re.IGNORECASE)
+    txt = re.sub(r"[ \t]*\(\s*[①②③④⑤]\s*\)[ \t]*", " ", txt)
+    txt = re.sub(r"[ \t]*[①②③④⑤][ \t]*", " ", txt)
+    # 문장/단락 시작의 기출 순서 라벨 (A), (B), (C), (D) 제거 (문맥상 괄호 약어는 보존)
+    txt = re.sub(r"(?:^|(?<=\n)|(?<=[.?!\"'”’]\s))\(\s*[ABCD]\s*\)\s*", " ", txt)
+    txt = re.sub(r"\n{3,}", "\n\n", txt)
+    txt = re.sub(r"[ \t]{2,}", " ", txt)
+    return txt.strip()
+
+
+def _count_english_sentences(text: str) -> int:
+    """영어 지문 본문의 문장 수를 약어/소수점을 제외하고 근사 계산한다."""
+    cleaned_lines: list[str] = []
+    for raw_ln in (text or "").splitlines():
+        ln = raw_ln.strip()
+        if not ln:
+            continue
+        if re.search(r"[가-힣]", ln) and not re.search(r"[A-Za-z]{4,}", ln):
+            continue
+        if ln.startswith("*") and ":" in ln:
+            continue
+        cleaned_lines.append(ln)
+    body = " ".join(cleaned_lines)
+    body = re.sub(r"[①②③④⑤]", " ", body)
+    body = _SENT_ABBREV_RE.sub("ABBR", body)
+    body = re.sub(r"\b\d+\.\d+\b", "NUM", body)
+    endings = re.findall(r"[.?!]+(?=\s|$|[\"'”’\)])", body)
+    return len(endings) if endings else (1 if re.search(r"[A-Za-z]{3,}", body) else 0)
+
+
+def _reconcile_english_insertion_answer(rw: RewrittenQuestion) -> None:
+    """문장 삽입 유형에서 해설에 명시된 위치 번호(①~⑤ / N번)와 preserved_answer가 어긋나면 자동 보정한다."""
+    exp = rw.pdf_grounded_explanation or ""
+    if not exp:
+        return
+    m_exp = re.search(
+        r"(?:정답(?:은|:)?|위치(?:는|가)?|삽입(?:하기에)?)\s*(?:은|는|:)?\s*(?:([1-5])\s*번|([①②③④⑤]))",
+        exp,
+    )
+    found_num = ""
+    if m_exp:
+        found_num = m_exp.group(1) or _CIRCLED_DIGIT_TO_NUM.get(m_exp.group(2) or "", "")
+    else:
+        circled = list(dict.fromkeys(re.findall(r"[①②③④⑤]", exp)))
+        if len(circled) == 1:
+            found_num = _CIRCLED_DIGIT_TO_NUM.get(circled[0], "")
+    if found_num in ("1", "2", "3", "4", "5") and found_num != _normalize_extracted_answer(rw.preserved_answer):
+        rw.preserved_answer = found_num
+
+
+def _reconcile_english_summary_answer(rw: RewrittenQuestion) -> None:
+    """요약문 완성 유형에서 해설의 (A)/(B) 정답 어휘 쌍 또는 명시 번호가 preserved_answer와 어긋나면 자동 보정한다."""
+    choices = rw.rewritten_choices or []
+    exp = rw.pdf_grounded_explanation or ""
+    if len(choices) != 5 or not exp:
+        return
+
+    # 1) 해설에 (A) wordA ... (B) wordB 쌍이 명시된 경우 선지와 대조
+    m_ab = re.search(
+        r"\(A\)\s*([A-Za-z][A-Za-z\-']*)[^A-Za-z]{1,20}\(B\)\s*([A-Za-z][A-Za-z\-']*)",
+        exp,
+        flags=re.IGNORECASE,
+    )
+    if m_ab:
+        w_a, w_b = m_ab.group(1).lower(), m_ab.group(2).lower()
+        matched_indices: list[int] = []
+        for idx_c, ch in enumerate(choices):
+            m_ch = re.search(
+                r"\(A\)\s*([A-Za-z][A-Za-z\-']*)[^A-Za-z]{1,20}\(B\)\s*([A-Za-z][A-Za-z\-']*)",
+                ch or "",
+                flags=re.IGNORECASE,
+            )
+            if m_ch and m_ch.group(1).lower() == w_a and m_ch.group(2).lower() == w_b:
+                matched_indices.append(idx_c + 1)
+        if len(matched_indices) == 1:
+            rw.preserved_answer = str(matched_indices[0])
+            return
+
+    # 2) 해설에 정답 번호가 명시된 경우 보정
+    m_num = re.search(
+        r"(?:정답(?:은|:)?)\s*(?:([1-5])\s*번|([①②③④⑤]))",
+        exp,
+    )
+    if m_num:
+        found_num = m_num.group(1) or _CIRCLED_DIGIT_TO_NUM.get(m_num.group(2) or "", "")
+        if found_num in ("1", "2", "3", "4", "5"):
+            rw.preserved_answer = found_num
 
 
 def _reconcile_english_order_answer(rw: RewrittenQuestion) -> None:
@@ -2654,22 +2752,25 @@ def _validate_english_transformed_output(
                         )
                         break
             if source_passage and ans_alpha:
-                # 5개 밑줄 어휘가 모두 원문 지문에 그대로 존재하면 실제 반의어 교체가 누락된 것
-                all_in_source = all(
-                    bool(
-                        re.search(
-                            rf"\b{re.escape(re.sub(r'[^a-zA-Z\-]', '', w).lower())}\b",
-                            source_passage,
-                            flags=re.IGNORECASE,
-                        )
-                    )
-                    for w in u_words[:5]
+                # 3. 문맥상 어휘 적절성: 5개 밑줄 단어 중 정확히 1개(정답 위치)만 원문과 다른 단어인지 검증
+                not_in_src_indices = [
+                    idx_u
+                    for idx_u, w in enumerate(u_words[:5])
                     if re.sub(r"[^a-zA-Z\-]", "", w)
-                )
-                if all_in_source:
+                    and not re.search(
+                        rf"\b{re.escape(re.sub(r'[^a-zA-Z\-]', '', w).lower())}\b",
+                        source_passage,
+                        flags=re.IGNORECASE,
+                    )
+                ]
+                if not not_in_src_indices:
                     issues.append(
                         f"문맥상 어휘 문제에서 5개 밑줄 단어({u_words[:5]})가 모두 원문 그대로입니다. "
                         f"반드시 정답 {ans}번 위치의 단어를 문맥상 부적절한 반의어로 지문 본문에서 직접 교체하세요."
+                    )
+                elif len(not_in_src_indices) == 1 and not_in_src_indices[0] != int(ans) - 1:
+                    issues.append(
+                        f"문맥상 어휘 문제의 정답 번호({ans}번)와 실제 지문에서 교체된 밑줄 위치({not_in_src_indices[0] + 1}번)가 일치하지 않습니다."
                     )
     elif "함축" in t:
         if u_count < 1:
@@ -2686,6 +2787,14 @@ def _validate_english_transformed_output(
             if c_num not in stem:
                 issues.append(f"무관한 문장 본문에 번호 `{c_num}`가 누락되었습니다.")
                 break
+        if source_passage:
+            src_cnt = _count_english_sentences(source_passage)
+            gen_cnt = _count_english_sentences(stem)
+            if src_cnt >= 3 and gen_cnt != src_cnt + 1:
+                issues.append(
+                    f"전체 흐름과 무관한 문장은 원문 문장({src_cnt}개)을 삭제하지 않고 무관한 새 문장 1개만 삽입해 "
+                    f"총 {src_cnt + 1}문장이 되어야 합니다 (현재 {gen_cnt}문장). 원문을 보존하고 새 문장 1개를 삽입하세요."
+                )
     elif "순서" in t:
         for mk in ("(A)", "(B)", "(C)"):
             if mk not in stem:
@@ -2698,6 +2807,15 @@ def _validate_english_transformed_output(
         for c_num in ("①", "②", "③", "④", "⑤"):
             if c_num not in stem:
                 issues.append(f"문장 삽입 본문에 위치 기호 `{c_num}`가 누락되었습니다.")
+                break
+        # ( ① )~( ⑤ ) 마커가 문장 경계(. ? ! 뒤)가 아닌 주어·동사 한가운데 삽입되었는지 검증
+        ins_body = re.split(r"\[주어진\s*문장\]", stem, maxsplit=1)[-1]
+        for m_ins in re.finditer(r"\(?\s*([①②③④⑤])\s*\)", ins_body):
+            before = ins_body[: m_ins.start()].rstrip()
+            if before and not re.search(r"[.?!][\"'”’\)]*$", before):
+                issues.append(
+                    f"문장 삽입 기호 `{m_ins.group(0).strip()}`가 문장 종결 부호(. ? !) 뒤의 문장 경계가 아닌 문장 중간에 배치되었습니다. 반드시 문장과 문장 사이 경계로 옮기세요."
+                )
                 break
     elif "요약" in t:
         if "[요약문]" not in stem and "요약문" not in stem:
@@ -2725,7 +2843,7 @@ def generate_english_transformed_question(
     Thinking 토큰 최소화(기본 MINIMAL, 정밀 모드 시 LOW) 및 2줄 이내 핵심 정답 근거만 지연 생성 전제로 출력해
     토큰 과금을 절감한 뒤 RewrittenQuestion 호환 객체로 반환한다.
     """
-    clean_passage = (source_passage or "").strip()
+    clean_passage = _preprocess_english_source_passage(source_passage)
     if not clean_passage:
         raise ValueError("변형할 영어 지문(source_passage)이 비어 있습니다.")
 
@@ -2820,6 +2938,10 @@ def generate_english_transformed_question(
         rw.preserved_answer = _normalize_extracted_answer(rw.preserved_answer)
         if "순서" in canonical_type:
             _reconcile_english_order_answer(rw)
+        elif "삽입" in canonical_type:
+            _reconcile_english_insertion_answer(rw)
+        elif "요약" in canonical_type:
+            _reconcile_english_summary_answer(rw)
 
         issues = _validate_english_transformed_output(
             rw,
