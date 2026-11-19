@@ -198,6 +198,11 @@ def _call_with_retry(fn: Callable[[], T], max_retries: int = 3) -> T:
     raise last_err
 
 
+def _is_flash_lite_model(model_name: str) -> bool:
+    low = (resolve_api_model_name(model_name) or "").lower()
+    return "flash-lite" in low or low.endswith("-lite")
+
+
 def _with_thinking_config(
     config: types.GenerateContentConfig | None,
     thinking_config: types.ThinkingConfig,
@@ -221,13 +226,22 @@ def _clone_config_for_model(
             types.ThinkingConfig(thinking_level="LOW"),
         )
 
+    if _is_flash_lite_model(resolved_model):
+        # 3.5 Flash-Lite 호출 시 fast_mode·config 여부와 무관하게 항상 최소 토큰(MINIMAL 사고 + 저해상도 미디어) 강제 적용
+        base_cfg = config if config is not None else types.GenerateContentConfig()
+        return base_cfg.model_copy(
+            update={
+                "thinking_config": types.ThinkingConfig(
+                    thinking_level=types.ThinkingLevel.MINIMAL,
+                    include_thoughts=False,
+                ),
+                "media_resolution": types.MediaResolution.MEDIA_RESOLUTION_LOW,
+            }
+        )
+
     if config is None:
         return None
     if not fast_mode:
-        return config
-    is_lite = "lite" in resolved_model.lower()
-    if is_lite:
-        # lite 모델은 thinking_budget=0 전달 시 400 INVALID_ARGUMENT가 발생할 수 있어 thinking_config 미지정
         return config
     if getattr(config, "thinking_config", None) is not None:
         return config
@@ -235,6 +249,43 @@ def _clone_config_for_model(
         config,
         types.ThinkingConfig(thinking_budget=0),
     )
+
+
+def _build_400_recovery_configs(
+    config: types.GenerateContentConfig | None,
+    eff_cfg: types.GenerateContentConfig | None,
+    cand_model: str,
+    err_msg: str,
+) -> list[types.GenerateContentConfig | None]:
+    """thinking_config 또는 media_resolution 관련 400 오류 시 최소 토큰 옵션을 유지하며 순차 복구 후보를 생성한다."""
+    is_bad_req = "400" in err_msg or "invalid_argument" in err_msg
+    is_media_err = "media_resolution" in err_msg or "resolution" in err_msg
+    is_thinking_err = "thinking" in err_msg
+    if not is_bad_req or not (is_media_err or is_thinking_err):
+        return []
+
+    recovery_configs: list[types.GenerateContentConfig | None] = []
+    if _is_flash_lite_model(cand_model) and eff_cfg is not None:
+        if is_media_err:
+            recovery_configs.append(eff_cfg.model_copy(update={"media_resolution": None}))
+        if is_thinking_err:
+            recovery_configs.append(
+                eff_cfg.model_copy(
+                    update={"thinking_config": types.ThinkingConfig(thinking_budget=0)}
+                )
+            )
+            recovery_configs.append(eff_cfg.model_copy(update={"thinking_config": None}))
+        recovery_configs.append(config)
+        return recovery_configs
+
+    if is_thinking_err:
+        if cand_model == HYDROGEN_MODEL:
+            recovery_configs.append(
+                _with_thinking_config(config, types.ThinkingConfig(thinking_budget=256))
+            )
+        if config is not None or cand_model == HYDROGEN_MODEL:
+            recovery_configs.append(config)
+    return recovery_configs
 
 
 def _generate_content_with_fallback(
@@ -266,8 +317,8 @@ def _generate_content_with_fallback(
                     f"Gemini API 호출 중 (모델: {cand_model}, 체인 {idx + 1}/{len(attempt_models)}, "
                     f"시도 {overload_attempt + 1}/{max_overload_retries + 1}, 타임아웃 30초)..."
                 )
+            eff_cfg = _clone_config_for_model(config, cand_model, fast_mode=fast_mode)
             try:
-                eff_cfg = _clone_config_for_model(config, cand_model, fast_mode=fast_mode)
                 return client.models.generate_content(
                     model=cand_model,
                     contents=contents,
@@ -276,25 +327,18 @@ def _generate_content_with_fallback(
             except Exception as exc:
                 last_err = exc
                 msg = str(exc).lower()
-                # thinking_config 미지원 400 오류 시 최소 thinking_budget 또는 기본 config로 복구 시도
-                if "thinking" in msg and "400" in msg:
-                    recovery_configs: list[types.GenerateContentConfig | None] = []
-                    if cand_model == HYDROGEN_MODEL:
-                        recovery_configs.append(
-                            _with_thinking_config(config, types.ThinkingConfig(thinking_budget=256))
+                # thinking_config / media_resolution 미지원 400 오류 시 단계별 안전 복구 시도
+                recovery_configs = _build_400_recovery_configs(config, eff_cfg, cand_model, msg)
+                for rec_cfg in recovery_configs:
+                    try:
+                        return client.models.generate_content(
+                            model=cand_model,
+                            contents=contents,
+                            config=rec_cfg,
                         )
-                    if config is not None or cand_model == HYDROGEN_MODEL:
-                        recovery_configs.append(config)
-                    for rec_cfg in recovery_configs:
-                        try:
-                            return client.models.generate_content(
-                                model=cand_model,
-                                contents=contents,
-                                config=rec_cfg,
-                            )
-                        except Exception as exc2:
-                            last_err = exc2
-                            msg = str(exc2).lower()
+                    except Exception as exc2:
+                        last_err = exc2
+                        msg = str(exc2).lower()
 
                 # 설정·인증·권한 오류(400/401/403)는 재시도 및 모델 전환 없이 즉시 중단
                 if _is_fatal_config_or_auth_error(msg):
