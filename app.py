@@ -837,6 +837,8 @@ is_admin = bool(current_user is not None and current_user.tier == "ADMIN")
 selected_model = DEFAULT_MODEL
 active_gemini_key = ""
 active_key_label = ""
+upload_gemini_key = ""
+upload_key_label = ""
 
 # ---------------------------------------------------------------------------
 # 사이드바: 비로그인 시 [로그인 / 회원가입] 탭만 표시, 로그인 시 프로필·개인키·설정 표시
@@ -889,6 +891,9 @@ with st.sidebar:
         active_gemini_key, active_key_label = resolve_active_gemini_api_key(
             current_user, creds.gemini_api_key
         )
+        upload_gemini_key, upload_key_label = resolve_active_gemini_api_key(
+            current_user, creds.gemini_api_key, force_server_key=True
+        )
         pro_weekly_rem = get_remaining_pro_weekly_quota(current_user)
 
         if tier_code == "FREE":
@@ -907,7 +912,8 @@ with st.sidebar:
             status_line = (
                 f"<div style='font-size:0.83rem; color:#166534; margin-top:0.45rem;'>"
                 f"등록된 개인 키: <code>{masked}</code>"
-                f"<br/><b>모든 모델 · 모든 기능 무제한</b></div>"
+                f"<br/><b>업로드·태깅: 서버 키 지원</b>"
+                f"<br/><b>고급 추론(3.8/Hydrogen): 개인 키 무제한</b></div>"
             )
         elif tier_code == "PRO":
             status_line = (
@@ -2182,13 +2188,12 @@ with tab1:
 
             if run_batch_btn:
                 verified_key, verified_key_label = resolve_active_gemini_api_key(
-                    current_user, creds.gemini_api_key
+                    current_user, creds.gemini_api_key, force_server_key=True
                 )
                 if not verified_key:
                     st.error(
-                        f"API 키가 설정되지 않았습니다 ({verified_key_label}). "
-                        "ADMIN/PRO/FREE 등급은 `.streamlit/secrets.toml`의 `GEMINI_API_KEY`를, "
-                        "CUSTOM 등급은 사이드바의 개인 Gemini API 키를 확인해 주세요."
+                        f"서버 업로드·태깅용 API 키가 설정되지 않았습니다 ({verified_key_label}). "
+                        "`.streamlit/secrets.toml`의 `GEMINI_API_KEY`를 확인해 주세요."
                     )
                 else:
                     existing_exam_names = {
@@ -2402,7 +2407,7 @@ with tab1:
                         parsed_local, has_p1_text, ai_verified = _detect_single_exam_cover(
                             active_prob_bytes,
                             active_prob_name,
-                            active_gemini_key,
+                            upload_gemini_key,
                         )
 
                 st.session_state["meta_year"] = parsed_local.get("year", "")
@@ -2501,7 +2506,7 @@ with tab1:
                         crops, total_p, _ = _crop_single_exam_pdf(
                             active_prob_bytes,
                             use_vision_fallback=bool(vision_fallback_chk),
-                            api_key=active_gemini_key,
+                            api_key=upload_gemini_key,
                             status_cb=lambda m: vision_status_ph.info(m),
                             progress_cb=lambda v: vision_prog_ph.progress(v),
                         )
@@ -2573,15 +2578,14 @@ with tab1:
         )
 
         def _run_stage2_extraction(target_q_nums: list[int], is_retry: bool = False) -> None:
-            # 등급별 API 키 전달 경로 즉시 검증 (ADMIN/PRO/FREE -> st.secrets, CUSTOM -> custom_api_key)
+            # 탭 1 업로드·태깅 전체는 CUSTOM 포함 모든 등급 서버 공용 API 키 사용
             verified_key, verified_key_label = resolve_active_gemini_api_key(
-                current_user, creds.gemini_api_key
+                current_user, creds.gemini_api_key, force_server_key=True
             )
             if not verified_key:
                 st.error(
-                    f"API 키가 설정되지 않았습니다 ({verified_key_label}). "
-                    "ADMIN/PRO/FREE 등급은 `.streamlit/secrets.toml`의 `GEMINI_API_KEY`를, "
-                    "CUSTOM 등급은 사이드바의 개인 Gemini API 키를 확인해 주세요."
+                    f"서버 업로드·태깅용 API 키가 설정되지 않았습니다 ({verified_key_label}). "
+                    "`.streamlit/secrets.toml`의 `GEMINI_API_KEY`를 확인해 주세요."
                 )
                 return
             if not target_q_nums:
@@ -2936,7 +2940,7 @@ with tab1:
 
                         if retag_clicked and can_retag_exam:
                             verified_key, verified_key_label = resolve_active_gemini_api_key(
-                                current_user, creds.gemini_api_key
+                                current_user, creds.gemini_api_key, force_server_key=True
                             )
                             if not verified_key:
                                 st.error(f"API 키가 설정되지 않았습니다 ({verified_key_label}).")
@@ -3318,8 +3322,11 @@ with tab2:
                             st.caption("단일 페이지가 선택되었습니다.")
 
                 if st.button("🔍 1단계: 업로드된 PDF 지식 화이트리스트 추출", type="primary"):
-                    if not active_gemini_key:
-                        st.error(f"사용 가능한 Gemini API 키({active_key_label})가 설정되지 않았습니다.")
+                    scope_api_key, scope_key_label = resolve_active_gemini_api_key(
+                        current_user, creds.gemini_api_key, model_name=CONCEPT_SCOPE_MODEL
+                    )
+                    if not scope_api_key:
+                        st.error(f"사용 가능한 Gemini API 키({scope_key_label})가 설정되지 않았습니다.")
                     else:
                         with st.spinner(f"PDF ({range_disp})의 순수 개념 본문·도표·용어를 정독해 화이트리스트를 구축 중..."):
                             sliced_bytes, sliced_text, slice_stats = extract_concept_pages_by_ranges(
@@ -3327,7 +3334,7 @@ with tab2:
                             )
                             try:
                                 wl = extract_concept_whitelist(
-                                    api_key=active_gemini_key,
+                                    api_key=scope_api_key,
                                     model_name=CONCEPT_SCOPE_MODEL,
                                     sliced_pdf_bytes=sliced_bytes,
                                     sliced_text=sliced_text,
@@ -3464,8 +3471,14 @@ with tab2:
 
             if st.button("🚀 기출 매칭 & 개념서 맞춤 문제 추출·개조 실행", type="primary"):
                 db_list = storage.load_db()
-                if not active_gemini_key:
-                    st.error(f"사용 가능한 Gemini API 키({active_key_label})가 설정되지 않았습니다.")
+                match_api_key, match_key_label = resolve_active_gemini_api_key(
+                    current_user, creds.gemini_api_key, model_name=match_model
+                )
+                rewrite_api_key, rewrite_key_label = resolve_active_gemini_api_key(
+                    current_user, creds.gemini_api_key, model_name=rewrite_model
+                )
+                if not match_api_key:
+                    st.error(f"사용 가능한 Gemini API 키({match_key_label})가 설정되지 않았습니다.")
                 elif not db_list:
                     st.warning("저장된 기출 DB가 비어 있습니다. 먼저 [탭 1]에서 모의고사를 수집·태깅해 주세요.")
                 else:
@@ -3488,7 +3501,7 @@ with tab2:
                         with st.spinner(f"후보 {len(candidates)}개 문항의 핵심 원리를 개념서 범위와 대조 중..."):
                             try:
                                 judgments = match_questions_to_whitelist(
-                                    api_key=active_gemini_key,
+                                    api_key=match_api_key,
                                     model_name=match_model,
                                     candidates=candidates,
                                     whitelist=whitelist,
@@ -3557,39 +3570,45 @@ with tab2:
                             rewritten_results: dict[int, RewrittenQuestion] = {}
                             failed_indices: set[int] = set()
                             if rewrite_indices:
-                                total_rw = len(rewrite_indices)
-                                stat.info(f"상위 문제 {total_rw}문항 병렬 자동 개조 중 (최대 4스레드)...")
-                                with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
-                                    future_map = {}
-                                    for idx in rewrite_indices:
-                                        q, j, crop_bytes, _ = prepared_items[idx]
-                                        fut = executor.submit(
-                                            rewrite_question_for_pdf,
-                                            api_key=active_gemini_key,
-                                            model_name=rewrite_model,
-                                            question=q,
-                                            crop_png_bytes=crop_bytes,
-                                            whitelist=whitelist,
-                                            out_of_scope_terms=j.out_of_scope_terms,
-                                            sliced_text=sliced_text_ctx,
-                                        )
-                                        future_map[fut] = idx
+                                if not rewrite_api_key:
+                                    st.error(
+                                        f"상위 문제 개조용 API 키가 설정되지 않았습니다 ({rewrite_key_label})."
+                                    )
+                                    failed_indices.update(rewrite_indices)
+                                else:
+                                    total_rw = len(rewrite_indices)
+                                    stat.info(f"상위 문제 {total_rw}문항 병렬 자동 개조 중 (최대 4스레드)...")
+                                    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+                                        future_map = {}
+                                        for idx in rewrite_indices:
+                                            q, j, crop_bytes, _ = prepared_items[idx]
+                                            fut = executor.submit(
+                                                rewrite_question_for_pdf,
+                                                api_key=rewrite_api_key,
+                                                model_name=rewrite_model,
+                                                question=q,
+                                                crop_png_bytes=crop_bytes,
+                                                whitelist=whitelist,
+                                                out_of_scope_terms=j.out_of_scope_terms,
+                                                sliced_text=sliced_text_ctx,
+                                            )
+                                            future_map[fut] = idx
 
-                                    done_cnt = 0
-                                    for fut in concurrent.futures.as_completed(future_map):
-                                        idx = future_map[fut]
-                                        q_done = prepared_items[idx][0]
-                                        done_cnt += 1
-                                        try:
-                                            rewritten_results[idx] = fut.result()
-                                        except ForbiddenTermRemainingError as fexc:
-                                            failed_indices.add(idx)
-                                            st.warning(f"⛔ {q_done.id} 금지 용어 잔존으로 제외: {fexc}")
-                                        except Exception as exc:
-                                            failed_indices.add(idx)
-                                            st.error(f"{q_done.id} 개조 실패 (원본 제외): {exc}")
-                                        prog.progress(done_cnt / total_rw)
-                                        stat.info(f"상위 문제 병렬 자동 개조 중 ({done_cnt}/{total_rw})...")
+                                        done_cnt = 0
+                                        for fut in concurrent.futures.as_completed(future_map):
+                                            idx = future_map[fut]
+                                            q_done = prepared_items[idx][0]
+                                            done_cnt += 1
+                                            try:
+                                                rewritten_results[idx] = fut.result()
+                                            except ForbiddenTermRemainingError as fexc:
+                                                failed_indices.add(idx)
+                                                st.warning(f"⛔ {q_done.id} 금지 용어 잔존으로 제외: {fexc}")
+                                            except Exception as exc:
+                                                failed_indices.add(idx)
+                                                st.error(f"{q_done.id} 개조 실패 (원본 제외): {exc}")
+                                            prog.progress(done_cnt / total_rw)
+                                            stat.info(f"상위 문제 병렬 자동 개조 중 ({done_cnt}/{total_rw})...")
 
                             for idx, (q, j, crop_bytes, concept_ref) in enumerate(prepared_items):
                                 if idx in failed_indices:

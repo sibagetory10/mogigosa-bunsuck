@@ -344,11 +344,27 @@ def clear_user_custom_api_key(
     return True, "개인 API 키를 삭제하고 무료 회원(FREE)으로 복귀했습니다.", target
 
 
-def resolve_active_gemini_api_key(user: UserRecord, server_api_key: str) -> tuple[str, str]:
-    """등급에 따라 실제 Gemini 호출에 사용할 API 키를 라우팅한다."""
+def resolve_active_gemini_api_key(
+    user: UserRecord,
+    server_api_key: str,
+    model_name: str | None = None,
+    force_server_key: bool = False,
+) -> tuple[str, str]:
+    """
+    등급 및 작업 유형(업로드·태깅 vs 고급 추론 모델)에 따라 실제 Gemini 호출용 API 키를 라우팅한다.
+    - force_server_key=True (탭 1 업로드/표지인식/크롭/태깅 전체): CUSTOM 포함 모든 등급 서버 키 사용
+    - CUSTOM 등급: 고급 추론 모델(3.8 / Hydrogen, is_premium_model=True)만 개인 API 키 사용,
+      기본 경량 모델(3.5 Flash-Lite 등)과 업로드·태깅 작업은 서버 키 사용
+    - FREE / PRO / ULTRA / ADMIN: 서버 키 사용
+    """
+    server_key = (server_api_key or "").strip()
+    if force_server_key:
+        return server_key, "서버 키 (업로드·태깅 공용)"
     if user.tier == "CUSTOM":
-        return user.custom_api_key.strip(), "개인 키 모드 (CUSTOM)"
-    return (server_api_key or "").strip(), f"서버 키 ({TIER_LABELS.get(user.tier, user.tier)})"
+        if model_name is None or is_premium_model(model_name):
+            return user.custom_api_key.strip(), "개인 키 모드 (CUSTOM · 고급 추론)"
+        return server_key, "서버 키 (기본·업로드 공용)"
+    return server_key, f"서버 키 ({TIER_LABELS.get(user.tier, user.tier)})"
 
 
 def get_remaining_free_quota(user: UserRecord) -> int | None:
