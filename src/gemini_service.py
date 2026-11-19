@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import concurrent.futures
+import hashlib
 import io
 import json
 import random
 import re
+import threading
 import time
 from typing import Any, Callable, Sequence, TypeVar
 
@@ -2440,8 +2442,10 @@ def _build_english_transform_rule(
         return (
             "어법상 틀린 것 (밑줄 ①~⑤)",
             "- 발문: `다음 글의 밑줄 친 부분 중, 어법상 틀린 것은?`\n"
-            "- 규칙: 원문 내 문법 포인트 5곳에 `① <u>word1</u>` ~ `⑤ <u>word5</u>` 표시. 정확히 1개(정답)만 실제 비문(수일치·분사 능/수동·관계사/접속사 what/that·병렬·대동사 do/be 중 1가지)으로 변형하고, 나머지 4개는 100% 올바른 어법 유지.\n"
-            "- 금지: 원문 정상 표현을 틀렸다고 우기기, 해설 자체 모순('타당하다/적절하다'), 의미만 반대인 반의어 교체, 문법상 둘 다 맞는 시제·진행형(`is occurring`↔`occurs`) 변형 절대 금지.\n"
+            "- 출력 절감 규칙: `rewritten_stem`에 지문 전체를 쓰지 말고, 원문 등장 순서대로 문법 포인트 5곳을 아래 5줄 형식으로만 반환하세요(시스템이 원문에 `① <u>...</u>`~`⑤ <u>...</u>`를 자동 조립).\n"
+            "  `1: 원문구절1`\n  `2: 원문구절2`\n  `3: 원문구절3 -> 틀린어법구절3`\n  `4: 원문구절4`\n  `5: 원문구절5`\n"
+            "- 규칙: 5개 구절은 원문에서 유일하게 찾을 수 있도록 1~3단어로 적고, 정확히 1줄(정답)에만 `-> 틀린어법`을 적어 실제 비문(수일치·분사 능/수동·관계사/접속사 what/that·병렬·대동사 do/be 중 1가지)으로 변형. 나머지 4줄은 화살표 없이 원문 그대로 유지.\n"
+            "- 금지: 원문 정상 표현을 틀렸다고 우기기, 해설 자체 모순('타당하다/적절하다'), 의미만 반대인 반의어 교체, 단순 시제·진행형(`is occurring`↔`occurs`, `signaled`↔`signals`) 변형 절대 금지.\n"
             "- 선지: `[\"①\", \"②\", \"③\", \"④\", \"⑤\"]` 5개.",
         )
     if "어휘" in t:
@@ -2455,9 +2459,11 @@ def _build_english_transform_rule(
         return (
             "문맥상 어휘 적절성 (밑줄 ①~⑤)",
             "- 발문: `다음 글의 밑줄 친 부분 중, 문맥상 낱말의 쓰임이 적절하지 않은 것은?`\n"
-            "- 규칙: 기존 본문 내 핵심 어휘 5곳에 `① <u>w1</u>` ~ `⑤ <u>w5</u>` 표시. 지문 끝에 새 문장 추가 절대 금지(문장 수 동일 유지). 정확히 1개(정답)만 문법 형태·품사가 100% 동일한 자연스러운 반의어로 교체.\n"
+            "- 출력 절감 규칙: `rewritten_stem`에 지문 전체를 쓰지 말고, 원문 등장 순서대로 핵심 어휘 5곳을 아래 5줄 형식으로만 반환하세요(시스템이 원문에 `① <u>...</u>`~`⑤ <u>...</u>`를 자동 조립).\n"
+            "  `1: 원문단어1`\n  `2: 원문단어2 -> 반의어2`\n  `3: 원문단어3`\n  `4: 원문단어4`\n  `5: 원문단어5`\n"
+            "- 규칙: 정확히 1줄(정답)에만 `-> 반의어`를 적어 문법 형태·품사가 100% 동일한 자연스러운 반의어로 교체. 나머지 4줄은 화살표 없이 원문 단어 그대로 유지.\n"
             "- 금지: 어법 오류(`makes`→`making` 등)·어색한 연어 생성 금지. 반어법·풍자 표현이나 부정어(`not`/`never`/`hardly`)가 걸린 절의 단어는 반의어 교체 대상에서 제외.\n"
-            "- 선지: 밑줄 친 5개 어휘 리스트.",
+            "- 선지: 밑줄 친 5개 어휘 리스트(정답 위치는 교체된 반의어).",
         )
     if "빈칸" in t:
         b_u = (blank_unit or "").strip()
@@ -2481,14 +2487,17 @@ def _build_english_transform_rule(
         return (
             "전체 흐름과 무관한 문장",
             "- 발문: `다음 글에서 전체 흐름과 관계없는 문장은?`\n"
-            "- 규칙: 첫 1~2문장(도입문) 뒤 문장들에 `①`~`⑤` 부여. 원문 문장을 1개도 삭제하지 말고, 핵심 주장·요지를 지지/요약하지 않으면서 키워드만 공유하고 논리 방향이 어긋나는 **새 영어 문장 1개만** 정답 위치에 삽입(총 문장 수 = 원문 + 1).\n"
+            "- 출력 절감 규칙: `rewritten_stem`에 지문 전체를 쓰지 말고, 아래 2줄 형식으로만 반환하세요(시스템이 원문 사이에 `①~⑤`와 새 문장을 자동 조립).\n"
+            "  `INSERT_AT: 3` (2~4 중 삽입할 번호 1개)\n"
+            "  `SENTENCE: <원문 키워드만 공유하고 전체 논리 흐름과 어긋나는 새 영어 문장 1개>`\n"
             "- 선지: `[\"①\", \"②\", \"③\", \"④\", \"⑤\"]` 5개.",
         )
     if "순서" in t:
         return (
             "글의 순서 ((A)-(B)-(C))",
             "- 발문: `주어진 글 다음에 이어질 글의 순서로 가장 적절한 것은?`\n"
-            "- 규칙: 도입 1~2문장을 `[주어진 글]`로 분리하고 나머지 원문 문장을 누락·추가 없이 3단락 `(A)`, `(B)`, `(C)`로 나눈 뒤 `(A)-(B)-(C)` 정순이 아닌 오순(예: `(B)-(A)-(C)`)으로 배치.\n"
+            "- 출력 절감 규칙: 원문 각 문장에 `[S0]`, `[S1]`, ... 번호가 붙어 있습니다. `rewritten_stem`에 지문 전체를 쓰지 말고, `[주어진 글]`과 3개 단락의 시작 문장 번호 3개만 아래 1줄 형식으로 반환하세요(시스템이 원문을 자르고 오순 셔플과 정답을 자동 확정).\n"
+            "  `SPLIT: s1, s2, s3` (예: `SPLIT: 1, 3, 5` → 주어진글=S0, 1번덩어리=S1~S2, 2번덩어리=S3~S4, 3번덩어리=S5~끝; `0 < s1 < s2 < s3 < 전체문장수`)\n"
             "- 선지: `[\"(A) - (C) - (B)\", \"(B) - (A) - (C)\", \"(B) - (C) - (A)\", \"(C) - (A) - (B)\", \"(C) - (B) - (A)\"]` 5개.",
         )
     if "삽입" in t:
@@ -3365,6 +3374,176 @@ def _assemble_english_slim_stem(
             else:
                 replaced_body = f"{clean_passage[:st_i]}<u>{orig_seg}</u>{clean_passage[en_i:]}"
                 rw.rewritten_stem = f"밑줄 친 부분이 다음 글에서 의미하는 바로 가장 적절한 것은?\n{replaced_body}"
+        return
+
+    if "순서" in t:
+        # 이미 완성된 (A)(B)(C) 전체 지문이 반환된 경우(폴백 재시도 등)는 그대로 보존
+        if "(A)" in raw_stem and "(B)" in raw_stem and "(C)" in raw_stem and len(raw_stem) >= max(100, int(len(clean_passage) * 0.6)):
+            return
+        m_sp = re.search(r"SPLIT\s*:\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)", raw_stem, flags=re.IGNORECASE)
+        sents = _split_english_sentences(clean_passage)
+        if m_sp and len(sents) >= 4:
+            s1, s2, s3 = int(m_sp.group(1)), int(m_sp.group(2)), int(m_sp.group(3))
+            if 0 < s1 < s2 < s3 < len(sents):
+                intro = " ".join(sents[:s1]).strip()
+                orig_blocks = [
+                    " ".join(sents[s1:s2]).strip(),
+                    " ".join(sents[s2:s3]).strip(),
+                    " ".join(sents[s3:]).strip(),
+                ]
+                if all(orig_blocks):
+                    # 5지선다 오순 조합: (A)-(C)-(B)=1, (B)-(A)-(C)=2, (B)-(C)-(A)=3, (C)-(A)-(B)=4, (C)-(B)-(A)=5
+                    # 각 조합에서 (A), (B), (C)에 어떤 원문 덩어리(0,1,2)를 넣으면 정답이 해당 순서가 되는지 매핑
+                    order_specs = [
+                        ("1", "(A) - (C) - (B)", (0, 2, 1)),  # A=0, B=2, C=1 -> 원문순서 0,1,2 = (A)-(C)-(B)
+                        ("2", "(B) - (A) - (C)", (1, 0, 2)),  # A=1, B=0, C=2 -> 원문순서 0,1,2 = (B)-(A)-(C)
+                        ("3", "(B) - (C) - (A)", (2, 0, 1)),  # A=2, B=0, C=1 -> 원문순서 0,1,2 = (B)-(C)-(A)
+                        ("4", "(C) - (A) - (B)", (1, 2, 0)),  # A=1, B=2, C=0 -> 원문순서 0,1,2 = (C)-(A)-(B)
+                        ("5", "(C) - (B) - (A)", (2, 1, 0)),  # A=2, B=1, C=0 -> 원문순서 0,1,2 = (C)-(B)-(A)
+                    ]
+                    ans_num, ans_seq_str, perm = random.choice(order_specs)
+                    block_a = orig_blocks[perm[0]]
+                    block_b = orig_blocks[perm[1]]
+                    block_c = orig_blocks[perm[2]]
+                    rw.rewritten_stem = (
+                        "주어진 글 다음에 이어질 글의 순서로 가장 적절한 것은?\n"
+                        "[주어진 글]\n"
+                        f"{intro}\n\n"
+                        f"(A) {block_a}\n\n"
+                        f"(B) {block_b}\n\n"
+                        f"(C) {block_c}"
+                    )
+                    rw.rewritten_choices = [
+                        "(A) - (C) - (B)",
+                        "(B) - (A) - (C)",
+                        "(B) - (C) - (A)",
+                        "(C) - (A) - (B)",
+                        "(C) - (B) - (A)",
+                    ]
+                    rw.preserved_answer = ans_num
+                    if rw.pdf_grounded_explanation:
+                        rw.pdf_grounded_explanation = _ORDER_SEQ_RE.sub(ans_seq_str, rw.pdf_grounded_explanation)
+                    else:
+                        rw.pdf_grounded_explanation = f"주어진 글 뒤에 논리적 흐름에 따라 {ans_seq_str} 순서로 이어지는 것이 자연스럽습니다."
+        return
+
+    if "무관" in t:
+        if all(mk in raw_stem for mk in ("①", "②", "③", "④", "⑤")) and len(raw_stem) >= max(100, int(len(clean_passage) * 0.6)):
+            return
+        m_pos = re.search(r"INSERT_AT\s*:\s*([1-5])", raw_stem, flags=re.IGNORECASE)
+        m_sent = re.search(r"SENTENCE\s*:\s*(.+)", raw_stem, flags=re.IGNORECASE | re.DOTALL)
+        sents = _split_english_sentences(clean_passage)
+        if m_sent and len(sents) >= 5:
+            ins_sent = re.sub(r"\s+", " ", m_sent.group(1)).strip().strip("\"'")
+            if ins_sent and not re.search(r"[.?!]$", ins_sent):
+                ins_sent += "."
+            if len(re.findall(r"[A-Za-z]+", ins_sent)) >= 5:
+                insert_pos = int(m_pos.group(1)) if m_pos else random.choice([2, 3, 4])
+                insert_pos = max(2, min(4, insert_pos))
+                intro_cnt = 2 if len(sents) >= 6 else 1
+                intro_part = " ".join(sents[:intro_cnt]).strip()
+                body_orig = sents[intro_cnt:]
+                numbered_orig = body_orig[:4]
+                tail_orig = body_orig[4:]
+                merged_five: list[str] = []
+                orig_iter = iter(numbered_orig)
+                for slot in range(1, 6):
+                    if slot == insert_pos:
+                        merged_five.append(ins_sent)
+                    else:
+                        try:
+                            merged_five.append(next(orig_iter))
+                        except StopIteration:
+                            break
+                if len(merged_five) == 5:
+                    syms = ["①", "②", "③", "④", "⑤"]
+                    marked_str = " ".join(f"{syms[i]} {merged_five[i]}" for i in range(5))
+                    tail_str = (" " + " ".join(tail_orig)) if tail_orig else ""
+                    rw.rewritten_stem = (
+                        "다음 글에서 전체 흐름과 관계없는 문장은?\n"
+                        f"{intro_part} {marked_str}{tail_str}".strip()
+                    )
+                    rw.rewritten_choices = list(syms)
+                    rw.preserved_answer = str(insert_pos)
+                    c_sym = syms[insert_pos - 1]
+                    if rw.pdf_grounded_explanation:
+                        rw.pdf_grounded_explanation = re.sub(
+                            r"(?:[1-5]\s*번|[①②③④⑤](?:\s*번)?)",
+                            f"{c_sym}번",
+                            rw.pdf_grounded_explanation,
+                            count=1,
+                        )
+        return
+
+    if ("어법" in t or ("어휘" in t and "선택형" not in t and "(A)" not in t)) and not (
+        "<u" in raw_stem.lower() and len(raw_stem) >= max(100, int(len(clean_passage) * 0.6))
+    ):
+        # 5줄 슬림 포맷 파싱: "1: orig" 또는 "3: orig -> replaced"
+        spec_lines: dict[int, tuple[str, str]] = {}
+        for ln in raw_stem.splitlines():
+            m_ln = re.match(r"^\s*(?:([1-5])|([①②③④⑤]))\s*[:.)]\s*(.+?)\s*$", ln)
+            if not m_ln:
+                continue
+            num_str = m_ln.group(1) or _CIRCLED_DIGIT_TO_NUM.get(m_ln.group(2) or "", "")
+            if not num_str:
+                continue
+            idx_n = int(num_str)
+            body_spec = m_ln.group(3).strip()
+            if "->" in body_spec or "→" in body_spec:
+                parts = re.split(r"\s*(?:->|→)\s*", body_spec, maxsplit=1)
+                orig_p = parts[0].strip().strip("`\"'“”‘’")
+                repl_p = parts[1].strip().strip("`\"'“”‘’")
+            else:
+                orig_p = body_spec.strip("`\"'“”‘’")
+                repl_p = orig_p
+            if orig_p:
+                spec_lines[idx_n] = (orig_p, repl_p)
+
+        if len(spec_lines) == 5:
+            syms = ["①", "②", "③", "④", "⑤"]
+            cursor = 0
+            out_parts: list[str] = []
+            display_words: list[str] = []
+            changed_indices: list[int] = []
+            matched_all = True
+            for i in range(1, 6):
+                orig_p, repl_p = spec_lines[i]
+                # 커서 이후에서 단어 경계 우선 매칭, 실패 시 단순 부분 문자열 매칭
+                seg_after = clean_passage[cursor:]
+                m_word = re.search(rf"(?<![A-Za-z]){re.escape(orig_p)}(?![A-Za-z])", seg_after)
+                if m_word is None:
+                    m_word = re.search(re.escape(orig_p), seg_after, flags=re.IGNORECASE)
+                if m_word is None:
+                    matched_all = False
+                    break
+                abs_st = cursor + m_word.start()
+                abs_en = cursor + m_word.end()
+                out_parts.append(clean_passage[cursor:abs_st])
+                shown = repl_p if repl_p != orig_p else clean_passage[abs_st:abs_en]
+                out_parts.append(f"{syms[i - 1]} <u>{shown}</u>")
+                display_words.append(shown)
+                if repl_p.lower() != orig_p.lower():
+                    changed_indices.append(i)
+                cursor = abs_en
+
+            if matched_all and len(changed_indices) == 1:
+                out_parts.append(clean_passage[cursor:])
+                assembled_body = "".join(out_parts)
+                instr = (
+                    "다음 글의 밑줄 친 부분 중, 어법상 틀린 것은?"
+                    if "어법" in t
+                    else "다음 글의 밑줄 친 부분 중, 문맥상 낱말의 쓰임이 적절하지 않은 것은?"
+                )
+                rw.rewritten_stem = f"{instr}\n{assembled_body}"
+                rw.preserved_answer = str(changed_indices[0])
+                if "어법" in t:
+                    rw.rewritten_choices = list(syms)
+                else:
+                    rw.rewritten_choices = display_words
+
+
+_RESTORED_PASSAGE_CACHE: dict[str, str] = {}
+_RESTORED_PASSAGE_LOCK = threading.RLock()
 
 
 _INCOMPLETE_BLANK_RE = re.compile(
@@ -3395,9 +3574,14 @@ def _restore_incomplete_source_passage(
     model_name: str,
     passage: str,
 ) -> str:
-    """빈칸 기출 원문에서 빠진 구절만 문맥에 맞게 복원해 완전한 영어 지문을 만든다."""
+    """빈칸 기출 원문에서 빠진 구절만 문맥에 맞게 복원해 완전한 영어 지문을 만든다 (해시 캐싱)."""
     if not api_key or not _has_incomplete_english_blank(passage):
         return passage
+    p_hash = hashlib.sha256(passage.encode("utf-8")).hexdigest()[:24]
+    with _RESTORED_PASSAGE_LOCK:
+        cached = _RESTORED_PASSAGE_CACHE.get(p_hash)
+        if cached:
+            return cached
     try:
         client = _build_client(api_key, timeout_seconds=45)
         prompt = (
@@ -3423,6 +3607,10 @@ def _restore_incomplete_source_passage(
         )
         restored = _preprocess_english_source_passage((resp.text or "").strip())
         if restored and len(restored) >= int(len(passage) * 0.8) and not _has_incomplete_english_blank(restored):
+            with _RESTORED_PASSAGE_LOCK:
+                if len(_RESTORED_PASSAGE_CACHE) > 512:
+                    _RESTORED_PASSAGE_CACHE.clear()
+                _RESTORED_PASSAGE_CACHE[p_hash] = restored
             return restored
     except Exception:
         pass
@@ -3504,11 +3692,17 @@ def generate_english_transformed_question(
             f"- 이전 정답: {previous_attempt.preserved_answer}\n"
         )
 
+    passage_for_prompt = clean_passage
+    if "순서" in canonical_type:
+        indexed_sents = _split_english_sentences(clean_passage)
+        if len(indexed_sents) >= 4:
+            passage_for_prompt = "\n".join(f"[S{i}] {s}" for i, s in enumerate(indexed_sents))
+
     base_prompt = (
         f"[출처]: {source_label or '영어 기출 독해 지문'}\n"
         f"[목표 수능 유형]: {canonical_type} | [난이도]: {difficulty}\n"
         f"{prev_feedback_block}\n"
-        f"[원문 영어 지문]\n{clean_passage}\n\n"
+        f"[원문 영어 지문]\n{passage_for_prompt}\n\n"
         "위 원문 영어 지문을 바탕으로 목표 유형의 출제 규칙만 엄격히 준수하여 변형 문제와 2줄 이내 핵심 정답 근거를 JSON으로 생성하세요."
     )
 
@@ -3579,6 +3773,8 @@ def generate_english_transformed_question(
                 fallback_hint = "\n- 구절 치환 매칭 실패 시 이번 재시도에서는 지문 전체와 빈칸/밑줄을 직접 완성해 `rewritten_stem`에 반환하세요."
             elif "요약" in canonical_type:
                 fallback_hint = "\n- `[요약문]` 섹션에는 선지 단어만 나열하지 말고 반드시 `(A) ________ ... (B) ________.` 형태의 완전한 요약문 1문장을 작성하세요."
+            elif any(k in canonical_type for k in ("어법", "어휘", "무관", "순서")):
+                fallback_hint = "\n- 슬림 포맷 조립 실패 시 이번 재시도에서는 원문 전체를 포함해 완성된 문제 지문을 `rewritten_stem`에 직접 반환하세요."
             prompt = (
                 base_prompt
                 + "\n\n[⚠️ 직전 출력 형식 오류 — 반드시 아래 누락 사항을 모두 수정하여 다시 생성하세요]\n"
