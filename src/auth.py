@@ -21,7 +21,9 @@ def _storage_lock(storage: StorageManager | None):
 
 KST = timezone(timedelta(hours=9))
 FREE_DAILY_LIMIT = 5  # 하위 호환용 상수 (개편 후 FREE는 업로드/3.5-lite 무제한)
-PRO_WEEKLY_PREMIUM_LIMIT = 20
+FREE_MAX_BATCH_QUESTIONS = 5
+PAID_MAX_BATCH_QUESTIONS = 20
+PRO_WEEKLY_PREMIUM_LIMIT = 50
 FREE_EXAMS_PER_UNLOCK = 3
 PREMIUM_MODEL_IDS: tuple[str, ...] = ("gemini-3.8-flash", "gemini-4-hydrogen")
 VALID_TIERS: tuple[TierType, ...] = ("FREE", "CUSTOM", "PRO", "ULTRA", "ADMIN")
@@ -372,8 +374,15 @@ def get_remaining_free_quota(user: UserRecord) -> int | None:
     return None
 
 
+def get_max_batch_questions(user: UserRecord | None) -> int:
+    """등급별 1회 최대 생성·변형 문항 수 제한을 반환한다 (FREE=5문항, PRO/ULTRA/CUSTOM/ADMIN=20문항)."""
+    if user is None or user.tier == "FREE":
+        return FREE_MAX_BATCH_QUESTIONS
+    return PAID_MAX_BATCH_QUESTIONS
+
+
 def get_remaining_pro_weekly_quota(user: UserRecord) -> int | None:
-    """PRO 등급의 이번 주(KST) 남은 고급 모델(3.8 / Hydrogen) 작업 횟수를 반환한다. 타 등급은 None."""
+    """PRO 등급의 이번 주(KST) 남은 고급 모델(3.8 / Hydrogen) 생성 문항 수(주간 50문항)를 반환한다. 타 등급은 None."""
     if user.tier != "PRO":
         return None
     current_week = get_kst_week_str()
@@ -413,8 +422,8 @@ def resolve_model_for_user(user: UserRecord, requested_model: str) -> tuple[str,
             rem = get_remaining_pro_weekly_quota(user) or 0
             if rem <= 0:
                 return (
-                    "gemini-3.5-flash",
-                    f"PRO 주간 고급 모델 한도({PRO_WEEKLY_PREMIUM_LIMIT}회)를 모두 사용해 Gemini 3.5 Flash로 실행됩니다.",
+                    "gemini-3.5-flash-lite",
+                    f"PRO 주간 고급 모델 한도({PRO_WEEKLY_PREMIUM_LIMIT}문항)를 모두 사용해 Gemini 3.5 Flash-Lite로 실행됩니다.",
                 )
         return req, ""
 
@@ -474,13 +483,17 @@ def consume_premium_model_usage(
     storage: StorageManager,
     username: str,
     used_model: str,
+    count: int = 1,
 ) -> UserRecord | None:
     """
-    고급 모델(3.8 / Hydrogen) 작업 실행 시 등급별 크레딧 또는 주간 사용량을 1회 차감/누적한다.
-    CUSTOM / ULTRA / ADMIN 또는 일반(3.5) 모델 실행 시에는 차감하지 않는다.
+    고급 모델(3.8 / Hydrogen) 작업 실행 시 등급별 크레딧 또는 주간 문항 사용량을 차감/누적한다.
+    - FREE: 실행당 해금 크레딧 1회 차감 (1회 최대 5문항)
+    - PRO: 실제 생성된 문항 수(count)만큼 주간 한도(50문항)에서 차감
+    - CUSTOM / ULTRA / ADMIN 또는 일반(3.5) 모델 실행 시에는 차감하지 않는다.
     """
     if not is_premium_model(used_model):
         return None
+    step_count = max(1, int(count or 1))
     norm_id = normalize_username(username)
     with _storage_lock(storage):
         users = storage.load_users()
@@ -500,7 +513,7 @@ def consume_premium_model_usage(
                     changed = True
                 elif u.tier == "PRO":
                     if hasattr(u, "weekly_premium_count"):
-                        u.weekly_premium_count = int(getattr(u, "weekly_premium_count", 0) or 0) + 1
+                        u.weekly_premium_count = int(getattr(u, "weekly_premium_count", 0) or 0) + step_count
                     if hasattr(u, "last_used_week"):
                         u.last_used_week = get_kst_week_str()
                     changed = True

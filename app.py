@@ -14,6 +14,8 @@ import streamlit as st
 
 from src.auth import (
     FREE_EXAMS_PER_UNLOCK,
+    FREE_MAX_BATCH_QUESTIONS,
+    PAID_MAX_BATCH_QUESTIONS,
     PRO_WEEKLY_PREMIUM_LIMIT,
     TIER_LABELS,
     VALID_TIERS,
@@ -26,6 +28,7 @@ from src.auth import (
     consume_premium_model_usage,
     create_session_token,
     delete_users_by_usernames,
+    get_max_batch_questions,
     get_remaining_pro_weekly_quota,
     get_user_by_username,
     is_premium_model,
@@ -1371,7 +1374,7 @@ with st.sidebar:
             credits = int(getattr(current_user, "premium_unlock_credits", 0) or 0)
             status_line = (
                 f"<div style='font-size:0.83rem; color:#334155; margin-top:0.45rem;'>"
-                f"기출 업로드: <b>무제한</b> (기본 추론 3.5 Flash-Lite)<br/>"
+                f"기본(3.5 Flash-Lite): <b>무제한</b> (1회 최대 {FREE_MAX_BATCH_QUESTIONS}문항)<br/>"
                 f"고급 모델(3.8/Hydrogen) 해금: <b>{credits}회</b> "
                 f"<span style='color:#64748B;'>({upload_prog}/{FREE_EXAMS_PER_UNLOCK}회 업로드)</span>"
                 f"</div>"
@@ -1387,8 +1390,8 @@ with st.sidebar:
         elif tier_code == "PRO":
             status_line = (
                 f"<div style='font-size:0.83rem; color:#1D4ED8; margin-top:0.45rem;'>"
-                f"✨ 서버 API · 업로드 무제한<br/>"
-                f"주간 고급 모델(3.8/Hydrogen): <b>{pro_weekly_rem} / {PRO_WEEKLY_PREMIUM_LIMIT}회</b>"
+                f"✨ 기본(3.5 Flash-Lite) 무제한 (1회 최대 {PAID_MAX_BATCH_QUESTIONS}문항)<br/>"
+                f"주간 고급 모델(3.8/Hydrogen): <b>{pro_weekly_rem} / {PRO_WEEKLY_PREMIUM_LIMIT}문항</b>"
                 f"</div>"
             )
         elif tier_code == "ULTRA":
@@ -2176,9 +2179,9 @@ if current_user is None:
         with st.container(border=True):
             st.markdown("<span class='tier-badge tier-FREE'>FREE · 0원</span>", unsafe_allow_html=True)
             st.markdown("#### 무료 회원")
-            st.write("- 기출 PDF 업로드 **무제한**")
-            st.write("- 기본 추론 **3.5 Flash-Lite** 전용")
-            st.write("- 기출 **3회 업로드마다** 3.8/Hydrogen **1회 해금**")
+            st.write("- 기출 PDF 업로드 & **3.5 Flash-Lite 무제한**")
+            st.write(f"- 영어·수학 1회 생성 **최대 {FREE_MAX_BATCH_QUESTIONS}문항** 제한")
+            st.write(f"- 기출 **{FREE_EXAMS_PER_UNLOCK}회 업로드마다** 3.8/Hydrogen **1회 해금**")
     with t_col2:
         with st.container(border=True):
             st.markdown("<span class='tier-badge tier-CUSTOM'>CUSTOM · 0원</span>", unsafe_allow_html=True)
@@ -2190,8 +2193,8 @@ if current_user is None:
         with st.container(border=True):
             st.markdown("<span class='tier-badge tier-PRO'>PRO · 1,990원/월</span>", unsafe_allow_html=True)
             st.markdown("#### 스탠다드 유료")
-            st.write("- **서버 API 제공** · 업로드 **무제한**")
-            st.write("- **주간 20회 이하** 3.8/Hydrogen 사용")
+            st.write(f"- 3.5 Flash-Lite 무제한 · **1회 최대 {PAID_MAX_BATCH_QUESTIONS}문항**")
+            st.write(f"- 고급 모델(3.8/Hydrogen) **주간 {PRO_WEEKLY_PREMIUM_LIMIT}문항**")
             st.write("- **공용 개념서 DB** 이용 가능")
     with t_col4:
         with st.container(border=True):
@@ -4003,11 +4006,19 @@ def _resolve_tab2_english_rewrite_model(key_suffix: str = "eng") -> tuple[str, b
         use_precision_mode = "flash-lite" not in rw_model.lower()
         pro_rem_weekly = get_remaining_pro_weekly_quota(current_user)
         if current_user.tier == "PRO":
-            st.warning(
-                f"💎 **PRO (1,990원/월)** · 고난도 정밀 생성 활성화: **{MODEL_LABELS.get(rw_model, rw_model)}** "
-                f"(`Thinking LOW` 제한 · 주간 고급 모델 남은 횟수: **{pro_rem_weekly} / {PRO_WEEKLY_PREMIUM_LIMIT}회**)"
-                + (f" — {rw_notice}" if rw_notice else "")
-            )
+            if (pro_rem_weekly or 0) <= 0:
+                rw_model = EXAM_TAGGING_MODEL
+                use_precision_mode = False
+                st.warning(
+                    f"⚠️ **PRO 주간 고급 모델 한도({PRO_WEEKLY_PREMIUM_LIMIT}문항)를 모두 소진**하여 "
+                    "**Gemini 3.5 Flash-Lite** 기본 모드로 자동 전환됩니다."
+                )
+            else:
+                st.warning(
+                    f"💎 **PRO (1,990원/월)** · 고난도 정밀 생성 활성화: **{MODEL_LABELS.get(rw_model, rw_model)}** "
+                    f"(`Thinking LOW` 제한 · 주간 고급 모델 남은 문항: **{pro_rem_weekly} / {PRO_WEEKLY_PREMIUM_LIMIT}문항**)"
+                    + (f" — {rw_notice}" if rw_notice else "")
+                )
         else:
             st.warning(
                 f"🔥 **고난도 정밀 생성 활성화 ({TIER_LABELS.get(current_user.tier, current_user.tier)})** · "
@@ -4025,17 +4036,34 @@ def _execute_english_transform_jobs(
     source_summary_label: str,
     use_precision_mode: bool = False,
 ) -> None:
-    """(영어 지문, 목표 수능 유형) 작업 목록을 최대 5문항 제한 하에 실행해 matched_items(모드 A/B 호환)로 저장한다."""
+    """(영어 지문, 목표 수능 유형) 작업 목록을 등급별 최대 문항(FREE=5, PRO+=20) 및 PRO 주간 한도 하에 실행한다."""
     if not jobs:
         st.warning("변형할 영어 지문과 목표 수능 유형을 최소 1개 이상 선택해 주세요.")
         return
 
-    if len(jobs) > MAX_ENGLISH_TRANSFORM_JOBS:
+    user_max_jobs = get_max_batch_questions(current_user)
+    if len(jobs) > user_max_jobs:
         st.warning(
-            f"⚠️ 과금 및 역마진 방지를 위해 1회 실행당 최대 {MAX_ENGLISH_TRANSFORM_JOBS}문항까지만 생성됩니다. "
-            f"(요청 {len(jobs)}건 중 앞의 {MAX_ENGLISH_TRANSFORM_JOBS}문항만 실행)"
+            f"⚠️ 현재 등급({TIER_LABELS.get(current_user.tier, current_user.tier)})은 1회 실행당 최대 **{user_max_jobs}문항**까지만 생성됩니다. "
+            f"(요청 {len(jobs)}건 중 앞의 {user_max_jobs}문항만 실행)"
         )
-        jobs = jobs[:MAX_ENGLISH_TRANSFORM_JOBS]
+        jobs = jobs[:user_max_jobs]
+
+    if current_user.tier == "PRO" and is_premium_model(rewrite_model):
+        pro_rem = get_remaining_pro_weekly_quota(current_user) or 0
+        if pro_rem <= 0:
+            st.warning(
+                f"⚠️ PRO 주간 고급 모델 한도({PRO_WEEKLY_PREMIUM_LIMIT}문항)를 모두 사용하여 "
+                "**Gemini 3.5 Flash-Lite** 기본 모드로 자동 전환해 실행합니다."
+            )
+            rewrite_model = EXAM_TAGGING_MODEL
+            use_precision_mode = False
+        elif len(jobs) > pro_rem:
+            st.warning(
+                f"⚠️ PRO 주간 고급 모델 잔여 한도(**{pro_rem}문항**)에 맞춰 앞의 {pro_rem}문항만 정밀 생성합니다. "
+                "(나머지 문항은 기본 모드 3.5 Flash-Lite로 무제한 생성 가능합니다.)"
+            )
+            jobs = jobs[:pro_rem]
 
     rewrite_api_key, rewrite_key_label = resolve_active_gemini_api_key(
         current_user, creds.gemini_api_key, model_name=rewrite_model
@@ -4127,7 +4155,9 @@ def _execute_english_transform_jobs(
     consume_extraction_quota(storage, current_user.username, len(assembled))
     updated_u = None
     if is_premium_model(rewrite_model):
-        updated_u = consume_premium_model_usage(storage, current_user.username, rewrite_model)
+        updated_u = consume_premium_model_usage(
+            storage, current_user.username, rewrite_model, count=len(assembled)
+        )
 
     st.session_state["matched_items"] = assembled
     st.session_state["match_diagnostics"] = []
@@ -4144,7 +4174,7 @@ def _execute_english_transform_jobs(
             rem_msg = f" | 남은 고급 모델 해금 크레딧: {int(getattr(updated_u, 'premium_unlock_credits', 0) or 0)}회"
         elif updated_u.tier == "PRO":
             pro_rem = get_remaining_pro_weekly_quota(updated_u)
-            rem_msg = f" | PRO 주간 고급 모델 잔여: {pro_rem}/{PRO_WEEKLY_PREMIUM_LIMIT}회"
+            rem_msg = f" | PRO 주간 고급 모델 잔여: {pro_rem}/{PRO_WEEKLY_PREMIUM_LIMIT}문항"
 
     st.success(f"🎯 총 **{len(assembled)}문항**의 수능형 영어 변형 문제 출제가 완료되었습니다! 아래 모드 A(시험지 PDF) 또는 모드 B(웹 바로 풀기)에서 확인하세요.{rem_msg}")
 
@@ -4153,6 +4183,7 @@ def _render_tab2_english_transform_section() -> None:
     """탭 2 영어 과목 전용: 기출 영어 지문 검색/직접 입력 및 수능 11개 독해 유형 변형 UI."""
     st.subheader("1️⃣ 영어 지문 선택 & 수능 독해 유형 변형 엔진")
     rewrite_model, use_precision_mode = _resolve_tab2_english_rewrite_model(key_suffix="eng")
+    user_max_jobs = min(MAX_ENGLISH_TRANSFORM_JOBS, get_max_batch_questions(current_user))
 
     eng_tab_db, eng_tab_direct = st.tabs(
         [
@@ -4267,11 +4298,11 @@ def _render_tab2_english_transform_section() -> None:
             else:
                 st.caption(
                     f"총 **{len(filtered_passages)}개** 영어 독해 지문이 조회되었습니다. "
-                    f"(과금 방지를 위해 기본 미선택 상태이며, 1회 최대 **{MAX_ENGLISH_TRANSFORM_JOBS}문항**까지만 생성됩니다.)"
+                    f"(과금 방지를 위해 기본 미선택 상태이며, 현재 등급은 1회 최대 **{user_max_jobs}문항**까지만 생성됩니다.)"
                 )
                 with st.form("tab2_eng_db_transform_form", border=True):
                     st.caption(
-                        f"📊 예상 AI 호출: N건 (최대 {MAX_ENGLISH_TRANSFORM_JOBS}건) — "
+                        f"📊 예상 AI 호출: N건 (최대 {user_max_jobs}건) — "
                         f"변형하려는 지문만 직접 체크해 주세요 (전체 선택 비활성화)."
                     )
                     cfg_c1, cfg_c2, cfg_c3 = st.columns(3)
@@ -4307,7 +4338,7 @@ def _render_tab2_english_transform_section() -> None:
                         )
 
                     st.markdown("---")
-                    st.markdown(f"**✅ 변형할 영어 기출 지문 선택 (모두 기본 미선택 · 1회 최대 {MAX_ENGLISH_TRANSFORM_JOBS}문항):**")
+                    st.markdown(f"**✅ 변형할 영어 기출 지문 선택 (모두 기본 미선택 · 1회 최대 {user_max_jobs}문항):**")
 
                     checked_rows: list[tuple[QuestionRecord, str, list[str]]] = []
                     for p_idx, (rec_p, q_label) in enumerate(filtered_passages):
@@ -4352,14 +4383,14 @@ def _render_tab2_english_transform_section() -> None:
                     )
                     if est_db_calls > 0:
                         st.info(
-                            f"📊 **예상 AI 호출: {min(est_db_calls, MAX_ENGLISH_TRANSFORM_JOBS)}건 "
-                            f"(최대 {MAX_ENGLISH_TRANSFORM_JOBS}건)** · 요청 {est_db_calls}건 "
+                            f"📊 **예상 AI 호출: {min(est_db_calls, user_max_jobs)}건 "
+                            f"(최대 {user_max_jobs}건)** · 요청 {est_db_calls}건 "
                             "(상세 구문/오답 해설은 [✨ AI 자동 해설] 클릭 시에만 지연 호출)"
                         )
                     else:
                         st.info(
-                            f"📊 **예상 AI 호출: N건 (최대 {MAX_ENGLISH_TRANSFORM_JOBS}건)** · "
-                            f"체크한 지문 × 선택 유형 수만큼 호출되며 1회 최대 {MAX_ENGLISH_TRANSFORM_JOBS}건으로 제한됩니다."
+                            f"📊 **예상 AI 호출: N건 (최대 {user_max_jobs}건)** · "
+                            f"체크한 지문 × 선택 유형 수만큼 호출되며 1회 최대 {user_max_jobs}건으로 제한됩니다."
                         )
 
                     run_eng_db_btn = st.form_submit_button(
@@ -4402,12 +4433,12 @@ def _render_tab2_english_transform_section() -> None:
                         if not jobs:
                             st.error("적용할 목표 수능 변형 유형을 최소 1개 이상 선택해 주세요.")
                         else:
-                            if len(jobs) > MAX_ENGLISH_TRANSFORM_JOBS:
+                            if len(jobs) > user_max_jobs:
                                 st.warning(
-                                    f"⚠️ 과금 및 역마진 방지를 위해 1회 실행당 최대 {MAX_ENGLISH_TRANSFORM_JOBS}문항까지만 생성됩니다. "
-                                    f"(선택 {len(jobs)}건 중 앞의 {MAX_ENGLISH_TRANSFORM_JOBS}문항만 실행)"
+                                    f"⚠️ 현재 등급은 1회 실행당 최대 {user_max_jobs}문항까지만 생성됩니다. "
+                                    f"(선택 {len(jobs)}건 중 앞의 {user_max_jobs}문항만 실행)"
                                 )
-                                jobs = jobs[:MAX_ENGLISH_TRANSFORM_JOBS]
+                                jobs = jobs[:user_max_jobs]
                             used_exams = sorted({j["base_question"].exam_name for j in jobs})
                             summary_lbl = (
                                 f"{used_exams[0]} 외 {len(used_exams) - 1}개 회차 ({len(jobs)}문항)"
@@ -4473,11 +4504,11 @@ def _render_tab2_english_transform_section() -> None:
             ) or 1
             est_direct_calls = min(
                 direct_chunk_cnt * len(direct_types),
-                MAX_ENGLISH_TRANSFORM_JOBS,
+                user_max_jobs,
             )
             st.info(
-                f"📊 **예상 AI 호출: {est_direct_calls}건 (최대 {MAX_ENGLISH_TRANSFORM_JOBS}건)** · "
-                f"선택 유형 {len(direct_types)}개 × 지문 수 (1회 최대 {MAX_ENGLISH_TRANSFORM_JOBS}문항 하드 제한)"
+                f"📊 **예상 AI 호출: {est_direct_calls}건 (최대 {user_max_jobs}건)** · "
+                f"선택 유형 {len(direct_types)}개 × 지문 수 (1회 최대 {user_max_jobs}문항 하드 제한)"
             )
             run_eng_direct_btn = st.form_submit_button(
                 "🚀 직접 입력한 영어 지문으로 수능형 변형 문제 생성",
@@ -4532,12 +4563,12 @@ def _render_tab2_english_transform_section() -> None:
                                 "source_label": f"출처: {src_title}",
                             }
                         )
-                if len(direct_jobs) > MAX_ENGLISH_TRANSFORM_JOBS:
+                if len(direct_jobs) > user_max_jobs:
                     st.warning(
-                        f"⚠️ 과금 및 역마진 방지를 위해 1회 실행당 최대 {MAX_ENGLISH_TRANSFORM_JOBS}문항까지만 생성됩니다. "
-                        f"(요청 {len(direct_jobs)}건 중 앞의 {MAX_ENGLISH_TRANSFORM_JOBS}문항만 실행)"
+                        f"⚠️ 현재 등급은 1회 실행당 최대 {user_max_jobs}문항까지만 생성됩니다. "
+                        f"(요청 {len(direct_jobs)}건 중 앞의 {user_max_jobs}문항만 실행)"
                     )
-                    direct_jobs = direct_jobs[:MAX_ENGLISH_TRANSFORM_JOBS]
+                    direct_jobs = direct_jobs[:user_max_jobs]
                 _execute_english_transform_jobs(
                     jobs=direct_jobs,
                     rewrite_model=rewrite_model,
@@ -4848,10 +4879,11 @@ with tab2:
             if current_user.tier == "PRO":
                 st.info(
                     f"💎 **PRO (1,990원/월)** · 상위 문제 개조 모델: **{MODEL_LABELS.get(rewrite_model, rewrite_model)}** "
-                    f"(주간 고급 모델 남은 횟수: **{pro_rem_weekly} / {PRO_WEEKLY_PREMIUM_LIMIT}회**)"
+                    f"(주간 고급 모델 남은 문항: **{pro_rem_weekly} / {PRO_WEEKLY_PREMIUM_LIMIT}문항**)"
                     + (f" — {rewrite_notice}" if rewrite_notice else "")
                 )
         st.session_state["active_rewrite_model"] = rewrite_model
+        tab2_max_batch = get_max_batch_questions(current_user)
 
         with st.container(border=True):
             with st.form("tab2_extract_options_form", border=False):
@@ -4862,8 +4894,8 @@ with tab2:
                     filter_grade = st.selectbox("학년 수준 필터", ["전체", "고1 이하", "고2 이하"], index=0)
                 with opt_c3:
                     count_mode = st.radio("추출 문항 수", ["전체", "N문제 지정"], horizontal=True)
-                    max_allowed_n = 100
-                    default_n = 5
+                    max_allowed_n = tab2_max_batch
+                    default_n = min(5, max_allowed_n)
                     target_n = int(
                         st.number_input(
                             "지정 문항 수 (N · 'N문제 지정' 선택 시 적용)",
@@ -4949,6 +4981,12 @@ with tab2:
 
                         if count_mode == "N문제 지정":
                             selected_pairs = selected_pairs[:target_n]
+                        if len(selected_pairs) > tab2_max_batch:
+                            st.warning(
+                                f"⚠️ 현재 등급은 1회 실행당 최대 {tab2_max_batch}문항까지만 추출·개조됩니다. "
+                                f"(매칭 {len(selected_pairs)}문항 중 앞의 {tab2_max_batch}문항만 실행)"
+                            )
+                            selected_pairs = selected_pairs[:tab2_max_batch]
 
                         st.session_state["match_diagnostics"] = diagnostics
 
@@ -5054,7 +5092,10 @@ with tab2:
                                 rewritten_cnt > 0 or current_user.tier == "FREE"
                             ):
                                 updated_u = consume_premium_model_usage(
-                                    storage, current_user.username, rewrite_model
+                                    storage,
+                                    current_user.username,
+                                    rewrite_model,
+                                    count=max(1, rewritten_cnt),
                                 )
                             st.session_state["matched_items"] = assembled
                             st.session_state["generated_exam_pdf"] = None
@@ -5068,7 +5109,7 @@ with tab2:
                                     rem_msg = f" | 남은 고급 모델 해금 크레딧: {int(getattr(updated_u, 'premium_unlock_credits', 0) or 0)}회"
                                 elif updated_u.tier == "PRO":
                                     pro_rem = get_remaining_pro_weekly_quota(updated_u)
-                                    rem_msg = f" | PRO 주간 고급 모델 잔여: {pro_rem}/{PRO_WEEKLY_PREMIUM_LIMIT}회"
+                                    rem_msg = f" | PRO 주간 고급 모델 잔여: {pro_rem}/{PRO_WEEKLY_PREMIUM_LIMIT}문항"
                             st.success(
                                 f"🎯 총 {len(assembled)}문항 추출 완료! "
                                 f"(원문 그대로 {sum(1 for it in assembled if it['rewritten'] is None)}문항 · "

@@ -72,7 +72,7 @@ class ScannedPageBoxes(BaseModel):
 
 DEFAULT_API_TIMEOUT_SECONDS: int = 30
 MAX_VISION_IMAGE_WIDTH: int = 1200
-MAX_ENGLISH_TRANSFORM_JOBS: int = 5
+MAX_ENGLISH_TRANSFORM_JOBS: int = 20
 
 
 def _build_client(api_key: str, timeout_seconds: int = DEFAULT_API_TIMEOUT_SECONDS) -> genai.Client:
