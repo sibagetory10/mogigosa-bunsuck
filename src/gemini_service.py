@@ -72,6 +72,7 @@ class ScannedPageBoxes(BaseModel):
 
 DEFAULT_API_TIMEOUT_SECONDS: int = 30
 MAX_VISION_IMAGE_WIDTH: int = 1200
+MAX_ENGLISH_TRANSFORM_JOBS: int = 5
 
 
 def _build_client(api_key: str, timeout_seconds: int = DEFAULT_API_TIMEOUT_SECONDS) -> genai.Client:
@@ -291,13 +292,33 @@ def _build_400_recovery_configs(
         recovery_configs.append(base_cfg)
 
     if is_thinking_err:
+        cur_level = getattr(
+            getattr(base_cfg if base_cfg is not None else config, "thinking_config", None),
+            "thinking_level",
+            None,
+        )
         if cand_model == HYDROGEN_MODEL:
             t_target = base_cfg if base_cfg is not None else config
-            recovery_configs.append(
-                _with_thinking_config(t_target, types.ThinkingConfig(thinking_budget=256))
-            )
+            if cur_level == types.ThinkingLevel.MINIMAL:
+                recovery_configs.append(
+                    _with_thinking_config(t_target, types.ThinkingConfig(thinking_budget=0))
+                )
+                recovery_configs.append(
+                    _with_thinking_config(
+                        t_target,
+                        types.ThinkingConfig(
+                            thinking_level=types.ThinkingLevel.LOW,
+                            include_thoughts=False,
+                        ),
+                    )
+                )
+                if t_target is not None:
+                    recovery_configs.append(t_target.model_copy(update={"thinking_config": None}))
+            else:
+                recovery_configs.append(
+                    _with_thinking_config(t_target, types.ThinkingConfig(thinking_budget=256))
+                )
         elif base_cfg is not None:
-            cur_level = getattr(getattr(base_cfg, "thinking_config", None), "thinking_level", None)
             if cur_level == types.ThinkingLevel.HIGH:
                 recovery_configs.append(
                     base_cfg.model_copy(
@@ -309,11 +330,28 @@ def _build_400_recovery_configs(
                         }
                     )
                 )
-            recovery_configs.append(
-                base_cfg.model_copy(
-                    update={"thinking_config": types.ThinkingConfig(thinking_budget=2048)}
+            elif cur_level == types.ThinkingLevel.MINIMAL:
+                recovery_configs.append(
+                    base_cfg.model_copy(
+                        update={"thinking_config": types.ThinkingConfig(thinking_budget=0)}
+                    )
                 )
-            )
+                recovery_configs.append(
+                    base_cfg.model_copy(
+                        update={
+                            "thinking_config": types.ThinkingConfig(
+                                thinking_level=types.ThinkingLevel.LOW,
+                                include_thoughts=False,
+                            )
+                        }
+                    )
+                )
+            if cur_level != types.ThinkingLevel.MINIMAL:
+                recovery_configs.append(
+                    base_cfg.model_copy(
+                        update={"thinking_config": types.ThinkingConfig(thinking_budget=2048)}
+                    )
+                )
             recovery_configs.append(base_cfg.model_copy(update={"thinking_config": None}))
 
     if config is not None or cand_model == HYDROGEN_MODEL or eff_cfg is not None:
@@ -2374,7 +2412,7 @@ def _build_english_transform_rule(
     blank_unit: str = "구 (3~6단어)",
     vocab_style: str = "밑줄형 (①~⑤)",
 ) -> tuple[str, str]:
-    """선택한 수능 영어 목표 유형에 맞는 평가원 표준 발문·지문 마크업·선택지 규칙을 반환한다."""
+    """입력 토큰 절감을 위해 11개 전체 규칙 대신 지정된 target_type 1개 유형의 규칙만 동적으로 반환한다."""
     t = (target_type or "").strip()
 
     if "함축" in t:
@@ -2429,16 +2467,16 @@ def _build_english_transform_rule(
             "- 선택지(`rewritten_choices`): 밑줄 친 5개 어휘 리스트(예: `[\"<u>word1</u>\", ...]`)를 순서대로 반환하세요.",
         )
     if "빈칸" in t:
-        unit_desc = (
-            "핵심 추상 명사/동사 **단어(1~2단어)**"
-            if "단어" in blank_unit
-            else (
-                "주어+술어 또는 접속사가 포함된 **절(6~12단어)**"
-                if "절" in blank_unit
-                else "핵심 의미를 압축한 **구(3~6단어)**"
-            )
-        )
-        short_u = "단어" if "단어" in blank_unit else ("절" if "절" in blank_unit else "구")
+        b_u = (blank_unit or "").strip()
+        if b_u.startswith("절") or ("절(" in b_u or "절 (" in b_u):
+            unit_desc = "주어+술어 또는 접속사가 포함된 **절(6~12단어)**"
+            short_u = "절"
+        elif b_u.startswith("단어") or ("단어" in b_u and not b_u.startswith("구")):
+            unit_desc = "핵심 추상 명사/동사 **단어(1~2단어)**"
+            short_u = "단어"
+        else:
+            unit_desc = "핵심 의미를 압축한 **구(3~6단어)**"
+            short_u = "구"
         return (
             f"빈칸 추론 ({short_u})",
             "- 한국어 발문: `다음 빈칸에 들어갈 말로 가장 적절한 것은?`\n"
@@ -2551,54 +2589,59 @@ def generate_english_transformed_question(
     vocab_style: str = "밑줄형 (①~⑤)",
     source_label: str = "",
     previous_attempt: RewrittenQuestion | None = None,
+    use_precision_mode: bool = False,
 ) -> RewrittenQuestion:
     """
-    원문 영어 독해 지문을 지정된 수능 독해 유형(11종)으로 변형·출제하고,
-    형식 검증(<u> 밑줄, 박스, 빈칸, 5지선다) 후 기존 RewrittenQuestion 호환 객체로 반환한다.
+    원문 영어 독해 지문을 지정된 수능 독해 유형(1개 유형 규칙만 동적 주입)으로 변형·출제한다.
+    Thinking 토큰 최소화(기본 MINIMAL, 정밀 모드 시 LOW) 및 2줄 이내 핵심 정답 근거만 지연 생성 전제로 출력해
+    토큰 과금을 절감한 뒤 RewrittenQuestion 호환 객체로 반환한다.
     """
     clean_passage = (source_passage or "").strip()
     if not clean_passage:
         raise ValueError("변형할 영어 지문(source_passage)이 비어 있습니다.")
 
+    eff_model = (model_name or "").strip() or EXAM_TAGGING_MODEL
     canonical_type, type_rule_block = _build_english_transform_rule(
         target_type=target_type,
         blank_unit=blank_unit,
         vocab_style=vocab_style,
     )
+    target_thinking_level = (
+        types.ThinkingLevel.LOW
+        if (use_precision_mode and not _is_flash_lite_model(eff_model))
+        else types.ThinkingLevel.MINIMAL
+    )
 
     client = _build_client(api_key, timeout_seconds=90)
     system_inst = (
-        "당신은 대한민국 대학수학능력시험(평가원·교육청) 영어 영역 최고 수준의 출제위원입니다.\n"
-        "주어진 영어 원문 지문의 핵심 논리 흐름과 문법적 완성도를 유지하면서, 요청된 **[목표 수능 독해 유형]**에 맞춰 실전 시험지에 바로 인쇄 가능한 고품질 변형 문제(`RewrittenQuestion`)를 출제하세요.\n\n"
+        "당신은 대한민국 수능·평가원 영어 영역 출제위원입니다.\n"
+        "원문 지문의 논리와 문법성을 유지하면서 지정된 **[목표 유형 1개]**에 맞춰 `RewrittenQuestion` JSON 1건을 생성하세요.\n\n"
         f"[목표 유형: {canonical_type} | 목표 난이도: {difficulty}]\n"
         f"{type_rule_block}\n\n"
-        "[공통 출제 및 조판 규칙]\n"
+        "[출제 조판 및 출력 토큰 절감 규칙]\n"
         "1. `rewritten_stem`: 첫 줄에 한국어 발문을 적고 줄바꿈 후 지문(및 필요한 `[주어진 문장]`/`[주어진 글]`/`[요약문]` 섹션)을 배치하세요.\n"
         "2. 밑줄이 필요한 유형(어법, 어휘 밑줄형, 함축적 의미)은 반드시 HTML `<u>...</u>` 태그를 사용하세요.\n"
-        "3. `rewritten_choices`: 정확히 5개의 선택지 리스트를 반환하세요(선지 앞의 ①~⑤ 번호는 시스템이 자동 부착하므로, 번호만 있는 유형만 `['①','②','③','④','⑤']`로 적고 텍스트 선지는 앞의 ①~⑤를 뺀 내용만 적으세요).\n"
-        "4. `preserved_answer`: 새로 출제한 이 변형 문제의 유일한 정답 번호를 `'1'`, `'2'`, `'3'`, `'4'`, `'5'` 중 단일 숫자 문자열로 정확히 기록하세요.\n"
-        "5. `pdf_grounded_explanation`: 학생이 완벽히 이해할 수 있도록 다음 3단 구조로 상세 해설을 작성하세요:\n"
-        "   - `[지문 핵심 요약 및 구문]`: 지문의 중심 논지와 핵심 구문/해석 요약\n"
-        "   - `[정답 근거]`: 왜 해당 번호가 유일한 정답인지 본문 단서와 연결해 명확히 설명\n"
-        "   - `[선지별 오답 분석 (①~⑤)]`: 각 번호/선지가 왜 정답 또는 오답인지(어법이면 올바른 형태와 틀린 이유, 어휘면 문맥상 적절한 어휘 등) 빠짐없이 해설\n"
-        "6. `replaced_terms_map`: 지문 내 핵심 어휘·구문 3~5개를 `'영단어/구문 → 한국어 뜻'` 형태로 요약해 담으세요."
+        "3. `rewritten_choices`: 정확히 5개 선지 리스트를 반환하세요(번호 ①~⑤ 제외, 번호형만 `['①','②','③','④','⑤']`).\n"
+        "4. `preserved_answer`: 유일한 정답 번호 `'1'`, `'2'`, `'3'`, `'4'`, `'5'` 중 단일 숫자 문자열 1개만 기록하세요.\n"
+        "5. `pdf_grounded_explanation`: 출력 토큰 절감을 위해 구문 분석이나 ①~⑤ 전체 오답 분석을 절대 작성하지 말고, 왜 정답 번호가 정답인지 **2줄 이내(150자 이내)의 핵심 정답 근거만** 간결하게 작성하세요. (상세 구문 및 선지별 오답 해설은 사용자가 별도 버튼 클릭 시 지연 생성됩니다.)\n"
+        "6. `replaced_terms_map`: 핵심 어휘 2~3개만 `'영단어 → 뜻'` 형태로 간결히 적으세요.\n"
+        "7. `self_verification_note`: 1줄(40자 이내)로만 간결히 적으세요."
     )
 
     prev_feedback_block = ""
     if previous_attempt is not None:
         prev_feedback_block = (
-            "\n[이전 생성본 (재변환 요청 — 이전과 다른 포인트/표현/오답 구성을 사용해 새롭게 출제하세요)]\n"
-            f"- 이전 지문/발문: {previous_attempt.rewritten_stem[:600]}\n"
+            "\n[이전 생성본 (재변환 요청 — 다른 포인트/오답 구성으로 새롭게 출제)]\n"
+            f"- 이전 지문/발문: {previous_attempt.rewritten_stem[:500]}\n"
             f"- 이전 정답: {previous_attempt.preserved_answer}\n"
         )
 
     base_prompt = (
         f"[출처]: {source_label or '영어 기출 독해 지문'}\n"
-        f"[목표 수능 유형]: {canonical_type}\n"
-        f"[목표 난이도]: {difficulty}\n"
+        f"[목표 수능 유형]: {canonical_type} | [난이도]: {difficulty}\n"
         f"{prev_feedback_block}\n"
         f"[원문 영어 지문]\n{clean_passage}\n\n"
-        "위 원문 영어 지문을 바탕으로 목표 유형의 평가원 출제 규칙을 엄격히 준수하여 변형 문제와 해설을 JSON으로 생성하세요."
+        "위 원문 영어 지문을 바탕으로 목표 유형의 출제 규칙만 엄격히 준수하여 변형 문제와 2줄 이내 핵심 정답 근거를 JSON으로 생성하세요."
     )
 
     prompt = base_prompt
@@ -2606,15 +2649,20 @@ def generate_english_transformed_question(
     for attempt in range(2):
         resp = _generate_content_with_fallback(
             client=client,
-            model_name=model_name,
+            model_name=eff_model,
             contents=prompt,
             config=types.GenerateContentConfig(
                 system_instruction=system_inst,
                 response_mime_type="application/json",
                 response_schema=RewrittenQuestion,
                 temperature=0.35 if previous_attempt is not None else 0.25,
+                max_output_tokens=2048,
+                thinking_config=types.ThinkingConfig(
+                    thinking_level=target_thinking_level,
+                    include_thoughts=False,
+                ),
             ),
-            fast_mode=False,
+            fast_mode=not use_precision_mode,
         )
         rw = _parse_structured(resp, RewrittenQuestion)
         # 번호형 선택지(어법/무관한 문장/문장 삽입 등)에서 선택지가 비어 있으면 ①~⑤ 자동 보완

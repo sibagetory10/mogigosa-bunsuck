@@ -57,6 +57,7 @@ from src.curriculum_2022 import (
 from src.ebsi_fetcher import attempt_ebsi_pdf_fetch
 from src.exporters import build_exam_ai_jsonl, build_exam_html, build_exam_markdown
 from src.gemini_service import (
+    MAX_ENGLISH_TRANSFORM_JOBS,
     ForbiddenTermRemainingError,
     analyze_english_exam_pdf_batch_with_gemini,
     analyze_english_question_with_gemini,
@@ -1838,6 +1839,11 @@ def _render_mode_b_solve_fragment(
                         st.markdown(format_explanation_text(rw.pdf_grounded_explanation, for_markdown=True))
                     else:
                         st.markdown(format_explanation_text(q.official_explanation, for_markdown=True))
+                    if is_eng_item:
+                        st.caption(
+                            "💡 토큰 절약을 위해 생성 단계에서는 1~2줄 핵심 정답 근거만 수록됩니다. "
+                            "구문 분석 및 ①~⑤ 오답 분석은 아래 [✨ AI 자동 해설] 버튼을 클릭해 생성하세요."
+                        )
                     st.caption(concept_ref_str)
 
             # ✨ AI 자동 해설 버튼 & 🔄 이 문제 다시 변환 버튼
@@ -1891,11 +1897,24 @@ def _render_mode_b_solve_fragment(
                             or getattr(q, "passage_text", "")
                             or getattr(q, "question_text", "")
                         )
+                        eng_rw_model = eng_meta.get("rewrite_model") or eff_rewrite_model
+                        eng_precision = bool(
+                            eng_meta.get(
+                                "use_precision_mode",
+                                st.session_state.get("active_eng_precision_mode", False),
+                            )
+                        )
+                        eng_rw_key, eng_rw_key_lbl = resolve_active_gemini_api_key(
+                            current_user,
+                            creds.gemini_api_key,
+                            model_name=eng_rw_model,
+                        )
+                        eff_eng_key = eng_rw_key or active_gemini_key
                         with st.spinner(f"'{eng_target_type}' 유형으로 이 지문을 새롭게 다시 변형 중..."):
                             try:
                                 new_rw = generate_english_transformed_question(
-                                    api_key=active_gemini_key,
-                                    model_name=eff_rewrite_model,
+                                    api_key=eff_eng_key,
+                                    model_name=eng_rw_model,
                                     source_passage=src_passage,
                                     target_type=eng_meta.get("target_type") or eng_target_type,
                                     difficulty=eng_meta.get("difficulty") or "고3 평가원·수능 수준",
@@ -1903,6 +1922,7 @@ def _render_mode_b_solve_fragment(
                                     vocab_style=eng_meta.get("vocab_style") or "밑줄형 (①~⑤)",
                                     source_label=eng_meta.get("source_label") or eng_source_caption,
                                     previous_attempt=rw,
+                                    use_precision_mode=eng_precision,
                                 )
                                 st.session_state["matched_items"][seq_num - 1]["rewritten"] = new_rw
                                 st.session_state["ai_explanations"].pop(q.id, None)
@@ -3941,53 +3961,81 @@ with tab1:
 # ===========================================================================
 # TAB 2: 개념서·교과서 PDF 분석 (수학·사회·과학) & 영어 지문 수능형 변형 엔진
 # ===========================================================================
-def _resolve_tab2_english_rewrite_model(key_suffix: str = "eng") -> str:
-    """탭 2 영어 지문 변형에 사용할 모델과 등급·크레딧 안내 배너를 렌더링한다 (기존 탭 2 정책 공유)."""
-    pro_rem_weekly = get_remaining_pro_weekly_quota(current_user)
-    if current_user.tier == "FREE":
+def _resolve_tab2_english_rewrite_model(key_suffix: str = "eng") -> tuple[str, bool]:
+    """탭 2 영어 지문 변형 기본 모델을 초경량 Flash-Lite로 고정하고, 정밀 모드 체크 시에만 상위 모델을 배정한다."""
+    use_precision_req = st.checkbox(
+        "고난도 정밀 생성 (상위 모델 사용 · 크레딧 소모 큼)",
+        value=False,
+        key=f"tab2_eng_precision_mode_{key_suffix}",
+        help=(
+            "기본값(체크 해제)에서는 관리자/PRO 등급을 포함한 전 등급이 단가가 가장 저렴한 "
+            "Gemini 3.5 Flash-Lite(Thinking MINIMAL)를 사용합니다. 체크 시에만 상위 모델(Thinking LOW)을 사용합니다."
+        ),
+    )
+
+    if not use_precision_req:
+        rw_model = EXAM_TAGGING_MODEL
+        use_precision_mode = False
+        st.info(
+            "⚡ **비용 절감 기본 모드**: **Gemini 3.5 Flash-Lite** "
+            "(`Thinking MINIMAL` · 1~2줄 핵심 정답 근거만 생성) — 전 등급 동일하게 토큰·크레딧 소모를 최소화합니다."
+        )
+    elif current_user.tier == "FREE":
         free_credits = int(getattr(current_user, "premium_unlock_credits", 0) or 0)
         free_uploads = int(getattr(current_user, "uploaded_exam_count", 0) or 0)
-        use_unlocked_premium = False
         if free_credits > 0:
-            use_unlocked_premium = st.checkbox(
-                f"🔓 해금 크레딧 1회 사용해 PRO/ULTRA/ADMIN 전용 모델({MODEL_LABELS.get(REWRITE_MODEL, REWRITE_MODEL)})로 변형 실행 (보유: {free_credits}회)",
-                value=False,
-                key=f"tab2_free_use_unlock_credit_{key_suffix}",
-            )
-        if use_unlocked_premium:
             rw_model = REWRITE_MODEL
-            st.info(
-                f"🔓 **무료 회원 (FREE)** · 해금 크레딧 사용: 영어 지문 변형 **{MODEL_LABELS.get(rw_model, rw_model)}** "
-                f"(실행 시 크레딧 1회 차감 · 남은 크레딧 {free_credits}회)"
+            use_precision_mode = True
+            st.warning(
+                f"🔓 **무료 회원 (FREE)** · 고난도 정밀 생성 활성화: **{MODEL_LABELS.get(rw_model, rw_model)}** "
+                f"(`Thinking LOW` 제한 · 실행 시 해금 크레딧 1회 차감 · 남은 크레딧 {free_credits}회)"
             )
         else:
             rw_model = EXAM_TAGGING_MODEL
+            use_precision_mode = False
             prog_mod = free_uploads % FREE_EXAMS_PER_UNLOCK
-            st.info(
-                f"🆓 **무료 회원 (FREE)** · **Gemini 3.5 Flash-Lite**로 변형 실행 "
-                f"(기출 PDF {FREE_EXAMS_PER_UNLOCK}회 업로드마다 고급 모델 1회 해금 · 현재 {prog_mod}/{FREE_EXAMS_PER_UNLOCK}회)"
+            st.warning(
+                f"⚠️ **해금 크레딧 부족 (0회)**: 기출 PDF {FREE_EXAMS_PER_UNLOCK}회 업로드마다 상위 모델 1회가 해금됩니다 "
+                f"(현재 {prog_mod}/{FREE_EXAMS_PER_UNLOCK}회). **Gemini 3.5 Flash-Lite** 기본 모드로 실행합니다."
             )
     else:
         rw_model, rw_notice = resolve_model_for_user(current_user, REWRITE_MODEL)
+        use_precision_mode = "flash-lite" not in rw_model.lower()
+        pro_rem_weekly = get_remaining_pro_weekly_quota(current_user)
         if current_user.tier == "PRO":
-            st.info(
-                f"💎 **PRO (1,990원/월)** · 영어 지문 변형 모델: **{MODEL_LABELS.get(rw_model, rw_model)}** "
-                f"(주간 고급 모델 남은 횟수: **{pro_rem_weekly} / {PRO_WEEKLY_PREMIUM_LIMIT}회**)"
+            st.warning(
+                f"💎 **PRO (1,990원/월)** · 고난도 정밀 생성 활성화: **{MODEL_LABELS.get(rw_model, rw_model)}** "
+                f"(`Thinking LOW` 제한 · 주간 고급 모델 남은 횟수: **{pro_rem_weekly} / {PRO_WEEKLY_PREMIUM_LIMIT}회**)"
                 + (f" — {rw_notice}" if rw_notice else "")
             )
+        else:
+            st.warning(
+                f"🔥 **고난도 정밀 생성 활성화 ({TIER_LABELS.get(current_user.tier, current_user.tier)})** · "
+                f"**{MODEL_LABELS.get(rw_model, rw_model)}** (`Thinking LOW` 제한 · 상위 모델 과금/크레딧 소모가 큽니다)"
+            )
+
     st.session_state["active_rewrite_model"] = rw_model
-    return rw_model
+    st.session_state["active_eng_precision_mode"] = bool(use_precision_mode)
+    return rw_model, bool(use_precision_mode)
 
 
 def _execute_english_transform_jobs(
     jobs: list[dict[str, Any]],
     rewrite_model: str,
     source_summary_label: str,
+    use_precision_mode: bool = False,
 ) -> None:
-    """(영어 지문, 목표 수능 유형) 작업 목록을 병렬 실행해 matched_items(모드 A/B 호환)로 저장한다."""
+    """(영어 지문, 목표 수능 유형) 작업 목록을 최대 5문항 제한 하에 실행해 matched_items(모드 A/B 호환)로 저장한다."""
     if not jobs:
         st.warning("변형할 영어 지문과 목표 수능 유형을 최소 1개 이상 선택해 주세요.")
         return
+
+    if len(jobs) > MAX_ENGLISH_TRANSFORM_JOBS:
+        st.warning(
+            f"⚠️ 과금 및 역마진 방지를 위해 1회 실행당 최대 {MAX_ENGLISH_TRANSFORM_JOBS}문항까지만 생성됩니다. "
+            f"(요청 {len(jobs)}건 중 앞의 {MAX_ENGLISH_TRANSFORM_JOBS}문항만 실행)"
+        )
+        jobs = jobs[:MAX_ENGLISH_TRANSFORM_JOBS]
 
     rewrite_api_key, rewrite_key_label = resolve_active_gemini_api_key(
         current_user, creds.gemini_api_key, model_name=rewrite_model
@@ -3999,12 +4047,12 @@ def _execute_english_transform_jobs(
     total_jobs = len(jobs)
     prog = st.progress(0.0)
     stat = st.empty()
-    stat.info(f"🔤 영어 지문 수능형 변형 {total_jobs}문항 병렬 출제 중 (최대 4스레드)...")
+    stat.info(f"🔤 영어 지문 수능형 변형 {total_jobs}문항 출제 중 (최대 2스레드)...")
 
     results_by_idx: dict[int, RewrittenQuestion] = {}
     errors_by_idx: dict[int, str] = {}
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
         future_map = {
             executor.submit(
                 generate_english_transformed_question,
@@ -4016,6 +4064,7 @@ def _execute_english_transform_jobs(
                 blank_unit=job["blank_unit"],
                 vocab_style=job["vocab_style"],
                 source_label=job["source_label"],
+                use_precision_mode=use_precision_mode,
             ): idx
             for idx, job in enumerate(jobs)
         }
@@ -4065,6 +4114,8 @@ def _execute_english_transform_jobs(
                     "blank_unit": job["blank_unit"],
                     "vocab_style": job["vocab_style"],
                     "source_label": job["source_label"],
+                    "use_precision_mode": use_precision_mode,
+                    "rewrite_model": rewrite_model,
                 },
             }
         )
@@ -4101,7 +4152,7 @@ def _execute_english_transform_jobs(
 def _render_tab2_english_transform_section() -> None:
     """탭 2 영어 과목 전용: 기출 영어 지문 검색/직접 입력 및 수능 11개 독해 유형 변형 UI."""
     st.subheader("1️⃣ 영어 지문 선택 & 수능 독해 유형 변형 엔진")
-    rewrite_model = _resolve_tab2_english_rewrite_model(key_suffix="eng")
+    rewrite_model, use_precision_mode = _resolve_tab2_english_rewrite_model(key_suffix="eng")
 
     eng_tab_db, eng_tab_direct = st.tabs(
         [
@@ -4216,9 +4267,13 @@ def _render_tab2_english_transform_section() -> None:
             else:
                 st.caption(
                     f"총 **{len(filtered_passages)}개** 영어 독해 지문이 조회되었습니다. "
-                    "(체크박스를 클릭해도 화면이 재로딩되지 않으며, 하단 생성 버튼을 누를 때 한 번에 실행됩니다.)"
+                    f"(과금 방지를 위해 기본 미선택 상태이며, 1회 최대 **{MAX_ENGLISH_TRANSFORM_JOBS}문항**까지만 생성됩니다.)"
                 )
                 with st.form("tab2_eng_db_transform_form", border=True):
+                    st.caption(
+                        f"📊 예상 AI 호출: N건 (최대 {MAX_ENGLISH_TRANSFORM_JOBS}건) — "
+                        f"변형하려는 지문만 직접 체크해 주세요 (전체 선택 비활성화)."
+                    )
                     cfg_c1, cfg_c2, cfg_c3 = st.columns(3)
                     with cfg_c1:
                         eng_difficulty = st.selectbox(
@@ -4252,12 +4307,7 @@ def _render_tab2_english_transform_section() -> None:
                         )
 
                     st.markdown("---")
-                    st.markdown("**✅ 변형할 영어 기출 지문 선택:**")
-                    sel_all_eng = st.checkbox(
-                        f"현재 목록 전체 선택 ({len(filtered_passages)}개 지문)",
-                        value=False,
-                        key="tab2_eng_select_all",
-                    )
+                    st.markdown(f"**✅ 변형할 영어 기출 지문 선택 (모두 기본 미선택 · 1회 최대 {MAX_ENGLISH_TRANSFORM_JOBS}문항):**")
 
                     checked_rows: list[tuple[QuestionRecord, str, list[str]]] = []
                     for p_idx, (rec_p, q_label) in enumerate(filtered_passages):
@@ -4293,8 +4343,24 @@ def _render_tab2_english_transform_section() -> None:
                             )
                             row_types = bulk_target_types
 
-                        if is_chk or sel_all_eng:
+                        if is_chk:
                             checked_rows.append((rec_p, q_label, row_types))
+
+                    est_db_calls = sum(
+                        len(r_types if is_per_passage_mode else bulk_target_types)
+                        for _, _, r_types in checked_rows
+                    )
+                    if est_db_calls > 0:
+                        st.info(
+                            f"📊 **예상 AI 호출: {min(est_db_calls, MAX_ENGLISH_TRANSFORM_JOBS)}건 "
+                            f"(최대 {MAX_ENGLISH_TRANSFORM_JOBS}건)** · 요청 {est_db_calls}건 "
+                            "(상세 구문/오답 해설은 [✨ AI 자동 해설] 클릭 시에만 지연 호출)"
+                        )
+                    else:
+                        st.info(
+                            f"📊 **예상 AI 호출: N건 (최대 {MAX_ENGLISH_TRANSFORM_JOBS}건)** · "
+                            f"체크한 지문 × 선택 유형 수만큼 호출되며 1회 최대 {MAX_ENGLISH_TRANSFORM_JOBS}건으로 제한됩니다."
+                        )
 
                     run_eng_db_btn = st.form_submit_button(
                         "🚀 선택한 기출 영어 지문 수능형 변형 문제 생성",
@@ -4336,16 +4402,23 @@ def _render_tab2_english_transform_section() -> None:
                         if not jobs:
                             st.error("적용할 목표 수능 변형 유형을 최소 1개 이상 선택해 주세요.")
                         else:
-                            src_exams = sorted({r[0].exam_name for r in checked_rows})
+                            if len(jobs) > MAX_ENGLISH_TRANSFORM_JOBS:
+                                st.warning(
+                                    f"⚠️ 과금 및 역마진 방지를 위해 1회 실행당 최대 {MAX_ENGLISH_TRANSFORM_JOBS}문항까지만 생성됩니다. "
+                                    f"(선택 {len(jobs)}건 중 앞의 {MAX_ENGLISH_TRANSFORM_JOBS}문항만 실행)"
+                                )
+                                jobs = jobs[:MAX_ENGLISH_TRANSFORM_JOBS]
+                            used_exams = sorted({j["base_question"].exam_name for j in jobs})
                             summary_lbl = (
-                                f"{src_exams[0]} 외 {len(src_exams) - 1}개 회차 ({len(checked_rows)}개 지문)"
-                                if len(src_exams) > 1
-                                else f"{src_exams[0]} ({len(checked_rows)}개 지문)"
+                                f"{used_exams[0]} 외 {len(used_exams) - 1}개 회차 ({len(jobs)}문항)"
+                                if len(used_exams) > 1
+                                else f"{used_exams[0]} ({len(jobs)}문항)"
                             )
                             _execute_english_transform_jobs(
                                 jobs=jobs,
                                 rewrite_model=rewrite_model,
                                 source_summary_label=summary_lbl,
+                                use_precision_mode=use_precision_mode,
                             )
 
     with eng_tab_direct:
@@ -4362,7 +4435,7 @@ def _render_tab2_english_transform_section() -> None:
                 direct_types = st.multiselect(
                     "🎯 생성할 수능 독해 변형 유형 (복수 선택 시 해당 유형들을 한 번에 생성)",
                     options=list(ENGLISH_TRANSFORM_TYPES),
-                    default=["빈칸 추론", "어법상 틀린 것 (밑줄 ①~⑤)"],
+                    default=["빈칸 추론"],
                     key="tab2_eng_direct_types",
                 )
 
@@ -4394,6 +4467,17 @@ def _render_tab2_english_transform_section() -> None:
                 height=210,
                 placeholder="Paste your English reading passage here...",
                 key="tab2_eng_direct_text",
+            )
+            direct_chunk_cnt = len(
+                [ch for ch in re.split(r"\n\s*-{3,}\s*\n", (direct_passage_raw or "").strip()) if ch.strip()]
+            ) or 1
+            est_direct_calls = min(
+                direct_chunk_cnt * len(direct_types),
+                MAX_ENGLISH_TRANSFORM_JOBS,
+            )
+            st.info(
+                f"📊 **예상 AI 호출: {est_direct_calls}건 (최대 {MAX_ENGLISH_TRANSFORM_JOBS}건)** · "
+                f"선택 유형 {len(direct_types)}개 × 지문 수 (1회 최대 {MAX_ENGLISH_TRANSFORM_JOBS}문항 하드 제한)"
             )
             run_eng_direct_btn = st.form_submit_button(
                 "🚀 직접 입력한 영어 지문으로 수능형 변형 문제 생성",
@@ -4448,10 +4532,17 @@ def _render_tab2_english_transform_section() -> None:
                                 "source_label": f"출처: {src_title}",
                             }
                         )
+                if len(direct_jobs) > MAX_ENGLISH_TRANSFORM_JOBS:
+                    st.warning(
+                        f"⚠️ 과금 및 역마진 방지를 위해 1회 실행당 최대 {MAX_ENGLISH_TRANSFORM_JOBS}문항까지만 생성됩니다. "
+                        f"(요청 {len(direct_jobs)}건 중 앞의 {MAX_ENGLISH_TRANSFORM_JOBS}문항만 실행)"
+                    )
+                    direct_jobs = direct_jobs[:MAX_ENGLISH_TRANSFORM_JOBS]
                 _execute_english_transform_jobs(
                     jobs=direct_jobs,
                     rewrite_model=rewrite_model,
                     source_summary_label=base_src,
+                    use_precision_mode=use_precision_mode,
                 )
 
 
