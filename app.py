@@ -2518,6 +2518,182 @@ def _render_my_exams_tab() -> None:
                     st.rerun()
 
 
+def _normalize_exam_identity(name: str) -> str:
+    """회차명 표기 차이(09월/9월, 공백, 로마숫자 등)를 흡수해 동일 기출 판별용 키를 생성한다."""
+    s = (name or "").strip()
+    if not s:
+        return ""
+    s_norm = (
+        s.replace("Ⅰ", "1")
+        .replace("Ⅱ", "2")
+        .replace("Ⅲ", "3")
+        .replace("(", " ")
+        .replace(")", " ")
+    )
+    year_m = re.search(r"(20\d{2})", s_norm)
+    month_m = re.search(r"(?<!\d)(0?[1-9]|1[0-2])\s*월", s_norm)
+    grade_m = re.search(r"(고\s*[123])", s_norm)
+
+    year_tok = year_m.group(1) if year_m else ""
+    month_tok = str(int(month_m.group(1))) if month_m else ("11" if "수능" in s_norm else "")
+    grade_tok = re.sub(r"\s+", "", grade_m.group(1)) if grade_m else ("고3" if "수능" in s_norm else "")
+
+    if year_tok and month_tok and grade_tok:
+        tail = s_norm
+        if year_m:
+            tail = tail.replace(year_m.group(0), " ")
+        if month_m:
+            tail = tail.replace(month_m.group(0), " ")
+        if grade_m:
+            tail = tail.replace(grade_m.group(0), " ")
+        for noise in ("대학수학능력시험", "전국연합학력평가", "모의평가", "학력평가", "모의고사", "학년도", "수능", "학평", "모평", "영역", "년"):
+            tail = tail.replace(noise, " ")
+        subj_tok = re.sub(r"[^가-힣a-zA-Z0-9]+", "", tail).lower()
+        return f"{year_tok}|{month_tok}|{grade_tok}|{subj_tok}"
+
+    return re.sub(r"[^가-힣a-zA-Z0-9]+", "", s_norm).lower()
+
+
+def _build_recommended_exam_catalog() -> list[dict[str, str]]:
+    """최근 3개년(2024~2026) 고1·고2·고3 주요 학평/모평/수능 + 과목별 추천 기출 카탈로그를 생성한다."""
+    years = ["2026", "2025", "2024"]
+    grade_specs: list[tuple[str, list[str], list[tuple[str, str]]]] = [
+        (
+            "고1",
+            ["3월", "6월", "9월", "10월"],
+            [("영어", "영어"), ("수학", "수학"), ("과학", "통합과학"), ("사회", "통합사회")],
+        ),
+        (
+            "고2",
+            ["3월", "6월", "9월", "10월"],
+            [
+                ("영어", "영어"),
+                ("수학", "수학"),
+                ("과학", "물리학Ⅰ"),
+                ("과학", "화학Ⅰ"),
+                ("과학", "생명과학Ⅰ"),
+                ("과학", "지구과학Ⅰ"),
+            ],
+        ),
+        (
+            "고3",
+            ["3월", "6월", "9월", "10월", "11월(수능)"],
+            [
+                ("영어", "영어"),
+                ("수학", "수학"),
+                ("과학", "물리학Ⅰ"),
+                ("과학", "화학Ⅰ"),
+                ("과학", "생명과학Ⅰ"),
+                ("과학", "지구과학Ⅰ"),
+            ],
+        ),
+    ]
+    catalog: list[dict[str, str]] = []
+    for y in years:
+        for grade, months, subjects in grade_specs:
+            for m in months:
+                for subj_cat, subj_name in subjects:
+                    catalog.append(
+                        {
+                            "year": y,
+                            "month": m,
+                            "grade": grade,
+                            "subject_cat": subj_cat,
+                            "subject_name": subj_name,
+                            "exam_name": f"{y}년 {m} {grade} {subj_name}",
+                        }
+                    )
+    return catalog
+
+
+def _render_exam_coverage_board() -> None:
+    """탭 1 상단에 이미 등록된 기출 목록과 추천 미등록 기출 목록을 나란히 표시한다."""
+    db_records = storage.load_db()
+    registered_map: dict[str, dict[str, Any]] = {}
+    registered_ids: set[str] = set()
+    for rec in db_records:
+        en = re.sub(r"\s+", " ", (rec.exam_name or "").strip())
+        if not en:
+            continue
+        norm_id = _normalize_exam_identity(en)
+        if norm_id:
+            registered_ids.add(norm_id)
+        entry = registered_map.setdefault(
+            en,
+            {
+                "회차명": en,
+                "과목": rec.subject_category or infer_subject_category(rec.curriculum_subject or en),
+                "문항 수": 0,
+            },
+        )
+        entry["문항 수"] += 1
+
+    catalog = _build_recommended_exam_catalog()
+    missing_all = [
+        item
+        for item in catalog
+        if _normalize_exam_identity(item["exam_name"]) not in registered_ids
+    ]
+
+    with st.expander(
+        f"📋 기출 DB 등록 현황 & 추천 미등록 기출 보기 (등록 {len(registered_map)}회차 · 추천 미등록 {len(missing_all)}건)",
+        expanded=True,
+    ):
+        fc1, fc2, fc3 = st.columns(3)
+        with fc1:
+            f_subj = st.selectbox(
+                "과목 필터",
+                options=["전체", "영어", "수학", "과학", "사회"],
+                key="cov_board_subj",
+            )
+        with fc2:
+            f_grade = st.selectbox(
+                "학년 필터",
+                options=["전체", "고1", "고2", "고3"],
+                key="cov_board_grade",
+            )
+        with fc3:
+            f_year = st.selectbox(
+                "연도 필터",
+                options=["전체", "2026", "2025", "2024"],
+                key="cov_board_year",
+            )
+
+        reg_rows = [
+            row
+            for row in sorted(registered_map.values(), key=lambda x: x["회차명"], reverse=True)
+            if (f_subj == "전체" or row["과목"] == f_subj)
+            and (f_grade == "전체" or f_grade in row["회차명"])
+            and (f_year == "전체" or f_year in row["회차명"])
+        ]
+        miss_rows = [
+            {
+                "연월": f"{it['year']}년 {it['month']}",
+                "학년": it["grade"],
+                "과목": it["subject_name"],
+                "추천 회차명": it["exam_name"],
+            }
+            for it in missing_all
+            if (f_subj == "전체" or it["subject_cat"] == f_subj)
+            and (f_grade == "전체" or it["grade"] == f_grade)
+            and (f_year == "전체" or it["year"] == f_year)
+        ]
+
+        col_reg, col_miss = st.columns(2)
+        with col_reg:
+            st.markdown(f"**✅ 이미 등록된 기출 ({len(reg_rows)}회차)**")
+            if reg_rows:
+                st.dataframe(reg_rows, hide_index=True, width="stretch", height=240)
+            else:
+                st.info("해당 조건으로 등록된 기출이 아직 없습니다.")
+        with col_miss:
+            st.markdown(f"**📌 추천 미등록 기출 ({len(miss_rows)}건)**")
+            if miss_rows:
+                st.dataframe(miss_rows, hide_index=True, width="stretch", height=240)
+            else:
+                st.success("해당 조건의 추천 기출이 모두 등록되어 있습니다!")
+
+
 if current_user is None:
     st.info("👈 좌측 사이드바 상단의 **[로그인 / 회원가입]** 탭에서 로그인하시면 기출 수집·추출·문제 개조 기능을 이용하실 수 있습니다.")
     t_col1, t_col2, t_col3, t_col4, t_col5 = st.columns(5)
@@ -3020,6 +3196,7 @@ else:
 # ===========================================================================
 with tab1:
     st.subheader("1️⃣ 기출 PDF 수집 및 고해상도 자동 크롭 (250 DPI)")
+    _render_exam_coverage_board()
 
     collect_mode = st.radio(
         "수집 방식 선택",
@@ -3237,9 +3414,15 @@ with tab1:
                         "`.streamlit/secrets.toml`의 `GEMINI_API_KEY`를 확인해 주세요."
                     )
                 else:
+                    db_batch_snapshot = storage.load_db()
                     existing_exam_names = {
                         re.sub(r"\s+", " ", r.exam_name.strip())
-                        for r in storage.load_db()
+                        for r in db_batch_snapshot
+                        if r.exam_name
+                    }
+                    existing_exam_ids = {
+                        _normalize_exam_identity(r.exam_name)
+                        for r in db_batch_snapshot
                         if r.exam_name
                     }
                     total_n = len(prob_files)
@@ -3294,15 +3477,16 @@ with tab1:
                             subj_cat = infer_subject_category(parsed_local.get("subject") or norm_exam_name)
                             _append_batch_log(f"🏷️ 회차명: {norm_exam_name} ({subj_cat})")
 
-                            if batch_skip_dup_chk and norm_exam_name in existing_exam_names:
-                                _append_batch_log(f"⏭️ 이미 DB에 등록됨 → 건너뜀: {norm_exam_name}")
+                            norm_exam_id = _normalize_exam_identity(norm_exam_name)
+                            if norm_exam_name in existing_exam_names or (norm_exam_id and norm_exam_id in existing_exam_ids):
+                                _append_batch_log(f"🚫 이미 DB에 등록된 회차 → 업로드 차단: {norm_exam_name}")
                                 batch_summary.append(
                                     {
                                         "file": prob_base,
                                         "exam_name": norm_exam_name,
                                         "status": "skipped",
                                         "saved_count": 0,
-                                        "message": "이미 DB에 등록된 회차(건너뜀)",
+                                        "message": "이미 DB에 등록된 회차(중복 차단)",
                                     }
                                 )
                                 overall_prog.progress(idx / total_n)
@@ -3355,6 +3539,8 @@ with tab1:
                             newly_saved_items = res["newly_saved"]
                             if newly_saved_items:
                                 existing_exam_names.add(norm_exam_name)
+                                if norm_exam_id:
+                                    existing_exam_ids.add(norm_exam_id)
                                 record_exam_upload_for_user(storage, current_user.username)
                             failed_qs = res["failed_q_nums"]
                             sync_err = res["sync_err"]
@@ -3561,13 +3747,23 @@ with tab1:
                     placeholder="예: 2026년 9월 고1 통합사회",
                 )
 
+            db_snapshot = storage.load_db()
             existing_exam_names = {
                 re.sub(r"\s+", " ", r.exam_name.strip())
-                for r in storage.load_db()
+                for r in db_snapshot
+                if r.exam_name
+            }
+            existing_exam_ids = {
+                _normalize_exam_identity(r.exam_name)
+                for r in db_snapshot
                 if r.exam_name
             }
             norm_input_exam = re.sub(r"\s+", " ", exam_name_input.strip())
-            is_duplicate_exam = bool(norm_input_exam and norm_input_exam in existing_exam_names)
+            norm_input_id = _normalize_exam_identity(norm_input_exam)
+            is_duplicate_exam = bool(
+                norm_input_exam
+                and (norm_input_exam in existing_exam_names or (norm_input_id and norm_input_id in existing_exam_ids))
+            )
             if is_duplicate_exam:
                 st.error(
                     f"🚫 **'{norm_input_exam}'** 모의고사는 이미 DB에 등록되어 있습니다. "
