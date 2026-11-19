@@ -2449,14 +2449,14 @@ def _build_english_transform_rule(
             return (
                 "문맥상 어휘 적절성 (선택형 (A)(B)(C))",
                 "- 발문: `(A), (B), (C)의 각 네모 안에서 문맥에 맞는 낱말로 가장 적절한 것은?`\n"
-                "- 규칙: 기존 본문 내 핵심 어휘 3곳을 `(A) [w1 / w2]`, `(B) [w3 / w4]`, `(C) [w5 / w6]`(원문 단어와 반의어 쌍)으로 표시. 지문 끝에 새 문장 추가·어색한 연어(`severe encouragement`)·어법 변형(`makes`↔`making`) 절대 금지.\n"
+                "- 규칙: 기존 본문 내 핵심 어휘 3곳을 `(A) [w1 / w2]`, `(B) [w3 / w4]`, `(C) [w5 / w6]`(원문 단어와 반의어 쌍)으로 표시. 지문 끝에 새 문장 추가·어색한 연어(`severe encouragement`)·어법 변형(`makes`↔`making`) 절대 금지. 반어법·풍자·부정어(`not`/`never`/`hardly`) 절의 단어는 교체 대상에서 제외.\n"
                 "- 선지: `\"(A) w1 — (B) w3 — (C) w5\"` 형식 5개.",
             )
         return (
             "문맥상 어휘 적절성 (밑줄 ①~⑤)",
             "- 발문: `다음 글의 밑줄 친 부분 중, 문맥상 낱말의 쓰임이 적절하지 않은 것은?`\n"
             "- 규칙: 기존 본문 내 핵심 어휘 5곳에 `① <u>w1</u>` ~ `⑤ <u>w5</u>` 표시. 지문 끝에 새 문장 추가 절대 금지(문장 수 동일 유지). 정확히 1개(정답)만 문법 형태·품사가 100% 동일한 자연스러운 반의어로 교체.\n"
-            "- 금지: 어법 오류(`makes`→`making` 등)·어색한 연어 생성 금지.\n"
+            "- 금지: 어법 오류(`makes`→`making` 등)·어색한 연어 생성 금지. 반어법·풍자 표현이나 부정어(`not`/`never`/`hardly`)가 걸린 절의 단어는 반의어 교체 대상에서 제외.\n"
             "- 선지: 밑줄 친 5개 어휘 리스트.",
         )
     if "빈칸" in t:
@@ -2893,6 +2893,112 @@ def _reconcile_english_order_answer(rw: RewrittenQuestion) -> None:
             return
 
 
+_REPEATABLE_PREPS: frozenset[str] = frozenset(
+    {"from", "to", "in", "on", "of", "with", "for", "by", "at", "into", "as", "about", "through"}
+)
+
+
+def _has_order_scrambled_sentences(stem: str, source_passage: str) -> bool:
+    """(A), (B), (C) 단락 각각이 원문의 연속된 문장 묶음으로 구성됐는지 확인해 비연속 문장 뒤섞임을 감지한다."""
+    src_sents = _split_english_sentences(source_passage)
+    if len(src_sents) < 4:
+        return False
+    after_given = re.split(r"\[주어진\s*글\]", stem or "", maxsplit=1)[-1]
+    parts = re.split(r"(?:^|\n|\s)\(([ABC])\)\s+", after_given)
+    chunk_map: dict[str, str] = {}
+    for i in range(1, len(parts) - 1, 2):
+        lbl = parts[i]
+        txt = parts[i + 1].strip()
+        if lbl in ("A", "B", "C") and txt:
+            chunk_map[lbl] = txt
+    if len(chunk_map) != 3:
+        return False
+
+    src_sets = [set(re.findall(r"[a-z0-9]+", s.lower())) for s in src_sents]
+    for lbl in ("A", "B", "C"):
+        c_sents = _split_english_sentences(chunk_map[lbl])
+        if len(c_sents) <= 1:
+            continue
+        idxs: list[int] = []
+        for cs in c_sents:
+            c_set = set(re.findall(r"[a-z0-9]+", cs.lower()))
+            if not c_set:
+                continue
+            best_i, best_sc = -1, 0.0
+            for i, s_set in enumerate(src_sets):
+                if not s_set:
+                    continue
+                sc = len(c_set & s_set) / max(1, len(c_set | s_set))
+                if sc > best_sc:
+                    best_sc, best_i = sc, i
+            if best_i != -1 and best_sc >= 0.55:
+                idxs.append(best_i)
+        if len(idxs) >= 2:
+            for k in range(len(idxs) - 1):
+                if idxs[k + 1] != idxs[k] + 1:
+                    return True
+    return False
+
+
+def _is_irrelevant_answer_from_source(stem: str, ans_num: str, source_passage: str) -> bool:
+    """무관한 문장 유형에서 정답 번호에 해당하는 문장이 원문에 이미 존재하는 문장인지 검사한다."""
+    if ans_num not in ("1", "2", "3", "4", "5") or not source_passage:
+        return False
+    sym = {"1": "①", "2": "②", "3": "③", "4": "④", "5": "⑤"}[ans_num]
+    m_sym = re.search(rf"{re.escape(sym)}\s*([^\n①②③④⑤]+)", stem or "")
+    if not m_sym:
+        return False
+    ans_toks = set(re.findall(r"[a-z0-9]+", m_sym.group(1).lower()))
+    if len(ans_toks) < 4:
+        return False
+    for s in _split_english_sentences(source_passage):
+        s_toks = set(re.findall(r"[a-z0-9]+", s.lower()))
+        if not s_toks:
+            continue
+        if len(ans_toks & s_toks) / max(1, len(ans_toks | s_toks)) >= 0.78:
+            return True
+    return False
+
+
+def _ensure_korean_instruction_prefix(stem: str, canonical_type: str, vocab_style: str) -> str:
+    """생성된 영어 변형 지문 첫 줄에 표준 한국어 발문이 누락된 경우 자동으로 부착한다."""
+    s = (stem or "").strip()
+    if not s:
+        return s
+    first_line = s.splitlines()[0].strip()
+    if re.search(r"[가-힣]", first_line) and ("?" in first_line or "시오" in first_line or "것은" in first_line or "곳은" in first_line):
+        return s
+
+    t = canonical_type or ""
+    if "함축" in t:
+        inst = "밑줄 친 부분이 다음 글에서 의미하는 바로 가장 적절한 것은?"
+    elif "요지" in t:
+        inst = "다음 글의 요지로 가장 적절한 것은?"
+    elif "주제" in t:
+        inst = "다음 글의 주제로 가장 적절한 것은?"
+    elif "제목" in t:
+        inst = "다음 글의 제목으로 가장 적절한 것은?"
+    elif "어법" in t:
+        inst = "다음 글의 밑줄 친 부분 중, 어법상 틀린 것은?"
+    elif "어휘" in t:
+        inst = (
+            "(A), (B), (C)의 각 네모 안에서 문맥에 맞는 낱말로 가장 적절한 것은?"
+            if ("선택형" in t or "선택형" in vocab_style or "(A)" in vocab_style)
+            else "다음 글의 밑줄 친 부분 중, 문맥상 낱말의 쓰임이 적절하지 않은 것은?"
+        )
+    elif "빈칸" in t:
+        inst = "다음 빈칸에 들어갈 말로 가장 적절한 것은?"
+    elif "무관" in t:
+        inst = "다음 글에서 전체 흐름과 관계없는 문장은?"
+    elif "순서" in t:
+        inst = "주어진 글 다음에 이어질 글의 순서로 가장 적절한 것은?"
+    elif "삽입" in t:
+        inst = "글의 흐름으로 보아, 주어진 문장이 들어가기에 가장 적절한 곳은?"
+    else:
+        inst = "다음 글의 내용을 한 문장으로 요약하고자 한다. 빈칸 (A), (B)에 들어갈 말로 가장 적절한 것은?"
+    return f"{inst}\n{s}"
+
+
 def _validate_english_transformed_output(
     rw: RewrittenQuestion,
     target_type: str,
@@ -2942,6 +3048,18 @@ def _validate_english_transformed_output(
     if "어법" in t or ("어휘" in t and "선택형" not in vocab_style and "(A)" not in vocab_style):
         if u_count < 5:
             issues.append(f"지문(rewritten_stem) 안에 `① <u>...</u>` ~ `⑤ <u>...</u>` 밑줄 태그 5개가 모두 포함되어야 합니다 (현재 `<u>` {u_count}개).")
+        elif "어법" in t:
+            exp_txt = rw.pdf_grounded_explanation or ""
+            if re.search(r"(?:의미상|문맥상\s*반대|반의어)", exp_txt):
+                issues.append(
+                    "어법 문제 해설에 어휘 뜻풀이('의미상'/'반의어')가 포함되었습니다. 어휘 문제와 혼동하지 말고 명백한 문법 비문 1개만 출제하세요."
+                )
+            elif re.search(r"(?:타당|적절|올바르|맞)(?:하다|다|습니다|음)(?!\s*(?:않|못))", exp_txt) and not re.search(
+                r"(?:적절하지\s*않|올바르지\s*않|타당하지\s*않|맞지\s*않)", exp_txt
+            ):
+                issues.append(
+                    "어법 문제 해설이 정답 밑줄을 '적절하다/타당하다'고 모순되게 설명했습니다. 명백한 문법 오류 1개만 출제하고 왜 틀렸는지 설명하세요."
+                )
         elif "어휘" in t and ans in ("1", "2", "3", "4", "5"):
             # 2. 문맥상 어휘 적절성: 해설/치환목록에 적힌 교체 단어가 실제 지문 정답 밑줄에 반영되었는지 확인
             u_words = [re.sub(r"<[^>]+>", "", w).strip() for w in u_matches]
@@ -3001,7 +3119,7 @@ def _validate_english_transformed_output(
                         "문장 전체(동사 포함)를 비우지 말고 주어·동사가 유지된 상태에서 핵심 목적어/보어/구만 빈칸으로 비우세요."
                     )
 
-            # 3. 빈칸 앞뒤 2단어와 정답 선지의 시작/끝 2단어 중복 차단
+            # 3. 빈칸 앞뒤 구절/전치사 중복 차단
             if m_blk and ans in ("1", "2", "3", "4", "5") and len(rw.rewritten_choices or []) >= int(ans):
                 before_toks = re.findall(r"[a-zA-Z\-']+", stem[: m_blk.start()].lower())
                 after_toks = re.findall(r"[a-zA-Z\-']+", stem[m_blk.end() :].lower())
@@ -3015,6 +3133,14 @@ def _validate_english_transformed_output(
                         issues.append(
                             f"빈칸 직후 구절({' '.join(after_toks[:2])})과 정답 선지의 끝 2단어가 중복됩니다. 중복을 제거해 다시 생성하세요."
                         )
+                if after_toks and after_toks[0] in _REPEATABLE_PREPS and after_toks[0] in ans_toks[-4:]:
+                    issues.append(
+                        f"빈칸 바로 뒤 전치사({after_toks[0]!r})가 정답 선지 끝부분에도 중복 포함되어 비문이 됩니다. 전치사를 겹치지 않게 다시 생성하세요."
+                    )
+                elif before_toks and before_toks[-1] in (_REPEATABLE_PREPS | {"a", "an", "the"}) and ans_toks and ans_toks[0] == before_toks[-1]:
+                    issues.append(
+                        f"빈칸 바로 앞 단어({before_toks[-1]!r})가 정답 선지 시작 단어와 중복됩니다. 중복을 제거해 다시 생성하세요."
+                    )
         if re.search(r"\(\s*[①②③④⑤]\s*\)|[①②③④⑤]", stem):
             issues.append(
                 "빈칸 추론 지문에는 문장 삽입 번호 기호 `( ① )~( ⑤ )` 또는 `①~⑤`가 포함되면 안 됩니다. 모두 제거하세요."
@@ -3031,6 +3157,10 @@ def _validate_english_transformed_output(
                 issues.append(
                     f"전체 흐름과 무관한 문장은 원문 문장({src_cnt}개)을 삭제하지 않고 무관한 새 문장 1개만 삽입해 "
                     f"총 {src_cnt + 1}문장이 되어야 합니다 (현재 {gen_cnt}문장). 원문을 보존하고 새 문장 1개를 삽입하세요."
+                )
+            elif _is_irrelevant_answer_from_source(stem, ans, source_passage):
+                issues.append(
+                    f"무관한 문장의 정답 {ans}번 문장이 원문 문장 그대로입니다. 원문 문장을 오답으로 우기지 말고 흐름과 무관한 새 문장을 삽입하세요."
                 )
     elif "순서" in t:
         for mk in ("(A)", "(B)", "(C)"):
@@ -3054,6 +3184,10 @@ def _validate_english_transformed_output(
                     "글의 순서 문제에서 (A), (B), (C)가 원문 등장 순서 그대로((A)-(B)-(C) 정순) 배열되었습니다. "
                     "수능 5지선다에는 (A)-(B)-(C)가 없으므로 반드시 (B)-(A)-(C), (C)-(B)-(A) 등 단락 순서를 섞어 다시 출제하세요."
                 )
+            elif _has_order_scrambled_sentences(stem, source_passage):
+                issues.append(
+                    "글의 순서 문제에서 (A), (B), (C) 단락 내부에 원문의 비연속 문장이 뒤섞여 합쳐졌습니다. 각 단락은 원문에서 연속된 문장 묶음으로만 구성하세요."
+                )
     elif "삽입" in t:
         if "[주어진 문장]" not in stem and "주어진 문장" not in stem:
             issues.append("문장 삽입 지문에 `[주어진 문장]` 섹션 헤더가 누락되었습니다.")
@@ -3073,8 +3207,9 @@ def _validate_english_transformed_output(
     elif "요약" in t:
         if "[요약문]" not in stem and "요약문" not in stem:
             issues.append("요약문 완성 지문에 `[요약문]` 섹션 헤더가 누락되었습니다.")
-        if "(A)" not in stem or "(B)" not in stem:
-            issues.append("요약문에 `(A)`와 `(B)` 빈칸 표기가 모두 포함되어야 합니다.")
+        sum_section = re.split(r"\[요약문\]", stem, maxsplit=1)[-1]
+        if not re.search(r"\(A\)\s*_{2,}", sum_section) or not re.search(r"\(B\)\s*_{2,}", sum_section):
+            issues.append("요약문 섹션 안에 `(A) ________`와 `(B) ________` 빈칸 표기가 모두 포함되어야 합니다.")
 
     return issues
 
@@ -3325,6 +3460,7 @@ def generate_english_transformed_question(
         rw.rewritten_stem = re.sub(r"[ \t]*\(\s*[①②③④⑤]\s*\)[ \t]*", " ", rw.rewritten_stem)
         rw.rewritten_stem = re.sub(r"[ \t]*[①②③④⑤][ \t]*", " ", rw.rewritten_stem)
         rw.rewritten_stem = re.sub(r"[ \t]{2,}", " ", rw.rewritten_stem).strip()
+    rw.rewritten_stem = _ensure_korean_instruction_prefix(rw.rewritten_stem, canonical_type, vocab_style)
     rw.pdf_grounded_explanation = format_explanation_text(rw.pdf_grounded_explanation)
     rw.preserved_answer = _normalize_extracted_answer(rw.preserved_answer) or "1"
     if len(rw.rewritten_choices) < 5:
