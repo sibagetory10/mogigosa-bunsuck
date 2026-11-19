@@ -301,20 +301,20 @@ def _detect_single_exam_cover(
                 first_page_png_bytes=p1_png,
                 filename=prob_name,
             )
-            raw_merged_year = (ai_meta.year or parsed_local.get("year") or "").strip().rstrip("년")
+            raw_ai_year = (ai_meta.year or "").strip().rstrip("년")
             merged_month = (ai_meta.month or parsed_local.get("month") or "").strip()
             if merged_month and not merged_month.endswith("월"):
                 merged_month = f"{merged_month}월"
             merged_grade = (ai_meta.grade or parsed_local.get("grade") or "").strip()
             merged_subject = (ai_meta.subject or parsed_local.get("subject") or "").strip()
             merged_year = normalize_exam_year(
-                raw_merged_year,
+                raw_ai_year,
                 text=p1_text,
                 filename=prob_name,
                 exam_title=ai_meta.exam_title or "",
                 month=merged_month,
                 grade=merged_grade,
-            )
+            ) or parsed_local.get("year", "")
             if merged_year and merged_month and merged_grade and merged_subject:
                 merged_title = f"{merged_year}년 {merged_month} {merged_grade} {merged_subject}"
             else:

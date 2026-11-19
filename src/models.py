@@ -579,11 +579,18 @@ def normalize_exam_year(
     combined = " ".join(str(x).strip() for x in (text, exam_title, filename) if str(x or "").strip())
     c_nospace = combined.replace(" ", "")
 
-    # 기본 연도 추출
+    # 기본 연도 추출: 원문 text에 명시된 연도를 최우선 사용 (이미 -1 보정된 raw_year의 이중 감산 방지)
     base_year: int | None = None
-    if raw_year and re.fullmatch(r"20\d{2}", str(raw_year).strip()):
+    text_str = str(text or "").strip()
+    if text_str:
+        tm = re.search(r"(20\d{2})\s*(?:학년도|년)", text_str) or re.search(
+            r"(?:^|[\s_\-.(])(20\d{2})(?:$|[\s_\-.)])", text_str
+        )
+        if tm:
+            base_year = int(tm.group(1))
+    if base_year is None and raw_year and re.fullmatch(r"20\d{2}", str(raw_year).strip()):
         base_year = int(str(raw_year).strip())
-    else:
+    if base_year is None:
         ym = re.search(r"(20\d{2})\s*(?:학년도|년)", combined) or re.search(
             r"(?:^|[\s_\-.(])(20\d{2})(?:$|[\s_\-.)])", combined
         )
