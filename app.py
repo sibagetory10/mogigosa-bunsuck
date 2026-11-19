@@ -94,6 +94,7 @@ from src.models import (
     RewrittenQuestion,
     build_whitelist_from_concept_units,
     infer_subject_category,
+    normalize_english_group_id,
     resolve_question_concept_reference,
 )
 from src.pdf_generator import generate_custom_exam_pdf
@@ -722,7 +723,11 @@ def _tag_and_save_single_exam(
                     answer_pdf_part=answer_pdf_part,
                     answer_text_hint=q_ans_hint,
                     question_text_hint=cq_item.extracted_text or "",
-                    shared_passage_hint=getattr(cq_item, "shared_passage_text", "") or "",
+                    shared_passage_hint=(
+                        (getattr(cq_item, "shared_passage_text", "") or "")
+                        if normalize_english_group_id(cq_item.q_num)
+                        else ""
+                    ),
                 )
                 return cq_item, extracted_out, time.perf_counter() - t_start
 
@@ -748,11 +753,7 @@ def _tag_and_save_single_exam(
         eng_group_passages: dict[str, str] = {}
         for cq in target_crops:
             ext = extracted_by_q.get(cq.q_num)
-            gid = (
-                (getattr(ext, "passage_group_id", "") if ext else "")
-                or getattr(cq, "passage_group_id", "")
-                or ("41~42" if cq.q_num in (41, 42) else ("43~45" if cq.q_num in (43, 45, 44) else ""))
-            )
+            gid = normalize_english_group_id(cq.q_num)
             if not gid:
                 continue
             cand_p = (
@@ -919,11 +920,7 @@ def _tag_and_save_single_exam(
         if is_english_exam:
             eng_sec = getattr(extracted, "english_section", "") or ("듣기" if cq.q_num <= 17 else "독해")
             eng_type = (getattr(extracted, "english_question_type", "") or "").strip() or eng_sec
-            p_group = (
-                (getattr(extracted, "passage_group_id", "") or "").strip()
-                or getattr(cq, "passage_group_id", "")
-                or ("41~42" if cq.q_num in (41, 42) else ("43~45" if cq.q_num in (43, 44, 45) else ""))
-            )
+            p_group = normalize_english_group_id(cq.q_num)
             raw_p_text = (getattr(extracted, "passage_text", "") or "").strip()
             if p_group and len(raw_p_text) < len(eng_group_passages.get(p_group, "")) * 0.7:
                 raw_p_text = eng_group_passages[p_group]
@@ -1040,7 +1037,7 @@ def _render_question_tag_details(
     if rec.subject_category == "영어":
         eng_sec = getattr(rec, "english_section", "") or ("듣기" if rec.q_num <= 17 else "독해")
         eng_type = getattr(rec, "english_question_type", "") or rec.unit_name
-        grp_id = getattr(rec, "passage_group_id", "")
+        grp_id = normalize_english_group_id(rec.q_num) if rec.subject_category == "영어" else getattr(rec, "passage_group_id", "")
         topic = getattr(rec, "passage_topic", "") or "-"
         vocab_list = list(getattr(rec, "key_vocabulary", []) or rec.required_terms or [])
         passage_txt = (getattr(rec, "passage_text", "") or "").strip()
@@ -4075,12 +4072,13 @@ def _execute_english_transform_jobs(
     total_jobs = len(jobs)
     prog = st.progress(0.0)
     stat = st.empty()
-    stat.info(f"🔤 영어 지문 수능형 변형 {total_jobs}문항 출제 중 (최대 2스레드)...")
+    n_workers = max(1, min(total_jobs, 5 if use_precision_mode else 8))
+    stat.info(f"🔤 영어 지문 수능형 변형 {total_jobs}문항 병렬 출제 중 (최대 {n_workers}스레드)...")
 
     results_by_idx: dict[int, RewrittenQuestion] = {}
     errors_by_idx: dict[int, str] = {}
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=n_workers) as executor:
         future_map = {
             executor.submit(
                 generate_english_transformed_question,
@@ -4282,7 +4280,7 @@ def _render_tab2_english_transform_section() -> None:
                     if kw_low not in blob:
                         continue
 
-                gid = (getattr(r, "passage_group_id", "") or "").strip()
+                gid = normalize_english_group_id(r.q_num)
                 if gid:
                     g_key = (r.exam_name, gid)
                     if g_key in seen_group_keys:

@@ -7,6 +7,21 @@ SubjectCategory = Literal["수학", "사회", "과학", "영어"]
 
 ENGLISH_DEFAULT_EXCLUDED_Q_NUMS: frozenset[int] = frozenset({18, 19, 25, 26, 27, 28, 43, 44, 45})
 
+# 실제로 하나의 영어 지문을 공유하는 세트 문항만 그룹으로 인정한다.
+# ([31~34], [36~37], [38~39] 등은 '발문 공통 헤더'일 뿐 지문은 문항마다 각각 다르다.)
+ENGLISH_SHARED_PASSAGE_SETS: dict[int, str] = {
+    41: "41~42",
+    42: "41~42",
+    43: "43~45",
+    44: "43~45",
+    45: "43~45",
+}
+
+
+def normalize_english_group_id(q_num: int, raw_group: str = "") -> str:
+    """영어 세트 지문 그룹 ID를 문항 번호 기준으로 정규화한다 (41~42, 43~45 외에는 항상 빈 문자열)."""
+    return ENGLISH_SHARED_PASSAGE_SETS.get(int(q_num), "")
+
 ENGLISH_TRANSFORM_TYPES: tuple[str, ...] = (
     "함축적 의미 추론",
     "요지 파악",

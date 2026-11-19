@@ -34,6 +34,7 @@ from src.models import (
     EnglishQuestionExtractionItem,
     EnglishSingleExtractionOutput,
     ExamHeaderMetadata,
+    normalize_english_group_id,
     MixedPdfClassificationOutput,
     QuestionExtractionOutput,
     QuestionMatchJudgment,
@@ -2197,16 +2198,8 @@ def classify_mixed_exam_pdfs_with_ai(
 # 영어(English) 과목 전용 기출 추출 & 수능 독해 11개 유형 변형 엔진
 # ===========================================================================
 def _infer_english_group_id(q_num: int, raw_group: str = "") -> str:
-    cleaned = (raw_group or "").strip()
-    if cleaned:
-        return cleaned
-    if q_num in (41, 42):
-        return "41~42"
-    if q_num in (43, 44, 45):
-        return "43~45"
-    if q_num in (16, 17):
-        return "16~17"
-    return ""
+    """41~42 / 43~45 장문 세트만 그룹으로 인정하고, 그 외 번호([31~34] 등 발문 헤더)는 항상 개별 지문으로 취급한다."""
+    return normalize_english_group_id(q_num, raw_group)
 
 
 def analyze_english_exam_pdf_batch_with_gemini(
@@ -2265,7 +2258,7 @@ def analyze_english_exam_pdf_batch_with_gemini(
         "'어법', '어휘', '빈칸 추론', '무관한 문장', '글의 순서', '문장 삽입', '요약문 완성', '장문 독해(41~42)', '장문 독해(43~45)'.\n"
         "   - `passage_text`: 한국어 발문(예: '다음 글의 요지로...')과 선택지(①~⑤)를 제외한 **영어 본문 지문 전체**를 빠짐없이 원문 그대로 추출하세요. "
         "(글의 순서 문항은 주어진 글과 (A)(B)(C) 본문을 자연스럽게 모두 포함하고, 문장 삽입 문항도 주어진 문장과 본문을 모두 포함하세요.)\n"
-        "   - **장문 세트(41~42번, 43~45번)**: `passage_group_id`를 `'41~42'` 또는 `'43~45'`로 표기하고, 세트 내 첫 문항(41번, 43번)의 `passage_text`에 공통 장문 지문 전체를 빠짐없이 수록하세요.\n"
+        "   - **장문 세트(41~42번, 43~45번)에만** `passage_group_id`를 `'41~42'` 또는 `'43~45'`로 표기하고 공통 장문 지문 전체를 수록하세요. **그 외 모든 문항(예: 31~34, 36~37, 38~39 등 발문 헤더 범위 포함)은 문항마다 지문이 각각 다르므로 `passage_group_id`를 반드시 빈 문자열로 두고 해당 번호 문항의 지문만 추출하세요.**\n"
         "   - `passage_topic`: 지문의 핵심 소재·주제를 한국어 1줄로 요약하세요.\n"
         "   - `key_vocabulary`: 지문 내 주요 어휘 3~6개를 `'단어: 한국어 뜻'` 형식으로 나열하세요.\n"
         "4. `official_explanation`과 `answer`: 해설지 기준 핵심 풀이 요약과 공식 정답(`'1'`~`'5'`)을 정확히 추출하세요."
@@ -2646,7 +2639,11 @@ def generate_english_transformed_question(
 
     prompt = base_prompt
     rw: RewrittenQuestion | None = None
+    # 출력에는 지문 전체(+선지)가 포함되므로 지문 길이에 비례해 출력 토큰 상한을 잡는다 (JSON 중간 잘림 방지).
+    base_out_tokens = min(8192, max(3072, int(len(clean_passage) / 2.0) + 1800))
+    last_parse_err: Exception | None = None
     for attempt in range(2):
+        out_tokens = base_out_tokens if attempt == 0 else min(12288, int(base_out_tokens * 1.6))
         resp = _generate_content_with_fallback(
             client=client,
             model_name=eff_model,
@@ -2656,7 +2653,7 @@ def generate_english_transformed_question(
                 response_mime_type="application/json",
                 response_schema=RewrittenQuestion,
                 temperature=0.35 if previous_attempt is not None else 0.25,
-                max_output_tokens=2048,
+                max_output_tokens=out_tokens,
                 thinking_config=types.ThinkingConfig(
                     thinking_level=target_thinking_level,
                     include_thoughts=False,
@@ -2664,7 +2661,16 @@ def generate_english_transformed_question(
             ),
             fast_mode=not use_precision_mode,
         )
-        rw = _parse_structured(resp, RewrittenQuestion)
+        try:
+            parsed_rw = _parse_structured(resp, RewrittenQuestion)
+        except Exception as parse_exc:
+            last_parse_err = parse_exc
+            if attempt == 0:
+                continue
+            if rw is not None:
+                break
+            raise
+        rw = parsed_rw
         # 번호형 선택지(어법/무관한 문장/문장 삽입 등)에서 선택지가 비어 있으면 ①~⑤ 자동 보완
         if not rw.rewritten_choices and any(k in canonical_type for k in ("어법", "무관", "삽입", "밑줄")):
             rw.rewritten_choices = ["①", "②", "③", "④", "⑤"]
