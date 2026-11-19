@@ -3,7 +3,23 @@ from __future__ import annotations
 from typing import Any, Literal
 from pydantic import BaseModel, Field, field_validator
 
-SubjectCategory = Literal["수학", "사회", "과학"]
+SubjectCategory = Literal["수학", "사회", "과학", "영어"]
+
+ENGLISH_DEFAULT_EXCLUDED_Q_NUMS: frozenset[int] = frozenset({18, 19, 25, 26, 27, 28, 43, 44, 45})
+
+ENGLISH_TRANSFORM_TYPES: tuple[str, ...] = (
+    "함축적 의미 추론",
+    "요지 파악",
+    "주제 파악",
+    "제목 추론",
+    "어법상 틀린 것 (밑줄 ①~⑤)",
+    "문맥상 어휘 적절성",
+    "빈칸 추론",
+    "전체 흐름과 무관한 문장",
+    "글의 순서 ((A)-(B)-(C))",
+    "주어진 문장 삽입",
+    "요약문 완성 ((A), (B))",
+)
 
 
 def _coerce_grade_int(value: Any) -> int:
@@ -19,15 +35,15 @@ def _coerce_grade_int(value: Any) -> int:
 
 
 class QuestionRecord(BaseModel):
-    """저장소에 영구 보관되는 단일 기출 문항 스키마 (2022 개정 교육과정 기준)."""
+    """저장소에 영구 보관되는 단일 기출 문항 스키마 (2022 개정 교육과정 기준 및 영어 전용 확장 포함)."""
 
     id: str = Field(..., description="고유 문항 ID (예: 2026_고3_6월_화학__Q05)")
     exam_name: str = Field(..., description="시험 회차명 (예: 2026_고3_6월_화학)")
     q_num: int = Field(..., ge=1, description="문항 번호")
-    subject_category: Literal["수학", "사회", "과학"] = Field(..., description="대분류 과목")
+    subject_category: Literal["수학", "사회", "과학", "영어"] = Field(..., description="대분류 과목")
     curriculum_subject: str = Field(..., description="2022 개정 교육과정 세부 과목명")
     unit_name: str = Field(..., description="단원명")
-    min_grade: int = Field(..., ge=1, le=3, description="최저 학년 수준 (1=고1, 2=고2, 3=고3)")
+    min_grade: int = Field(default=1, ge=1, le=3, description="최저 학년 수준 (1=고1, 2=고2, 3=고3)")
 
     @field_validator("min_grade", mode="before")
     @classmethod
@@ -70,7 +86,7 @@ class QuestionRecord(BaseModel):
         description="할루시네이션·모순 검사에서 감지된 검토 사유 목록",
     )
     is_single_concept: bool = Field(
-        ...,
+        default=True,
         description="단일 핵심 원리만으로 풀리는지 여부",
     )
     answer: str = Field(..., description="공식 정답")
@@ -78,6 +94,30 @@ class QuestionRecord(BaseModel):
     question_text: str = Field(
         default="",
         description="PyMuPDF로 추출한 문항 원문 텍스트 (AI 서칭·변형 시 토큰 절감용)",
+    )
+    english_section: str = Field(
+        default="",
+        description="영어 영역 구분 ('듣기' | '독해', 비영어 과목은 빈 문자열)",
+    )
+    english_question_type: str = Field(
+        default="",
+        description="영어 원래 문항 유형 (예: 목적, 심경, 함축 의미, 요지, 주제, 제목, 도표, 내용 일치, 어법, 어휘, 빈칸, 무관한 문장, 순서, 삽입, 요약문, 장문)",
+    )
+    passage_text: str = Field(
+        default="",
+        description="영어 독해 지문 원문 (41~42, 43~45 세트 문항은 공통 지문 연결)",
+    )
+    passage_group_id: str = Field(
+        default="",
+        description="세트 문항 공통 지문 그룹 식별자 (예: '41~42', '43~45')",
+    )
+    passage_topic: str = Field(
+        default="",
+        description="영어 지문 주제·소재 요약",
+    )
+    key_vocabulary: list[str] = Field(
+        default_factory=list,
+        description="영어 지문 핵심 어휘 목록 (예: ['resilience: 회복탄력성'])",
     )
     image_filename: str = Field(default="", description="크롭된 문항 PNG 파일명")
     source_pdf: str = Field(default="", description="원본 문제지 PDF 파일명")
@@ -342,6 +382,63 @@ class RewrittenQuestion(BaseModel):
         default="",
         description="원본 그림·그래프·표 속에 범위 외 상위 용어/단위(예: mol, M)가 포함되어 있을 때 본문 허용 용어와 연결해 주는 안내 문구 (없으면 빈 문자열)",
     )
+    target_question_type: str = Field(
+        default="",
+        description="영어 수능형 변형 목표 유형명 (예: '빈칸 추론 (구)', '어법상 틀린 것')",
+    )
+    subject_domain: str = Field(
+        default="",
+        description="개조/변형 도메인 구분 (''=개념서 기반 개조, '영어'=영어 수능형 지문 변형)",
+    )
+
+
+class EnglishSingleExtractionOutput(BaseModel):
+    """영어 기출 단일 문항 추출 스키마 (2022 성취기준·학년 제한 없이 지문·유형·어휘 추출)."""
+
+    english_section: Literal["듣기", "독해"] = Field(
+        ...,
+        description="1~17번은 '듣기', 18~45번은 '독해'",
+    )
+    english_question_type: str = Field(
+        ...,
+        description="원래 문항 유형 (예: 목적, 심경, 함축 의미, 요지, 주제, 제목, 도표, 내용 일치, 실용문, 어법, 어휘, 빈칸 추론, 무관한 문장, 글의 순서, 문장 삽입, 요약문 완성, 장문 독해, 듣기)",
+    )
+    passage_group_id: str = Field(
+        default="",
+        description="장문 세트 문항인 경우 공통 지문 그룹 (예: '41~42', '43~45', 단일 문항은 빈 문자열)",
+    )
+    passage_text: str = Field(
+        default="",
+        description="독해(18~45번) 문항의 순수 영어 지문 원문 (발문과 선택지 ①~⑤를 제외한 본문 전체; 듣기 1~17번은 빈 문자열)",
+    )
+    passage_topic: str = Field(
+        default="",
+        description="영어 지문의 중심 주제·소재 한국어 1줄 요약",
+    )
+    key_vocabulary: list[str] = Field(
+        default_factory=list,
+        description="지문 핵심 어휘 3~6개 목록 (형식: 'word: 한국어 뜻')",
+    )
+    official_explanation: str = Field(
+        ...,
+        description="해설지 기준 핵심 풀이 및 정답 근거 요약",
+    )
+    answer: str = Field(
+        ...,
+        description="공식 정답 ('1'~'5' 단일 숫자 문자열)",
+    )
+
+
+class EnglishQuestionExtractionItem(EnglishSingleExtractionOutput):
+    """영어 모의고사 전체 PDF 일괄 추출 시 문항 번호가 포함된 항목."""
+
+    q_num: int = Field(..., ge=1, le=45, description="문항 번호 (1~45)")
+
+
+class BatchEnglishExamExtractionOutput(BaseModel):
+    """영어 모의고사 PDF 전체 일괄 추출 출력 스키마."""
+
+    questions: list[EnglishQuestionExtractionItem] = Field(default_factory=list)
 
 
 class ExamHeaderMetadata(BaseModel):
@@ -398,8 +495,11 @@ class MixedPdfClassificationOutput(BaseModel):
 
 
 def infer_subject_category(subject: str) -> SubjectCategory:
-    """세부 과목명을 대분류('수학' | '사회' | '과학')로 매핑한다."""
+    """세부 과목명을 대분류('수학' | '사회' | '과학' | '영어')로 매핑한다."""
     s = (subject or "").strip()
+    s_low = s.lower()
+    if "영어" in s or "english" in s_low:
+        return "영어"
     if any(k in s for k in ("수학", "미적분", "기하", "확률", "통계", "대수")):
         return "수학"
     if any(k in s for k in ("과학", "물리", "화학", "생명", "지구")):
@@ -514,8 +614,15 @@ def resolve_question_concept_reference(
     """
     매칭·개조된 문항에 대해
     '📖 참고 개념: {교재명} - {단원명} ({페이지 범위})'
-    형식의 출처 문자열을 결정한다.
+    (영어 과목인 경우 '📚 출처: {회차명} {문항번호}번') 형식의 출처 문자열을 결정한다.
     """
+    if question.subject_category == "영어":
+        if question.exam_name and "직접 입력" in question.exam_name:
+            return f"📚 출처: {question.exam_name}"
+        if question.exam_name and question.q_num:
+            return f"📚 출처: {question.exam_name} {question.q_num}번"
+        return f"📚 출처: {fallback_source_label or question.exam_name or '영어 기출 지문'}"
+
     book_title = (whitelist.book_title if whitelist and whitelist.book_title else "").strip()
     unit_name = (judgment.matched_unit_name if judgment and judgment.matched_unit_name else "").strip()
     page_range = (judgment.matched_page_range if judgment and judgment.matched_page_range else "").strip()

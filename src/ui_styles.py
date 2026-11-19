@@ -222,6 +222,100 @@ def inject_responsive_css() -> None:
         }
         .bogi-item:last-child { margin-bottom: 0; }
         .bogi-marker { font-weight: 800; color: #1E3A8A; }
+
+        /* 영어(English) 수능형 변형 전용 스타일 */
+        .eng-u {
+            text-decoration: underline;
+            text-underline-offset: 3px;
+            text-decoration-thickness: 1.8px;
+            font-weight: 700;
+            color: #0F172A;
+        }
+        .eng-blank {
+            display: inline-block;
+            min-width: 7.5rem;
+            border-bottom: 1.8px solid #0F172A;
+            margin: 0 4px;
+            vertical-align: baseline;
+        }
+        .eng-instruction {
+            font-weight: 700;
+            font-size: clamp(0.97rem, 1.48vw, 1.06rem);
+            color: #0F172A;
+            margin-bottom: 0.65rem;
+            word-break: keep-all;
+        }
+        .eng-given-box {
+            background: #F8FAFC;
+            border: 1.5px solid #334155;
+            border-radius: 8px;
+            padding: 0.85rem 1rem;
+            margin: 0.65rem 0 0.8rem 0;
+            font-size: clamp(0.95rem, 1.42vw, 1.03rem);
+            line-height: 1.8;
+            color: #0F172A;
+        }
+        .eng-given-title {
+            font-size: 0.78rem;
+            font-weight: 800;
+            color: #1E3A8A;
+            letter-spacing: 0.05em;
+            margin-bottom: 0.3rem;
+        }
+        .eng-passage {
+            font-size: clamp(0.96rem, 1.45vw, 1.05rem);
+            line-height: 1.85;
+            color: #0F172A;
+            word-break: normal;
+            overflow-wrap: break-word;
+            margin-bottom: 0.7rem;
+        }
+        .eng-order-wrap {
+            display: flex;
+            flex-direction: column;
+            gap: 0.55rem;
+            margin: 0.65rem 0 0.75rem 0;
+        }
+        .eng-order-item {
+            display: grid;
+            grid-template-columns: 2.1rem 1fr;
+            gap: 0.45rem;
+            background: #FFFFFF;
+            border: 1px solid #CBD5E1;
+            border-left: 3.5px solid #2563EB;
+            border-radius: 8px;
+            padding: 0.7rem 0.9rem;
+            line-height: 1.8;
+            font-size: clamp(0.95rem, 1.42vw, 1.03rem);
+        }
+        .eng-order-mk {
+            font-weight: 800;
+            color: #1E3A8A;
+        }
+        .eng-summary-arrow {
+            text-align: center;
+            font-size: 1.15rem;
+            font-weight: 800;
+            color: #334155;
+            margin: 0.3rem 0;
+        }
+        .eng-summary-box {
+            background: #EFF6FF;
+            border: 1.5px solid #1E3A8A;
+            border-radius: 8px;
+            padding: 0.8rem 1rem;
+            margin-bottom: 0.75rem;
+            line-height: 1.8;
+            font-size: clamp(0.95rem, 1.42vw, 1.03rem);
+            color: #0F172A;
+        }
+        .eng-footnote {
+            font-size: 0.85rem;
+            color: #475569;
+            margin-top: 0.35rem;
+            margin-bottom: 0.5rem;
+            font-style: italic;
+        }
         .rewritten-choices-wrap {
             margin-top: 0.85rem;
             display: flex;

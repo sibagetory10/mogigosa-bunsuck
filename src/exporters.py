@@ -40,6 +40,15 @@ def build_exam_ai_jsonl(records: list[QuestionRecord]) -> str:
         adv_terms = list(getattr(r, "advanced_terms", []) or [])
         if adv_terms:
             compact_obj["adv_terms"] = adv_terms
+        if r.subject_category == "영어":
+            compact_obj["eng_sec"] = getattr(r, "english_section", "")
+            compact_obj["eng_type"] = getattr(r, "english_question_type", "")
+            compact_obj["topic"] = getattr(r, "passage_topic", "")
+            compact_obj["vocab"] = list(getattr(r, "key_vocabulary", []) or [])
+            if getattr(r, "passage_group_id", ""):
+                compact_obj["group"] = r.passage_group_id
+            if getattr(r, "passage_text", ""):
+                compact_obj["passage"] = r.passage_text
         lines.append(json.dumps(compact_obj, ensure_ascii=False, separators=(",", ":")))
     return "\n".join(lines)
 
@@ -63,6 +72,28 @@ def build_exam_markdown(
     ]
 
     for rec in ordered:
+        if rec.subject_category == "영어":
+            sec = getattr(rec, "english_section", "") or ("듣기" if rec.q_num <= 17 else "독해")
+            q_type = getattr(rec, "english_question_type", "") or rec.unit_name
+            grp = getattr(rec, "passage_group_id", "")
+            grp_suffix = f" · 세트 `[{grp}]`" if grp else ""
+            topic = getattr(rec, "passage_topic", "") or "-"
+            vocab = ", ".join(getattr(rec, "key_vocabulary", []) or []) or "-"
+            passage = (getattr(rec, "passage_text", "") or "").strip()
+            lines.extend(
+                [
+                    f"## {rec.q_num}번 ([{sec}] {q_type}{grp_suffix})",
+                    "",
+                    f"- **영역:** {sec} | **유형:** {q_type} | **정답:** `{rec.answer}`",
+                    f"- **주제·소재:** {topic}",
+                    f"- **핵심 어휘:** {vocab}",
+                ]
+            )
+            if passage:
+                lines.extend(["- **영어 지문 원문:**", "", f"> {passage.replace(chr(10), chr(10) + '> ')}", ""])
+            lines.extend([f"- **공식 해설:** {rec.official_explanation or '-'}", ""])
+            continue
+
         single_label = "단일 원리" if rec.is_single_concept else "복합 원리"
         principles = ", ".join(rec.core_principles) if rec.core_principles else "-"
         terms = ", ".join(rec.required_terms) if rec.required_terms else "-"
@@ -150,6 +181,54 @@ def build_exam_html(
                 f'<div class="muted" style="margin-bottom:6px;">'
                 f'상위 전문: {adv_str} · 기본 용어: {bas_str}</div>'
             )
+
+        if rec.subject_category == "영어":
+            sec = getattr(rec, "english_section", "") or ("듣기" if rec.q_num <= 17 else "독해")
+            q_type = getattr(rec, "english_question_type", "") or rec.unit_name
+            grp = getattr(rec, "passage_group_id", "")
+            grp_badge = f'<span class="pill">세트 [{html.escape(grp)}]</span>' if grp else ""
+            topic = getattr(rec, "passage_topic", "") or "-"
+            vocab_html = "".join(
+                f'<span class="chip chip-amber">{html.escape(v)}</span>'
+                for v in (getattr(rec, "key_vocabulary", []) or [])
+            ) or '<span class="muted">-</span>'
+            passage_txt = (getattr(rec, "passage_text", "") or "").strip()
+            passage_html = (
+                f'<div class="field-label">영어 지문 원문 (passage_text)</div>'
+                f'<p class="expl" style="white-space:pre-wrap; font-family:Georgia,serif;">{html.escape(passage_txt)}</p>'
+                if passage_txt
+                else ""
+            )
+            cards_html.append(
+                f"""
+                <article class="card" id="q-{rec.q_num}">
+                  <header class="card-head">
+                    <div class="q-title">
+                      <span class="q-num">{rec.q_num}번</span>
+                      <span class="badge">{html.escape(sec)}</span>
+                      <span class="unit">{html.escape(q_type)}</span>
+                    </div>
+                    <div class="meta-pills">
+                      {grp_badge}
+                      <span class="pill pill-ans">정답 {html.escape(rec.answer)}</span>
+                    </div>
+                  </header>
+                  <div class="card-body">
+                    <div class="img-col">{img_tag}</div>
+                    <div class="info-col">
+                      <div class="field-label">주제 · 소재 (passage_topic)</div>
+                      <p class="expl">{html.escape(topic)}</p>
+                      <div class="field-label">핵심 어휘 (key_vocabulary)</div>
+                      <div class="chips">{vocab_html}</div>
+                      {passage_html}
+                      <div class="field-label">공식 해설</div>
+                      <p class="expl">{html.escape(rec.official_explanation or "-")}</p>
+                    </div>
+                  </div>
+                </article>
+                """
+            )
+            continue
 
         single_txt = "단일 원리" if rec.is_single_concept else "복합 원리"
         cards_html.append(

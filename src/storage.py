@@ -21,7 +21,7 @@ from src.models import ConceptBookRecord, QuestionRecord, UserRecord
 
 DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive"]
 FOLDER_MIME = "application/vnd.google-apps.folder"
-KNOWN_SUBJECT_FOLDERS = ("수학", "사회", "과학")
+KNOWN_SUBJECT_FOLDERS = ("수학", "사회", "과학", "영어")
 
 
 def _safe_segment(name: str) -> str:

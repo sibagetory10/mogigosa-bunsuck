@@ -13,6 +13,8 @@ from src.models import ConceptWhitelist, QuestionRecord, RewrittenQuestion
 from src.text_formatter import (
     format_chemical_scripts,
     format_explanation_text,
+    render_english_inline_html,
+    split_english_stem_blocks,
     split_stem_blocks,
     unicode_scripts_to_html_tags,
 )
@@ -243,6 +245,77 @@ sup {
     color: #1D4ED8;
     margin-bottom: 3pt;
 }
+.eng-u {
+    text-decoration: underline;
+    font-weight: bold;
+}
+.eng-blank {
+    text-decoration: underline;
+    font-weight: bold;
+}
+.eng-inst {
+    font-weight: bold;
+    margin-top: 2pt;
+    margin-bottom: 4pt;
+    word-break: keep-all;
+}
+.eng-given-box {
+    border: 1pt solid #1E293B;
+    background-color: #F8FAFC;
+    padding: 5pt 7pt;
+    margin: 4pt 0 5pt 0;
+    font-size: 9.1pt;
+    line-height: 1.5;
+}
+.eng-given-title {
+    font-size: 7.6pt;
+    font-weight: bold;
+    color: #1E3A8A;
+    margin-bottom: 2pt;
+}
+.eng-passage {
+    margin-top: 2pt;
+    margin-bottom: 4pt;
+    font-size: 9.2pt;
+    line-height: 1.52;
+}
+.eng-order-tbl {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 4pt 0;
+    font-size: 9.1pt;
+    line-height: 1.5;
+}
+.eng-order-tbl td {
+    vertical-align: top;
+    padding: 2.5pt 0;
+}
+.eng-order-mk {
+    width: 20pt;
+    font-weight: bold;
+    color: #1E3A8A;
+}
+.eng-summary-arrow {
+    text-align: center;
+    font-weight: bold;
+    font-size: 9.5pt;
+    color: #334155;
+    margin: 2pt 0;
+}
+.eng-summary-box {
+    border: 1pt solid #1E3A8A;
+    background-color: #F8FAFC;
+    padding: 5pt 7pt;
+    margin: 2pt 0 5pt 0;
+    font-size: 9.1pt;
+    line-height: 1.5;
+}
+.eng-footnote {
+    font-size: 7.8pt;
+    color: #475569;
+    margin-top: 2pt;
+    margin-bottom: 3pt;
+}
 """
 
 
@@ -264,11 +337,50 @@ def _extract_short_page_ref(concept_ref: str) -> str:
     m = re.search(r"\(([^()]+)\)\s*$", concept_ref.strip())
     if m:
         return m.group(1).strip()
-    cleaned = concept_ref.replace("📖 참고 개념:", "").strip()
-    return cleaned[:24] if cleaned else "-"
+    cleaned = concept_ref.replace("📖 참고 개념:", "").replace("📚 출처:", "").strip()
+    return cleaned[:26] if cleaned else "-"
 
 
-def _build_stem_blocks_html(stem_text: str) -> str:
+def _build_english_stem_blocks_html(stem_text: str) -> str:
+    blocks = split_english_stem_blocks(stem_text)
+    parts: list[str] = []
+    for kind, content in blocks:
+        if kind == "instruction":
+            parts.append(f"<div class='eng-inst'>{render_english_inline_html(str(content))}</div>")
+        elif kind == "given_box":
+            g_title = str(content.get("title") or "주어진 글") if isinstance(content, dict) else "주어진 글"
+            g_body = str(content.get("body") or "") if isinstance(content, dict) else str(content)
+            parts.append(
+                f"""
+                <div class="eng-given-box">
+                  <div class="eng-given-title">[{html.escape(g_title)}]</div>
+                  <div>{render_english_inline_html(g_body)}</div>
+                </div>
+                """
+            )
+        elif kind == "order_chunks":
+            rows = "".join(
+                f"<tr><td class='eng-order-mk'>{html.escape(mk)}</td><td>{render_english_inline_html(txt)}</td></tr>"
+                for mk, txt in content
+            )
+            parts.append(f"<table class='eng-order-tbl'>{rows}</table>")
+        elif kind == "summary_box":
+            parts.append(
+                f"""
+                <div class="eng-summary-arrow">↓</div>
+                <div class="eng-summary-box">{render_english_inline_html(str(content))}</div>
+                """
+            )
+        elif kind == "footnote":
+            parts.append(f"<div class='eng-footnote'>{render_english_inline_html(str(content))}</div>")
+        else:
+            parts.append(f"<div class='eng-passage'>{render_english_inline_html(str(content))}</div>")
+    return "".join(parts)
+
+
+def _build_stem_blocks_html(stem_text: str, is_english: bool = False) -> str:
+    if is_english:
+        return _build_english_stem_blocks_html(stem_text)
     blocks = split_stem_blocks(stem_text)
     parts: list[str] = []
     for kind, content in blocks:
@@ -317,31 +429,40 @@ def _build_stem_blocks_html(stem_text: str) -> str:
     return "".join(parts)
 
 
-def _build_choices_html(choices: list[str]) -> str:
+def _build_choices_html(choices: list[str], is_english: bool = False) -> str:
     if not choices:
         return ""
     capped = choices[:5]
-    formatted_items = [format_chemical_scripts(c.strip()) for c in capped]
+    if is_english:
+        formatted_items = [c.strip() for c in capped]
+    else:
+        formatted_items = [format_chemical_scripts(c.strip()) for c in capped]
     max_len = max((len(c) for c in formatted_items), default=0)
     total_len = sum(len(c) + 4 for c in formatted_items)
 
-    def _cell(i: int, txt: str) -> str:
+    def _fmt_choice_body(i: int, txt: str) -> str:
         sym = CIRCLED_NUMS[i] if i < len(CIRCLED_NUMS) else f"{i + 1})"
-        return f"<td><b>{sym}</b> {_esc_pdf(txt)}</td>"
+        cleaned = txt.strip()
+        if cleaned == sym or not cleaned:
+            return f"<b>{sym}</b>"
+        rendered = render_english_inline_html(cleaned) if is_english else _esc_pdf(cleaned)
+        return f"<b>{sym}</b> {rendered}"
+
+    def _cell(i: int, txt: str) -> str:
+        return f"<td>{_fmt_choice_body(i, txt)}</td>"
 
     # 짧은 선지는 평가원 모의고사처럼 1줄 또는 2줄(3+2) 가로 배열
     if len(capped) <= 5 and total_len <= 28 and all("\n" not in c for c in formatted_items):
         cells = "".join(_cell(i, c) for i, c in enumerate(formatted_items))
         return f"<table class='choice-grid'><tr>{cells}</tr></table>"
-    if len(capped) == 5 and max_len <= 13 and all("\n" not in c for c in formatted_items):
+    if len(capped) == 5 and max_len <= 18 and all("\n" not in c for c in formatted_items):
         row1 = "".join(_cell(i, formatted_items[i]) for i in range(3))
         row2 = "".join(_cell(i, formatted_items[i]) for i in range(3, 5)) + "<td></td>"
         return f"<table class='choice-grid'><tr>{row1}</tr><tr>{row2}</tr></table>"
 
     rows = []
     for i, c in enumerate(formatted_items):
-        sym = CIRCLED_NUMS[i] if i < len(CIRCLED_NUMS) else f"{i + 1})"
-        rows.append(f"<div class='choice-item'><b>{sym}</b> {_esc_pdf(c)}</div>")
+        rows.append(f"<div class='choice-item'>{_fmt_choice_body(i, c)}</div>")
     return f"<div class='choices'>{''.join(rows)}</div>"
 
 
@@ -384,17 +505,24 @@ def _draw_first_page_banner(
     exam_title: str,
     source_label: str,
     total_count: int,
+    is_english_exam: bool = False,
 ) -> float:
     w = page.rect.width
     today = datetime.now().strftime("%Y.%m.%d")
+    sub_banner = (
+        "수능 · 평가원 · 교육청 영어 기출 지문 맞춤형 수능형 변형 모의고사"
+        if is_english_exam
+        else "2022 개정 교육과정 맞춤형 기출 · 개념서 범위 엄격 준수"
+    )
+    src_prefix = "지문 출처:" if is_english_exam else "기준 개념서:"
     banner_html = f"""
     <div>
       <div class="exam-banner">
-        <div class="exam-banner-sub">2022 개정 교육과정 맞춤형 기출 · 개념서 범위 엄격 준수</div>
+        <div class="exam-banner-sub">{sub_banner}</div>
         <div class="exam-banner-title">{html.escape(exam_title)}</div>
         <table class="student-box">
           <tr>
-            <td style="width:44%;"><b>기준 개념서:</b> {html.escape(source_label)}</td>
+            <td style="width:44%;"><b>{src_prefix}</b> {html.escape(source_label)}</td>
             <td style="width:20%;"><b>총 {total_count}문항</b> ({today})</td>
             <td style="width:36%;"><b>학년:</b> ____ &nbsp;<b>반:</b> ____ &nbsp;<b>번호:</b> ____ &nbsp;<b>이름:</b> _________</td>
           </tr>
@@ -405,8 +533,24 @@ def _draw_first_page_banner(
     </div>
     """
     banner_h = _measure_html_height(banner_html, w - 60.0, max_h=170.0)
-    page.insert_htmlbox(pymupdf.Rect(30, 22, w - 30, 22 + banner_h + 4.0), banner_html, css=EXAM_CSS)
+    page.insert_htmlbox(pymupdf.Rect(30, 22, w - 60.0 + 30.0, 22 + banner_h + 4.0), banner_html, css=EXAM_CSS)
     return 22.0 + banner_h + 10.0
+
+
+def _is_english_item_dict(item: dict[str, Any]) -> bool:
+    q = item.get("question")
+    rw = item.get("rewritten")
+    return (
+        getattr(q, "subject_category", "") == "영어"
+        or getattr(rw, "subject_domain", "") == "영어"
+        or bool(item.get("english_meta"))
+    )
+
+
+def _format_english_source_text(q: QuestionRecord) -> str:
+    if "직접 입력" in (q.exam_name or ""):
+        return f"출처: {q.exam_name}"
+    return f"출처: {q.exam_name} {q.q_num}번"
 
 
 def generate_custom_exam_pdf(
@@ -426,6 +570,7 @@ def generate_custom_exam_pdf(
     margin_x = 28.0
     margin_bottom = 42.0
     col_gap = 22.0
+    is_english_exam_set = bool(items) and all(_is_english_item_dict(it) for it in items)
 
     def get_col_rects(top_y: float, is_two_col: bool) -> list[tuple[float, float, float]]:
         if is_two_col:
@@ -438,7 +583,13 @@ def generate_custom_exam_pdf(
 
     # 1) 문제지 페이지 생성
     page = doc.new_page(width=page_w, height=page_h)
-    first_top = _draw_first_page_banner(page, exam_title, source_label, len(items))
+    first_top = _draw_first_page_banner(
+        page,
+        exam_title,
+        source_label,
+        len(items),
+        is_english_exam=is_english_exam_set,
+    )
     first_divider_y = first_top - 2.0
     cur_divider_y = first_divider_y
     col_rects = get_col_rects(first_top, two_column)
@@ -462,6 +613,7 @@ def generate_custom_exam_pdf(
         q: QuestionRecord = item["question"]
         crop_bytes: bytes | None = item.get("crop_png_bytes")
         rewritten: RewrittenQuestion | None = item.get("rewritten")
+        is_eng_item = _is_english_item_dict(item)
         concept_ref: str = str(item.get("concept_reference") or "").strip()
         ref_html = (
             f"<div class='ref-note'>{html.escape(concept_ref)}</div>"
@@ -474,15 +626,22 @@ def generate_custom_exam_pdf(
         max_col_h = (page_h - margin_bottom) - col_rects[col_idx][2]
 
         if rewritten is not None:
-            stem_body_html = _build_stem_blocks_html(rewritten.rewritten_stem)
-            choices_html = _build_choices_html(rewritten.rewritten_choices)
+            stem_body_html = _build_stem_blocks_html(rewritten.rewritten_stem, is_english=is_eng_item)
+            choices_html = _build_choices_html(rewritten.rewritten_choices, is_english=is_eng_item)
+            if is_eng_item:
+                t_type = (getattr(rewritten, "target_question_type", "") or "수능형 변형").strip()
+                badge_lbl = f"수능형 변형 · {html.escape(t_type)}"
+                meta_lbl = html.escape(_format_english_source_text(q))
+            else:
+                badge_lbl = "PDF 맞춤 개조"
+                meta_lbl = f"{html.escape(q.curriculum_subject)} · 원본 {html.escape(q.exam_name)} {q.q_num}번"
 
             card_html = f"""
             <div class="q-wrap">
               <div class="q-header">
                 <span class="q-num">{idx}.</span>
-                <span class="badge">PDF 맞춤 개조</span>
-                <span class="meta">{html.escape(q.curriculum_subject)} · 원본 {html.escape(q.exam_name)} {q.q_num}번</span>
+                <span class="badge">{badge_lbl}</span>
+                <span class="meta">{meta_lbl}</span>
               </div>
               {stem_body_html}
               {choices_html}
@@ -493,7 +652,8 @@ def generate_custom_exam_pdf(
 
             img_draw_h = 0.0
             img_draw_w = col_w
-            if include_original_for_rewritten and crop_bytes:
+            # 영어 변형 문항은 원본 이미지(기존 밑줄·정답 노출)를 절대 수록하지 않음
+            if include_original_for_rewritten and crop_bytes and not is_eng_item:
                 with Image.open(io.BytesIO(crop_bytes)) as im:
                     iw, ih = im.size
                 ratio = ih / max(1, iw)
@@ -601,11 +761,18 @@ def generate_custom_exam_pdf(
 
     # 2) 뒷장: [빠른 정답 한눈에 보기] 표 + 2단 맞춤 해설
     ans_page = doc.new_page(width=page_w, height=page_h)
+    ans_sub_title = (
+        "정답 및 수능 영어 구문·논리·오답 분석 해설"
+        if is_english_exam_set
+        else "정답 및 개념서 용어 기준 맞춤 해설"
+    )
+    ans_src_prefix = "지문 출처" if is_english_exam_set else "기준 개념서"
+    ref_col_header = "출처 / 유형" if is_english_exam_set else "참고 개념서 페이지"
     ans_header = f"""
     <div class="exam-banner" style="padding:6pt 9pt;">
-      <div class="exam-banner-sub">정답 및 개념서 용어 기준 맞춤 해설</div>
+      <div class="exam-banner-sub">{ans_sub_title}</div>
       <div class="exam-banner-title" style="font-size:12.5pt;">{html.escape(exam_title)}</div>
-      <div class="meta" style="margin-top:2pt;">기준 개념서: {html.escape(source_label)} &nbsp;|&nbsp; 총 {len(items)}문항</div>
+      <div class="meta" style="margin-top:2pt;">{ans_src_prefix}: {html.escape(source_label)} &nbsp;|&nbsp; 총 {len(items)}문항</div>
     </div>
     """
     ah = _measure_html_height(ans_header, page_w - 2 * margin_x, max_h=120.0)
@@ -640,8 +807,8 @@ def generate_custom_exam_pdf(
             )
         ans_table_html = (
             "<table class='ans-table'>"
-            "<tr><th>문항 번호</th><th>정답</th><th>참고 개념서 페이지</th>"
-            "<th>문항 번호</th><th>정답</th><th>참고 개념서 페이지</th></tr>"
+            f"<tr><th>문항 번호</th><th>정답</th><th>{ref_col_header}</th>"
+            f"<th>문항 번호</th><th>정답</th><th>{ref_col_header}</th></tr>"
             + "".join(summary_rows)
             + "</table>"
         )
@@ -654,7 +821,7 @@ def generate_custom_exam_pdf(
             )
         ans_table_html = (
             "<table class='ans-table'>"
-            "<tr><th>문항 번호</th><th>정답</th><th>참고 개념서 페이지</th></tr>"
+            f"<tr><th>문항 번호</th><th>정답</th><th>{ref_col_header}</th></tr>"
             + "".join(summary_rows)
             + "</table>"
         )
@@ -685,6 +852,7 @@ def generate_custom_exam_pdf(
     for idx, item in enumerate(items, start=1):
         q = item["question"]
         rewritten = item.get("rewritten")
+        is_eng_item = _is_english_item_dict(item)
         concept_ref = str(item.get("concept_reference") or "").strip()
         exp_ref_html = (
             f"<div class='ref-note'>{html.escape(concept_ref)}</div>"
@@ -696,15 +864,19 @@ def generate_custom_exam_pdf(
             ans_disp = _format_answer_badge(rewritten.preserved_answer)
             swap_info = ""
             if rewritten.replaced_terms_map:
+                swap_label = "핵심 어휘·구문:" if is_eng_item else "용어 치환:"
                 swap_info = (
-                    "<div class='exp-sub'><b>용어 치환:</b> "
-                    + _esc_pdf(" / ".join(rewritten.replaced_terms_map))
+                    f"<div class='exp-sub'><b>{swap_label}</b> "
+                    + (
+                        render_english_inline_html(" / ".join(rewritten.replaced_terms_map))
+                        if is_eng_item
+                        else _esc_pdf(" / ".join(rewritten.replaced_terms_map))
+                    )
                     + "</div>"
                 )
-            exp_body = _esc_pdf(
-                format_explanation_text(rewritten.pdf_grounded_explanation, for_markdown=False)
-            )
-            badge = "PDF 맞춤 개조"
+            exp_txt = format_explanation_text(rewritten.pdf_grounded_explanation, for_markdown=False)
+            exp_body = render_english_inline_html(exp_txt) if is_eng_item else _esc_pdf(exp_txt)
+            badge = (getattr(rewritten, "target_question_type", "") or "수능형 영어 변형") if is_eng_item else "PDF 맞춤 개조"
         else:
             ans_disp = _format_answer_badge(q.answer)
             swap_info = (
@@ -717,11 +889,12 @@ def generate_custom_exam_pdf(
             )
             badge = "원본 기출 해설"
 
+        src_meta_str = _format_english_source_text(q) if is_eng_item else f"{q.exam_name} {q.q_num}번"
         exp_html = f"""
         <div class="exp-card">
           <div class="exp-title">
             {idx}번 &nbsp; 정답: <span class="exp-ans">{html.escape(ans_disp)}</span>
-            <span class="meta">({badge} · {html.escape(q.exam_name)} {q.q_num}번)</span>
+            <span class="meta">({html.escape(badge)} · {html.escape(src_meta_str)})</span>
           </div>
           {swap_info}
           <div>{exp_body}</div>

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html as _html
 import re
 from typing import Any, Sequence
 
@@ -397,3 +398,185 @@ def find_forbidden_terms_in_text(
                 seen_found.add(fk)
                 found.append(term)
     return found
+
+
+_ENG_U_TAG_RE = re.compile(r"<u\b[^>]*>(.*?)</u>", re.IGNORECASE | re.DOTALL)
+_ENG_BLANK_RE = re.compile(r"_{4,}")
+_ENG_GIVEN_TAG_RE = re.compile(
+    r"(?<![가-힣A-Za-z0-9])[<\[\〈]\s*(주어진\s*문장|주어진\s*글|요\s*약\s*문|요\s*약)\s*[>\]\〉][ \t]*"
+)
+_ENG_ORDER_INLINE_RE = re.compile(r"(?<=[.?!\"'\)])\s+(?=\([ABC]\)\s+(?!\[)[A-Z\"'])")
+_ENG_ORDER_LINE_RE = re.compile(r"^\(([ABC])\)\s+(?!\[)(.+)$")
+_ENG_FOOTNOTE_LINE_RE = re.compile(r"^\*{1,2}\s*[A-Za-z][A-Za-z\s\-']*:")
+_KOR_INSTRUCTION_RE = re.compile(
+    r"(?:다음\s*글|주어진\s*(?:글|문장)|밑줄\s*친|빈칸에\s*들어갈|흐름으로\s*보아|요약하고자\s*할\s*때|가장\s*적절한\s*것은|어법상|문맥상)"
+)
+
+
+def render_english_inline_html(text: str) -> str:
+    """
+    영어 지문/선지 내 <u>...</u> 밑줄과 _____ 빈칸을 XSS 없이 안전한 HTML로 변환한다.
+    화학식 위·아래첨자 변환(format_chemical_scripts)은 호출하지 않아 영문 하이픈·약어를 보호한다.
+    """
+    if not text:
+        return ""
+
+    u_segments: list[str] = []
+
+    def _stash_u(m: re.Match[str]) -> str:
+        idx = len(u_segments)
+        u_segments.append(m.group(1))
+        return f"@@ENG_U_{idx}@@"
+
+    stashed = _ENG_U_TAG_RE.sub(_stash_u, text)
+    escaped = _html.escape(stashed)
+
+    for idx, inner in enumerate(u_segments):
+        safe_inner = _html.escape(inner)
+        escaped = escaped.replace(
+            f"@@ENG_U_{idx}@@",
+            f"<u class='eng-u'>{safe_inner}</u>",
+        )
+
+    escaped = _ENG_BLANK_RE.sub(
+        "<span class='eng-blank'>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;</span>",
+        escaped,
+    )
+    escaped = re.sub(r"([①②③④⑤])", r"<b>\1</b>", escaped)
+    return escaped.replace("\n", "<br/>")
+
+
+def normalize_english_exam_text(text: str) -> str:
+    """영어 변형 문제 발문·지문의 [주어진 문장], [주어진 글], (A)/(B)/(C), [요약문] 줄바꿈을 정규화한다."""
+    if not text:
+        return ""
+    cleaned = _unescape_newlines(text)
+
+    def _norm_eng_tag(m: re.Match[str]) -> str:
+        raw = re.sub(r"\s+", "", m.group(1))
+        if raw == "주어진문장":
+            return "\n\n[주어진 문장]\n"
+        if raw == "주어진글":
+            return "\n\n[주어진 글]\n"
+        return "\n\n[요약문]\n"
+
+    cleaned = _ENG_GIVEN_TAG_RE.sub(_norm_eng_tag, cleaned)
+    cleaned = _ENG_ORDER_INLINE_RE.sub("\n", cleaned)
+    lines = [ln.strip() for ln in cleaned.split("\n")]
+    out = "\n".join(lines)
+    out = re.sub(r"\n{3,}", "\n\n", out)
+    return out.strip()
+
+
+def split_english_stem_blocks(text: str) -> list[tuple[str, Any]]:
+    """
+    영어 변형 발문을 시맨틱 블록 리스트로 분해한다:
+      - ('instruction', str)
+      - ('given_box', {'title': str, 'body': str})
+      - ('passage', str)
+      - ('order_chunks', list[tuple[str, str]])
+      - ('summary_box', str)
+      - ('footnote', str)
+    """
+    norm = normalize_english_exam_text(text)
+    if not norm:
+        return []
+
+    blocks: list[tuple[str, Any]] = []
+    mode = "passage"
+    box_title = ""
+    buf_lines: list[str] = []
+    order_items: list[tuple[str, str]] = []
+    footnote_lines: list[str] = []
+
+    def _flush() -> None:
+        nonlocal buf_lines, order_items
+        if mode == "given_box":
+            joined = "\n".join(buf_lines).strip()
+            if joined:
+                blocks.append(("given_box", {"title": box_title, "body": joined}))
+            buf_lines = []
+        elif mode == "summary_box":
+            joined = "\n".join(buf_lines).strip()
+            if joined:
+                blocks.append(("summary_box", joined))
+            buf_lines = []
+        elif mode == "order_chunks":
+            if order_items:
+                blocks.append(("order_chunks", list(order_items)))
+            order_items = []
+            buf_lines = []
+        else:
+            joined = "\n".join(buf_lines).strip()
+            if joined:
+                blocks.append(("passage", joined))
+            buf_lines = []
+
+    raw_lines = norm.split("\n")
+    idx = 0
+    # 첫 문단이 한국어 발문이면 ('instruction', ...) 블록으로 분리
+    inst_lines: list[str] = []
+    while idx < len(raw_lines):
+        cand = raw_lines[idx].strip()
+        if not cand:
+            if inst_lines:
+                idx += 1
+                break
+            idx += 1
+            continue
+        if not inst_lines and (_KOR_INSTRUCTION_RE.search(cand) or cand.endswith("?")):
+            inst_lines.append(cand)
+            idx += 1
+            break
+        break
+
+    if inst_lines:
+        blocks.append(("instruction", "\n".join(inst_lines)))
+
+    for raw_ln in raw_lines[idx:]:
+        ln = raw_ln.strip()
+        if not ln:
+            if mode in ("given_box", "summary_box") and buf_lines:
+                _flush()
+                mode = "passage"
+            elif mode == "passage" and buf_lines and buf_lines[-1] != "":
+                buf_lines.append("")
+            continue
+
+        if _ENG_FOOTNOTE_LINE_RE.match(ln):
+            footnote_lines.append(ln)
+            continue
+
+        if ln in ("[주어진 문장]", "[주어진 글]"):
+            _flush()
+            mode = "given_box"
+            box_title = ln.strip("[]")
+            continue
+
+        if ln == "[요약문]":
+            _flush()
+            mode = "summary_box"
+            continue
+
+        om = _ENG_ORDER_LINE_RE.match(ln)
+        if om and mode != "summary_box":
+            if mode != "order_chunks":
+                _flush()
+                mode = "order_chunks"
+            order_items.append((f"({om.group(1)})", om.group(2).strip()))
+            continue
+
+        if mode == "order_chunks":
+            if order_items:
+                prev_mk, prev_txt = order_items[-1]
+                order_items[-1] = (prev_mk, f"{prev_txt} {ln}".strip())
+            else:
+                buf_lines.append(ln)
+            continue
+
+        buf_lines.append(ln)
+
+    _flush()
+    if footnote_lines:
+        blocks.append(("footnote", "\n".join(footnote_lines)))
+    return blocks

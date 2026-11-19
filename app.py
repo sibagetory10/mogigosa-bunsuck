@@ -58,9 +58,12 @@ from src.ebsi_fetcher import attempt_ebsi_pdf_fetch
 from src.exporters import build_exam_ai_jsonl, build_exam_html, build_exam_markdown
 from src.gemini_service import (
     ForbiddenTermRemainingError,
+    analyze_english_exam_pdf_batch_with_gemini,
+    analyze_english_question_with_gemini,
     analyze_exam_pdf_batch_with_gemini,
     analyze_question_with_gemini,
     build_gemini_client,
+    chat_followup_with_english,
     chat_followup_with_pdf,
     classify_mixed_exam_pdfs_with_ai,
     detect_concept_pages_with_ai,
@@ -69,6 +72,8 @@ from src.gemini_service import (
     extract_concept_book_units,
     extract_concept_whitelist,
     extract_exam_header_metadata,
+    generate_english_explanation,
+    generate_english_transformed_question,
     generate_pdf_grounded_explanation,
     match_problem_and_answer_pdfs_with_ai,
     match_questions_to_whitelist,
@@ -76,6 +81,8 @@ from src.gemini_service import (
     rewrite_question_for_pdf,
 )
 from src.models import (
+    ENGLISH_DEFAULT_EXCLUDED_Q_NUMS,
+    ENGLISH_TRANSFORM_TYPES,
     ConceptBookRecord,
     ConceptUnit,
     ConceptWhitelist,
@@ -108,6 +115,8 @@ from src.text_formatter import (
     format_chemical_scripts,
     format_explanation_text,
     has_visual_reference,
+    render_english_inline_html,
+    split_english_stem_blocks,
     split_stem_blocks,
 )
 from src.ui_styles import inject_responsive_css, render_chips
@@ -666,116 +675,200 @@ def _tag_and_save_single_exam(
 
     batch_t0 = time.perf_counter()
     extracted_by_q: dict[int, Any] = {}
+    is_english_exam = meta["subject_category"] == "영어"
 
-    concept_books = storage.load_concept_books()
-    grounding_ctx = build_tagging_grounding_context(
-        subject_category=meta["subject_category"],
-        exam_name=meta["exam_name"],
-        concept_books=concept_books,
-    )
-
-    has_answer_sheet = bool(answer_snippets or answer_pdf_part is not None)
-    if has_answer_sheet:
+    if is_english_exam:
         if meta.get("prob_bytes"):
-            _status(f"⚡ 전체 문제지 PDF({len(target_crops)}문항) 한 번에 태깅 중 (모델: {tagging_model_label})...")
+            _status(
+                f"⚡ 영어 문제지 PDF({len(target_crops)}문항 · 듣기/독해/장문세트) 일괄 분석 중 (모델: {tagging_model_label})..."
+            )
             try:
-                batch_map = analyze_exam_pdf_batch_with_gemini(
+                batch_map = analyze_english_exam_pdf_batch_with_gemini(
                     api_key=api_key,
                     model_name=tagging_model,
                     prob_pdf_bytes=meta["prob_bytes"],
                     target_q_nums=[c.q_num for c in target_crops],
-                    subject_category=meta["subject_category"],
                     exam_name=meta["exam_name"],
                     answer_snippets=answer_snippets,
                     answer_pdf_part=answer_pdf_part,
                     status_callback=_status,
-                    concept_books=concept_books,
-                    grounding_context=grounding_ctx,
                 )
                 extracted_by_q.update(batch_map)
                 _log(
-                    f"⚡ 전체 PDF 일괄 태깅 완료: {len(batch_map)}/{len(target_crops)}문항 "
+                    f"⚡ 영어 PDF 일괄 추출 완료: {len(batch_map)}/{len(target_crops)}문항 "
                     f"({time.perf_counter() - batch_t0:.1f}초 · {tagging_model_label})"
                 )
             except Exception as exc:
-                _log(f"⚠️ 전체 PDF 일괄 태깅 실패 → 개별 보완 모드로 전환: {exc}")
+                _log(f"⚠️ 영어 PDF 일괄 추출 실패 → 개별 문항 보완 모드로 전환: {exc}")
         _prog(0.65)
-    else:
-        crops_no_img = [c for c in target_crops if not c.png_bytes]
-        if crops_no_img and meta.get("prob_bytes"):
-            try:
-                batch_map = analyze_exam_pdf_batch_with_gemini(
+
+        missing_crops = [c for c in target_crops if c.q_num not in extracted_by_q]
+        if missing_crops:
+            _status(f"🔁 누락된 영어 {len(missing_crops)}개 문항 보완 추출 중 ({tagging_model_label})...")
+
+            def _analyze_eng_worker(cq_item: CroppedQuestion) -> tuple[CroppedQuestion, Any, float]:
+                t_start = time.perf_counter()
+                q_ans_hint = answer_snippets.get(cq_item.q_num, "")
+                extracted_out = analyze_english_question_with_gemini(
                     api_key=api_key,
-                    model_name=solver_model,
-                    prob_pdf_bytes=meta["prob_bytes"],
-                    target_q_nums=[c.q_num for c in crops_no_img],
+                    model_name=tagging_model,
+                    crop_png_bytes=cq_item.png_bytes,
+                    q_num=cq_item.q_num,
+                    exam_name=meta["exam_name"],
+                    answer_pdf_part=answer_pdf_part,
+                    answer_text_hint=q_ans_hint,
+                    question_text_hint=cq_item.extracted_text or "",
+                    shared_passage_hint=getattr(cq_item, "shared_passage_text", "") or "",
+                )
+                return cq_item, extracted_out, time.perf_counter() - t_start
+
+            done_cnt = 0
+            total_missing = len(missing_crops)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+                future_to_cq = {executor.submit(_analyze_eng_worker, cq): cq for cq in missing_crops}
+                for fut in concurrent.futures.as_completed(future_to_cq):
+                    cq = future_to_cq[fut]
+                    done_cnt += 1
+                    try:
+                        _, extracted, elapsed_s = fut.result()
+                        extracted_by_q[cq.q_num] = extracted
+                        _log(f"✅ 영어 {cq.q_num}번 보완 추출 완료 (정답: {extracted.answer} · {elapsed_s:.1f}초)")
+                    except Exception as exc:
+                        err_msg = f"{cq.q_num}번 오류 (건너뜀): {exc}"
+                        failed_q_nums.append(cq.q_num)
+                        errors.append(err_msg)
+                        _log(f"❌ {err_msg}")
+                    _prog(0.65 + 0.20 * (done_cnt / max(1, total_missing)))
+
+        # 41~42, 43~45 세트 문항 간 공통 지문 최종 동기화
+        eng_group_passages: dict[str, str] = {}
+        for cq in target_crops:
+            ext = extracted_by_q.get(cq.q_num)
+            gid = (
+                (getattr(ext, "passage_group_id", "") if ext else "")
+                or getattr(cq, "passage_group_id", "")
+                or ("41~42" if cq.q_num in (41, 42) else ("43~45" if cq.q_num in (43, 45, 44) else ""))
+            )
+            if not gid:
+                continue
+            cand_p = (
+                (getattr(ext, "passage_text", "") if ext else "")
+                or getattr(cq, "shared_passage_text", "")
+                or ""
+            ).strip()
+            if len(cand_p) > len(eng_group_passages.get(gid, "")):
+                eng_group_passages[gid] = cand_p
+    else:
+        eng_group_passages = {}
+        concept_books = storage.load_concept_books()
+        grounding_ctx = build_tagging_grounding_context(
+            subject_category=meta["subject_category"],
+            exam_name=meta["exam_name"],
+            concept_books=concept_books,
+        )
+
+        has_answer_sheet = bool(answer_snippets or answer_pdf_part is not None)
+        if has_answer_sheet:
+            if meta.get("prob_bytes"):
+                _status(f"⚡ 전체 문제지 PDF({len(target_crops)}문항) 한 번에 태깅 중 (모델: {tagging_model_label})...")
+                try:
+                    batch_map = analyze_exam_pdf_batch_with_gemini(
+                        api_key=api_key,
+                        model_name=tagging_model,
+                        prob_pdf_bytes=meta["prob_bytes"],
+                        target_q_nums=[c.q_num for c in target_crops],
+                        subject_category=meta["subject_category"],
+                        exam_name=meta["exam_name"],
+                        answer_snippets=answer_snippets,
+                        answer_pdf_part=answer_pdf_part,
+                        status_callback=_status,
+                        concept_books=concept_books,
+                        grounding_context=grounding_ctx,
+                    )
+                    extracted_by_q.update(batch_map)
+                    _log(
+                        f"⚡ 전체 PDF 일괄 태깅 완료: {len(batch_map)}/{len(target_crops)}문항 "
+                        f"({time.perf_counter() - batch_t0:.1f}초 · {tagging_model_label})"
+                    )
+                except Exception as exc:
+                    _log(f"⚠️ 전체 PDF 일괄 태깅 실패 → 개별 보완 모드로 전환: {exc}")
+            _prog(0.65)
+        else:
+            crops_no_img = [c for c in target_crops if not c.png_bytes]
+            if crops_no_img and meta.get("prob_bytes"):
+                try:
+                    batch_map = analyze_exam_pdf_batch_with_gemini(
+                        api_key=api_key,
+                        model_name=solver_model,
+                        prob_pdf_bytes=meta["prob_bytes"],
+                        target_q_nums=[c.q_num for c in crops_no_img],
+                        subject_category=meta["subject_category"],
+                        exam_name=meta["exam_name"],
+                        answer_snippets=None,
+                        answer_pdf_part=None,
+                        status_callback=_status,
+                        concept_books=concept_books,
+                        grounding_context=grounding_ctx,
+                    )
+                    extracted_by_q.update(batch_map)
+                except Exception as exc:
+                    _log(f"⚠️ 이미지 없는 문항 배치 풀이 경고: {exc}")
+            _log(
+                f"🧠 해설지 미첨부 감지 → 정답 정확도를 위해 {solver_model_label} · HIGH 추론 · 문항별 고해상도 직접 풀이·검산 모드 실행 ({len(target_crops)}문항)"
+            )
+            _prog(0.10)
+
+        missing_crops = [c for c in target_crops if c.q_num not in extracted_by_q]
+        if missing_crops:
+            if has_answer_sheet:
+                _status(f"🔁 누락된 {len(missing_crops)}개 문항 보완 태깅 중 ({tagging_model_label})...")
+            else:
+                _status(f"🧠 {solver_model_label} · HIGH 추론 · 문항별 고해상도 직접 풀이·검산 중 ({len(missing_crops)}문항)...")
+
+            def _analyze_worker(cq_item: CroppedQuestion) -> tuple[CroppedQuestion, Any, float, bool]:
+                t_start = time.perf_counter()
+                q_ans_hint = answer_snippets.get(cq_item.q_num, "")
+                q_has_answer = bool((q_ans_hint and q_ans_hint.strip()) or answer_pdf_part is not None)
+                worker_model = tagging_model if q_has_answer else solver_model
+                extracted_out = analyze_question_with_gemini(
+                    api_key=api_key,
+                    model_name=worker_model,
+                    crop_png_bytes=cq_item.png_bytes,
+                    q_num=cq_item.q_num,
                     subject_category=meta["subject_category"],
                     exam_name=meta["exam_name"],
-                    answer_snippets=None,
-                    answer_pdf_part=None,
-                    status_callback=_status,
+                    answer_pdf_part=answer_pdf_part,
+                    answer_text_hint=q_ans_hint,
+                    status_callback=None,
                     concept_books=concept_books,
                     grounding_context=grounding_ctx,
+                    question_text_hint=cq_item.extracted_text or "",
+                    solve_without_answer=not q_has_answer,
                 )
-                extracted_by_q.update(batch_map)
-            except Exception as exc:
-                _log(f"⚠️ 이미지 없는 문항 배치 풀이 경고: {exc}")
-        _log(
-            f"🧠 해설지 미첨부 감지 → 정답 정확도를 위해 {solver_model_label} · HIGH 추론 · 문항별 고해상도 직접 풀이·검산 모드 실행 ({len(target_crops)}문항)"
-        )
-        _prog(0.10)
+                return cq_item, extracted_out, time.perf_counter() - t_start, q_has_answer
 
-    missing_crops = [c for c in target_crops if c.q_num not in extracted_by_q]
-    if missing_crops:
-        if has_answer_sheet:
-            _status(f"🔁 누락된 {len(missing_crops)}개 문항 보완 태깅 중 ({tagging_model_label})...")
-        else:
-            _status(f"🧠 {solver_model_label} · HIGH 추론 · 문항별 고해상도 직접 풀이·검산 중 ({len(missing_crops)}문항)...")
-
-        def _analyze_worker(cq_item: CroppedQuestion) -> tuple[CroppedQuestion, Any, float, bool]:
-            t_start = time.perf_counter()
-            q_ans_hint = answer_snippets.get(cq_item.q_num, "")
-            q_has_answer = bool((q_ans_hint and q_ans_hint.strip()) or answer_pdf_part is not None)
-            worker_model = tagging_model if q_has_answer else solver_model
-            extracted_out = analyze_question_with_gemini(
-                api_key=api_key,
-                model_name=worker_model,
-                crop_png_bytes=cq_item.png_bytes,
-                q_num=cq_item.q_num,
-                subject_category=meta["subject_category"],
-                exam_name=meta["exam_name"],
-                answer_pdf_part=answer_pdf_part,
-                answer_text_hint=q_ans_hint,
-                status_callback=None,
-                concept_books=concept_books,
-                grounding_context=grounding_ctx,
-                question_text_hint=cq_item.extracted_text or "",
-                solve_without_answer=not q_has_answer,
-            )
-            return cq_item, extracted_out, time.perf_counter() - t_start, q_has_answer
-
-        done_cnt = 0
-        total_missing = len(missing_crops)
-        base_prog = 0.65 if has_answer_sheet else 0.10
-        span_prog = 0.85 - base_prog
-        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
-            future_to_cq = {executor.submit(_analyze_worker, cq): cq for cq in missing_crops}
-            for fut in concurrent.futures.as_completed(future_to_cq):
-                cq = future_to_cq[fut]
-                done_cnt += 1
-                try:
-                    _, extracted, elapsed_s, q_has_answer = fut.result()
-                    extracted_by_q[cq.q_num] = extracted
-                    mode_txt = "보완 태깅" if q_has_answer else "직접 풀이·태깅"
-                    _log(f"✅ {cq.q_num}번 {mode_txt} 완료 (정답: {extracted.answer} · {elapsed_s:.1f}초)")
-                except Exception as exc:
-                    err_msg = f"{cq.q_num}번 오류 (건너뜀): {exc}"
-                    failed_q_nums.append(cq.q_num)
-                    errors.append(err_msg)
-                    _log(f"❌ {err_msg}")
-                _prog(base_prog + span_prog * (done_cnt / max(1, total_missing)))
-                if not has_answer_sheet:
-                    _status(f"🧠 {solver_model_label} 직접 풀이·검산 진행 중 ({done_cnt}/{total_missing}문항)...")
+            done_cnt = 0
+            total_missing = len(missing_crops)
+            base_prog = 0.65 if has_answer_sheet else 0.10
+            span_prog = 0.85 - base_prog
+            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+                future_to_cq = {executor.submit(_analyze_worker, cq): cq for cq in missing_crops}
+                for fut in concurrent.futures.as_completed(future_to_cq):
+                    cq = future_to_cq[fut]
+                    done_cnt += 1
+                    try:
+                        _, extracted, elapsed_s, q_has_answer = fut.result()
+                        extracted_by_q[cq.q_num] = extracted
+                        mode_txt = "보완 태깅" if q_has_answer else "직접 풀이·태깅"
+                        _log(f"✅ {cq.q_num}번 {mode_txt} 완료 (정답: {extracted.answer} · {elapsed_s:.1f}초)")
+                    except Exception as exc:
+                        err_msg = f"{cq.q_num}번 오류 (건너뜀): {exc}"
+                        failed_q_nums.append(cq.q_num)
+                        errors.append(err_msg)
+                        _log(f"❌ {err_msg}")
+                    _prog(base_prog + span_prog * (done_cnt / max(1, total_missing)))
+                    if not has_answer_sheet:
+                        _status(f"🧠 {solver_model_label} 직접 풀이·검산 진행 중 ({done_cnt}/{total_missing}문항)...")
 
     _prog(0.85)
 
@@ -819,32 +912,80 @@ def _tag_and_save_single_exam(
             )
         )
 
-        record = QuestionRecord(
-            id=q_id,
-            exam_name=meta["exam_name"],
-            q_num=cq.q_num,
-            subject_category=meta["subject_category"],
-            curriculum_subject=extracted.curriculum_subject,
-            unit_name=extracted.unit_name,
-            min_grade=extracted.min_grade,
-            core_principles=extracted.core_principles,
-            required_terms=extracted.required_terms,
-            advanced_terms=list(getattr(extracted, "advanced_terms", []) or []),
-            basic_terms=list(getattr(extracted, "basic_terms", []) or []),
-            standard_code=(getattr(extracted, "standard_code", "") or "").strip(),
-            standard_codes=list(getattr(extracted, "standard_codes", []) or []),
-            grade_evidence=(getattr(extracted, "grade_evidence", "") or "").strip(),
-            needs_review=bool(getattr(extracted, "needs_review", False)),
-            review_notes=list(getattr(extracted, "review_notes", []) or []),
-            is_single_concept=extracted.is_single_concept,
-            answer=extracted.answer,
-            official_explanation=extracted.official_explanation,
-            question_text=re.sub(r"\s+", " ", (cq.extracted_text or "")).strip(),
-            image_filename=img_filename,
-            source_pdf=eff_source_pdf,
-            answer_pdf=eff_answer_pdf,
-            created_at=now_iso,
-        )
+        if is_english_exam:
+            eng_sec = getattr(extracted, "english_section", "") or ("듣기" if cq.q_num <= 17 else "독해")
+            eng_type = (getattr(extracted, "english_question_type", "") or "").strip() or eng_sec
+            p_group = (
+                (getattr(extracted, "passage_group_id", "") or "").strip()
+                or getattr(cq, "passage_group_id", "")
+                or ("41~42" if cq.q_num in (41, 42) else ("43~45" if cq.q_num in (43, 44, 45) else ""))
+            )
+            raw_p_text = (getattr(extracted, "passage_text", "") or "").strip()
+            if p_group and len(raw_p_text) < len(eng_group_passages.get(p_group, "")) * 0.7:
+                raw_p_text = eng_group_passages[p_group]
+            p_text = "" if eng_sec == "듣기" else raw_p_text
+            p_topic = (getattr(extracted, "passage_topic", "") or "").strip()
+            k_vocab = [v.strip() for v in (getattr(extracted, "key_vocabulary", []) or []) if v and v.strip()]
+
+            record = QuestionRecord(
+                id=q_id,
+                exam_name=meta["exam_name"],
+                q_num=cq.q_num,
+                subject_category="영어",
+                curriculum_subject="영어",
+                unit_name=eng_type,
+                min_grade=1,
+                core_principles=[p_topic] if p_topic else [eng_type],
+                required_terms=k_vocab,
+                advanced_terms=[],
+                basic_terms=k_vocab,
+                standard_code="",
+                standard_codes=[],
+                grade_evidence="",
+                needs_review=False,
+                review_notes=[],
+                is_single_concept=True,
+                answer=extracted.answer,
+                official_explanation=extracted.official_explanation,
+                question_text=re.sub(r"\s+", " ", (cq.extracted_text or "")).strip(),
+                english_section=eng_sec,
+                english_question_type=eng_type,
+                passage_text=p_text,
+                passage_group_id=p_group,
+                passage_topic=p_topic,
+                key_vocabulary=k_vocab,
+                image_filename=img_filename,
+                source_pdf=eff_source_pdf,
+                answer_pdf=eff_answer_pdf,
+                created_at=now_iso,
+            )
+        else:
+            record = QuestionRecord(
+                id=q_id,
+                exam_name=meta["exam_name"],
+                q_num=cq.q_num,
+                subject_category=meta["subject_category"],
+                curriculum_subject=extracted.curriculum_subject,
+                unit_name=extracted.unit_name,
+                min_grade=extracted.min_grade,
+                core_principles=extracted.core_principles,
+                required_terms=extracted.required_terms,
+                advanced_terms=list(getattr(extracted, "advanced_terms", []) or []),
+                basic_terms=list(getattr(extracted, "basic_terms", []) or []),
+                standard_code=(getattr(extracted, "standard_code", "") or "").strip(),
+                standard_codes=list(getattr(extracted, "standard_codes", []) or []),
+                grade_evidence=(getattr(extracted, "grade_evidence", "") or "").strip(),
+                needs_review=bool(getattr(extracted, "needs_review", False)),
+                review_notes=list(getattr(extracted, "review_notes", []) or []),
+                is_single_concept=extracted.is_single_concept,
+                answer=extracted.answer,
+                official_explanation=extracted.official_explanation,
+                question_text=re.sub(r"\s+", " ", (cq.extracted_text or "")).strip(),
+                image_filename=img_filename,
+                source_pdf=eff_source_pdf,
+                answer_pdf=eff_answer_pdf,
+                created_at=now_iso,
+            )
         rec_map[q_id] = record
         newly_saved.append(record)
 
@@ -891,7 +1032,80 @@ def _render_question_tag_details(
     key_prefix: str,
     allow_delete: bool = False,
 ) -> None:
-    """문항 1건의 2022 원리/용어 분리 결과·검토 경고 배지·인라인 교정 UI를 공통 렌더링한다."""
+    """문항 1건의 2022 원리/용어 분리 결과(또는 영어 전용 지문·유형·어휘)·인라인 교정 UI를 공통 렌더링한다."""
+    if rec.subject_category == "영어":
+        eng_sec = getattr(rec, "english_section", "") or ("듣기" if rec.q_num <= 17 else "독해")
+        eng_type = getattr(rec, "english_question_type", "") or rec.unit_name
+        grp_id = getattr(rec, "passage_group_id", "")
+        topic = getattr(rec, "passage_topic", "") or "-"
+        vocab_list = list(getattr(rec, "key_vocabulary", []) or rec.required_terms or [])
+        passage_txt = (getattr(rec, "passage_text", "") or "").strip()
+
+        badge_bits = [f"**영역:** `{eng_sec}`", f"**원래 유형:** `{eng_type}`"]
+        if grp_id:
+            badge_bits.append(f"**세트 그룹:** `[{grp_id}]`")
+        st.caption(" · ".join(badge_bits))
+        st.write(f"**지문 주제·소재 (`passage_topic`):** {topic}")
+        if vocab_list:
+            st.markdown("**핵심 어휘 (`key_vocabulary`)**")
+            render_chips(vocab_list, variant="amber")
+        if passage_txt:
+            with st.expander("📖 추출된 영어 지문 원문 (`passage_text`) 보기", expanded=False):
+                st.markdown(
+                    f"<div class='eng-given-box' style='white-space:pre-wrap;'>{_html.escape(passage_txt)}</div>",
+                    unsafe_allow_html=True,
+                )
+        st.write(f"**공식 해설 요약:** {rec.official_explanation}")
+
+        with st.expander("✏️ 영어 유형·주제·지문 원문·정답 빠른 수정", expanded=False):
+            ec1, ec2, ec3 = st.columns([1.2, 1.8, 0.8])
+            with ec1:
+                new_eng_type = st.text_input(
+                    "원래 문항 유형",
+                    value=eng_type,
+                    key=f"{key_prefix}_edit_eng_type_{rec.id}",
+                )
+            with ec2:
+                new_topic = st.text_input(
+                    "지문 주제·소재",
+                    value="" if topic == "-" else topic,
+                    key=f"{key_prefix}_edit_eng_topic_{rec.id}",
+                )
+            with ec3:
+                new_ans = st.text_input(
+                    "정답",
+                    value=rec.answer,
+                    key=f"{key_prefix}_edit_eng_ans_{rec.id}",
+                )
+            new_passage = st.text_area(
+                "영어 지문 원문 (passage_text)",
+                value=passage_txt,
+                height=130,
+                key=f"{key_prefix}_edit_eng_passage_{rec.id}",
+            )
+            if st.button("💾 영어 문항 수정 저장", key=f"{key_prefix}_save_eng_edit_{rec.id}"):
+                all_recs = storage.load_db()
+                for r in all_recs:
+                    if r.id == rec.id:
+                        r.english_question_type = new_eng_type.strip() or r.english_question_type
+                        r.unit_name = r.english_question_type or r.unit_name
+                        r.passage_topic = new_topic.strip()
+                        r.core_principles = [r.passage_topic] if r.passage_topic else [r.unit_name]
+                        r.answer = new_ans.strip() or r.answer
+                        r.passage_text = new_passage.strip()
+                        break
+                storage.save_db(all_recs, target_exams={rec.exam_name})
+                _build_cached_exam_exports.clear()
+                st.success("영어 문항 정보를 저장했습니다.")
+                st.rerun()
+
+        if allow_delete:
+            if st.button("이 문항 삭제", key=f"{key_prefix}_del_{rec.id}"):
+                storage.delete_question(rec.id)
+                _build_cached_exam_exports.clear()
+                st.rerun()
+        return
+
     if getattr(rec, "needs_review", False):
         notes = getattr(rec, "review_notes", []) or []
         note_txt = " / ".join(notes) if notes else "2022 개정 기준표와 불일치 의심 항목입니다."
@@ -1303,8 +1517,58 @@ st.markdown(
 )
 
 
+def _render_english_rewritten_card_html(rw: RewrittenQuestion) -> str:
+    """영어 수능형 변형 문항의 밑줄(<u>)·빈칸·[주어진 문장]·(A)-(B)-(C) 순서·[요약문] 박스 HTML을 조립한다."""
+    blocks = split_english_stem_blocks(rw.rewritten_stem)
+    body_parts: list[str] = []
+    for kind, content in blocks:
+        if kind == "instruction":
+            body_parts.append(f"<div class='eng-instruction'>{render_english_inline_html(str(content))}</div>")
+        elif kind == "given_box":
+            g_title = str(content.get("title") or "주어진 글") if isinstance(content, dict) else "주어진 글"
+            g_body = str(content.get("body") or "") if isinstance(content, dict) else str(content)
+            body_parts.append(
+                f"<div class='eng-given-box'><div class='eng-given-title'>[{_html.escape(g_title)}]</div>"
+                f"<div>{render_english_inline_html(g_body)}</div></div>"
+            )
+        elif kind == "order_chunks":
+            order_rows = "".join(
+                f"<div class='eng-order-item'><span class='eng-order-mk'>{_html.escape(mk)}</span>"
+                f"<span>{render_english_inline_html(txt)}</span></div>"
+                for mk, txt in content
+            )
+            body_parts.append(f"<div class='eng-order-wrap'>{order_rows}</div>")
+        elif kind == "summary_box":
+            body_parts.append(
+                f"<div class='eng-summary-arrow'>↓</div>"
+                f"<div class='eng-summary-box'>{render_english_inline_html(str(content))}</div>"
+            )
+        elif kind == "footnote":
+            body_parts.append(f"<div class='eng-footnote'>{render_english_inline_html(str(content))}</div>")
+        else:
+            body_parts.append(f"<div class='eng-passage'>{render_english_inline_html(str(content))}</div>")
+
+    choices_html = ""
+    if rw.rewritten_choices:
+        choice_divs = []
+        for ci, c_text in enumerate(rw.rewritten_choices):
+            sym = CIRCLED_MAP.get(str(ci + 1), f"{ci + 1})")
+            cleaned = (c_text or "").strip()
+            if cleaned == sym or not cleaned:
+                choice_divs.append(f"<div class='rewritten-choice'><b>{sym}</b></div>")
+            else:
+                choice_divs.append(
+                    f"<div class='rewritten-choice'><b>{sym}</b> {render_english_inline_html(cleaned)}</div>"
+                )
+        choices_html = f"<div class='rewritten-choices-wrap'>{''.join(choice_divs)}</div>"
+
+    return f"<div class='rewritten-card'>{''.join(body_parts)}{choices_html}</div>"
+
+
 def _render_rewritten_card_html(rw: RewrittenQuestion) -> str:
-    """개조 문항의 <자료>·<보기> 분리 박스, 화학식 첨자, 선지 HTML을 모던 학습지 스타일로 조립한다."""
+    """개조 문항의 <자료>·<보기> 분리 박스, 화학식 첨자(영어는 수능형 밑줄/박스), 선지 HTML을 모던 학습지 스타일로 조립한다."""
+    if getattr(rw, "subject_domain", "") == "영어":
+        return _render_english_rewritten_card_html(rw)
     blocks = split_stem_blocks(rw.rewritten_stem)
     body_parts: list[str] = []
     for kind, content in blocks:
@@ -1417,27 +1681,53 @@ def _render_mode_b_solve_fragment(
         )
 
         with st.container(border=True):
+            is_eng_item = (
+                q.subject_category == "영어"
+                or getattr(rw, "subject_domain", "") == "영어"
+                or bool(item.get("english_meta"))
+            )
+            eng_target_type = (
+                (getattr(rw, "target_question_type", "") if rw is not None else "")
+                or (item.get("english_meta") or {}).get("target_type", "")
+                or getattr(q, "english_question_type", "")
+                or q.unit_name
+            )
+            eng_source_caption = (
+                f"출처: {q.exam_name}"
+                if "직접 입력" in (q.exam_name or "")
+                else f"출처: {q.exam_name} {q.q_num}번"
+            )
+
             # 카드 상단 헤더 + 번호 배지
             hdr_col1, hdr_col2 = st.columns([3.2, 1])
             with hdr_col1:
+                header_title = f"영어 · {eng_target_type}" if is_eng_item else f"{q.curriculum_subject} · {q.unit_name}"
                 st.markdown(
                     f"""
                     <div class="q-badge-row">
                       <span class="q-num-pill">Q{seq_num:02d}</span>
                       <span style="font-size:0.9rem; font-weight:700; color:#1E293B;">
-                        {_html.escape(q.curriculum_subject)} · {_html.escape(q.unit_name)}
+                        {_html.escape(header_title)}
                       </span>
                     </div>
                     """,
                     unsafe_allow_html=True,
                 )
-                st.caption(
-                    f"출처: {q.exam_name} {q.q_num}번 · 본질 원리: {', '.join(q.core_principles)}"
-                )
+                if is_eng_item:
+                    st.caption(eng_source_caption)
+                else:
+                    st.caption(
+                        f"출처: {q.exam_name} {q.q_num}번 · 본질 원리: {', '.join(q.core_principles)}"
+                    )
             with hdr_col2:
                 if rw is not None:
+                    badge_txt = (
+                        f"✨ 수능형 변형 · {_html.escape(eng_target_type)}"
+                        if is_eng_item
+                        else "✨ 개념서 기준 개조 문항"
+                    )
                     st.markdown(
-                        "<div style='text-align:right;'><span class='chip chip-blue'>✨ 개념서 기준 개조 문항</span></div>",
+                        f"<div style='text-align:right;'><span class='chip chip-blue'>{badge_txt}</span></div>",
                         unsafe_allow_html=True,
                     )
                 else:
@@ -1450,45 +1740,49 @@ def _render_mode_b_solve_fragment(
             if rw is not None:
                 st.markdown(_render_rewritten_card_html(rw), unsafe_allow_html=True)
 
-                vis_term_note = (getattr(rw, "visual_term_note", "") or "").strip()
-                needs_visual_display = bool(crop_b) and (
-                    has_visual_reference(rw.rewritten_stem)
-                    or has_visual_reference(" ".join(rw.rewritten_choices or []))
-                    or has_visual_reference(getattr(q, "question_text", ""))
-                    or bool(vis_term_note)
-                )
-
-                if needs_visual_display and crop_b:
-                    st.image(
-                        crop_b,
-                        caption=f"📊 원본 그림·도표 참고 ({q.exam_name} {q.q_num}번)",
-                        width="stretch",
-                    )
-                if vis_term_note:
-                    st.markdown(
-                        f"<div class='visual-term-note'>📌 <b>[그림 용어 안내]</b> {_html.escape(format_chemical_scripts(vis_term_note))}</div>",
-                        unsafe_allow_html=True,
+                if not is_eng_item:
+                    vis_term_note = (getattr(rw, "visual_term_note", "") or "").strip()
+                    needs_visual_display = bool(crop_b) and (
+                        has_visual_reference(rw.rewritten_stem)
+                        or has_visual_reference(" ".join(rw.rewritten_choices or []))
+                        or has_visual_reference(getattr(q, "question_text", ""))
+                        or bool(vis_term_note)
                     )
 
-                if rw.replaced_terms_map:
-                    render_chips(rw.replaced_terms_map, variant="purple")
+                    if needs_visual_display and crop_b:
+                        st.image(
+                            crop_b,
+                            caption=f"📊 원본 그림·도표 참고 ({q.exam_name} {q.q_num}번)",
+                            width="stretch",
+                        )
+                    if vis_term_note:
+                        st.markdown(
+                            f"<div class='visual-term-note'>📌 <b>[그림 용어 안내]</b> {_html.escape(format_chemical_scripts(vis_term_note))}</div>",
+                            unsafe_allow_html=True,
+                        )
 
-                exp_title = (
-                    "🔍 개조 검증 & 치환 내역 보기"
-                    if needs_visual_display
-                    else "🖼️ 원본 문제 이미지 & 개조 검증 내역 보기"
-                )
-                with st.expander(exp_title, expanded=False):
-                    if crop_b and not needs_visual_display:
-                        st.image(crop_b, caption=f"원본 ({q.exam_name} {q.q_num}번)", width="stretch")
-                    st.info(f"**자가 검증:** {rw.self_verification_note}")
+                    if rw.replaced_terms_map:
+                        render_chips(rw.replaced_terms_map, variant="purple")
+
+                    exp_title = (
+                        "🔍 개조 검증 & 치환 내역 보기"
+                        if needs_visual_display
+                        else "🖼️ 원본 문제 이미지 & 개조 검증 내역 보기"
+                    )
+                    with st.expander(exp_title, expanded=False):
+                        if crop_b and not needs_visual_display:
+                            st.image(crop_b, caption=f"원본 ({q.exam_name} {q.q_num}번)", width="stretch")
+                        st.info(f"**자가 검증:** {rw.self_verification_note}")
+                else:
+                    if rw.replaced_terms_map:
+                        render_chips(rw.replaced_terms_map, variant="purple")
             else:
-                if crop_b:
+                if crop_b and not is_eng_item:
                     st.image(crop_b, width="stretch")
                 else:
                     st.warning("문항 이미지를 불러올 수 없습니다.")
 
-            # 문항 카드 하단: 참고 개념서 단원 및 페이지 번호 표기
+            # 문항 카드 하단: 참고 개념서 단원/페이지 또는 영어 기출 출처 표기
             st.markdown(
                 f"<div style='background:#EFF6FF; border-left:4px solid #2563EB; padding:8px 12px; "
                 f"border-radius:6px; margin:8px 0; font-size:0.9rem; font-weight:600; color:#1E3A8A;'>"
@@ -1499,7 +1793,7 @@ def _render_mode_b_solve_fragment(
             # 답안 입력 UI (객관식 1~5 터치 버튼 또는 주관식 입력)
             st.markdown("**내 답안 선택 / 입력:**")
             current_ans = st.session_state["user_answers"].get(q.id, "")
-            is_mc = is_multiple_choice_question(q, rw)
+            is_mc = True if is_eng_item else is_multiple_choice_question(q, rw)
 
             if is_mc:
                 st.markdown("<div class='omr-row'>", unsafe_allow_html=True)
@@ -1552,6 +1846,20 @@ def _render_mode_b_solve_fragment(
                 if st.button("✨ AI 자동 해설", key=f"ai_btn_{q.id}", width="stretch"):
                     if not active_gemini_key:
                         st.error(f"사용 가능한 Gemini API 키({active_key_label})가 설정되지 않았습니다.")
+                    elif is_eng_item:
+                        with st.spinner("영어 구문·논리·오답 분석 해설 생성 중..."):
+                            try:
+                                exp_md = generate_english_explanation(
+                                    api_key=active_gemini_key,
+                                    model_name=selected_model,
+                                    question=q,
+                                    rewritten=rw,
+                                    user_answer=st.session_state["user_answers"].get(q.id, ""),
+                                    source_reference=concept_ref_str,
+                                )
+                                st.session_state["ai_explanations"][q.id] = exp_md
+                            except Exception as exc:
+                                st.error(f"영어 AI 해설 생성 실패: {exc}")
                     elif whitelist is None:
                         st.error("개념서 화이트리스트가 필요합니다.")
                     else:
@@ -1576,6 +1884,34 @@ def _render_mode_b_solve_fragment(
                 if st.button("🔄 이 문제 다시 변환", key=f"re_rw_btn_{q.id}", width="stretch"):
                     if not active_gemini_key:
                         st.error(f"사용 가능한 Gemini API 키({active_key_label})가 설정되지 않았습니다.")
+                    elif is_eng_item:
+                        eng_meta = item.get("english_meta") or {}
+                        src_passage = (
+                            eng_meta.get("source_passage")
+                            or getattr(q, "passage_text", "")
+                            or getattr(q, "question_text", "")
+                        )
+                        with st.spinner(f"'{eng_target_type}' 유형으로 이 지문을 새롭게 다시 변형 중..."):
+                            try:
+                                new_rw = generate_english_transformed_question(
+                                    api_key=active_gemini_key,
+                                    model_name=eff_rewrite_model,
+                                    source_passage=src_passage,
+                                    target_type=eng_meta.get("target_type") or eng_target_type,
+                                    difficulty=eng_meta.get("difficulty") or "고3 평가원·수능 수준",
+                                    blank_unit=eng_meta.get("blank_unit") or "구 (3~6단어)",
+                                    vocab_style=eng_meta.get("vocab_style") or "밑줄형 (①~⑤)",
+                                    source_label=eng_meta.get("source_label") or eng_source_caption,
+                                    previous_attempt=rw,
+                                )
+                                st.session_state["matched_items"][seq_num - 1]["rewritten"] = new_rw
+                                st.session_state["ai_explanations"].pop(q.id, None)
+                                st.session_state["ai_chats"].pop(q.id, None)
+                                st.session_state["generated_exam_pdf"] = None
+                                st.session_state["generated_exam_pdf_sig"] = ""
+                                st.rerun(scope="fragment")
+                            except Exception as exc:
+                                st.error(f"영어 문항 재변환 실패: {exc}")
                     elif whitelist is None:
                         st.error("개념서 화이트리스트가 필요합니다.")
                     else:
@@ -1608,13 +1944,13 @@ def _render_mode_b_solve_fragment(
                                 st.error(f"문항 재변환 실패: {exc}")
 
             if q.id in st.session_state["ai_explanations"]:
-                st.info("✨ **개념서 범위 기준 AI 맞춤 해설**")
+                st.info("✨ **수능 영어 구문·논리·오답 AI 맞춤 해설**" if is_eng_item else "✨ **개념서 범위 기준 AI 맞춤 해설**")
                 st.markdown(st.session_state["ai_explanations"][q.id])
                 if concept_ref_str not in st.session_state["ai_explanations"][q.id]:
                     st.markdown(f"**{_html.escape(concept_ref_str)}**")
 
                 # 문항별 추가 질문 채팅
-                st.markdown("💬 **추가 질문 채팅 (개념서 범위 내 1:1 질의응답)**")
+                st.markdown("💬 **추가 질문 채팅 (1:1 질의응답)**")
                 q_chat_history: list[dict[str, str]] = st.session_state["ai_chats"].get(q.id, [])
                 for msg in q_chat_history:
                     with st.chat_message(msg["role"]):
@@ -1623,29 +1959,43 @@ def _render_mode_b_solve_fragment(
                 with st.form(key=f"chat_form_{q.id}", clear_on_submit=True):
                     followup_q = st.text_input(
                         "이 문제에 대해 궁금한 점을 질문하세요",
-                        placeholder="예: 왜 이 식에서 질량비가 이렇게 적용되나요?",
+                        placeholder=(
+                            "예: 3번 선지가 왜 오답인지, 또는 첫 문장 구문 구조를 설명해 주세요."
+                            if is_eng_item
+                            else "예: 왜 이 식에서 질량비가 이렇게 적용되나요?"
+                        ),
                         label_visibility="collapsed",
                     )
                     send_chat = st.form_submit_button("질문 보내기")
 
                 if send_chat and followup_q.strip():
-                    if not active_gemini_key or whitelist is None:
-                        st.error(f"사용 가능한 Gemini API 키({active_key_label})와 개념서 화이트리스트가 필요합니다.")
+                    if not active_gemini_key or (not is_eng_item and whitelist is None):
+                        st.error(f"사용 가능한 Gemini API 키({active_key_label})가 필요합니다.")
                     else:
                         q_chat_history.append({"role": "user", "content": followup_q.strip()})
-                        with st.spinner("개념서 범위 내에서 답변 생성 중..."):
+                        with st.spinner("답변 생성 중..."):
                             try:
-                                reply = chat_followup_with_pdf(
-                                    api_key=active_gemini_key,
-                                    model_name=selected_model,
-                                    question=q,
-                                    crop_png_bytes=crop_b,
-                                    whitelist=whitelist,
-                                    chat_history=q_chat_history[:-1],
-                                    user_question=followup_q.strip(),
-                                    rewritten=rw,
-                                    sliced_text=st.session_state.get("concept_sliced_text", ""),
-                                )
+                                if is_eng_item:
+                                    reply = chat_followup_with_english(
+                                        api_key=active_gemini_key,
+                                        model_name=selected_model,
+                                        question=q,
+                                        rewritten=rw,
+                                        chat_history=q_chat_history[:-1],
+                                        user_query=followup_q.strip(),
+                                    )
+                                else:
+                                    reply = chat_followup_with_pdf(
+                                        api_key=active_gemini_key,
+                                        model_name=selected_model,
+                                        question=q,
+                                        crop_png_bytes=crop_b,
+                                        whitelist=whitelist,
+                                        chat_history=q_chat_history[:-1],
+                                        user_question=followup_q.strip(),
+                                        rewritten=rw,
+                                        sliced_text=st.session_state.get("concept_sliced_text", ""),
+                                    )
                                 q_chat_history.append({"role": "assistant", "content": reply})
                                 st.session_state["ai_chats"][q.id] = q_chat_history
                                 st.rerun(scope="fragment")
@@ -2828,7 +3178,11 @@ with tab1:
 
             col_meta1, col_meta2 = st.columns([1, 2])
             with col_meta1:
-                subject_cat = st.selectbox("과목 (대분류)", options=["과학", "수학", "사회"], key="tab1_subject_cat")
+                subject_cat = st.selectbox(
+                    "과목 (대분류)",
+                    options=["과학", "수학", "사회", "영어"],
+                    key="tab1_subject_cat",
+                )
             with col_meta2:
                 exam_name_input = st.text_input(
                     "회차명 (자동 조합)",
@@ -3090,9 +3444,16 @@ with tab1:
                 )
                 for rec in saved_records:
                     review_badge = "⚠️ 검토 필요 · " if getattr(rec, "needs_review", False) else "✅ "
-                    with st.expander(
-                        f"{review_badge}{rec.q_num}번 · [{rec.curriculum_subject}] {rec.unit_name} (고{rec.min_grade} · 정답: {rec.answer})"
-                    ):
+                    if rec.subject_category == "영어":
+                        sec_lbl = getattr(rec, "english_section", "") or ("듣기" if rec.q_num <= 17 else "독해")
+                        type_lbl = getattr(rec, "english_question_type", "") or rec.unit_name
+                        exp_hdr = f"{review_badge}{rec.q_num}번 · [영어 · {sec_lbl}] {type_lbl} (정답: {rec.answer})"
+                    else:
+                        exp_hdr = (
+                            f"{review_badge}{rec.q_num}번 · [{rec.curriculum_subject}] {rec.unit_name} "
+                            f"(고{rec.min_grade} · 정답: {rec.answer})"
+                        )
+                    with st.expander(exp_hdr):
                         c_img, c_info = st.columns([1, 1.3])
                         with c_img:
                             b = storage.get_crop_bytes(
@@ -3171,7 +3532,7 @@ with tab1:
             key=lambda m: int(re.sub(r"[^0-9]", "", m) or 0),
         )
         avail_grades = ["고1", "고2", "고3"]
-        avail_subjects = ["수학", "사회", "과학"]
+        avail_subjects = ["수학", "사회", "과학", "영어"]
 
         with st.form("db_search_form", border=True):
             sc1, sc2, sc3, sc4 = st.columns(4)
@@ -3545,10 +3906,19 @@ with tab1:
                         with st.expander(f"📋 '{exam_name}' 문항 상세 보기 ({len(exam_recs)}문항)", expanded=False):
                             for rec in exam_recs:
                                 warn_prefix = "⚠️ 검토 필요 · " if getattr(rec, "needs_review", False) else ""
-                                st.markdown(
-                                    f"{warn_prefix}**{rec.q_num}번** · `{rec.curriculum_subject}` · {rec.unit_name} "
-                                    f"(고{rec.min_grade}, {'단일 원리' if rec.is_single_concept else '복합 원리'}, 정답 `{rec.answer}`)"
-                                )
+                                if rec.subject_category == "영어":
+                                    sec_lbl = getattr(rec, "english_section", "") or ("듣기" if rec.q_num <= 17 else "독해")
+                                    type_lbl = getattr(rec, "english_question_type", "") or rec.unit_name
+                                    grp_lbl = f" · 세트 `[{rec.passage_group_id}]`" if getattr(rec, "passage_group_id", "") else ""
+                                    st.markdown(
+                                        f"{warn_prefix}**{rec.q_num}번** · `영어 ({sec_lbl})` · {type_lbl}{grp_lbl} "
+                                        f"(정답 `{rec.answer}`)"
+                                    )
+                                else:
+                                    st.markdown(
+                                        f"{warn_prefix}**{rec.q_num}번** · `{rec.curriculum_subject}` · {rec.unit_name} "
+                                        f"(고{rec.min_grade}, {'단일 원리' if rec.is_single_concept else '복합 원리'}, 정답 `{rec.answer}`)"
+                                    )
                                 col_a, col_b = st.columns([1, 1.3])
                                 with col_a:
                                     img_b = storage.get_crop_bytes(
@@ -3569,9 +3939,523 @@ with tab1:
 
 
 # ===========================================================================
-# TAB 2: 개념서·교과서 PDF 분석 → 엄격한 범위 내 추출 & 상위 문제 개조
+# TAB 2: 개념서·교과서 PDF 분석 (수학·사회·과학) & 영어 지문 수능형 변형 엔진
 # ===========================================================================
-with tab2:
+def _resolve_tab2_english_rewrite_model(key_suffix: str = "eng") -> str:
+    """탭 2 영어 지문 변형에 사용할 모델과 등급·크레딧 안내 배너를 렌더링한다 (기존 탭 2 정책 공유)."""
+    pro_rem_weekly = get_remaining_pro_weekly_quota(current_user)
+    if current_user.tier == "FREE":
+        free_credits = int(getattr(current_user, "premium_unlock_credits", 0) or 0)
+        free_uploads = int(getattr(current_user, "uploaded_exam_count", 0) or 0)
+        use_unlocked_premium = False
+        if free_credits > 0:
+            use_unlocked_premium = st.checkbox(
+                f"🔓 해금 크레딧 1회 사용해 PRO/ULTRA/ADMIN 전용 모델({MODEL_LABELS.get(REWRITE_MODEL, REWRITE_MODEL)})로 변형 실행 (보유: {free_credits}회)",
+                value=False,
+                key=f"tab2_free_use_unlock_credit_{key_suffix}",
+            )
+        if use_unlocked_premium:
+            rw_model = REWRITE_MODEL
+            st.info(
+                f"🔓 **무료 회원 (FREE)** · 해금 크레딧 사용: 영어 지문 변형 **{MODEL_LABELS.get(rw_model, rw_model)}** "
+                f"(실행 시 크레딧 1회 차감 · 남은 크레딧 {free_credits}회)"
+            )
+        else:
+            rw_model = EXAM_TAGGING_MODEL
+            prog_mod = free_uploads % FREE_EXAMS_PER_UNLOCK
+            st.info(
+                f"🆓 **무료 회원 (FREE)** · **Gemini 3.5 Flash-Lite**로 변형 실행 "
+                f"(기출 PDF {FREE_EXAMS_PER_UNLOCK}회 업로드마다 고급 모델 1회 해금 · 현재 {prog_mod}/{FREE_EXAMS_PER_UNLOCK}회)"
+            )
+    else:
+        rw_model, rw_notice = resolve_model_for_user(current_user, REWRITE_MODEL)
+        if current_user.tier == "PRO":
+            st.info(
+                f"💎 **PRO (1,990원/월)** · 영어 지문 변형 모델: **{MODEL_LABELS.get(rw_model, rw_model)}** "
+                f"(주간 고급 모델 남은 횟수: **{pro_rem_weekly} / {PRO_WEEKLY_PREMIUM_LIMIT}회**)"
+                + (f" — {rw_notice}" if rw_notice else "")
+            )
+    st.session_state["active_rewrite_model"] = rw_model
+    return rw_model
+
+
+def _execute_english_transform_jobs(
+    jobs: list[dict[str, Any]],
+    rewrite_model: str,
+    source_summary_label: str,
+) -> None:
+    """(영어 지문, 목표 수능 유형) 작업 목록을 병렬 실행해 matched_items(모드 A/B 호환)로 저장한다."""
+    if not jobs:
+        st.warning("변형할 영어 지문과 목표 수능 유형을 최소 1개 이상 선택해 주세요.")
+        return
+
+    rewrite_api_key, rewrite_key_label = resolve_active_gemini_api_key(
+        current_user, creds.gemini_api_key, model_name=rewrite_model
+    )
+    if not rewrite_api_key:
+        st.error(f"영어 지문 변형용 Gemini API 키({rewrite_key_label})가 설정되지 않았습니다.")
+        return
+
+    total_jobs = len(jobs)
+    prog = st.progress(0.0)
+    stat = st.empty()
+    stat.info(f"🔤 영어 지문 수능형 변형 {total_jobs}문항 병렬 출제 중 (최대 4스레드)...")
+
+    results_by_idx: dict[int, RewrittenQuestion] = {}
+    errors_by_idx: dict[int, str] = {}
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+        future_map = {
+            executor.submit(
+                generate_english_transformed_question,
+                api_key=rewrite_api_key,
+                model_name=rewrite_model,
+                source_passage=job["passage_text"],
+                target_type=job["target_type"],
+                difficulty=job["difficulty"],
+                blank_unit=job["blank_unit"],
+                vocab_style=job["vocab_style"],
+                source_label=job["source_label"],
+            ): idx
+            for idx, job in enumerate(jobs)
+        }
+        done_cnt = 0
+        for fut in concurrent.futures.as_completed(future_map):
+            idx = future_map[fut]
+            done_cnt += 1
+            try:
+                results_by_idx[idx] = fut.result()
+            except Exception as exc:
+                errors_by_idx[idx] = str(exc)
+            prog.progress(done_cnt / total_jobs)
+            stat.info(f"🔤 영어 지문 수능형 변형 출제 중 ({done_cnt}/{total_jobs})...")
+
+    prog.progress(1.0)
+    stat.empty()
+
+    for idx, err_str in sorted(errors_by_idx.items()):
+        j_info = jobs[idx]
+        st.error(f"❌ [{j_info['source_label']} → {j_info['target_type']}] 변형 실패: {err_str}")
+
+    assembled: list[dict[str, Any]] = []
+    for idx, job in enumerate(jobs):
+        rw_item = results_by_idx.get(idx)
+        if rw_item is None:
+            continue
+        base_q: QuestionRecord = job["base_question"]
+        unique_q = base_q.model_copy(
+            update={
+                "id": f"{base_q.id}__eng_{idx + 1:02d}",
+                "subject_category": "영어",
+                "curriculum_subject": "영어",
+                "unit_name": rw_item.target_question_type or job["target_type"],
+            }
+        )
+        assembled.append(
+            {
+                "question": unique_q,
+                "judgment": None,
+                "crop_png_bytes": None,
+                "rewritten": rw_item,
+                "concept_reference": f"📚 {job['source_label']}",
+                "english_meta": {
+                    "source_passage": job["passage_text"],
+                    "target_type": job["target_type"],
+                    "difficulty": job["difficulty"],
+                    "blank_unit": job["blank_unit"],
+                    "vocab_style": job["vocab_style"],
+                    "source_label": job["source_label"],
+                },
+            }
+        )
+
+    if not assembled:
+        st.warning("생성된 영어 변형 문항이 없습니다.")
+        return
+
+    consume_extraction_quota(storage, current_user.username, len(assembled))
+    updated_u = None
+    if is_premium_model(rewrite_model):
+        updated_u = consume_premium_model_usage(storage, current_user.username, rewrite_model)
+
+    st.session_state["matched_items"] = assembled
+    st.session_state["match_diagnostics"] = []
+    st.session_state["concept_source_label"] = source_summary_label
+    st.session_state["generated_exam_pdf"] = None
+    st.session_state["user_answers"] = {}
+    st.session_state["graded"] = False
+    st.session_state["ai_explanations"] = {}
+    st.session_state["ai_chats"] = {}
+
+    rem_msg = ""
+    if updated_u is not None and is_premium_model(rewrite_model):
+        if updated_u.tier == "FREE":
+            rem_msg = f" | 남은 고급 모델 해금 크레딧: {int(getattr(updated_u, 'premium_unlock_credits', 0) or 0)}회"
+        elif updated_u.tier == "PRO":
+            pro_rem = get_remaining_pro_weekly_quota(updated_u)
+            rem_msg = f" | PRO 주간 고급 모델 잔여: {pro_rem}/{PRO_WEEKLY_PREMIUM_LIMIT}회"
+
+    st.success(f"🎯 총 **{len(assembled)}문항**의 수능형 영어 변형 문제 출제가 완료되었습니다! 아래 모드 A(시험지 PDF) 또는 모드 B(웹 바로 풀기)에서 확인하세요.{rem_msg}")
+
+
+def _render_tab2_english_transform_section() -> None:
+    """탭 2 영어 과목 전용: 기출 영어 지문 검색/직접 입력 및 수능 11개 독해 유형 변형 UI."""
+    st.subheader("1️⃣ 영어 지문 선택 & 수능 독해 유형 변형 엔진")
+    rewrite_model = _resolve_tab2_english_rewrite_model(key_suffix="eng")
+
+    eng_tab_db, eng_tab_direct = st.tabs(
+        [
+            "📂 기출 DB 영어 지문에서 선택 (회차·원래 유형별 검색)",
+            "✍️ 새 영어 지문 직접 붙여넣기",
+        ]
+    )
+
+    with eng_tab_db:
+        all_db = storage.load_db()
+        eng_reading_recs = [
+            r
+            for r in all_db
+            if r.subject_category == "영어"
+            and (getattr(r, "english_section", "") == "독해" or r.q_num >= 18)
+            and bool((getattr(r, "passage_text", "") or "").strip())
+        ]
+
+        if not eng_reading_recs:
+            st.info(
+                "아직 DB에 저장된 **영어 독해(18~45번) 지문**이 없습니다. "
+                "**[📥 탭 1]**에서 영어 모의고사 문제지+해설지 PDF를 먼저 수집·추출하거나, "
+                "우측 **[✍️ 새 영어 지문 직접 붙여넣기]** 탭을 이용해 주세요."
+            )
+        else:
+            f_c1, f_c2, f_c3 = st.columns([1.2, 1.1, 1.3])
+            avail_eng_exams = sorted({r.exam_name for r in eng_reading_recs}, reverse=True)
+            avail_eng_types = sorted(
+                {
+                    (getattr(r, "english_question_type", "") or r.unit_name).strip()
+                    for r in eng_reading_recs
+                    if (getattr(r, "english_question_type", "") or r.unit_name).strip()
+                }
+            )
+            with f_c1:
+                sel_eng_exam = st.selectbox(
+                    "모의고사 회차 필터",
+                    options=["전체"] + avail_eng_exams,
+                    key="tab2_eng_filter_exam",
+                )
+            with f_c2:
+                sel_eng_orig_type = st.selectbox(
+                    "원래 문항 유형 필터",
+                    options=["전체"] + avail_eng_types,
+                    key="tab2_eng_filter_type",
+                )
+            with f_c3:
+                eng_kw = st.text_input(
+                    "주제·어휘·지문 키워드 검색",
+                    placeholder="예: artificial intelligence, climate, 감정...",
+                    key="tab2_eng_filter_kw",
+                )
+
+            opt_row1, opt_row2 = st.columns([1.3, 1.2])
+            with opt_row1:
+                include_excluded_q = st.checkbox(
+                    "목적·심경·도표·내용일치·실용문·장문(18, 19, 25, 26, 27, 28, 43, 44, 45번) 지문도 목록에 포함",
+                    value=False,
+                    key="tab2_eng_include_excluded_q",
+                )
+            with opt_row2:
+                assign_mode = st.radio(
+                    "목표 변형 유형 지정 방식",
+                    options=[
+                        "⚡ 일괄 유형 적용 (선택 지문 전체에 동일 유형 적용)",
+                        "🎯 지문별 개별 유형 지정 (지문마다 원하는 유형 복수 선택)",
+                    ],
+                    horizontal=True,
+                    key="tab2_eng_assign_mode",
+                )
+            is_per_passage_mode = assign_mode.startswith("🎯")
+
+            # 필터링 및 세트 지문(41~42, 43~45) 중복 묶음 처리
+            filtered_passages: list[tuple[QuestionRecord, str]] = []
+            seen_group_keys: set[tuple[str, str]] = set()
+            kw_low = (eng_kw or "").strip().lower()
+
+            for r in sorted(eng_reading_recs, key=lambda x: (x.exam_name, x.q_num)):
+                if not include_excluded_q and r.q_num in ENGLISH_DEFAULT_EXCLUDED_Q_NUMS:
+                    continue
+                if sel_eng_exam != "전체" and r.exam_name != sel_eng_exam:
+                    continue
+                r_orig_t = (getattr(r, "english_question_type", "") or r.unit_name).strip()
+                if sel_eng_orig_type != "전체" and r_orig_t != sel_eng_orig_type:
+                    continue
+                if kw_low:
+                    blob = " ".join(
+                        [
+                            r.exam_name,
+                            r_orig_t,
+                            getattr(r, "passage_topic", ""),
+                            " ".join(getattr(r, "key_vocabulary", []) or []),
+                            getattr(r, "passage_text", ""),
+                        ]
+                    ).lower()
+                    if kw_low not in blob:
+                        continue
+
+                gid = (getattr(r, "passage_group_id", "") or "").strip()
+                if gid:
+                    g_key = (r.exam_name, gid)
+                    if g_key in seen_group_keys:
+                        continue
+                    seen_group_keys.add(g_key)
+                    q_label = f"{r.exam_name} {gid}번"
+                else:
+                    q_label = f"{r.exam_name} {r.q_num}번"
+                filtered_passages.append((r, q_label))
+
+            if not filtered_passages:
+                st.warning("조건에 맞는 영어 독해 지문이 없습니다. 필터를 완화하거나 상단 제외 문항 포함 체크박스를 켜 보세요.")
+            else:
+                st.caption(
+                    f"총 **{len(filtered_passages)}개** 영어 독해 지문이 조회되었습니다. "
+                    "(체크박스를 클릭해도 화면이 재로딩되지 않으며, 하단 생성 버튼을 누를 때 한 번에 실행됩니다.)"
+                )
+                with st.form("tab2_eng_db_transform_form", border=True):
+                    cfg_c1, cfg_c2, cfg_c3 = st.columns(3)
+                    with cfg_c1:
+                        eng_difficulty = st.selectbox(
+                            "변형 목표 난이도",
+                            options=["고3 평가원·수능 수준", "고1·고2 학평 수준"],
+                            index=0,
+                            key="tab2_eng_db_diff",
+                        )
+                    with cfg_c2:
+                        eng_blank_unit = st.selectbox(
+                            "빈칸 추론 선택 시 빈칸 단위",
+                            options=["구 (3~6단어)", "단어 (1~2단어)", "절 (주어+동사 포함)"],
+                            index=0,
+                            key="tab2_eng_db_blank_unit",
+                        )
+                    with cfg_c3:
+                        eng_vocab_style = st.selectbox(
+                            "문맥상 어휘 선택 시 출제 형식",
+                            options=["밑줄형 (①~⑤)", "선택형 ((A)(B)(C) 네모)"],
+                            index=0,
+                            key="tab2_eng_db_vocab_style",
+                        )
+
+                    bulk_target_types: list[str] = []
+                    if not is_per_passage_mode:
+                        bulk_target_types = st.multiselect(
+                            "🎯 선택한 모든 지문에 적용할 목표 수능 독해 유형 (1개~여러 개 복수 선택 가능)",
+                            options=list(ENGLISH_TRANSFORM_TYPES),
+                            default=["빈칸 추론"],
+                            key="tab2_eng_bulk_types",
+                        )
+
+                    st.markdown("---")
+                    st.markdown("**✅ 변형할 영어 기출 지문 선택:**")
+                    sel_all_eng = st.checkbox(
+                        f"현재 목록 전체 선택 ({len(filtered_passages)}개 지문)",
+                        value=False,
+                        key="tab2_eng_select_all",
+                    )
+
+                    checked_rows: list[tuple[QuestionRecord, str, list[str]]] = []
+                    for p_idx, (rec_p, q_label) in enumerate(filtered_passages):
+                        r_orig_t = (getattr(rec_p, "english_question_type", "") or rec_p.unit_name).strip()
+                        r_topic = (getattr(rec_p, "passage_topic", "") or "").strip()
+                        p_preview = re.sub(r"\s+", " ", (rec_p.passage_text or "").strip())[:115]
+                        row_label = (
+                            f"[{q_label}] 원래 유형: {r_orig_t}"
+                            + (f" · 주제: {r_topic}" if r_topic else "")
+                            + f" — \"{p_preview}...\""
+                        )
+                        if is_per_passage_mode:
+                            rc1, rc2 = st.columns([1.8, 1.2])
+                            with rc1:
+                                is_chk = st.checkbox(
+                                    row_label,
+                                    value=False,
+                                    key=f"tab2_eng_p_chk_{rec_p.id}_{p_idx}",
+                                )
+                            with rc2:
+                                row_types = st.multiselect(
+                                    f"목표 유형 ({q_label})",
+                                    options=list(ENGLISH_TRANSFORM_TYPES),
+                                    default=["빈칸 추론"],
+                                    key=f"tab2_eng_p_types_{rec_p.id}_{p_idx}",
+                                    label_visibility="collapsed",
+                                )
+                        else:
+                            is_chk = st.checkbox(
+                                row_label,
+                                value=False,
+                                key=f"tab2_eng_p_chk_{rec_p.id}_{p_idx}",
+                            )
+                            row_types = bulk_target_types
+
+                        if is_chk or sel_all_eng:
+                            checked_rows.append((rec_p, q_label, row_types))
+
+                    run_eng_db_btn = st.form_submit_button(
+                        "🚀 선택한 기출 영어 지문 수능형 변형 문제 생성",
+                        type="primary",
+                        width="stretch",
+                    )
+
+                with st.expander("📖 조회된 기출 영어 지문 원문·어휘 미리보기", expanded=False):
+                    for rec_p, q_label in filtered_passages[:30]:
+                        r_orig_t = (getattr(rec_p, "english_question_type", "") or rec_p.unit_name).strip()
+                        r_topic = (getattr(rec_p, "passage_topic", "") or "-").strip()
+                        st.markdown(f"**📌 {q_label}** (`{r_orig_t}` · 주제: {r_topic})")
+                        if getattr(rec_p, "key_vocabulary", None):
+                            render_chips(rec_p.key_vocabulary, variant="amber", limit=10)
+                        st.markdown(
+                            f"<div class='eng-given-box' style='white-space:pre-wrap;'>{_html.escape(rec_p.passage_text)}</div>",
+                            unsafe_allow_html=True,
+                        )
+
+                if run_eng_db_btn:
+                    if not checked_rows:
+                        st.error("변형할 영어 지문을 최소 1개 이상 체크해 주세요.")
+                    else:
+                        jobs: list[dict[str, Any]] = []
+                        for rec_p, q_label, r_types in checked_rows:
+                            eff_types = r_types if is_per_passage_mode else bulk_target_types
+                            for t_type in eff_types:
+                                jobs.append(
+                                    {
+                                        "base_question": rec_p,
+                                        "passage_text": rec_p.passage_text,
+                                        "target_type": t_type,
+                                        "difficulty": eng_difficulty,
+                                        "blank_unit": eng_blank_unit,
+                                        "vocab_style": eng_vocab_style,
+                                        "source_label": f"출처: {q_label}",
+                                    }
+                                )
+                        if not jobs:
+                            st.error("적용할 목표 수능 변형 유형을 최소 1개 이상 선택해 주세요.")
+                        else:
+                            src_exams = sorted({r[0].exam_name for r in checked_rows})
+                            summary_lbl = (
+                                f"{src_exams[0]} 외 {len(src_exams) - 1}개 회차 ({len(checked_rows)}개 지문)"
+                                if len(src_exams) > 1
+                                else f"{src_exams[0]} ({len(checked_rows)}개 지문)"
+                            )
+                            _execute_english_transform_jobs(
+                                jobs=jobs,
+                                rewrite_model=rewrite_model,
+                                source_summary_label=summary_lbl,
+                            )
+
+    with eng_tab_direct:
+        with st.form("tab2_eng_direct_transform_form", border=True):
+            st.markdown("**✍️ 변형할 새 영어 지문을 붙여넣고 원하는 수능 독해 유형을 선택하세요:**")
+            d_c1, d_c2 = st.columns([1.2, 1.8])
+            with d_c1:
+                direct_src_name = st.text_input(
+                    "출처 표기 (시험지·해설 표시용)",
+                    value="직접 입력 영어 지문",
+                    key="tab2_eng_direct_src",
+                )
+            with d_c2:
+                direct_types = st.multiselect(
+                    "🎯 생성할 수능 독해 변형 유형 (복수 선택 시 해당 유형들을 한 번에 생성)",
+                    options=list(ENGLISH_TRANSFORM_TYPES),
+                    default=["빈칸 추론", "어법상 틀린 것 (밑줄 ①~⑤)"],
+                    key="tab2_eng_direct_types",
+                )
+
+            d_opt1, d_opt2, d_opt3 = st.columns(3)
+            with d_opt1:
+                d_difficulty = st.selectbox(
+                    "변형 목표 난이도",
+                    options=["고3 평가원·수능 수준", "고1·고2 학평 수준"],
+                    index=0,
+                    key="tab2_eng_direct_diff",
+                )
+            with d_opt2:
+                d_blank_unit = st.selectbox(
+                    "빈칸 추론 선택 시 빈칸 단위",
+                    options=["구 (3~6단어)", "단어 (1~2단어)", "절 (주어+동사 포함)"],
+                    index=0,
+                    key="tab2_eng_direct_blank_unit",
+                )
+            with d_opt3:
+                d_vocab_style = st.selectbox(
+                    "문맥상 어휘 선택 시 출제 형식",
+                    options=["밑줄형 (①~⑤)", "선택형 ((A)(B)(C) 네모)"],
+                    index=0,
+                    key="tab2_eng_direct_vocab_style",
+                )
+
+            direct_passage_raw = st.text_area(
+                "영어 지문 원문 입력 (여러 개의 지문을 한 번에 넣으려면 지문 사이에 '---' 줄을 넣어 구분하세요)",
+                height=210,
+                placeholder="Paste your English reading passage here...",
+                key="tab2_eng_direct_text",
+            )
+            run_eng_direct_btn = st.form_submit_button(
+                "🚀 직접 입력한 영어 지문으로 수능형 변형 문제 생성",
+                type="primary",
+                width="stretch",
+            )
+
+        if run_eng_direct_btn:
+            raw_chunks = [
+                ch.strip()
+                for ch in re.split(r"\n\s*-{3,}\s*\n", (direct_passage_raw or "").strip())
+                if ch.strip()
+            ]
+            if not raw_chunks:
+                st.error("변형할 영어 지문 텍스트를 입력해 주세요.")
+            elif not direct_types:
+                st.error("생성할 목표 수능 독해 유형을 최소 1개 이상 선택해 주세요.")
+            else:
+                base_src = (direct_src_name or "직접 입력 영어 지문").strip()
+                direct_jobs: list[dict[str, Any]] = []
+                now_str = datetime.now().isoformat(timespec="seconds")
+                for c_idx, chunk_txt in enumerate(raw_chunks, start=1):
+                    src_title = f"{base_src} #{c_idx}" if len(raw_chunks) > 1 else base_src
+                    virtual_q = QuestionRecord(
+                        id=f"direct_eng_{hashlib.md5(chunk_txt.encode('utf-8')).hexdigest()[:8]}_{c_idx}",
+                        exam_name=src_title,
+                        q_num=c_idx,
+                        subject_category="영어",
+                        curriculum_subject="영어",
+                        unit_name="직접 입력 지문",
+                        min_grade=1,
+                        core_principles=["영어 독해 변형"],
+                        required_terms=[],
+                        is_single_concept=True,
+                        answer="1",
+                        official_explanation="",
+                        question_text=chunk_txt,
+                        english_section="독해",
+                        english_question_type="직접 입력",
+                        passage_text=chunk_txt,
+                        created_at=now_str,
+                    )
+                    for t_type in direct_types:
+                        direct_jobs.append(
+                            {
+                                "base_question": virtual_q,
+                                "passage_text": chunk_txt,
+                                "target_type": t_type,
+                                "difficulty": d_difficulty,
+                                "blank_unit": d_blank_unit,
+                                "vocab_style": d_vocab_style,
+                                "source_label": f"출처: {src_title}",
+                            }
+                        )
+                _execute_english_transform_jobs(
+                    jobs=direct_jobs,
+                    rewrite_model=rewrite_model,
+                    source_summary_label=base_src,
+                )
+
+
+def _render_tab2_concept_source_tabs() -> None:
     st.subheader("1️⃣ 기준 개념서 범위 설정 (공용 개념서 DB 선택 또는 PDF 직접 업로드)")
 
     source_tab_db, source_tab_pdf = st.tabs(
@@ -3778,9 +4662,26 @@ with tab2:
                             except Exception as exc:
                                 st.error(f"화이트리스트 추출 실패: {exc}")
 
+
+with tab2:
+    tab2_domain_mode = st.radio(
+        "작업 과목 모드 선택",
+        options=[
+            "📚 수학 · 사회 · 과학 (개념서 범위 추출 & 상위 용어 개조)",
+            "🔤 영어 (기출 지문 선택 & 수능 독해 유형 변형)",
+        ],
+        horizontal=True,
+        key="tab2_domain_mode",
+    )
+    is_tab2_english_mode = tab2_domain_mode.startswith("🔤")
+    if is_tab2_english_mode:
+        _render_tab2_english_transform_section()
+    else:
+        _render_tab2_concept_source_tabs()
+
     # 추출된 화이트리스트 표시
     whitelist: ConceptWhitelist | None = st.session_state.get("concept_whitelist")
-    if whitelist is not None:
+    if (not is_tab2_english_mode) and (whitelist is not None):
         st.markdown("### 📋 현재 적용된 개념서 지식 화이트리스트 (이 범위만 학습한 것으로 간주)")
         with st.container(border=True):
             book_badge = f"**기준 교재:** `{whitelist.book_title}` | " if whitelist.book_title else ""
@@ -4087,7 +4988,7 @@ with tab2:
     # 결과 활용 2가지 모드 (모드 A: PDF 다운로드 / 모드 B: 웹에서 풀기 + AI 해설)
     # -----------------------------------------------------------------------
     matched_items: list[dict[str, Any]] = st.session_state.get("matched_items") or []
-    if st.session_state.get("match_diagnostics"):
+    if (not is_tab2_english_mode) and st.session_state.get("match_diagnostics"):
         with st.expander("🔎 후보 문항 매칭/제외 판정 근거 상세 보기", expanded=False):
             for q, j in st.session_state["match_diagnostics"]:
                 icon = "🟢" if j.is_solvable_by_pdf_only and not j.needs_rewriting else ("🔵" if j.is_solvable_by_pdf_only else "⚪")
@@ -4126,10 +5027,21 @@ with tab2:
                 )
             else:
                 with st.container(border=True):
+                    is_all_eng_matched = bool(matched_items) and all(
+                        it["question"].subject_category == "영어"
+                        or getattr(it.get("rewritten"), "subject_domain", "") == "영어"
+                        or bool(it.get("english_meta"))
+                        for it in matched_items
+                    )
+                    default_pdf_title = (
+                        "수능·모의고사 영어 지문 맞춤형 변형 모의고사"
+                        if is_all_eng_matched
+                        else "2022 개정 교육과정 개념서 맞춤형 기출 모의고사"
+                    )
                     with st.form("tab2_mode_a_pdf_form", border=False):
                         pdf_title = st.text_input(
                             "시험지 제목",
-                            value="2022 개정 교육과정 개념서 맞춤형 기출 모의고사",
+                            value=default_pdf_title,
                         )
                         pa_c1, pa_c2 = st.columns(2)
                         with pa_c1:
@@ -4139,10 +5051,14 @@ with tab2:
                                 horizontal=True,
                             )
                         with pa_c2:
-                            include_orig_fig = st.checkbox(
-                                "개조 문항 아래 참고용 원본 도표/이미지 함께 수록",
-                                value=True,
-                            )
+                            if is_all_eng_matched:
+                                st.caption("📌 영어 변형 시험지는 원본 이미지를 제외하고 기출 출처(회차·번호)만 표기됩니다.")
+                                include_orig_fig = False
+                            else:
+                                include_orig_fig = st.checkbox(
+                                    "개조 문항 아래 참고용 원본 도표/이미지 함께 수록",
+                                    value=True,
+                                )
 
                         build_pdf_btn = st.form_submit_button("🛠️ 맞춤형 시험지 PDF 생성하기", type="primary")
 

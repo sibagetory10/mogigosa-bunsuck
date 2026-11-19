@@ -22,6 +22,8 @@ class CroppedQuestion:
     width: int
     height: int
     extracted_text: str
+    passage_group_id: str = ""
+    shared_passage_text: str = ""
 
 
 def get_pdf_page_count(pdf_bytes: bytes) -> int:
@@ -757,8 +759,9 @@ def parse_exam_pdf(pdf_bytes: bytes, dpi: int = 250) -> tuple[list[CroppedQuesti
     seen_q_nums: set[int] = set()
     total_text_chars = 0
 
-    # 이전 단(또는 이전 페이지) 끝에서 미처 첫 문항을 만나지 못한 세트 지문 [N~M] 이월용
+    # 이전 단(또는 이전 페이지) 끝에서 미처 첫 문항을 만나지 못한 세트 지문 [N~M] 이월용 및 세트 문항 공통 텍스트 유지용
     carried_passage: dict | None = None
+    active_passage_group: dict | None = None
 
     with pymupdf.open(stream=pdf_bytes, filetype="pdf") as doc:
         for page_idx in range(doc.page_count):
@@ -788,6 +791,7 @@ def parse_exam_pdf(pdf_bytes: bytes, dpi: int = 250) -> tuple[list[CroppedQuesti
 
                 markers: list[dict] = []
                 pending_passage_y0: float | None = None
+                pending_passage_start_q: int | None = None
                 pending_passage_end_q: int | None = None
 
                 for ln in lines:
@@ -795,13 +799,14 @@ def parse_exam_pdf(pdf_bytes: bytes, dpi: int = 250) -> tuple[list[CroppedQuesti
                     if _is_footer_or_header_noise(txt, ln["y0"], page_h):
                         continue
 
-                    # 공통/세트 지문 헤더 [1~3], [16~17], [41~42] 등 감지
+                    # 공통/세트 지문 헤더 [1~3], [16~17], [41~42], [43~45] 등 감지
                     pm = SHARED_PASSAGE_RE.match(txt)
                     if pm and ln["x0"] <= col_x0 + 0.45 * col_w:
                         p_start = int(pm.group(1))
                         p_end = int(pm.group(2))
                         if 1 <= p_start <= p_end <= 45:
                             pending_passage_y0 = ln["y0"]
+                            pending_passage_start_q = p_start
                             pending_passage_end_q = p_end
                         continue
 
@@ -824,11 +829,24 @@ def parse_exam_pdf(pdf_bytes: bytes, dpi: int = 250) -> tuple[list[CroppedQuesti
                     start_y = ln["y0"]
                     if (
                         pending_passage_y0 is not None
+                        and pending_passage_start_q is not None
                         and pending_passage_end_q is not None
                         and q_num <= pending_passage_end_q
                     ):
+                        same_col_shared_txt = "\n".join(
+                            l_item["text"]
+                            for l_item in lines
+                            if pending_passage_y0 - 2.0 <= l_item["y0"] < ln["y0"] - 1.0
+                        ).strip()
+                        active_passage_group = {
+                            "start_q": pending_passage_start_q,
+                            "end_q": pending_passage_end_q,
+                            "group_id": f"{pending_passage_start_q}~{pending_passage_end_q}",
+                            "text": same_col_shared_txt,
+                        }
                         start_y = min(start_y, pending_passage_y0)
                         pending_passage_y0 = None
+                        pending_passage_start_q = None
                         pending_passage_end_q = None
 
                     markers.append(
@@ -845,7 +863,11 @@ def parse_exam_pdf(pdf_bytes: bytes, dpi: int = 250) -> tuple[list[CroppedQuesti
                 )
 
                 # 현재 단에 [N~M] 지문만 있고 문항이 없다면(또는 마지막 문항 아래에 새 지문이 있다면) 다음 단으로 이월
-                if pending_passage_y0 is not None and pending_passage_end_q is not None:
+                if (
+                    pending_passage_y0 is not None
+                    and pending_passage_start_q is not None
+                    and pending_passage_end_q is not None
+                ):
                     p_bottom = 0.93 * page_h
                     p_boxes = [
                         b
@@ -865,9 +887,18 @@ def parse_exam_pdf(pdf_bytes: bytes, dpi: int = 250) -> tuple[list[CroppedQuesti
                             for ln in lines
                             if ln["y1"] >= p_clip.y0 and ln["y0"] <= p_clip.y1
                         )
+                        grp_str = f"{pending_passage_start_q}~{pending_passage_end_q}"
                         carried_passage = {
+                            "start_q": pending_passage_start_q,
                             "end_q": pending_passage_end_q,
+                            "group_id": grp_str,
                             "png_bytes": p_pix.tobytes("png"),
+                            "text": p_txt,
+                        }
+                        active_passage_group = {
+                            "start_q": pending_passage_start_q,
+                            "end_q": pending_passage_end_q,
+                            "group_id": grp_str,
                             "text": p_txt,
                         }
 
@@ -939,7 +970,7 @@ def parse_exam_pdf(pdf_bytes: bytes, dpi: int = 250) -> tuple[list[CroppedQuesti
                         if ln["y1"] >= clip.y0 and ln["y0"] <= clip.y1
                     )
 
-                    # 직전 단에서 이월된 세트 지문이 현재 문항 번호를 포함하면 상단에 결합
+                    # 직전 단에서 이월된 세트 지문이 현재 문항 번호를 포함하면 첫 문항 상단에 이미지 결합
                     if carried_passage is not None and marker["q_num"] <= carried_passage["end_q"]:
                         png_out, out_w, out_h = _stitch_vertical_pngs(
                             carried_passage["png_bytes"],
@@ -951,6 +982,17 @@ def parse_exam_pdf(pdf_bytes: bytes, dpi: int = 250) -> tuple[list[CroppedQuesti
                     elif carried_passage is not None and marker["q_num"] > carried_passage["end_q"]:
                         carried_passage = None
 
+                    q_group_id = ""
+                    q_shared_text = ""
+                    if active_passage_group is not None:
+                        if active_passage_group["start_q"] <= marker["q_num"] <= active_passage_group["end_q"]:
+                            q_group_id = str(active_passage_group.get("group_id") or "")
+                            q_shared_text = str(active_passage_group.get("text") or "").strip()
+                            if q_shared_text and q_shared_text not in q_text:
+                                q_text = f"{q_shared_text}\n\n{q_text}".strip()
+                        elif marker["q_num"] > active_passage_group["end_q"]:
+                            active_passage_group = None
+
                     results.append(
                         CroppedQuestion(
                             q_num=marker["q_num"],
@@ -959,6 +1001,8 @@ def parse_exam_pdf(pdf_bytes: bytes, dpi: int = 250) -> tuple[list[CroppedQuesti
                             width=out_w,
                             height=out_h,
                             extracted_text=q_text,
+                            passage_group_id=q_group_id,
+                            shared_passage_text=q_shared_text,
                         )
                     )
 
