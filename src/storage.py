@@ -402,6 +402,20 @@ class StorageManager:
                         if not target.exists() or (remote_size > 0 and target.stat().st_size != remote_size):
                             target.write_bytes(self._download_file_bytes(item["id"]))
 
+                # 1-d) 영어 변형 풀 캐시 (english_question_pool.json) 동기화
+                if "english_question_pool.json" in root_files_by_name:
+                    ep_bytes = self._download_file_bytes(root_files_by_name["english_question_pool.json"]["id"])
+                    _atomic_write_bytes(self.english_pool_path, ep_bytes)
+                    result["english_pool_synced"] = True
+                elif self.english_pool_path.exists():
+                    self._upsert_drive_file(
+                        self.drive_folder_id,
+                        "english_question_pool.json",
+                        self.english_pool_path.read_bytes(),
+                        "application/json",
+                    )
+                    result["english_pool_synced"] = True
+
                 if not sync_media:
                     return result
 
@@ -1176,6 +1190,68 @@ class StorageManager:
         except Exception:
             return {}
 
+    def _save_english_pool_unlocked(self, pool: dict[str, list[dict[str, Any]]]) -> str | None:
+        raw = json.dumps(pool, ensure_ascii=False, indent=2)
+        _atomic_write_text(self.english_pool_path, raw, encoding="utf-8")
+        if self.drive_connected and self.drive_service:
+            try:
+                self._upsert_drive_file(
+                    self.drive_folder_id,
+                    "english_question_pool.json",
+                    raw.encode("utf-8"),
+                    "application/json",
+                )
+            except Exception as exc:
+                return f"Google Drive 동기화 실패 (로컬 저장은 완료됨): {exc}"
+        return None
+
+    def load_english_pool(self) -> dict[str, list[dict[str, Any]]]:
+        """저장된 영어 변형 풀(Pool) 전체를 안전하게 조회한다."""
+        with self._lock:
+            pool = self._load_english_pool_unlocked()
+            return {
+                k: [dict(it) for it in v if isinstance(it, dict)]
+                for k, v in pool.items()
+                if isinstance(v, list) and v
+            }
+
+    def delete_english_pool_entry(
+        self,
+        cache_key: str,
+        item_idx: int | None = None,
+    ) -> tuple[int, str | None]:
+        """특정 캐시 키 전체 또는 해당 키 내 특정 인덱스 변형 문항 1개를 삭제한다."""
+        if not cache_key:
+            return 0, None
+        with self._lock:
+            pool = self._load_english_pool_unlocked()
+            items = pool.get(cache_key)
+            if not isinstance(items, list) or not items:
+                return 0, None
+            if item_idx is None:
+                removed = len(items)
+                pool.pop(cache_key, None)
+            elif 0 <= item_idx < len(items):
+                items = list(items)
+                items.pop(item_idx)
+                removed = 1
+                if items:
+                    pool[cache_key] = items
+                else:
+                    pool.pop(cache_key, None)
+            else:
+                return 0, None
+            drive_err = self._save_english_pool_unlocked(pool)
+            return removed, drive_err
+
+    def clear_english_pool(self) -> tuple[int, str | None]:
+        """영어 변형 풀(Pool) 캐시만 전체 비운다 (기출 DB 및 회원 DB는 유지)."""
+        with self._lock:
+            pool = self._load_english_pool_unlocked()
+            removed = sum(len(v) for v in pool.values() if isinstance(v, list))
+            drive_err = self._save_english_pool_unlocked({})
+            return removed, drive_err
+
     def get_cached_english_question(
         self,
         cache_key: str,
@@ -1219,8 +1295,4 @@ class StorageManager:
             if len(items) > max_per_key:
                 items = items[-max_per_key:]
             pool[cache_key] = items
-            _atomic_write_text(
-                self.english_pool_path,
-                json.dumps(pool, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
+            self._save_english_pool_unlocked(pool)

@@ -2184,6 +2184,104 @@ def _render_admin_panel() -> None:
                 elif del_note:
                     st.warning(del_note)
 
+    _render_english_pool_admin_section()
+
+
+def _render_english_pool_admin_section() -> None:
+    st.divider()
+    st.subheader("🔤 영어 변형 문제 풀(Pool) 캐시 관리")
+    st.caption(
+        "파이썬 검증을 통과한 영어 변형 문항은 `./exam_db/english_question_pool.json`에 "
+        "지문·유형·옵션 해시별로 최대 3개씩 저장되며 Google Drive 연동 시 자동 동기화됩니다."
+    )
+
+    pool = storage.load_english_pool()
+    total_keys = len(pool)
+    flat_entries: list[tuple[str, int, dict]] = []
+    type_counts: dict[str, int] = {}
+    for c_key, items in pool.items():
+        for idx, item in enumerate(items):
+            t_name = str(item.get("target_type") or "기타").strip() or "기타"
+            type_counts[t_name] = type_counts.get(t_name, 0) + 1
+            flat_entries.append((c_key, idx, item))
+
+    total_items = len(flat_entries)
+    c_m1, c_m2, c_m3 = st.columns(3)
+    c_m1.metric("캐시 키(지문×유형) 수", f"{total_keys}개")
+    c_m2.metric("저장된 변형 문항 수", f"{total_items}문항")
+    c_m3.metric("저장된 변형 유형 수", f"{len(type_counts)}종")
+
+    if type_counts:
+        summary_parts = [f"{k}({v})" for k, v in sorted(type_counts.items(), key=lambda kv: (-kv[1], kv[0]))]
+        st.caption("유형별 분포: " + " · ".join(summary_parts))
+
+    if total_items == 0:
+        st.info("현재 저장된 영어 변형 캐시 문항이 없습니다.")
+        return
+
+    col_clr1, col_clr2 = st.columns([2, 1])
+    with col_clr1:
+        confirm_clear = st.checkbox(
+            "영어 변형 캐시만 전체 비우기 확인 (기출 DB·회원 DB는 유지됨)",
+            key="admin_confirm_clear_eng_pool",
+        )
+    with col_clr2:
+        if st.button(
+            "🧹 영어 변형 캐시 전체 비우기",
+            disabled=not confirm_clear,
+            width="stretch",
+            key="admin_clear_eng_pool_btn",
+        ):
+            removed_cnt, drive_err = storage.clear_english_pool()
+            if drive_err:
+                st.warning(f"로컬 캐시 {removed_cnt}문항 삭제 완료 / {drive_err}")
+            else:
+                st.success(f"🧹 영어 변형 캐시 {removed_cnt}문항을 모두 비웠습니다.")
+            st.rerun()
+
+    with st.expander(f"📋 저장된 영어 변형 캐시 상세 조회 / 개별 삭제 ({total_items}문항)", expanded=False):
+        f_col1, f_col2 = st.columns([1, 2])
+        with f_col1:
+            type_options = ["전체"] + sorted(type_counts.keys())
+            sel_type = st.selectbox("유형 필터", options=type_options, key="admin_eng_pool_type_filter")
+        with f_col2:
+            pool_q = st.text_input(
+                "지문/해설/키 검색",
+                placeholder="키워드 또는 캐시 키 입력...",
+                key="admin_eng_pool_search",
+            ).strip().lower()
+
+        filtered_entries = [
+            (ck, idx, it)
+            for ck, idx, it in flat_entries
+            if (sel_type == "전체" or (it.get("target_type") or "기타").strip() == sel_type)
+            and (
+                not pool_q
+                or pool_q in ck.lower()
+                or pool_q in str(it.get("rewritten_stem") or "").lower()
+                or pool_q in str(it.get("pdf_grounded_explanation") or "").lower()
+            )
+        ]
+
+        st.caption(f"검색 결과: {len(filtered_entries)}문항 (최대 50건 표시)")
+        for ck, idx, it in filtered_entries[:50]:
+            t_label = str(it.get("target_type") or "기타")
+            ans_label = str(it.get("answer") or "-")
+            stem_preview = " ".join(str(it.get("rewritten_stem") or "").split())[:130]
+            r_col1, r_col2 = st.columns([5, 1])
+            with r_col1:
+                st.markdown(f"**[{t_label}]** · 키 `{ck}` (#{idx + 1}) · 정답 `{ans_label}`")
+                if stem_preview:
+                    st.caption(f"{stem_preview}...")
+            with r_col2:
+                if st.button("🗑️ 삭제", key=f"del_eng_pool_{ck}_{idx}", width="stretch"):
+                    removed, d_err = storage.delete_english_pool_entry(ck, idx)
+                    if d_err:
+                        st.warning(d_err)
+                    elif removed > 0:
+                        st.success(f"캐시 항목(`{ck}` #{idx + 1})을 삭제했습니다.")
+                    st.rerun()
+
 
 if current_user is None:
     st.info("👈 좌측 사이드바 상단의 **[로그인 / 회원가입]** 탭에서 로그인하시면 기출 수집·추출·문제 개조 기능을 이용하실 수 있습니다.")
