@@ -568,26 +568,25 @@ def normalize_exam_year(
     exam_title: str = "",
     month: str = "",
     grade: str = "",
-    current_year: int | None = None,
 ) -> str:
-    """PDF 첫 페이지 텍스트·파일명·AI 추출 회차명에서 실제 시행 연도를 표준화한다."""
+    """PDF 첫 페이지 텍스트·파일명·AI 추출 회차명에서 실제 시행 연도를 표준화한다.
+
+    규칙:
+    1. 고3 모의고사 중 '대학수학능력시험' 글자가 검출되면 연도에 -1
+    2. 혹은 고3이면서 6월 / 9월 / 수능일 경우 연도에 -1
+    3. 나머지는 연도 그대로 유지
+    """
     combined = " ".join(str(x).strip() for x in (text, exam_title, filename) if str(x or "").strip())
-    cur_yr = int(current_year) if current_year is not None else datetime.now().year
+    c_nospace = combined.replace(" ", "")
 
-    # 규칙 1: '(\d{4})\s*학년도' 표기가 있으면 무조건 year - 1 확정
-    hak_m = re.search(r"(20\d{2})\s*학년도", combined)
-    if hak_m:
-        yr = int(hak_m.group(1)) - 1
-        if yr > cur_yr:
-            yr -= 1
-        return str(yr)
-
-    # 기본 연도 후보 추출
+    # 기본 연도 추출
     base_year: int | None = None
     if raw_year and re.fullmatch(r"20\d{2}", str(raw_year).strip()):
         base_year = int(str(raw_year).strip())
     else:
-        ym = re.search(r"(20\d{2})\s*년", combined) or re.search(r"(?:^|[\s_\-.(])(20\d{2})(?:$|[\s_\-.)])", combined)
+        ym = re.search(r"(20\d{2})\s*(?:학년도|년)", combined) or re.search(
+            r"(?:^|[\s_\-.(])(20\d{2})(?:$|[\s_\-.)])", combined
+        )
         if ym:
             base_year = int(ym.group(1))
 
@@ -600,31 +599,24 @@ def normalize_exam_year(
         mm = re.search(r"(?:^|[\s_\-.(])(1[0-2]|[1-9])\s*월", combined)
         if mm:
             eff_month = f"{int(mm.group(1))}월"
-        elif "대학수학능력시험" in combined or "수능" in combined:
-            eff_month = "11월"
 
     eff_grade = re.sub(r"\s+", "", (grade or "").strip())
     if not eff_grade:
         gm = re.search(r"(고\s*[123])", combined)
         if gm:
             eff_grade = gm.group(1).replace(" ", "")
-        elif "대학수학능력시험" in combined or "모의평가" in combined or "수능" in combined:
+        elif "대학수학능력시험" in c_nospace or "모의평가" in c_nospace or "수능" in c_nospace:
             eff_grade = "고3"
 
-    # 규칙 2: '학년도' 글자가 누락되었더라도 고3 + 6/9/11월 + 모의평가/수능 키워드면 year - 1
-    is_hakpyeong = "전국연합학력평가" in combined or "학력평가" in combined
-    is_kice = ("모의평가" in combined or "대학수학능력시험" in combined or "수능" in combined) and not is_hakpyeong
-    if is_kice and eff_grade == "고3" and eff_month in ("6월", "9월", "11월"):
-        yr = base_year - 1
-    else:
-        # 규칙 3: 'YYYY년' 또는 학력평가 표기인 경우 연도 그대로 사용
-        yr = base_year
+    has_csat_full = "대학수학능력시험" in c_nospace
+    is_suneung = has_csat_full or "수능" in c_nospace
+    is_g3_target = eff_grade == "고3" and (
+        has_csat_full or eff_month in ("6월", "9월") or is_suneung
+    )
 
-    # 규칙 4: 미래 연도 안전장치
-    if yr > cur_yr:
-        yr -= 1
-
-    return str(yr)
+    if is_g3_target:
+        return str(base_year - 1)
+    return str(base_year)
 
 
 def normalize_exam_title_year(
@@ -634,7 +626,7 @@ def normalize_exam_title_year(
     filename: str = "",
     current_year: int | None = None,
 ) -> str:
-    """회차명 문자열 내 연도(예: 2027년 9월 고3...)를 실제 시행 연도로 보정한다."""
+    """회차명 문자열 내 연도(예: 2027학년도 / 미래 연도 2027년)를 실제 시행 연도로 보정한다."""
     title = re.sub(r"\s+", " ", (exam_title or "").strip())
     if not title:
         return ""
@@ -642,12 +634,15 @@ def normalize_exam_title_year(
     if not ym:
         return title
     raw_yr = ym.group(1)
+    cur_yr = int(current_year) if current_year is not None else datetime.now().year
+    # 이미 'YYYY년'으로 저장된 정상 과거/현재 연도는 재호출 시 중복 -1 되지 않도록 보존
+    if ym.group(2) == "년" and int(raw_yr) <= cur_yr and not text:
+        return title
     norm_yr = normalize_exam_year(
         raw_yr,
         text=text,
         filename=filename,
         exam_title=title,
-        current_year=current_year,
     )
     if not norm_yr:
         return title
