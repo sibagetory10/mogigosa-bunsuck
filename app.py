@@ -3300,55 +3300,47 @@ with tab2:
                     f"추출 페이지 구간: `{chosen_book.page_ranges_spec}`"
                 )
 
-                st.markdown("**✅ 출제 및 개조 기준으로 사용할 단원을 체크하세요:**")
-                sel_all_key = f"sel_all_units_{chosen_book.id}"
-
-                def _toggle_all_units(
-                    book_id: str = chosen_book.id,
-                    unit_count: int = len(chosen_book.units),
-                ) -> None:
-                    target_val = bool(st.session_state.get(f"sel_all_units_{book_id}", False))
-                    for idx_u in range(unit_count):
-                        st.session_state[f"unit_chk_{book_id}_{idx_u}"] = target_val
-
-                st.checkbox(
-                    "전체 단원 일괄 선택",
-                    value=False,
-                    key=sel_all_key,
-                    on_change=_toggle_all_units,
-                )
-                selected_units_list: list[ConceptUnit] = []
-                for u_i, unit_obj in enumerate(chosen_book.units):
-                    chk_key = f"unit_chk_{chosen_book.id}_{u_i}"
-                    if chk_key not in st.session_state:
-                        st.session_state[chk_key] = False
-                    checked = st.checkbox(
-                        f"{unit_obj.unit_name} ({unit_obj.page_range}) — 핵심개념 {len(unit_obj.core_concepts)}개 · 허용용어 {len(unit_obj.allowed_terms_and_units)}개",
-                        key=chk_key,
+                with st.form(key=f"tab2_unit_select_form_{chosen_book.id}"):
+                    st.markdown("**✅ 출제 및 개조 기준으로 사용할 단원을 체크한 뒤 아래 적용 버튼을 누르세요:**")
+                    select_all_units = st.checkbox(
+                        "전체 단원 일괄 선택 (체크 후 적용 시 전체 단원 반영)",
+                        value=False,
+                        key=f"sel_all_units_{chosen_book.id}",
                     )
-                    if checked:
-                        selected_units_list.append(unit_obj)
+                    selected_units_list: list[ConceptUnit] = []
+                    for u_i, unit_obj in enumerate(chosen_book.units):
+                        checked = st.checkbox(
+                            f"{unit_obj.unit_name} ({unit_obj.page_range}) — 핵심개념 {len(unit_obj.core_concepts)}개 · 허용용어 {len(unit_obj.allowed_terms_and_units)}개",
+                            value=False,
+                            key=f"unit_chk_{chosen_book.id}_{u_i}",
+                        )
+                        if checked:
+                            selected_units_list.append(unit_obj)
 
-                if st.button(
-                    "📚 선택한 단원으로 지식 화이트리스트 즉시 적용",
-                    type="primary",
-                    width="stretch",
-                    key="apply_shared_concept_units_btn",
-                ):
-                    if not selected_units_list:
+                    apply_units_btn = st.form_submit_button(
+                        "📚 선택한 단원으로 지식 화이트리스트 즉시 적용",
+                        type="primary",
+                        width="stretch",
+                    )
+
+                if apply_units_btn:
+                    effective_units = (
+                        list(chosen_book.units) if select_all_units else selected_units_list
+                    )
+                    if not effective_units:
                         st.error("최소 1개 이상의 단원을 체크해 주세요.")
                     else:
                         wl_from_db, ctx_text = build_whitelist_from_concept_units(
                             book_title=chosen_book.book_title,
                             subject=chosen_book.subject,
                             grade=chosen_book.grade,
-                            selected_units=selected_units_list,
+                            selected_units=effective_units,
                         )
                         unit_names_short = ", ".join(
-                            f"{u.unit_name}({u.page_range})" for u in selected_units_list[:3]
+                            f"{u.unit_name}({u.page_range})" for u in effective_units[:3]
                         )
-                        if len(selected_units_list) > 3:
-                            unit_names_short += f" 외 {len(selected_units_list) - 3}개 단원"
+                        if len(effective_units) > 3:
+                            unit_names_short += f" 외 {len(effective_units) - 3}개 단원"
                         st.session_state["concept_whitelist"] = wl_from_db
                         st.session_state["concept_sliced_text"] = ctx_text
                         st.session_state["concept_source_label"] = (
@@ -3357,7 +3349,7 @@ with tab2:
                         st.session_state["matched_items"] = []
                         st.session_state["generated_exam_pdf"] = None
                         st.success(
-                            f"✅ 공용 개념서 `{chosen_book.book_title}`의 {len(selected_units_list)}개 단원이 출제·개조 기준으로 적용되었습니다!"
+                            f"✅ 공용 개념서 `{chosen_book.book_title}`의 {len(effective_units)}개 단원이 출제·개조 기준으로 적용되었습니다!"
                         )
 
             with st.expander("➕ 새 개념서·교과서 PDF를 공용 DB에 바로 추가하기", expanded=not bool(shared_books)):
@@ -3546,20 +3538,19 @@ with tab2:
         st.session_state["active_rewrite_model"] = rewrite_model
 
         with st.container(border=True):
-            opt_c1, opt_c2, opt_c3 = st.columns(3)
-            with opt_c1:
-                filter_subject = st.selectbox("과목 필터", ["전체", "수학", "사회", "과학"], index=0)
-            with opt_c2:
-                filter_grade = st.selectbox("학년 수준 필터", ["전체", "고1 이하", "고2 이하"], index=0)
-            with opt_c3:
-                count_mode = st.radio("추출 문항 수", ["전체", "N문제 지정"], horizontal=True)
-                max_allowed_n = 100
-                default_n = 5
-                target_n = default_n
-                if count_mode == "N문제 지정":
+            with st.form("tab2_extract_options_form", border=False):
+                opt_c1, opt_c2, opt_c3 = st.columns(3)
+                with opt_c1:
+                    filter_subject = st.selectbox("과목 필터", ["전체", "수학", "사회", "과학"], index=0)
+                with opt_c2:
+                    filter_grade = st.selectbox("학년 수준 필터", ["전체", "고1 이하", "고2 이하"], index=0)
+                with opt_c3:
+                    count_mode = st.radio("추출 문항 수", ["전체", "N문제 지정"], horizontal=True)
+                    max_allowed_n = 100
+                    default_n = 5
                     target_n = int(
                         st.number_input(
-                            "지정 문항 수 (N)",
+                            "지정 문항 수 (N · 'N문제 지정' 선택 시 적용)",
                             min_value=1,
                             max_value=max_allowed_n,
                             value=default_n,
@@ -3567,17 +3558,22 @@ with tab2:
                         )
                     )
 
-            chk_c1, chk_c2 = st.columns(2)
-            with chk_c1:
-                only_single = st.checkbox("단일 개념 문항만 보기 (`is_single_concept`)", value=False)
-            with chk_c2:
-                auto_rewrite_mode = st.checkbox(
-                    "✨ 상위 과목 문제 자동 개조 모드 (PDF-Grounded Rewriter)",
-                    value=True,
-                    help="풀이 원리는 PDF로 해결되지만 범위 외 상위 용어(mol, 엔탈피, 한계효용 등)가 포함된 문항을 PDF 내부 용어만으로 자동 개조합니다.",
+                chk_c1, chk_c2 = st.columns(2)
+                with chk_c1:
+                    only_single = st.checkbox("단일 개념 문항만 보기 (`is_single_concept`)", value=False)
+                with chk_c2:
+                    auto_rewrite_mode = st.checkbox(
+                        "✨ 상위 과목 문제 자동 개조 모드 (PDF-Grounded Rewriter)",
+                        value=True,
+                        help="풀이 원리는 PDF로 해결되지만 범위 외 상위 용어(mol, 엔탈피, 한계효용 등)가 포함된 문항을 PDF 내부 용어만으로 자동 개조합니다.",
+                    )
+
+                run_extract_btn = st.form_submit_button(
+                    "🚀 기출 매칭 & 개념서 맞춤 문제 추출·개조 실행",
+                    type="primary",
                 )
 
-            if st.button("🚀 기출 매칭 & 개념서 맞춤 문제 추출·개조 실행", type="primary"):
+            if run_extract_btn:
                 db_list = storage.load_db()
                 match_api_key, match_key_label = resolve_active_gemini_api_key(
                     current_user, creds.gemini_api_key, model_name=match_model
@@ -3806,22 +3802,25 @@ with tab2:
                 )
             else:
                 with st.container(border=True):
-                    pdf_title = st.text_input(
-                        "시험지 제목",
-                        value="2022 개정 교육과정 개념서 맞춤형 기출 모의고사",
-                    )
-                    pa_c1, pa_c2 = st.columns(2)
-                    with pa_c1:
-                        layout_choice = st.radio(
-                            "시험지 레이아웃",
-                            options=["2단 모의고사 스타일", "1단 태블릿/인쇄 스타일"],
-                            horizontal=True,
+                    with st.form("tab2_mode_a_pdf_form", border=False):
+                        pdf_title = st.text_input(
+                            "시험지 제목",
+                            value="2022 개정 교육과정 개념서 맞춤형 기출 모의고사",
                         )
-                    with pa_c2:
-                        include_orig_fig = st.checkbox(
-                            "개조 문항 아래 참고용 원본 도표/이미지 함께 수록",
-                            value=True,
-                        )
+                        pa_c1, pa_c2 = st.columns(2)
+                        with pa_c1:
+                            layout_choice = st.radio(
+                                "시험지 레이아웃",
+                                options=["2단 모의고사 스타일", "1단 태블릿/인쇄 스타일"],
+                                horizontal=True,
+                            )
+                        with pa_c2:
+                            include_orig_fig = st.checkbox(
+                                "개조 문항 아래 참고용 원본 도표/이미지 함께 수록",
+                                value=True,
+                            )
+
+                        build_pdf_btn = st.form_submit_button("🛠️ 맞춤형 시험지 PDF 생성하기", type="primary")
 
                     items_sig = hashlib.sha256(
                         json.dumps(
@@ -3840,7 +3839,7 @@ with tab2:
                         ).encode("utf-8")
                     ).hexdigest()[:16]
 
-                    if st.button("🛠️ 맞춤형 시험지 PDF 생성하기", type="primary"):
+                    if build_pdf_btn:
                         with st.spinner("PDF 조판 및 뒷장 정답·해설 페이지 생성 중..."):
                             pdf_bytes = generate_custom_exam_pdf(
                                 items=matched_items,
