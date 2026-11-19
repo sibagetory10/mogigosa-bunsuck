@@ -3474,7 +3474,7 @@ with tab1:
                             if not raw_title:
                                 raw_title = os.path.splitext(prob_base)[0].replace("_", " ").strip()
                             norm_exam_name = re.sub(r"\s+", " ", raw_title)
-                            subj_cat = infer_subject_category(parsed_local.get("subject") or norm_exam_name)
+                            subj_cat = infer_subject_category(parsed_local.get("subject", ""), exam_title=norm_exam_name)
                             _append_batch_log(f"🏷️ 회차명: {norm_exam_name} ({subj_cat})")
 
                             norm_exam_id = _normalize_exam_identity(norm_exam_name)
@@ -3691,7 +3691,10 @@ with tab1:
                 st.session_state["meta_grade"] = parsed_local.get("grade", "")
                 st.session_state["meta_subject"] = parsed_local.get("subject", "")
                 st.session_state["meta_title"] = parsed_local.get("exam_title", "")
-                st.session_state["tab1_subject_cat"] = infer_subject_category(parsed_local.get("subject", ""))
+                st.session_state["tab1_subject_cat"] = infer_subject_category(
+                    parsed_local.get("subject", ""),
+                    exam_title=parsed_local.get("exam_title", "") or active_prob_name,
+                )
                 st.session_state["tab1_last_loaded_sig"] = file_sig
 
                 if ai_verified and parsed_local.get("exam_title"):
@@ -4253,6 +4256,7 @@ with tab1:
                                     st.rerun()
 
                         if retag_clicked and can_retag_exam:
+                            subj_cat = infer_subject_category("", exam_title=exam_name, default=subj_cat)
                             verified_key, verified_key_label = resolve_active_gemini_api_key(
                                 current_user, creds.gemini_api_key, force_server_key=True
                             )

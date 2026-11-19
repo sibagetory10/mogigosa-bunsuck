@@ -509,34 +509,53 @@ class MixedPdfClassificationOutput(BaseModel):
     items: list[MixedPdfRoleItem] = Field(default_factory=list)
 
 
-def infer_subject_category(subject: str) -> SubjectCategory:
-    """세부 과목명을 대분류('수학' | '사회' | '과학' | '영어')로 매핑한다."""
-    s = (subject or "").strip()
-    s_low = s.lower()
-    if "영어" in s or "english" in s_low:
-        return "영어"
-    if any(k in s for k in ("수학", "미적분", "기하", "확률", "통계", "대수")):
-        return "수학"
-    if any(k in s for k in ("과학", "물리", "화학", "생명", "지구")):
-        return "과학"
-    if any(
-        k in s
-        for k in (
-            "사회",
-            "한국사",
-            "역사",
-            "지리",
-            "윤리",
-            "사상",
-            "경제",
-            "정치",
-            "법",
-            "문화",
-            "사탐",
-        )
-    ):
+def infer_subject_category(
+    subject: str,
+    exam_title: str = "",
+    default: SubjectCategory = "과학",
+) -> SubjectCategory:
+    """세부 과목명 또는 시험지 제목을 대분류('수학' | '사회' | '과학' | '영어')로 매핑한다."""
+    combined = " ".join(f"{subject or ''} {exam_title or ''}".split()).strip()
+    if not combined:
+        return default
+    c_low = combined.lower()
+    c_nospace = combined.replace(" ", "")
+
+    # 1) 구체적인 과목명 최우선 매칭 (사회탐구 / 과학탐구 / 수학 / 영어)
+    social_exact = (
+        "세계사",
+        "동아시아사",
+        "한국지리",
+        "세계지리",
+        "생활과윤리",
+        "윤리와사상",
+        "경제",
+        "정치와법",
+        "사회·문화",
+        "사회문화",
+        "통합사회",
+        "한국사",
+    )
+    if any(k in c_nospace for k in social_exact):
         return "사회"
-    return "과학"
+
+    science_exact = ("물리학", "물리", "화학", "생명과학", "지구과학", "통합과학")
+    if any(k in c_nospace for k in science_exact):
+        return "과학"
+
+    if any(k in c_nospace for k in ("수학", "미적분", "기하", "확률과통계", "확률", "통계", "대수")):
+        return "수학"
+
+    if "영어" in c_nospace or "english" in c_low:
+        return "영어"
+
+    # 2) 포괄 키워드 매칭
+    if any(k in c_nospace for k in ("사회", "사탐", "역사", "지리", "윤리", "사상", "정치", "법", "문화")):
+        return "사회"
+    if any(k in c_nospace for k in ("과학", "과탐", "생명", "지구")):
+        return "과학"
+
+    return default
 
 
 TierType = Literal["FREE", "CUSTOM", "PRO", "ULTRA", "ADMIN"]
