@@ -3978,10 +3978,6 @@ def _resolve_tab2_english_rewrite_model(key_suffix: str = "eng") -> tuple[str, b
     """탭 2 영어 지문 변형 모델을 전 등급 동일하게 초경량 Gemini 3.5 Flash-Lite로 통일한다."""
     rw_model = EXAM_TAGGING_MODEL
     use_precision_mode = False
-    st.info(
-        "⚡ **탭 2 통일 모델**: **Gemini 3.5 Flash-Lite** "
-        "(`Thinking MINIMAL` · 1~2줄 핵심 정답 근거만 생성) — 전 등급 동일하게 초고속·최저 비용으로 실행됩니다."
-    )
     st.session_state["active_rewrite_model"] = rw_model
     st.session_state["active_eng_precision_mode"] = False
     return rw_model, use_precision_mode
@@ -4813,10 +4809,6 @@ with tab2:
         is_premium = can_use_premium_features(current_user)
         match_model = EXAM_TAGGING_MODEL
         rewrite_model = EXAM_TAGGING_MODEL
-        st.info(
-            "⚡ **탭 2 통일 모델**: **Gemini 3.5 Flash-Lite** — "
-            "전 등급 동일하게 기출 매칭 및 문제 개조에 초경량 모델을 사용합니다."
-        )
         st.session_state["active_rewrite_model"] = rewrite_model
         tab2_max_batch = get_max_batch_questions(current_user)
 
