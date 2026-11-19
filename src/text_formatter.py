@@ -157,7 +157,24 @@ def unicode_scripts_to_html_tags(escaped_html: str) -> str:
 
 
 def _unescape_newlines(text: str) -> str:
-    return re.sub(r"\\n(?![A-Za-z])", "\n", (text or "").replace("\r\n", "\n").replace("\r", "\n"))
+    # LaTeX 수식 명령(\neq, \nu, \nabla 등)은 보존하면서 리터럴 \n 이스케이프는 실제 줄바꿈으로 복원한다.
+    norm = (text or "").replace("\r\n", "\n").replace("\r", "\n").replace("\\r\\n", "\n")
+    return re.sub(
+        r"\\n(?!(?:eq|u|abla|atural|otin|ull|ewline|oindent)\b)(?!(?:e|i|ot)\b)",
+        "\n",
+        norm,
+    )
+
+
+def _unescape_newlines_english(text: str) -> str:
+    """영어 지문·발문용: 수식 명령 예외 없이 모든 리터럴 \\n / \\r\\n 문자열을 실제 줄바꿈으로 치환한다."""
+    return (
+        (text or "")
+        .replace("\r\n", "\n")
+        .replace("\r", "\n")
+        .replace("\\r\\n", "\n")
+        .replace("\\n", "\n")
+    )
 
 
 def normalize_exam_layout_text(text: str) -> str:
@@ -428,6 +445,7 @@ def render_english_inline_html(text: str) -> str:
     if not text:
         return ""
 
+    text = _unescape_newlines_english(text)
     u_segments: list[str] = []
 
     def _stash_u(m: re.Match[str]) -> str:
@@ -457,7 +475,7 @@ def normalize_english_exam_text(text: str) -> str:
     """영어 변형 문제 발문·지문의 한국어 발문 뒤 줄바꿈, [주어진 문장], [주어진 글], (A)/(B)/(C), [요약문] 줄바꿈을 정규화한다."""
     if not text:
         return ""
-    cleaned = _unescape_newlines(text).strip()
+    cleaned = _unescape_newlines_english(text).strip()
 
     # 첫 줄에서 한국어 발문(? 또는 ~시오.)과 영어 본문이 줄바꿈 없이 한 줄에 붙어 있는 경우 강제 줄바꿈 분리
     m_inst = _KOR_INST_PREFIX_SPLIT_RE.match(cleaned)

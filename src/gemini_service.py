@@ -2457,6 +2457,7 @@ def _build_english_transform_rule(
                 "문맥상 어휘 적절성 (선택형 (A)(B)(C))",
                 "- 한국어 발문: `(A), (B), (C)의 각 네모 안에서 문맥에 맞는 낱말로 가장 적절한 것은?`\n"
                 "- 지문 규칙: **기존 원문 지문 본문 안에 이미 존재하는** 문맥상 핵심 어휘 3곳을 골라 `(A) [word1 / word2]`, `(B) [word3 / word4]`, `(C) [word5 / word6]`(원문 단어와 자연스러운 반의어 쌍)으로 본문 안에 표시하세요. **지문 끝에 새 문장을 억지로 덧붙이거나 어색한 연어 조합(예: `severe encouragement`)을 새로 만들어 넣지 마세요.**\n"
+                "- **어법 오류 출제 절대 금지**: 동사 형태·수일치·시제·준동사 변형(예: `makes` vs `making`) 같은 문법 오류를 섞지 말고, **문법적 형태·품사는 100% 동일·올바르지만 의미가 반대인 어휘 쌍**으로만 출제하세요.\n"
                 "- 선택지(`rewritten_choices`): `\"(A) word1 — (B) word3 — (C) word5\"` 형식의 5개 영어 어휘 조합을 작성하세요.",
             )
         return (
@@ -2464,6 +2465,7 @@ def _build_english_transform_rule(
             "- 한국어 발문: `다음 글의 밑줄 친 부분 중, 문맥상 낱말의 쓰임이 적절하지 않은 것은?`\n"
             "- 지문 규칙: **기존 원문 지문 본문 안에 이미 있는** 논리·문맥상 핵심 어휘(동사·형용사·부사·명사) 5곳을 골라 `① <u>word1</u>` ~ `⑤ <u>word5</u>` 형식으로 본문 안에 표시하세요.\n"
             "- **본문 내 교체 우선 & 억지 추가 금지**: 지문 맨 끝에 새 문장을 억지로 덧붙이거나 비문맥적·어색한 연어 조합(예: `severe encouragement`)을 생성하지 마세요. 반드시 기존 본문 단어 5개 중 **정확히 1개(정답 번호)만** 문맥 흐름상 정반대 의미의 자연스러운 반의어로 교체하고, 나머지 4개는 원문 단어 그대로 유지하세요.\n"
+            "- **어법 오류 출제 절대 금지**: `makes` → `making`, `cause` → `causing`, 수일치·태 변형 같은 **문법적 오류는 절대 내지 마세요.** 정답 번호의 밑줄 어휘는 반드시 **문법적 형태·품사·수일치·태가 100% 올바르지만 의미만 문맥과 정반대인 반의어/오용 어휘**여야 합니다.\n"
             "- 선택지(`rewritten_choices`): 밑줄 친 5개 어휘 리스트(예: `[\"<u>word1</u>\", ...]`)를 순서대로 반환하세요.",
         )
     if "빈칸" in t:
@@ -2480,14 +2482,16 @@ def _build_english_transform_rule(
         return (
             f"빈칸 추론 ({short_u})",
             "- 한국어 발문: `다음 빈칸에 들어갈 말로 가장 적절한 것은?`\n"
-            f"- 지문 규칙: 지문의 주제문 또는 핵심 추론 구간을 골라 {unit_desc} 분량을 `___________`(언더스코어 10개)으로 비우세요. (기존에 다른 빈칸이나 ①~⑤ 표기가 있었다면 원문 문맥으로 복원한 뒤 새 빈칸 1개만 남기세요.)\n"
+            f"- 지문 규칙: 지문의 주제문 또는 핵심 추론 구간을 골라 {unit_desc} 분량을 `___________`(언더스코어 10개)으로 비우세요.\n"
+            "- **문장 삽입 기호 절대 금지**: 지문 본문에 문장 삽입용 번호 기호인 `( ① )`, `( ② )`, `( ③ )`, `( ④ )`, `( ⑤ )` 또는 `①`~`⑤`를 절대 넣지 마세요. 원문에 해당 기호나 다른 빈칸이 있었다면 모두 제거·복원한 뒤 새 빈칸 `___________` 1개만 남기세요.\n"
             f"- 선택지(`rewritten_choices`): 빈칸 단위에 정확히 맞고 문법적으로 호응하는 **영어 선지 5개**({unit_desc} 길이·품사 통일, 정답 1개 + 지문 키워드를 교묘히 비튼 매력적 오답 4개)를 작성하세요.",
         )
     if "무관" in t:
         return (
             "전체 흐름과 무관한 문장",
             "- 한국어 발문: `다음 글에서 전체 흐름과 관계없는 문장은?`\n"
-            "- 지문 규칙: 첫 1~2문장(주제 도입문) 뒤에 이어지는 본문 문장 5개 앞에 `①`, `②`, `③`, `④`, `⑤` 번호를 붙이세요. 그중 **정답 번호 1개 문장**만 지문의 중심 소재(단어)는 공유하되 글의 핵심 논지·방향에서 벗어난 무관한 영어 문장으로 작성(또는 교체)하세요.\n"
+            "- 지문 규칙: 첫 1~2문장(주제 도입문) 뒤에 이어지는 본문 문장들에 `①`, `②`, `③`, `④`, `⑤` 번호를 붙이세요.\n"
+            "- **원문 삭제 금지 & 무관한 새 문장 삽입 강제**: 원문 지문의 정상 문장들을 삭제한 뒤 정상 문장을 정답으로 우기지 마세요. 원문 본문 문장들은 그대로 보존하고, **정답 번호 1개 위치에는 원문의 중심 소재(단어)만 공유할 뿐 글의 핵심 논지·방향과 무관한 새로운 영어 문장 1개를 반드시 새로 작성해 삽입**하세요. 나머지 4개 번호의 문장은 모두 글의 흐름에 자연스럽게 이어지는 원문 문장이어야 합니다.\n"
             "- 선택지(`rewritten_choices`): `[\"①\", \"②\", \"③\", \"④\", \"⑤\"]` 5개를 반환하세요.",
         )
     if "순서" in t:
@@ -2559,6 +2563,15 @@ def _validate_english_transformed_output(
     elif "빈칸" in t:
         if "____" not in stem:
             issues.append("빈칸 추론 지문에는 `___________` 빈칸 표기가 반드시 포함되어야 합니다.")
+        if re.search(r"\(\s*[①②③④⑤]\s*\)|[①②③④⑤]", stem):
+            issues.append(
+                "빈칸 추론 지문에는 문장 삽입 번호 기호 `( ① )~( ⑤ )` 또는 `①~⑤`가 포함되면 안 됩니다. 모두 제거하세요."
+            )
+    elif "무관" in t:
+        for c_num in ("①", "②", "③", "④", "⑤"):
+            if c_num not in stem:
+                issues.append(f"무관한 문장 본문에 번호 `{c_num}`가 누락되었습니다.")
+                break
     elif "순서" in t:
         for mk in ("(A)", "(B)", "(C)"):
             if mk not in stem:
@@ -2703,6 +2716,10 @@ def generate_english_transformed_question(
 
     assert rw is not None
     rw.rewritten_stem = strip_english_embedded_choices(normalize_english_exam_text(rw.rewritten_stem))
+    if "빈칸" in canonical_type:
+        rw.rewritten_stem = re.sub(r"[ \t]*\(\s*[①②③④⑤]\s*\)[ \t]*", " ", rw.rewritten_stem)
+        rw.rewritten_stem = re.sub(r"[ \t]*[①②③④⑤][ \t]*", " ", rw.rewritten_stem)
+        rw.rewritten_stem = re.sub(r"[ \t]{2,}", " ", rw.rewritten_stem).strip()
     rw.pdf_grounded_explanation = format_explanation_text(rw.pdf_grounded_explanation)
     rw.preserved_answer = _normalize_extracted_answer(rw.preserved_answer) or "1"
     if len(rw.rewritten_choices) < 5:
