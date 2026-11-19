@@ -408,6 +408,9 @@ _ENG_GIVEN_TAG_RE = re.compile(
 _ENG_ORDER_INLINE_RE = re.compile(r"(?<=[.?!\"'”’\)])\s+(?=\([ABC]\)\s+(?!\[)[A-Za-z0-9\"'“‘])")
 _ENG_ORDER_LINE_RE = re.compile(r"^\(([ABC])\)\s+(?!\[)(.+)$")
 _ENG_FOOTNOTE_LINE_RE = re.compile(r"^\*{1,2}\s*[A-Za-z][A-Za-z\s\-']*:")
+_ENG_EMBEDDED_CHOICES_HDR_RE = re.compile(r"^[<\[\〈]\s*(?:선\s*지|선\s*택\s*지)\s*[>\]\〉]\s*$")
+_ENG_CHOICE_LINE_RE = re.compile(r"^[①②③④⑤]\s*(?:\(A\)|.+[—\-].+\(B\)|\S+)")
+_ENG_MD_TABLE_SEP_RE = re.compile(r"^\|[\s:\-\|]+\|$")
 _KOR_INSTRUCTION_RE = re.compile(
     r"(?:다음\s*글|다음\s*빈칸|주어진\s*(?:글|문장)|밑줄\s*친|빈칸에\s*들어갈|흐름으로\s*보아|흐름과\s*관계|요약하고자|가장\s*적절한\s*것은|어법상|문맥상|글의\s*(?:순서|요지|주제|제목))"
 )
@@ -574,6 +577,17 @@ def split_english_stem_blocks(text: str) -> list[tuple[str, Any]]:
             footnote_lines.append(ln)
             continue
 
+        # AI가 rewritten_stem 내부에 [선지] / [선택지] 블록이나 요약문 (A)-(B) 마크다운 표를 중복 삽입한 경우 본문에서 제거
+        if _ENG_EMBEDDED_CHOICES_HDR_RE.match(ln):
+            _flush()
+            break
+        if mode == "summary_box" and buf_lines and (
+            (ln.startswith("|") and ("(A)" in ln or "(B)" in ln or _ENG_MD_TABLE_SEP_RE.match(ln)))
+            or _ENG_CHOICE_LINE_RE.match(ln)
+        ):
+            _flush()
+            break
+
         if ln in ("[주어진 문장]", "[주어진 글]"):
             _flush()
             mode = "given_box"
@@ -607,3 +621,31 @@ def split_english_stem_blocks(text: str) -> list[tuple[str, Any]]:
     if footnote_lines:
         blocks.append(("footnote", "\n".join(footnote_lines)))
     return blocks
+
+
+def strip_english_embedded_choices(stem_text: str) -> str:
+    """rewritten_stem 끝에 AI가 중복 삽입한 [선지] 블록이나 요약문 (A)-(B) 선택지 목록을 제거한다."""
+    if not stem_text:
+        return ""
+    lines = normalize_english_exam_text(stem_text).split("\n")
+    out: list[str] = []
+    in_summary = False
+    for idx_l, raw_ln in enumerate(lines):
+        ln = raw_ln.strip()
+        if _ENG_EMBEDDED_CHOICES_HDR_RE.match(ln):
+            break
+        if ln == "[요약문]":
+            in_summary = True
+            out.append(raw_ln)
+            continue
+        if in_summary and ln.startswith("|") and ("(A)" in ln or "(B)" in ln or _ENG_MD_TABLE_SEP_RE.match(ln)):
+            break
+        if in_summary and _ENG_CHOICE_LINE_RE.match(ln):
+            break
+        # 본문 맨 끝에 ① ~ ⑤ 5개 선지가 통째로 붙어 나온 경우 제거
+        if ln.startswith("①") and idx_l + 4 < len(lines):
+            tail_syms = [lines[idx_l + k].strip()[:1] for k in range(5)]
+            if tail_syms == ["①", "②", "③", "④", "⑤"]:
+                break
+        out.append(raw_ln)
+    return "\n".join(out).strip()

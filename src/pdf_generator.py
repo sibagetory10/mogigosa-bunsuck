@@ -16,6 +16,7 @@ from src.text_formatter import (
     render_english_inline_html,
     split_english_stem_blocks,
     split_stem_blocks,
+    strip_english_embedded_choices,
     unicode_scripts_to_html_tags,
 )
 
@@ -342,7 +343,7 @@ def _extract_short_page_ref(concept_ref: str) -> str:
 
 
 def _build_english_stem_blocks_html(stem_text: str) -> str:
-    blocks = split_english_stem_blocks(stem_text)
+    blocks = split_english_stem_blocks(strip_english_embedded_choices(stem_text))
     parts: list[str] = []
     for kind, content in blocks:
         if kind == "instruction":
