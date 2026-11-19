@@ -5,6 +5,7 @@ import hashlib
 import html as _html
 import json
 import os
+import random
 import re
 import time
 from datetime import datetime
@@ -5073,6 +5074,35 @@ with tab2:
 
     if matched_items:
         st.markdown("---")
+        if len(matched_items) >= 2:
+            shuf_c1, shuf_c2, shuf_c3 = st.columns([1.15, 1.05, 2.3])
+            with shuf_c1:
+                if st.button("🔀 문항 순서 섞기", key="tab2_shuffle_matched_items", width="stretch"):
+                    shuffled_items = list(matched_items)
+                    random.shuffle(shuffled_items)
+                    st.session_state["matched_items"] = shuffled_items
+                    st.session_state["generated_exam_pdf"] = None
+                    st.session_state["generated_exam_pdf_sig"] = ""
+                    st.rerun()
+            with shuf_c2:
+                if st.button("🔢 번호순 정렬", key="tab2_sort_matched_items", width="stretch"):
+                    sorted_items = sorted(
+                        matched_items,
+                        key=lambda it: (it["question"].exam_name, it["question"].q_num, it["question"].id),
+                    )
+                    st.session_state["matched_items"] = sorted_items
+                    st.session_state["generated_exam_pdf"] = None
+                    st.session_state["generated_exam_pdf_sig"] = ""
+                    st.rerun()
+            with shuf_c3:
+                order_preview = " → ".join(
+                    f"{idx_o}. {getattr(it.get('rewritten'), 'target_question_type', '') or it['question'].unit_name}({it['question'].q_num}번)"
+                    for idx_o, it in enumerate(matched_items[:6], start=1)
+                )
+                if len(matched_items) > 6:
+                    order_preview += f" … (총 {len(matched_items)}문항)"
+                st.caption(f"📋 현재 출제 순서: {order_preview}")
+
         mode_tab_a, mode_tab_b = st.tabs(
             [
                 "📄 모드 A: 맞춤형 시험지 PDF 생성 & 다운로드",
