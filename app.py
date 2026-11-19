@@ -48,7 +48,6 @@ from src.config import (
     EXAM_NO_ANSWER_SOLVER_MODEL,
     EXAM_TAGGING_MODEL,
     MODEL_LABELS,
-    REWRITE_MODEL,
     resolve_credentials,
 )
 from src.curriculum_2022 import (
@@ -1684,8 +1683,6 @@ def _render_mode_b_solve_fragment(
             unsafe_allow_html=True,
         )
 
-    eff_rewrite_model = rewrite_model or st.session_state.get("active_rewrite_model") or selected_model
-
     for seq_num, item in enumerate(matched_items, start=1):
         q = item["question"]
         j = item["judgment"]
@@ -1915,13 +1912,8 @@ def _render_mode_b_solve_fragment(
                             or getattr(q, "passage_text", "")
                             or getattr(q, "question_text", "")
                         )
-                        eng_rw_model = _gate_regen_model(eng_meta.get("rewrite_model") or eff_rewrite_model)
-                        eng_precision = bool(
-                            eng_meta.get(
-                                "use_precision_mode",
-                                st.session_state.get("active_eng_precision_mode", False),
-                            )
-                        ) and is_premium_model(eng_rw_model)
+                        eng_rw_model = EXAM_TAGGING_MODEL
+                        eng_precision = False
                         eng_rw_key, eng_rw_key_lbl = resolve_active_gemini_api_key(
                             current_user,
                             creds.gemini_api_key,
@@ -1961,7 +1953,7 @@ def _render_mode_b_solve_fragment(
                                     or getattr(q, "advanced_terms", [])
                                     or []
                                 )
-                                math_rw_model = _gate_regen_model(eff_rewrite_model)
+                                math_rw_model = EXAM_TAGGING_MODEL
                                 new_rw = rewrite_question_for_pdf(
                                     api_key=active_gemini_key,
                                     model_name=math_rw_model,
@@ -3983,71 +3975,16 @@ with tab1:
 # TAB 2: 개념서·교과서 PDF 분석 (수학·사회·과학) & 영어 지문 수능형 변형 엔진
 # ===========================================================================
 def _resolve_tab2_english_rewrite_model(key_suffix: str = "eng") -> tuple[str, bool]:
-    """탭 2 영어 지문 변형 기본 모델을 초경량 Flash-Lite로 고정하고, 정밀 모드 체크 시에만 상위 모델을 배정한다."""
-    use_precision_req = st.checkbox(
-        "고난도 정밀 생성 (상위 모델 사용 · 크레딧 소모 큼)",
-        value=False,
-        key=f"tab2_eng_precision_mode_{key_suffix}",
-        help=(
-            "기본값(체크 해제)에서는 관리자/PRO 등급을 포함한 전 등급이 단가가 가장 저렴한 "
-            "Gemini 3.5 Flash-Lite(Thinking MINIMAL)를 사용합니다. 체크 시에만 상위 모델(Thinking LOW)을 사용합니다."
-        ),
+    """탭 2 영어 지문 변형 모델을 전 등급 동일하게 초경량 Gemini 3.5 Flash-Lite로 통일한다."""
+    rw_model = EXAM_TAGGING_MODEL
+    use_precision_mode = False
+    st.info(
+        "⚡ **탭 2 통일 모델**: **Gemini 3.5 Flash-Lite** "
+        "(`Thinking MINIMAL` · 1~2줄 핵심 정답 근거만 생성) — 전 등급 동일하게 초고속·최저 비용으로 실행됩니다."
     )
-
-    if not use_precision_req:
-        rw_model = EXAM_TAGGING_MODEL
-        use_precision_mode = False
-        st.info(
-            "⚡ **비용 절감 기본 모드**: **Gemini 3.5 Flash-Lite** "
-            "(`Thinking MINIMAL` · 1~2줄 핵심 정답 근거만 생성) — 전 등급 동일하게 토큰·크레딧 소모를 최소화합니다."
-        )
-    elif current_user.tier == "FREE":
-        free_credits = int(getattr(current_user, "premium_unlock_credits", 0) or 0)
-        free_uploads = int(getattr(current_user, "uploaded_exam_count", 0) or 0)
-        if free_credits > 0:
-            rw_model = REWRITE_MODEL
-            use_precision_mode = True
-            st.warning(
-                f"🔓 **무료 회원 (FREE)** · 고난도 정밀 생성 활성화: **{MODEL_LABELS.get(rw_model, rw_model)}** "
-                f"(`Thinking LOW` 제한 · 실행 시 해금 크레딧 1회 차감 · 남은 크레딧 {free_credits}회)"
-            )
-        else:
-            rw_model = EXAM_TAGGING_MODEL
-            use_precision_mode = False
-            prog_mod = free_uploads % FREE_EXAMS_PER_UNLOCK
-            st.warning(
-                f"⚠️ **해금 크레딧 부족 (0회)**: 기출 PDF {FREE_EXAMS_PER_UNLOCK}회 업로드마다 상위 모델 1회가 해금됩니다 "
-                f"(현재 {prog_mod}/{FREE_EXAMS_PER_UNLOCK}회). **Gemini 3.5 Flash-Lite** 기본 모드로 실행합니다."
-            )
-    else:
-        fresh_user = get_user_by_username(storage, current_user.username) or current_user
-        rw_model, rw_notice = resolve_model_for_user(fresh_user, REWRITE_MODEL)
-        use_precision_mode = "flash-lite" not in rw_model.lower()
-        pro_rem_weekly = get_remaining_pro_weekly_quota(fresh_user)
-        weekly_cap = get_weekly_premium_limit(fresh_user)
-        if fresh_user.tier in ("PRO", "ULTRA"):
-            if (pro_rem_weekly or 0) <= 0:
-                rw_model = EXAM_TAGGING_MODEL
-                use_precision_mode = False
-                st.warning(
-                    f"⚠️ **{fresh_user.tier} 주간 고급 모델 한도({weekly_cap}문항)를 모두 소진**하여 "
-                    "**Gemini 3.5 Flash-Lite** 기본 모드로 자동 전환됩니다."
-                )
-            else:
-                st.warning(
-                    f"💎 **{TIER_LABELS.get(fresh_user.tier, fresh_user.tier)}** · 고난도 정밀 생성 활성화: **{MODEL_LABELS.get(rw_model, rw_model)}** "
-                    f"(`Thinking LOW` 제한 · 주간 고급 모델 남은 문항: **{pro_rem_weekly} / {weekly_cap}문항**)"
-                    + (f" — {rw_notice}" if rw_notice else "")
-                )
-        else:
-            st.warning(
-                f"🔥 **고난도 정밀 생성 활성화 ({TIER_LABELS.get(current_user.tier, current_user.tier)})** · "
-                f"**{MODEL_LABELS.get(rw_model, rw_model)}** (`Thinking LOW` 제한 · 상위 모델 과금/크레딧 소모가 큽니다)"
-            )
-
     st.session_state["active_rewrite_model"] = rw_model
-    st.session_state["active_eng_precision_mode"] = bool(use_precision_mode)
-    return rw_model, bool(use_precision_mode)
+    st.session_state["active_eng_precision_mode"] = False
+    return rw_model, use_precision_mode
 
 
 def _execute_english_transform_jobs(
@@ -4874,41 +4811,12 @@ with tab2:
         st.subheader("2️⃣~3️⃣ 엄격한 범위 내 기출 매칭 & 상위 문제 자동 개조")
 
         is_premium = can_use_premium_features(current_user)
-        pro_rem_weekly = get_remaining_pro_weekly_quota(current_user)
-        if current_user.tier == "FREE":
-            free_credits = int(getattr(current_user, "premium_unlock_credits", 0) or 0)
-            free_uploads = int(getattr(current_user, "uploaded_exam_count", 0) or 0)
-            use_unlocked_premium = False
-            if free_credits > 0:
-                use_unlocked_premium = st.checkbox(
-                    f"🔓 해금 크레딧 1회 사용해 PRO/ULTRA/ADMIN 전용 모델(상위 개조: {MODEL_LABELS.get(REWRITE_MODEL, REWRITE_MODEL)})로 실행 (보유: {free_credits}회)",
-                    value=False,
-                    key="tab2_free_use_unlock_credit",
-                )
-            if use_unlocked_premium:
-                match_model = EXAM_TAGGING_MODEL
-                rewrite_model = REWRITE_MODEL
-                st.info(
-                    f"🔓 **무료 회원 (FREE)** · 해금 크레딧 사용: 상위 문제 개조 **{MODEL_LABELS.get(rewrite_model, rewrite_model)}** "
-                    f"(실행 시 크레딧 1회 차감 · 남은 크레딧 {free_credits}회)"
-                )
-            else:
-                match_model = EXAM_TAGGING_MODEL
-                rewrite_model = EXAM_TAGGING_MODEL
-                prog_mod = free_uploads % FREE_EXAMS_PER_UNLOCK
-                st.info(
-                    f"🆓 **무료 회원 (FREE)** · **Gemini 3.5 Flash-Lite**로 추론 실행 "
-                    f"(기출 PDF {FREE_EXAMS_PER_UNLOCK}회 업로드마다 PRO/ULTRA/ADMIN 전용 모델 1회 해금 · 현재 {prog_mod}/{FREE_EXAMS_PER_UNLOCK}회)"
-                )
-        else:
-            match_model = EXAM_TAGGING_MODEL
-            rewrite_model, rewrite_notice = resolve_model_for_user(current_user, REWRITE_MODEL)
-            if current_user.tier in ("PRO", "ULTRA"):
-                st.info(
-                    f"💎 **{TIER_LABELS.get(current_user.tier, current_user.tier)}** · 상위 문제 개조 모델: **{MODEL_LABELS.get(rewrite_model, rewrite_model)}** "
-                    f"(주간 고급 모델 남은 문항: **{pro_rem_weekly} / {get_weekly_premium_limit(current_user)}문항**)"
-                    + (f" — {rewrite_notice}" if rewrite_notice else "")
-                )
+        match_model = EXAM_TAGGING_MODEL
+        rewrite_model = EXAM_TAGGING_MODEL
+        st.info(
+            "⚡ **탭 2 통일 모델**: **Gemini 3.5 Flash-Lite** — "
+            "전 등급 동일하게 기출 매칭 및 문제 개조에 초경량 모델을 사용합니다."
+        )
         st.session_state["active_rewrite_model"] = rewrite_model
         tab2_max_batch = get_max_batch_questions(current_user)
 
