@@ -4221,6 +4221,7 @@ with tab1:
                 for subj_cat, exam_name in matched_keys:
                     exam_recs = sorted(exam_groups[(subj_cat, exam_name)], key=lambda r: r.q_num)
                     safe_fn_prefix = sanitize_id_part(exam_name)
+                    exam_uid = f"{safe_fn_prefix}_{hashlib.sha1(f'{subj_cat}||{exam_name}'.encode('utf-8')).hexdigest()[:8]}"
 
                     with st.container(border=True):
                         retag_clicked = False
@@ -4236,14 +4237,14 @@ with tab1:
                             with head_col2:
                                 retag_clicked = st.button(
                                     "🔄 다시 태깅",
-                                    key=f"retag_exam_search_{subj_cat}_{safe_fn_prefix}",
+                                    key=f"retag_exam_search_{subj_cat}_{exam_uid}",
                                     width="stretch",
                                     help="PRO · ULTRA · ADMIN 전용 — 현재 2022 개정 기준표와 공용 개념서 DB 기준으로 이 회차 전체 문항을 다시 태깅합니다.",
                                 )
                             with head_col3:
                                 if st.button(
                                     "🗑️ 회차 삭제",
-                                    key=f"del_exam_search_{subj_cat}_{safe_fn_prefix}",
+                                    key=f"del_exam_search_{subj_cat}_{exam_uid}",
                                     width="stretch",
                                 ):
                                     cnt = storage.delete_exam(exam_name)
@@ -4261,7 +4262,7 @@ with tab1:
                             with head_col2:
                                 if st.button(
                                     "🗑️ 회차 삭제",
-                                    key=f"del_exam_search_{subj_cat}_{safe_fn_prefix}",
+                                    key=f"del_exam_search_{subj_cat}_{exam_uid}",
                                     width="stretch",
                                 ):
                                     cnt = storage.delete_exam(exam_name)
@@ -4276,11 +4277,11 @@ with tab1:
                                     edited_exam_name = st.text_input(
                                         "새 회차명",
                                         value=normalize_exam_title_year(exam_name),
-                                        key=f"rename_input_{subj_cat}_{safe_fn_prefix}",
+                                        key=f"rename_input_{subj_cat}_{exam_uid}",
                                         label_visibility="collapsed",
                                     )
                                 with rn_c2:
-                                    if st.button("💾 회차명 저장", key=f"rename_btn_{subj_cat}_{safe_fn_prefix}", width="stretch"):
+                                    if st.button("💾 회차명 저장", key=f"rename_btn_{subj_cat}_{exam_uid}", width="stretch"):
                                         new_en = re.sub(r"\s+", " ", (edited_exam_name or "").strip())
                                         if new_en and new_en != exam_name:
                                             rn_cnt = storage.rename_exam(exam_name, new_en)
@@ -4449,7 +4450,7 @@ with tab1:
                                 data=html_bytes,
                                 file_name=f"{safe_fn_prefix}_기출정리.html",
                                 mime="text/html",
-                                key=f"dl_html_search_{subj_cat}_{safe_fn_prefix}",
+                                key=f"dl_html_search_{subj_cat}_{exam_uid}",
                                 width="stretch",
                             )
                         with dl_c2:
@@ -4458,7 +4459,7 @@ with tab1:
                                 data=md_bytes,
                                 file_name=f"{safe_fn_prefix}_기출정리.md",
                                 mime="text/markdown",
-                                key=f"dl_md_search_{subj_cat}_{safe_fn_prefix}",
+                                key=f"dl_md_search_{subj_cat}_{exam_uid}",
                                 width="stretch",
                             )
                         with dl_c3:
@@ -4467,7 +4468,7 @@ with tab1:
                                 data=ai_jsonl_bytes,
                                 file_name=f"{safe_fn_prefix}_ai_index.jsonl",
                                 mime="application/x-ndjson",
-                                key=f"dl_jsonl_search_{subj_cat}_{safe_fn_prefix}",
+                                key=f"dl_jsonl_search_{subj_cat}_{exam_uid}",
                                 width="stretch",
                             )
                         with dl_c4:
@@ -4476,7 +4477,7 @@ with tab1:
                                 data=json_bytes,
                                 file_name=f"{safe_fn_prefix}_문제목록.json",
                                 mime="application/json",
-                                key=f"dl_json_search_{subj_cat}_{safe_fn_prefix}",
+                                key=f"dl_json_search_{subj_cat}_{exam_uid}",
                                 width="stretch",
                             )
 
@@ -4494,7 +4495,7 @@ with tab1:
                                     data=prob_bytes,
                                     file_name=prob_pdf_name,
                                     mime="application/pdf",
-                                    key=f"dl_prob_search_{subj_cat}_{safe_fn_prefix}",
+                                    key=f"dl_prob_search_{subj_cat}_{exam_uid}",
                                     width="stretch",
                                 )
                         with dl_c6:
@@ -4509,7 +4510,7 @@ with tab1:
                                     data=ans_bytes,
                                     file_name=ans_pdf_name,
                                     mime="application/pdf",
-                                    key=f"dl_ans_search_{subj_cat}_{safe_fn_prefix}",
+                                    key=f"dl_ans_search_{subj_cat}_{exam_uid}",
                                     width="stretch",
                                 )
 
