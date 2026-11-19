@@ -293,9 +293,21 @@ def _build_400_recovery_configs(
                 _with_thinking_config(t_target, types.ThinkingConfig(thinking_budget=256))
             )
         elif base_cfg is not None:
+            cur_level = getattr(getattr(base_cfg, "thinking_config", None), "thinking_level", None)
+            if cur_level == types.ThinkingLevel.HIGH:
+                recovery_configs.append(
+                    base_cfg.model_copy(
+                        update={
+                            "thinking_config": types.ThinkingConfig(
+                                thinking_level=types.ThinkingLevel.MEDIUM,
+                                include_thoughts=False,
+                            )
+                        }
+                    )
+                )
             recovery_configs.append(
                 base_cfg.model_copy(
-                    update={"thinking_config": types.ThinkingConfig(thinking_budget=1024)}
+                    update={"thinking_config": types.ThinkingConfig(thinking_budget=2048)}
                 )
             )
             recovery_configs.append(base_cfg.model_copy(update={"thinking_config": None}))
@@ -540,7 +552,7 @@ def analyze_question_with_gemini(
 
     client = _build_client(
         api_key,
-        timeout_seconds=60 if is_self_solve else DEFAULT_API_TIMEOUT_SECONDS,
+        timeout_seconds=120 if is_self_solve else DEFAULT_API_TIMEOUT_SECONDS,
     )
     max_img_w = 1400 if is_self_solve else MAX_VISION_IMAGE_WIDTH
     if status_callback is not None:
@@ -557,7 +569,9 @@ def analyze_question_with_gemini(
     if is_self_solve:
         rule_5 = (
             "5) [직접 풀이·검산 및 최종 정답(`official_explanation` → `answer`)]: 해설지가 첨부되지 않았습니다. 절대 답을 찍거나 어림짐작하지 말고 다음 절차를 반드시 지키세요.\n"
-            "   - 먼저 `official_explanation`에 첨부된 고해상도 문항 이미지(및 참고 텍스트) 속 모든 수치·조건·단위·그래프 축·표·`<보기>`(ㄱ, ㄴ, ㄷ 각각의 참/거짓 판정 포함)를 순서대로 직접 풀고 역산·검산한 풀이 과정을 작성하세요.\n"
+            "   - 먼저 `official_explanation`에 첨부된 고해상도 문항 이미지(및 참고 텍스트) 속 모든 수치·조건·단위·그래프 축·표·`<보기>`를 순서대로 직접 풀고 검증 과정을 작성하세요.\n"
+            "   - 고난도 킬러 문항 오답 방지를 위해 ① 경우의 수/구간 나누기 누락 여부, ② 등호·경계값 및 자연수·정수·정의역 조건(무연근 배제), "
+            "③ `<보기>` ㄱ·ㄴ·ㄷ 각각의 반례 존재 여부, ④ 구한 해의 원본 조건 대입 역산 검산까지 마친 뒤 `official_explanation`을 완결하세요.\n"
             "   - 객관식(`①`~`⑤`)은 계산 결과 또는 참인 `<보기>` 조합을 이미지 속 실제 선지 ①~⑤와 1:1 대조하여 일치하는 선지 번호를 확인한 뒤, `answer`에는 선지 내용·수치가 아닌 선지 번호 숫자 `'1'`~`'5'` 중 하나만 기록하세요.\n"
             "   - 선지 ①~⑤가 없는 주관식/단답형만 최종 계산값/정답을 `answer`에 정확히 기록하세요."
         )
@@ -619,7 +633,7 @@ def analyze_question_with_gemini(
             temperature=0.0,
             media_resolution=types.MediaResolution.MEDIA_RESOLUTION_HIGH,
             thinking_config=types.ThinkingConfig(
-                thinking_level=types.ThinkingLevel.MEDIUM,
+                thinking_level=types.ThinkingLevel.HIGH,
                 include_thoughts=False,
             ),
         )
@@ -673,7 +687,16 @@ def analyze_exam_pdf_batch_with_gemini(
     if not ordered_q:
         return {}
 
-    client = _build_client(api_key, timeout_seconds=120)
+    snippets_map = answer_snippets or {}
+    snippet_lines: list[str] = []
+    for q in ordered_q:
+        sn = (snippets_map.get(q) or "").strip()
+        if sn:
+            snippet_lines.append(f"[{q}번 해설 발췌] {sn[:500]}")
+
+    has_answer_ref = bool(snippet_lines or answer_pdf_part is not None)
+    use_high_solver = (not has_answer_ref) and (not _is_flash_lite_model(model_name))
+    client = _build_client(api_key, timeout_seconds=180 if use_high_solver else 120)
     if status_callback is not None:
         status_callback(f"📄 전체 모의고사 PDF({len(ordered_q)}문항) 일괄 분석 준비 중...")
 
@@ -689,14 +712,6 @@ def analyze_exam_pdf_batch_with_gemini(
         concept_books=concept_books,
     )
 
-    snippets_map = answer_snippets or {}
-    snippet_lines: list[str] = []
-    for q in ordered_q:
-        sn = (snippets_map.get(q) or "").strip()
-        if sn:
-            snippet_lines.append(f"[{q}번 해설 발췌] {sn[:500]}")
-
-    has_answer_ref = bool(snippet_lines or answer_pdf_part is not None)
     ans_rule_line = (
         "- official_explanation / answer: 해설지 기준 핵심 풀이를 official_explanation에 먼저 요약하고, "
         "answer에 공식 정답(객관식 '1'~'5' 단일 숫자, 주관식은 값)을 기록\n"
@@ -741,17 +756,33 @@ def analyze_exam_pdf_batch_with_gemini(
     if status_callback is not None:
         status_callback(f"⚡ {model_name} 모델로 전체 PDF({len(ordered_q)}문항) 2022 기준 일괄 태깅 중...")
 
-    resp = _generate_content_with_fallback(
-        client=client,
-        model_name=model_name,
-        contents=contents,
-        config=types.GenerateContentConfig(
+    if use_high_solver:
+        batch_config = types.GenerateContentConfig(
+            system_instruction=system_inst,
+            response_mime_type="application/json",
+            response_schema=BatchExamExtractionOutput,
+            temperature=0.0,
+            max_output_tokens=32768,
+            media_resolution=types.MediaResolution.MEDIA_RESOLUTION_HIGH,
+            thinking_config=types.ThinkingConfig(
+                thinking_level=types.ThinkingLevel.HIGH,
+                include_thoughts=False,
+            ),
+        )
+    else:
+        batch_config = types.GenerateContentConfig(
             system_instruction=system_inst,
             response_mime_type="application/json",
             response_schema=BatchExamExtractionOutput,
             temperature=0.1 if has_answer_ref else 0.0,
             max_output_tokens=32768,
-        ),
+        )
+
+    resp = _generate_content_with_fallback(
+        client=client,
+        model_name=model_name,
+        contents=contents,
+        config=batch_config,
         fast_mode=has_answer_ref,
         status_callback=status_callback,
     )

@@ -708,7 +708,7 @@ def _tag_and_save_single_exam(
             except Exception as exc:
                 _log(f"⚠️ 이미지 없는 문항 배치 풀이 경고: {exc}")
         _log(
-            f"🧠 해설지 미첨부 감지 → 정답 정확도를 위해 {solver_model_label} 문항별 고해상도 직접 풀이·검산 모드 실행 ({len(target_crops)}문항)"
+            f"🧠 해설지 미첨부 감지 → 정답 정확도를 위해 {solver_model_label} · HIGH 추론 · 문항별 고해상도 직접 풀이·검산 모드 실행 ({len(target_crops)}문항)"
         )
         _prog(0.10)
 
@@ -717,7 +717,7 @@ def _tag_and_save_single_exam(
         if has_answer_sheet:
             _status(f"🔁 누락된 {len(missing_crops)}개 문항 보완 태깅 중 ({tagging_model_label})...")
         else:
-            _status(f"🧠 {solver_model_label} 문항별 고해상도 직접 풀이·검산 중 ({len(missing_crops)}문항)...")
+            _status(f"🧠 {solver_model_label} · HIGH 추론 · 문항별 고해상도 직접 풀이·검산 중 ({len(missing_crops)}문항)...")
 
         def _analyze_worker(cq_item: CroppedQuestion) -> tuple[CroppedQuestion, Any, float, bool]:
             t_start = time.perf_counter()
