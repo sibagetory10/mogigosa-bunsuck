@@ -854,6 +854,14 @@ def parse_exam_pdf(pdf_bytes: bytes, dpi: int = 250) -> tuple[list[CroppedQuesti
                             "q_num": q_num,
                             "y_start": start_y,
                             "anchor_y": ln["y0"],
+                            "passage_group": (
+                                dict(active_passage_group)
+                                if (
+                                    active_passage_group is not None
+                                    and active_passage_group["start_q"] <= q_num <= active_passage_group["end_q"]
+                                )
+                                else None
+                            ),
                         }
                     )
                     seen_q_nums.add(q_num)
@@ -862,48 +870,37 @@ def parse_exam_pdf(pdf_bytes: bytes, dpi: int = 250) -> tuple[list[CroppedQuesti
                     page, page_dict, col_x0, col_x1, page_h
                 )
 
-                # 현재 단에 [N~M] 지문만 있고 문항이 없다면(또는 마지막 문항 아래에 새 지문이 있다면) 다음 단으로 이월
+                # 직전 단에서 이월된 세트 지문(예: [43~45] (A))이 현재 단 상단에서 (B)(C)(D) 등으로 이어진 뒤 첫 문항(43.)이 나오는 경우,
+                # 첫 문항 위의 이어지는 지문 영역과 텍스트를 첫 문항 및 공통 지문에 자동 병합한다.
                 if (
-                    pending_passage_y0 is not None
-                    and pending_passage_start_q is not None
-                    and pending_passage_end_q is not None
+                    markers
+                    and carried_passage is not None
+                    and carried_passage["start_q"] <= markers[0]["q_num"] <= carried_passage["end_q"]
                 ):
-                    p_bottom = 0.93 * page_h
-                    p_boxes = [
-                        b
-                        for b in content_boxes
-                        if b[3] > pending_passage_y0 - 4.0 and b[1] < p_bottom
+                    first_m = markers[0]
+                    cont_lines = [
+                        ln
+                        for ln in lines
+                        if 0.05 * page_h <= ln["y0"] < first_m["y_start"] - 1.0
+                        and not _is_footer_or_header_noise(ln["text"], ln["y0"], page_h)
                     ]
-                    if p_boxes:
-                        p_clip = pymupdf.Rect(
-                            max(col_x0 + 2.0, min(b[0] for b in p_boxes) - 10.0),
-                            max(8.0, min(pending_passage_y0, min(b[1] for b in p_boxes)) - 6.0),
-                            min(col_x1 - 2.0, max(b[2] for b in p_boxes) + 10.0),
-                            min(0.935 * page_h, max(b[3] for b in p_boxes) + 10.0),
-                        )
-                        p_pix = page.get_pixmap(dpi=effective_dpi, clip=p_clip, alpha=False)
-                        p_txt = "\n".join(
-                            ln["text"]
-                            for ln in lines
-                            if ln["y1"] >= p_clip.y0 and ln["y0"] <= p_clip.y1
-                        )
-                        grp_str = f"{pending_passage_start_q}~{pending_passage_end_q}"
-                        carried_passage = {
-                            "start_q": pending_passage_start_q,
-                            "end_q": pending_passage_end_q,
-                            "group_id": grp_str,
-                            "png_bytes": p_pix.tobytes("png"),
-                            "text": p_txt,
-                        }
-                        active_passage_group = {
-                            "start_q": pending_passage_start_q,
-                            "end_q": pending_passage_end_q,
-                            "group_id": grp_str,
-                            "text": p_txt,
-                        }
-
-                if not markers:
-                    continue
+                    if cont_lines:
+                        cont_txt = "\n".join(ln["text"] for ln in cont_lines).strip()
+                        if cont_txt:
+                            carried_passage["text"] = f"{carried_passage.get('text', '')}\n{cont_txt}".strip()
+                            if (
+                                active_passage_group is not None
+                                and active_passage_group["start_q"] == carried_passage["start_q"]
+                            ):
+                                active_passage_group["text"] = carried_passage["text"]
+                        first_m["y_start"] = min(first_m["y_start"], min(ln["y0"] for ln in cont_lines))
+                    if (
+                        active_passage_group is not None
+                        and active_passage_group["start_q"] <= first_m["q_num"] <= active_passage_group["end_q"]
+                    ):
+                        for m_item in markers:
+                            if active_passage_group["start_q"] <= m_item["q_num"] <= active_passage_group["end_q"]:
+                                m_item["passage_group"] = dict(active_passage_group)
 
                 for i, marker in enumerate(markers):
                     is_last_in_col = i == len(markers) - 1
@@ -916,7 +913,7 @@ def parse_exam_pdf(pdf_bytes: bytes, dpi: int = 250) -> tuple[list[CroppedQuesti
                     if not is_last_in_col:
                         y_bottom_limit = markers[i + 1]["y_start"] - 4.0
                     elif trailing_passage_cuts_col:
-                        y_bottom_limit = pending_passage_y0 - 4.0
+                        y_bottom_limit = pending_passage_y0 - 6.0
                     else:
                         # 각 단 맨 아래 문항은 쪽번호/저작권 위쪽 약 0.93*H까지 넉넉히 확보
                         y_bottom_limit = 0.93 * page_h
@@ -950,7 +947,7 @@ def parse_exam_pdf(pdf_bytes: bytes, dpi: int = 250) -> tuple[list[CroppedQuesti
                         max(8.0, min_y - pad_y),
                         min(col_x1 - 2.0, max_x + pad_x),
                         min(
-                            0.935 * page_h if is_last_in_col else y_bottom_limit,
+                            0.935 * page_h if (is_last_in_col and not trailing_passage_cuts_col) else y_bottom_limit,
                             max_y + pad_y,
                         ),
                     )
@@ -970,8 +967,11 @@ def parse_exam_pdf(pdf_bytes: bytes, dpi: int = 250) -> tuple[list[CroppedQuesti
                         if ln["y1"] >= clip.y0 and ln["y0"] <= clip.y1
                     )
 
-                    # 직전 단에서 이월된 세트 지문이 현재 문항 번호를 포함하면 첫 문항 상단에 이미지 결합
-                    if carried_passage is not None and marker["q_num"] <= carried_passage["end_q"]:
+                    # 직전 단에서 이월된 세트 지문이 현재 문항 번호 구간(start_q <= q_num <= end_q)에 속할 때만 첫 문항 상단에 이미지 결합
+                    if (
+                        carried_passage is not None
+                        and carried_passage["start_q"] <= marker["q_num"] <= carried_passage["end_q"]
+                    ):
                         png_out, out_w, out_h = _stitch_vertical_pngs(
                             carried_passage["png_bytes"],
                             png_out,
@@ -984,14 +984,17 @@ def parse_exam_pdf(pdf_bytes: bytes, dpi: int = 250) -> tuple[list[CroppedQuesti
 
                     q_group_id = ""
                     q_shared_text = ""
-                    if active_passage_group is not None:
+                    m_group = marker.get("passage_group")
+                    if m_group is None and active_passage_group is not None:
                         if active_passage_group["start_q"] <= marker["q_num"] <= active_passage_group["end_q"]:
-                            q_group_id = str(active_passage_group.get("group_id") or "")
-                            q_shared_text = str(active_passage_group.get("text") or "").strip()
-                            if q_shared_text and q_shared_text not in q_text:
-                                q_text = f"{q_shared_text}\n\n{q_text}".strip()
+                            m_group = active_passage_group
                         elif marker["q_num"] > active_passage_group["end_q"]:
                             active_passage_group = None
+                    if m_group is not None:
+                        q_group_id = str(m_group.get("group_id") or "")
+                        q_shared_text = str(m_group.get("text") or "").strip()
+                        if q_shared_text and q_shared_text not in q_text:
+                            q_text = f"{q_shared_text}\n\n{q_text}".strip()
 
                     results.append(
                         CroppedQuestion(
@@ -1005,6 +1008,48 @@ def parse_exam_pdf(pdf_bytes: bytes, dpi: int = 250) -> tuple[list[CroppedQuesti
                             shared_passage_text=q_shared_text,
                         )
                     )
+
+                # 현재 단의 모든 문항을 먼저 처리한 뒤, 단 하단에 미처 첫 문항을 만나지 못한 [N~M] 지문이 남아 있으면 다음 단으로 이월한다.
+                if (
+                    pending_passage_y0 is not None
+                    and pending_passage_start_q is not None
+                    and pending_passage_end_q is not None
+                ):
+                    p_bottom = 0.902 * page_h
+                    p_boxes = [
+                        b
+                        for b in content_boxes
+                        if b[3] > pending_passage_y0 - 4.0 and b[1] < p_bottom
+                    ]
+                    if p_boxes:
+                        p_clip = pymupdf.Rect(
+                            max(col_x0 + 2.0, min(b[0] for b in p_boxes) - 10.0),
+                            max(8.0, min(pending_passage_y0, min(b[1] for b in p_boxes)) - 6.0),
+                            min(col_x1 - 2.0, max(b[2] for b in p_boxes) + 10.0),
+                            min(0.908 * page_h, max(b[3] for b in p_boxes) + 8.0),
+                        )
+                        p_pix = page.get_pixmap(dpi=effective_dpi, clip=p_clip, alpha=False)
+                        p_txt = "\n".join(
+                            ln["text"]
+                            for ln in lines
+                            if ln["y1"] >= p_clip.y0
+                            and ln["y0"] <= p_clip.y1
+                            and not _is_footer_or_header_noise(ln["text"], ln["y0"], page_h)
+                        )
+                        grp_str = f"{pending_passage_start_q}~{pending_passage_end_q}"
+                        carried_passage = {
+                            "start_q": pending_passage_start_q,
+                            "end_q": pending_passage_end_q,
+                            "group_id": grp_str,
+                            "png_bytes": p_pix.tobytes("png"),
+                            "text": p_txt,
+                        }
+                        active_passage_group = {
+                            "start_q": pending_passage_start_q,
+                            "end_q": pending_passage_end_q,
+                            "group_id": grp_str,
+                            "text": p_txt,
+                        }
 
     results.sort(key=lambda r: r.q_num)
     has_text_layer = total_text_chars >= 60
@@ -1035,13 +1080,35 @@ def crop_normalized_box(
         return pix.tobytes("png"), pix.width, pix.height
 
 
-_ANS_LINE_MARKER_RE = re.compile(r"^(?:\[?\s*(\d{1,2})\s*\]?\s*[.)번]|\[\s*(\d{1,2})\s*\])\s*(.*)$")
+_ANS_RANGE_MARKER_RE = re.compile(
+    r"^(?:\[?\s*(\d{1,2})\s*[~\-～–—]\s*(\d{1,2})\s*\]?\s*[.)번]?|\[\s*(\d{1,2})\s*[~\-～–—]\s*(\d{1,2})\s*\])\s*(.*)$"
+)
+_ANS_LINE_MARKER_RE = re.compile(
+    r"^(?:[•▶▷*]\s*)?(?:\[?\s*(\d{1,2})\s*\]?\s*[.)번]|\[\s*(\d{1,2})\s*\])\s*(.*)$"
+)
+
+
+def _trim_answer_snippet_preserving_explanation(text: str, max_chars: int) -> str:
+    """장문(41~42, 43~45) 해설에서 앞부분 긴 [해석] 때문에 뒷부분 [해설]/정답이 잘리지 않도록 보존한다."""
+    if len(text) <= max_chars:
+        return text
+    exp_idx = -1
+    for marker in ("[해설]", "해설:", "[풀이]", "[출제의도]", "41.", "42.", "43.", "44.", "45."):
+        pos = text.find(marker, 40)
+        if pos != -1 and (exp_idx == -1 or pos < exp_idx):
+            exp_idx = pos
+    if exp_idx != -1 and len(text) - exp_idx < max_chars - 60:
+        tail = text[exp_idx:]
+        head_budget = max(60, max_chars - len(tail) - 5)
+        return f"{text[:head_budget].rstrip()}\n...\n{tail}"
+    half = max_chars // 2
+    return f"{text[:half].rstrip()}\n...\n{text[-half:].lstrip()}"
 
 
 def extract_answer_snippets_from_pdf(pdf_bytes: bytes, max_chars_per_q: int = 1200) -> tuple[dict[int, str], bool]:
     """
     텍스트 레이어가 있는 해설지 PDF에서 문항 번호별 해설 텍스트 스니펫을 빠르게 추출한다.
-    문항마다 전체 해설지 PDF 바이너리를 반복 전송하지 않도록 경량화하는 데 사용한다.
+    [41~42], [43~45] 등 세트 해설 헤더도 해당 번호 전체에 매핑하고 [해설] 본문이 잘리지 않게 보존한다.
     """
     full_lines: list[str] = []
     with pymupdf.open(stream=pdf_bytes, filetype="pdf") as doc:
@@ -1055,25 +1122,40 @@ def extract_answer_snippets_from_pdf(pdf_bytes: bytes, max_chars_per_q: int = 12
         return {}, False
 
     snippets: dict[int, list[str]] = {}
-    cur_q: int | None = None
+    cur_qs: list[int] = []
+    active_range_qs: list[int] = []
     for ln in full_lines:
+        rm = _ANS_RANGE_MARKER_RE.match(ln)
+        if rm:
+            s_str = rm.group(1) or rm.group(3)
+            e_str = rm.group(2) or rm.group(4)
+            if s_str and e_str:
+                q_s, q_e = int(s_str), int(e_str)
+                if 1 <= q_s <= q_e <= 45 and (q_e - q_s) <= 4:
+                    cur_qs = list(range(q_s, q_e + 1))
+                    active_range_qs = list(cur_qs)
+                    for qn in cur_qs:
+                        snippets.setdefault(qn, []).append(ln)
+                    continue
         m = _ANS_LINE_MARKER_RE.match(ln)
         if m:
             q_str = m.group(1) or m.group(2)
             if q_str:
                 q_num = int(q_str)
                 if 1 <= q_num <= 45:
-                    cur_q = q_num
-                    snippets.setdefault(cur_q, []).append(ln)
+                    cur_qs = [q_num]
+                    if q_num not in active_range_qs:
+                        active_range_qs = []
+                    snippets.setdefault(q_num, []).append(ln)
                     continue
-        if cur_q is not None:
-            snippets[cur_q].append(ln)
+        for qn in cur_qs:
+            snippets.setdefault(qn, []).append(ln)
 
     out: dict[int, str] = {}
     for q_num, parts in snippets.items():
         merged = "\n".join(parts).strip()
         if merged:
-            out[q_num] = merged[:max_chars_per_q]
+            out[q_num] = _trim_answer_snippet_preserving_explanation(merged, max_chars_per_q)
     return out, True
 
 

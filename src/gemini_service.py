@@ -2235,7 +2235,7 @@ def analyze_english_exam_pdf_batch_with_gemini(
     for q in ordered_q:
         sn = (snippets_map.get(q) or "").strip()
         if sn:
-            snippet_lines.append(f"[{q}번 해설 발췌] {sn[:450]}")
+            snippet_lines.append(f"[{q}번 해설 발췌] {sn[:650]}")
 
     hint_section = (
         "\n[해설지 문항별 발췌]\n" + "\n".join(snippet_lines) + "\n"
@@ -2257,10 +2257,11 @@ def analyze_english_exam_pdf_batch_with_gemini(
         "'어법', '어휘', '빈칸 추론', '무관한 문장', '글의 순서', '문장 삽입', '요약문 완성', '장문 독해(41~42)', '장문 독해(43~45)'.\n"
         "   - `passage_text`: 한국어 발문(예: '다음 글의 요지로...')과 선택지(①~⑤)를 제외한 **영어 본문 지문 전체**를 빠짐없이 원문 그대로 추출하세요. "
         "(글의 순서 문항은 주어진 글과 (A)(B)(C) 본문을 자연스럽게 모두 포함하고, 문장 삽입 문항도 주어진 문장과 본문을 모두 포함하세요.)\n"
-        "   - **장문 세트(41~42번, 43~45번)에만** `passage_group_id`를 `'41~42'` 또는 `'43~45'`로 표기하고 공통 장문 지문 전체를 수록하세요. **그 외 모든 문항(예: 31~34, 36~37, 38~39 등 발문 헤더 범위 포함)은 문항마다 지문이 각각 다르므로 `passage_group_id`를 반드시 빈 문자열로 두고 해당 번호 문항의 지문만 추출하세요.**\n"
+        "   - **장문 세트(41~42번, 43~45번)에만** `passage_group_id`를 `'41~42'` 또는 `'43~45'`로 표기하고 공통 장문 지문 전체(43~45번은 (A)~(D) 전체 단락)를 수록하세요. **그 외 모든 문항(예: 31~34, 36~37, 38~39 등 발문 헤더 범위 포함)은 문항마다 지문이 각각 다르므로 `passage_group_id`를 반드시 빈 문자열로 두고 해당 번호 문항의 지문만 추출하세요.**\n"
         "   - `passage_topic`: 지문의 핵심 소재·주제를 한국어 1줄로 요약하세요.\n"
         "   - `key_vocabulary`: 지문 내 주요 어휘 3~6개를 `'단어: 한국어 뜻'` 형식으로 나열하세요.\n"
-        "4. `official_explanation`과 `answer`: 해설지 기준 핵심 풀이 요약과 공식 정답(`'1'`~`'5'`)을 정확히 추출하세요."
+        "4. `official_explanation`과 `answer`: 해설지 PDF(특히 1페이지 상단 1~45번 빠른 정답표)와 문항별 해설을 대조하여 핵심 풀이 요약과 공식 정답(`'1'`~`'5'`)을 정확히 추출하세요. "
+        "**특히 41번(제목 추론)과 42번(밑줄 (a)~(e) 어휘 적절성), 그리고 43번(순서 배열)·44번(지칭 추론 (a)~(e))·45번(내용 일치) 세트 문항의 정답과 해설이 서로 뒤바뀌지 않도록 문항 번호별 발문과 정답표를 반드시 1:1 확인하세요.**"
     )
 
     q_list_str = ", ".join(str(q) for q in ordered_q)
@@ -2272,7 +2273,7 @@ def analyze_english_exam_pdf_batch_with_gemini(
     )
 
     contents: list[Any] = [prob_part]
-    if answer_pdf_part is not None and not snippet_lines:
+    if answer_pdf_part is not None:
         contents.append(answer_pdf_part)
     contents.append(prompt)
 

@@ -403,13 +403,17 @@ def find_forbidden_terms_in_text(
 _ENG_U_TAG_RE = re.compile(r"<u\b[^>]*>(.*?)</u>", re.IGNORECASE | re.DOTALL)
 _ENG_BLANK_RE = re.compile(r"_{4,}")
 _ENG_GIVEN_TAG_RE = re.compile(
-    r"(?<![가-힣A-Za-z0-9])[<\[\〈]\s*(주어진\s*문장|주어진\s*글|요\s*약\s*문|요\s*약)\s*[>\]\〉][ \t]*"
+    r"(?<![가-힣A-Za-z0-9])[<\[\〈]\s*(주어진\s*문장|주어진\s*글|요\s*약\s*문|요\s*약|본\s*문|지\s*문)\s*[>\]\〉][ \t]*"
 )
-_ENG_ORDER_INLINE_RE = re.compile(r"(?<=[.?!\"'\)])\s+(?=\([ABC]\)\s+(?!\[)[A-Z\"'])")
+_ENG_ORDER_INLINE_RE = re.compile(r"(?<=[.?!\"'”’\)])\s+(?=\([ABC]\)\s+(?!\[)[A-Za-z0-9\"'“‘])")
 _ENG_ORDER_LINE_RE = re.compile(r"^\(([ABC])\)\s+(?!\[)(.+)$")
 _ENG_FOOTNOTE_LINE_RE = re.compile(r"^\*{1,2}\s*[A-Za-z][A-Za-z\s\-']*:")
 _KOR_INSTRUCTION_RE = re.compile(
-    r"(?:다음\s*글|주어진\s*(?:글|문장)|밑줄\s*친|빈칸에\s*들어갈|흐름으로\s*보아|요약하고자\s*할\s*때|가장\s*적절한\s*것은|어법상|문맥상)"
+    r"(?:다음\s*글|다음\s*빈칸|주어진\s*(?:글|문장)|밑줄\s*친|빈칸에\s*들어갈|흐름으로\s*보아|흐름과\s*관계|요약하고자|가장\s*적절한\s*것은|어법상|문맥상|글의\s*(?:순서|요지|주제|제목))"
+)
+# 한국어 발문(예: '다음 글의 제목으로 가장 적절한 것은?') 뒤에 줄바꿈 없이 바로 영어 지문/기호가 이어지는 경우 분리용 정규식
+_KOR_INST_PREFIX_SPLIT_RE = re.compile(
+    r"^([^\n]*?[가-힣][^\n]*?(?:\?|시오\.)(?:\s*[\[\(]\d+\s*점[\]\)])?)[ \t]+(?=[A-Za-z\"'“‘\(\[<①-⑤_])"
 )
 
 
@@ -447,10 +451,15 @@ def render_english_inline_html(text: str) -> str:
 
 
 def normalize_english_exam_text(text: str) -> str:
-    """영어 변형 문제 발문·지문의 [주어진 문장], [주어진 글], (A)/(B)/(C), [요약문] 줄바꿈을 정규화한다."""
+    """영어 변형 문제 발문·지문의 한국어 발문 뒤 줄바꿈, [주어진 문장], [주어진 글], (A)/(B)/(C), [요약문] 줄바꿈을 정규화한다."""
     if not text:
         return ""
-    cleaned = _unescape_newlines(text)
+    cleaned = _unescape_newlines(text).strip()
+
+    # 첫 줄에서 한국어 발문(? 또는 ~시오.)과 영어 본문이 줄바꿈 없이 한 줄에 붙어 있는 경우 강제 줄바꿈 분리
+    m_inst = _KOR_INST_PREFIX_SPLIT_RE.match(cleaned)
+    if m_inst and _KOR_INSTRUCTION_RE.search(m_inst.group(1)):
+        cleaned = f"{m_inst.group(1).strip()}\n\n{cleaned[m_inst.end():].lstrip()}"
 
     def _norm_eng_tag(m: re.Match[str]) -> str:
         raw = re.sub(r"\s+", "", m.group(1))
@@ -458,6 +467,8 @@ def normalize_english_exam_text(text: str) -> str:
             return "\n\n[주어진 문장]\n"
         if raw == "주어진글":
             return "\n\n[주어진 글]\n"
+        if raw in ("본문", "지문"):
+            return "\n\n"
         return "\n\n[요약문]\n"
 
     cleaned = _ENG_GIVEN_TAG_RE.sub(_norm_eng_tag, cleaned)
@@ -514,7 +525,7 @@ def split_english_stem_blocks(text: str) -> list[tuple[str, Any]]:
 
     raw_lines = norm.split("\n")
     idx = 0
-    # 첫 문단이 한국어 발문이면 ('instruction', ...) 블록으로 분리
+    # 첫 문단이 한국어 발문이면 ('instruction', ...) 블록으로 분리 (영어 지문이 한 줄에 붙어 있어도 발문만 분리)
     inst_lines: list[str] = []
     while idx < len(raw_lines):
         cand = raw_lines[idx].strip()
@@ -524,9 +535,15 @@ def split_english_stem_blocks(text: str) -> list[tuple[str, Any]]:
                 break
             idx += 1
             continue
-        if not inst_lines and (_KOR_INSTRUCTION_RE.search(cand) or cand.endswith("?")):
-            inst_lines.append(cand)
-            idx += 1
+        has_korean = bool(re.search(r"[가-힣]", cand))
+        if not inst_lines and has_korean and (_KOR_INSTRUCTION_RE.search(cand) or cand.endswith("?")):
+            m_inline = _KOR_INST_PREFIX_SPLIT_RE.match(cand)
+            if m_inline:
+                inst_lines.append(m_inline.group(1).strip())
+                raw_lines[idx] = cand[m_inline.end():].strip()
+            else:
+                inst_lines.append(cand)
+                idx += 1
             break
         break
 
@@ -542,6 +559,16 @@ def split_english_stem_blocks(text: str) -> list[tuple[str, Any]]:
             elif mode == "passage" and buf_lines and buf_lines[-1] != "":
                 buf_lines.append("")
             continue
+
+        # [주어진 문장] 박스 뒤에 빈 줄 없이 바로 삽입 위치(①, ②)가 포함된 본문 줄이 이어지면 박스 종료 후 본문으로 전환
+        if (
+            mode == "given_box"
+            and box_title == "주어진 문장"
+            and buf_lines
+            and ("①" in ln or "②" in ln)
+        ):
+            _flush()
+            mode = "passage"
 
         if _ENG_FOOTNOTE_LINE_RE.match(ln):
             footnote_lines.append(ln)
