@@ -21,7 +21,6 @@ def _storage_lock(storage: StorageManager | None):
 
 KST = timezone(timedelta(hours=9))
 FREE_MAX_BATCH_QUESTIONS = 5
-PAID_MAX_BATCH_QUESTIONS = 20
 PRO_WEEKLY_PREMIUM_LIMIT = 50
 ULTRA_WEEKLY_PREMIUM_LIMIT = 200
 WEEKLY_PREMIUM_LIMITS: dict[str, int] = {
@@ -406,11 +405,11 @@ def get_remaining_free_quota(user: UserRecord) -> int | None:
     return None
 
 
-def get_max_batch_questions(user: UserRecord | None) -> int:
-    """등급별 1회 최대 생성·변형 문항 수 제한을 반환한다 (FREE=5문항, PRO/ULTRA/CUSTOM/ADMIN=20문항)."""
+def get_max_batch_questions(user: UserRecord | None) -> int | None:
+    """등급별 1회 최대 생성·변형 문항 수 제한을 반환한다 (FREE=5문항, 유료·관리자=제한 없음 None)."""
     if user is None or user.tier == "FREE":
         return FREE_MAX_BATCH_QUESTIONS
-    return PAID_MAX_BATCH_QUESTIONS
+    return None
 
 
 def get_weekly_premium_limit(user: UserRecord | None) -> int | None:

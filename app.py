@@ -15,7 +15,6 @@ import streamlit as st
 from src.auth import (
     FREE_EXAMS_PER_UNLOCK,
     FREE_MAX_BATCH_QUESTIONS,
-    PAID_MAX_BATCH_QUESTIONS,
     PRO_WEEKLY_PREMIUM_LIMIT,
     ULTRA_WEEKLY_PREMIUM_LIMIT,
     TIER_LABELS,
@@ -62,7 +61,6 @@ from src.curriculum_2022 import (
 from src.ebsi_fetcher import attempt_ebsi_pdf_fetch
 from src.exporters import build_exam_ai_jsonl, build_exam_html, build_exam_markdown
 from src.gemini_service import (
-    MAX_ENGLISH_TRANSFORM_JOBS,
     ForbiddenTermRemainingError,
     analyze_english_exam_pdf_batch_with_gemini,
     analyze_english_question_with_gemini,
@@ -1389,14 +1387,14 @@ with st.sidebar:
         elif tier_code == "PRO":
             status_line = (
                 f"<div style='font-size:0.83rem; color:#1D4ED8; margin-top:0.45rem;'>"
-                f"✨ 기본(3.5 Flash-Lite) 무제한 (1회 최대 {PAID_MAX_BATCH_QUESTIONS}문항)<br/>"
+                f"✨ 기본(3.5 Flash-Lite): <b>무제한</b><br/>"
                 f"주간 고급 모델(3.8/Hydrogen): <b>{pro_weekly_rem} / {PRO_WEEKLY_PREMIUM_LIMIT}문항</b>"
                 f"</div>"
             )
         elif tier_code == "ULTRA":
             status_line = (
                 "<div style='font-size:0.83rem; color:#C2410C; font-weight:600; margin-top:0.45rem;'>"
-                f"🔥 서버 API · 기본 모델 무제한 (1회 최대 {PAID_MAX_BATCH_QUESTIONS}문항)<br/>"
+                "🔥 서버 API · 기본 모델 <b>무제한</b><br/>"
                 f"주간 고급 모델(3.8/Hydrogen): <b>{pro_weekly_rem} / {ULTRA_WEEKLY_PREMIUM_LIMIT}문항</b></div>"
             )
         else:
@@ -2213,7 +2211,7 @@ if current_user is None:
         with st.container(border=True):
             st.markdown("<span class='tier-badge tier-PRO'>PRO · 1,990원/월</span>", unsafe_allow_html=True)
             st.markdown("#### 스탠다드 유료")
-            st.write(f"- 3.5 Flash-Lite 무제한 · **1회 최대 {PAID_MAX_BATCH_QUESTIONS}문항**")
+            st.write("- **3.5 Flash-Lite 무제한** · 1회 제한 없음")
             st.write(f"- 고급 모델(3.8/Hydrogen) **주간 {PRO_WEEKLY_PREMIUM_LIMIT}문항**")
             st.write("- **공용 개념서 DB** 이용 가능")
     with t_col4:
@@ -4058,13 +4056,13 @@ def _execute_english_transform_jobs(
     source_summary_label: str,
     use_precision_mode: bool = False,
 ) -> None:
-    """(영어 지문, 목표 수능 유형) 작업 목록을 등급별 최대 문항(FREE=5, PRO+=20) 및 PRO 주간 한도 하에 실행한다."""
+    """(영어 지문, 목표 수능 유형) 작업 목록을 등급별 제한(FREE=5문항, 유료=제한 없음, PRO/ULTRA 정밀 모드 주간 한도) 하에 실행한다."""
     if not jobs:
         st.warning("변형할 영어 지문과 목표 수능 유형을 최소 1개 이상 선택해 주세요.")
         return
 
     user_max_jobs = get_max_batch_questions(current_user)
-    if len(jobs) > user_max_jobs:
+    if user_max_jobs is not None and len(jobs) > user_max_jobs:
         st.warning(
             f"⚠️ 현재 등급({TIER_LABELS.get(current_user.tier, current_user.tier)})은 1회 실행당 최대 **{user_max_jobs}문항**까지만 생성됩니다. "
             f"(요청 {len(jobs)}건 중 앞의 {user_max_jobs}문항만 실행)"
@@ -4208,7 +4206,8 @@ def _render_tab2_english_transform_section() -> None:
     """탭 2 영어 과목 전용: 기출 영어 지문 검색/직접 입력 및 수능 11개 독해 유형 변형 UI."""
     st.subheader("1️⃣ 영어 지문 선택 & 수능 독해 유형 변형 엔진")
     rewrite_model, use_precision_mode = _resolve_tab2_english_rewrite_model(key_suffix="eng")
-    user_max_jobs = min(MAX_ENGLISH_TRANSFORM_JOBS, get_max_batch_questions(current_user))
+    user_max_jobs = get_max_batch_questions(current_user)
+    max_limit_badge = f"1회 최대 **{user_max_jobs}문항**" if user_max_jobs is not None else "1회 문항 수 **제한 없음**"
 
     eng_tab_db, eng_tab_direct = st.tabs(
         [
@@ -4323,12 +4322,13 @@ def _render_tab2_english_transform_section() -> None:
             else:
                 st.caption(
                     f"총 **{len(filtered_passages)}개** 영어 독해 지문이 조회되었습니다. "
-                    f"(과금 방지를 위해 기본 미선택 상태이며, 현재 등급은 1회 최대 **{user_max_jobs}문항**까지만 생성됩니다.)"
+                    f"(과금 방지를 위해 기본 미선택 상태이며, 현재 등급은 {max_limit_badge} 생성 가능합니다.)"
                 )
                 with st.form("tab2_eng_db_transform_form", border=True):
+                    cap_txt = f"최대 {user_max_jobs}건" if user_max_jobs is not None else "문항 수 제한 없음"
                     st.caption(
-                        f"📊 예상 AI 호출: N건 (최대 {user_max_jobs}건) — "
-                        f"변형하려는 지문만 직접 체크해 주세요 (전체 선택 비활성화)."
+                        f"📊 예상 AI 호출: N건 ({cap_txt}) — "
+                        "변형하려는 지문만 직접 체크해 주세요 (전체 선택 비활성화)."
                     )
                     cfg_c1, cfg_c2, cfg_c3 = st.columns(3)
                     with cfg_c1:
@@ -4363,7 +4363,8 @@ def _render_tab2_english_transform_section() -> None:
                         )
 
                     st.markdown("---")
-                    st.markdown(f"**✅ 변형할 영어 기출 지문 선택 (모두 기본 미선택 · 1회 최대 {user_max_jobs}문항):**")
+                    hdr_limit = f"1회 최대 {user_max_jobs}문항" if user_max_jobs is not None else "원하는 만큼 선택 가능"
+                    st.markdown(f"**✅ 변형할 영어 기출 지문 선택 (모두 기본 미선택 · {hdr_limit}):**")
 
                     checked_rows: list[tuple[QuestionRecord, str, list[str]]] = []
                     for p_idx, (rec_p, q_label) in enumerate(filtered_passages):
@@ -4407,15 +4408,17 @@ def _render_tab2_english_transform_section() -> None:
                         for _, _, r_types in checked_rows
                     )
                     if est_db_calls > 0:
+                        eff_db_calls = min(est_db_calls, user_max_jobs) if user_max_jobs is not None else est_db_calls
+                        lim_note = f"(최대 {user_max_jobs}건)" if user_max_jobs is not None else "(제한 없음)"
                         st.info(
-                            f"📊 **예상 AI 호출: {min(est_db_calls, user_max_jobs)}건 "
-                            f"(최대 {user_max_jobs}건)** · 요청 {est_db_calls}건 "
+                            f"📊 **예상 AI 호출: {eff_db_calls}건 {lim_note}** · 요청 {est_db_calls}건 "
                             "(상세 구문/오답 해설은 [✨ AI 자동 해설] 클릭 시에만 지연 호출)"
                         )
                     else:
+                        lim_note = f"최대 {user_max_jobs}건" if user_max_jobs is not None else "제한 없음"
                         st.info(
-                            f"📊 **예상 AI 호출: N건 (최대 {user_max_jobs}건)** · "
-                            f"체크한 지문 × 선택 유형 수만큼 호출되며 1회 최대 {user_max_jobs}건으로 제한됩니다."
+                            f"📊 **예상 AI 호출: N건 ({lim_note})** · "
+                            "체크한 지문 × 선택 유형 수만큼 호출됩니다."
                         )
 
                     run_eng_db_btn = st.form_submit_button(
@@ -4458,7 +4461,7 @@ def _render_tab2_english_transform_section() -> None:
                         if not jobs:
                             st.error("적용할 목표 수능 변형 유형을 최소 1개 이상 선택해 주세요.")
                         else:
-                            if len(jobs) > user_max_jobs:
+                            if user_max_jobs is not None and len(jobs) > user_max_jobs:
                                 st.warning(
                                     f"⚠️ 현재 등급은 1회 실행당 최대 {user_max_jobs}문항까지만 생성됩니다. "
                                     f"(선택 {len(jobs)}건 중 앞의 {user_max_jobs}문항만 실행)"
@@ -4527,13 +4530,12 @@ def _render_tab2_english_transform_section() -> None:
             direct_chunk_cnt = len(
                 [ch for ch in re.split(r"\n\s*-{3,}\s*\n", (direct_passage_raw or "").strip()) if ch.strip()]
             ) or 1
-            est_direct_calls = min(
-                direct_chunk_cnt * len(direct_types),
-                user_max_jobs,
-            )
+            raw_direct_calls = direct_chunk_cnt * len(direct_types)
+            est_direct_calls = min(raw_direct_calls, user_max_jobs) if user_max_jobs is not None else raw_direct_calls
+            lim_note_d = f"(최대 {user_max_jobs}건)" if user_max_jobs is not None else "(제한 없음)"
             st.info(
-                f"📊 **예상 AI 호출: {est_direct_calls}건 (최대 {user_max_jobs}건)** · "
-                f"선택 유형 {len(direct_types)}개 × 지문 수 (1회 최대 {user_max_jobs}문항 하드 제한)"
+                f"📊 **예상 AI 호출: {est_direct_calls}건 {lim_note_d}** · "
+                f"선택 유형 {len(direct_types)}개 × 지문 수"
             )
             run_eng_direct_btn = st.form_submit_button(
                 "🚀 직접 입력한 영어 지문으로 수능형 변형 문제 생성",
@@ -4588,7 +4590,7 @@ def _render_tab2_english_transform_section() -> None:
                                 "source_label": f"출처: {src_title}",
                             }
                         )
-                if len(direct_jobs) > user_max_jobs:
+                if user_max_jobs is not None and len(direct_jobs) > user_max_jobs:
                     st.warning(
                         f"⚠️ 현재 등급은 1회 실행당 최대 {user_max_jobs}문항까지만 생성됩니다. "
                         f"(요청 {len(direct_jobs)}건 중 앞의 {user_max_jobs}문항만 실행)"
@@ -4919,7 +4921,7 @@ with tab2:
                     filter_grade = st.selectbox("학년 수준 필터", ["전체", "고1 이하", "고2 이하"], index=0)
                 with opt_c3:
                     count_mode = st.radio("추출 문항 수", ["전체", "N문제 지정"], horizontal=True)
-                    max_allowed_n = tab2_max_batch
+                    max_allowed_n = tab2_max_batch or 100
                     default_n = min(5, max_allowed_n)
                     target_n = int(
                         st.number_input(
@@ -5006,7 +5008,7 @@ with tab2:
 
                         if count_mode == "N문제 지정":
                             selected_pairs = selected_pairs[:target_n]
-                        if len(selected_pairs) > tab2_max_batch:
+                        if tab2_max_batch is not None and len(selected_pairs) > tab2_max_batch:
                             st.warning(
                                 f"⚠️ 현재 등급은 1회 실행당 최대 {tab2_max_batch}문항까지만 추출·개조됩니다. "
                                 f"(매칭 {len(selected_pairs)}문항 중 앞의 {tab2_max_batch}문항만 실행)"
