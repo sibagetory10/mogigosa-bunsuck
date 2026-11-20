@@ -5,7 +5,7 @@ from datetime import datetime
 from typing import Any, Literal
 from pydantic import BaseModel, Field, field_validator
 
-SubjectCategory = Literal["수학", "사회", "과학", "영어"]
+SubjectCategory = Literal["수학", "사회", "과학", "한국사", "영어"]
 
 ENGLISH_DEFAULT_EXCLUDED_Q_NUMS: frozenset[int] = frozenset({18, 19, 25, 26, 27, 28, 43, 44, 45})
 
@@ -57,7 +57,7 @@ class QuestionRecord(BaseModel):
     id: str = Field(..., description="고유 문항 ID (예: 2026_고3_6월_화학__Q05)")
     exam_name: str = Field(..., description="시험 회차명 (예: 2026_고3_6월_화학)")
     q_num: int = Field(..., ge=1, description="문항 번호")
-    subject_category: Literal["수학", "사회", "과학", "영어"] = Field(..., description="대분류 과목")
+    subject_category: Literal["수학", "사회", "과학", "한국사", "영어"] = Field(..., description="대분류 과목")
     curriculum_subject: str = Field(..., description="2022 개정 교육과정 세부 과목명")
     unit_name: str = Field(..., description="단원명")
     min_grade: int = Field(default=1, ge=1, le=3, description="최저 학년 수준 (1=고1, 2=고2, 3=고3)")
@@ -147,7 +147,7 @@ class QuestionExtractionOutput(BaseModel):
 
     curriculum_subject: str = Field(
         ...,
-        description="2022 개정 교육과정 세부 과목명 (예: 공통수학1, 공통수학2, 대수, 미적분1, 통합사회1, 통합사회2, 경제, 통합과학1, 통합과학2, 화학, 물리학 등)",
+        description="2022 개정 교육과정 세부 과목명 (예: 공통수학1, 공통수학2, 대수, 미적분1, 통합사회1, 통합사회2, 한국사1, 한국사2, 경제, 통합과학1, 통합과학2, 화학, 물리학 등)",
     )
     unit_name: str = Field(..., description="단원명")
     min_grade: int = Field(
@@ -516,14 +516,18 @@ def infer_subject_category(
     exam_title: str = "",
     default: SubjectCategory = "과학",
 ) -> SubjectCategory:
-    """세부 과목명 또는 시험지 제목을 대분류('수학' | '사회' | '과학' | '영어')로 매핑한다."""
+    """세부 과목명 또는 시험지 제목을 대분류('수학' | '사회' | '과학' | '한국사' | '영어')로 매핑한다."""
     combined = " ".join(f"{subject or ''} {exam_title or ''}".split()).strip()
     if not combined:
         return default
     c_low = combined.lower()
     c_nospace = combined.replace(" ", "")
 
-    # 1) 구체적인 과목명 최우선 매칭 (사회탐구 / 과학탐구 / 수학 / 영어)
+    # 1) 한국사 최우선 매칭 (독립 대분류)
+    if any(k in c_nospace for k in ("한국사", "한국근현대사")):
+        return "한국사"
+
+    # 2) 구체적인 과목명 매칭 (사회탐구 / 과학탐구 / 수학 / 영어)
     social_exact = (
         "세계사",
         "동아시아사",
@@ -536,7 +540,6 @@ def infer_subject_category(
         "사회·문화",
         "사회문화",
         "통합사회",
-        "한국사",
     )
     if any(k in c_nospace for k in social_exact):
         return "사회"
@@ -551,7 +554,7 @@ def infer_subject_category(
     if "영어" in c_nospace or "english" in c_low:
         return "영어"
 
-    # 2) 포괄 키워드 매칭
+    # 3) 포괄 키워드 매칭
     if any(k in c_nospace for k in ("사회", "사탐", "역사", "지리", "윤리", "사상", "정치", "법", "문화")):
         return "사회"
     if any(k in c_nospace for k in ("과학", "과탐", "생명", "지구")):

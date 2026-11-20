@@ -1389,22 +1389,23 @@ def _render_ncic_curriculum_manager(key_prefix: str = "ncic") -> None:
             "국가교육과정정보센터(ncic.re.kr)의 [별책 7(사회) / 별책 8(수학) / 별책 9(과학)] PDF를 올리면 "
             "공식 성취기준 코드가 기준표에 누적되어 태깅 할루시네이션 검증이 한층 엄격해집니다."
         )
-        m1, m2, m3 = st.columns(3)
+        m1, m2, m3, m4 = st.columns(4)
         m1.metric("수학 기준표", f"{stats['수학']['subjects']}과목", f"성취기준 {stats['수학']['standards']}개")
         m2.metric("사회 기준표", f"{stats['사회']['subjects']}과목", f"성취기준 {stats['사회']['standards']}개")
         m3.metric("과학 기준표", f"{stats['과학']['subjects']}과목", f"성취기준 {stats['과학']['standards']}개")
+        m4.metric("한국사 기준표", f"{stats['한국사']['subjects']}과목", f"성취기준 {stats['한국사']['standards']}개")
 
         nc1, nc2 = st.columns([2, 1])
         with nc1:
             ncic_pdf = st.file_uploader(
-                "NCIC 2022 교육과정 고시 PDF 업로드 (별책 7/8/9)",
+                "NCIC 2022 교육과정 고시 PDF 업로드 (별책 7/8/9 · 한국사 포함)",
                 type=["pdf"],
                 key=f"{key_prefix}_ncic_pdf",
             )
         with nc2:
             ncic_cat_hint = st.selectbox(
                 "기본 교과 대분류",
-                options=["과학", "수학", "사회"],
+                options=["과학", "수학", "사회", "한국사"],
                 key=f"{key_prefix}_ncic_cat",
             )
         if ncic_pdf is not None and st.button("📥 NCIC 고시 PDF 성취기준 추출·반영", key=f"{key_prefix}_ncic_apply"):
@@ -2870,7 +2871,7 @@ def _build_recommended_exam_catalog() -> list[dict[str, str]]:
         (
             "고1",
             ["3월", "6월", "9월", "10월"],
-            [("영어", "영어"), ("수학", "수학"), ("과학", "통합과학"), ("사회", "통합사회")],
+            [("영어", "영어"), ("수학", "수학"), ("한국사", "한국사"), ("과학", "통합과학"), ("사회", "통합사회")],
         ),
         (
             "고2",
@@ -2878,6 +2879,7 @@ def _build_recommended_exam_catalog() -> list[dict[str, str]]:
             [
                 ("영어", "영어"),
                 ("수학", "수학"),
+                ("한국사", "한국사"),
                 ("과학", "물리학Ⅰ"),
                 ("과학", "화학Ⅰ"),
                 ("과학", "생명과학Ⅰ"),
@@ -2890,6 +2892,7 @@ def _build_recommended_exam_catalog() -> list[dict[str, str]]:
             [
                 ("영어", "영어"),
                 ("수학", "수학"),
+                ("한국사", "한국사"),
                 ("과학", "물리학Ⅰ"),
                 ("과학", "화학Ⅰ"),
                 ("과학", "생명과학Ⅰ"),
@@ -2927,11 +2930,13 @@ def _render_exam_coverage_board() -> None:
         norm_id = _normalize_exam_identity(en)
         if norm_id:
             registered_ids.add(norm_id)
+        inferred_cat = infer_subject_category(rec.curriculum_subject or en, exam_title=en)
+        eff_cat = "한국사" if inferred_cat == "한국사" else (rec.subject_category or inferred_cat)
         entry = registered_map.setdefault(
             en,
             {
                 "회차명": en,
-                "과목": rec.subject_category or infer_subject_category(rec.curriculum_subject or en),
+                "과목": eff_cat,
                 "문항 수": 0,
             },
         )
@@ -2952,7 +2957,7 @@ def _render_exam_coverage_board() -> None:
         with fc1:
             f_subj = st.selectbox(
                 "과목 필터",
-                options=["전체", "영어", "수학", "과학", "사회"],
+                options=["전체", "영어", "수학", "한국사", "과학", "사회"],
                 key="cov_board_subj",
             )
         with fc2:
@@ -4060,7 +4065,7 @@ with tab1:
             with col_meta1:
                 subject_cat = st.selectbox(
                     "과목 (대분류)",
-                    options=["과학", "수학", "사회", "영어"],
+                    options=["과학", "수학", "사회", "한국사", "영어"],
                     key="tab1_subject_cat",
                 )
             with col_meta2:
@@ -4391,11 +4396,13 @@ with tab1:
         ym = re.search(r"(20\d{2})", exam_name or "")
         mm = re.search(r"(\d{1,2})\s*월", exam_name or "")
         gm = re.search(r"고\s*([123])", exam_name or "")
+        inferred_cat = infer_subject_category(exam_name or "", exam_title=exam_name or "")
+        eff_subj = "한국사" if inferred_cat == "한국사" else (subj_cat or "")
         return {
             "year": f"{ym.group(1)}년" if ym else "",
             "month": f"{int(mm.group(1))}월" if mm else "",
             "grade": f"고{gm.group(1)}" if gm else "",
-            "subject": subj_cat or "",
+            "subject": eff_subj,
         }
 
     if not db_records:
@@ -4418,7 +4425,7 @@ with tab1:
             key=lambda m: int(re.sub(r"[^0-9]", "", m) or 0),
         )
         avail_grades = ["고1", "고2", "고3"]
-        avail_subjects = ["수학", "사회", "과학", "영어"]
+        avail_subjects = ["수학", "사회", "과학", "한국사", "영어"]
 
         with st.form("db_search_form", border=True):
             sc1, sc2, sc3, sc4 = st.columns(4)
@@ -5517,7 +5524,7 @@ def _render_tab2_concept_source_tabs() -> None:
 
     with source_tab_pdf:
         concept_file = st.file_uploader(
-            "통합과학·통합사회·공통수학 등 개념서/교과서 PDF 업로드",
+            "통합과학·통합사회·한국사·공통수학 등 개념서/교과서 PDF 업로드",
             type=["pdf"],
             key="tab2_concept_pdf",
         )
@@ -5622,7 +5629,7 @@ with tab2:
     tab2_domain_mode = st.radio(
         "작업 과목 모드 선택",
         options=[
-            "📚 수학 · 사회 · 과학 (개념서 범위 추출 & 상위 용어 개조)",
+            "📚 수학 · 사회 · 과학 · 한국사 (개념서 범위 추출 & 상위 용어 개조)",
             "🔤 영어 (기출 지문 선택 & 수능 독해 유형 변형)",
         ],
         horizontal=True,
@@ -5689,7 +5696,7 @@ with tab2:
             with st.form("tab2_extract_options_form", border=False):
                 opt_c1, opt_c2, opt_c3 = st.columns(3)
                 with opt_c1:
-                    filter_subject = st.selectbox("과목 필터", ["전체", "수학", "사회", "과학"], index=0)
+                    filter_subject = st.selectbox("과목 필터", ["전체", "수학", "사회", "과학", "한국사"], index=0)
                 with opt_c2:
                     filter_grade = st.selectbox("학년 수준 필터", ["전체", "고1 이하", "고2 이하"], index=0)
                 with opt_c3:
@@ -5736,10 +5743,18 @@ with tab2:
                 elif not db_list:
                     st.warning("저장된 기출 DB가 비어 있습니다. 먼저 [탭 1]에서 모의고사를 수집·태깅해 주세요.")
                 else:
-                    # 1차 메타데이터 필터링
+                    # 1차 메타데이터 필터링 (비영어 과목 전용 · 과거 '사회'로 저장된 한국사 문항 호환 포함)
                     candidates: list[QuestionRecord] = []
                     for r in db_list:
-                        if filter_subject != "전체" and r.subject_category != filter_subject:
+                        if r.subject_category == "영어":
+                            continue
+                        is_history_rec = (
+                            r.subject_category == "한국사"
+                            or "한국사" in (r.curriculum_subject or "")
+                            or "한국사" in (r.exam_name or "")
+                        )
+                        eff_subj_cat = "한국사" if is_history_rec else r.subject_category
+                        if filter_subject != "전체" and eff_subj_cat != filter_subject:
                             continue
                         if filter_grade == "고1 이하" and r.min_grade > 1:
                             continue

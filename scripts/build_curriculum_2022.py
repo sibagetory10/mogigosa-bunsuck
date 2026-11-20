@@ -22,12 +22,14 @@ def main() -> int:
     parser.add_argument("--math", type=Path, help="별책 8 수학과 교육과정 PDF 경로")
     parser.add_argument("--science", type=Path, help="별책 9 과학과 교육과정 PDF 경로")
     parser.add_argument("--social", type=Path, help="별책 7 사회과 교육과정 PDF 경로")
+    parser.add_argument("--history", type=Path, help="별책 7 사회과(한국사 포함) 또는 한국사 교육과정 PDF 경로")
     args = parser.parse_args()
 
     targets: list[tuple[str, Path | None]] = [
         ("수학", args.math),
         ("과학", args.science),
         ("사회", args.social),
+        ("한국사", args.history),
     ]
     all_extracted = []
     for cat, pdf_path in targets:
@@ -41,7 +43,7 @@ def main() -> int:
         all_extracted.extend(items)
 
     if not all_extracted:
-        print("추출할 PDF 인자가 지정되지 않았습니다. --math / --science / --social 옵션을 확인하세요.")
+        print("추출할 PDF 인자가 지정되지 않았습니다. --math / --science / --social / --history 옵션을 확인하세요.")
         return 1
 
     res = merge_ncic_standards_to_catalog(all_extracted)

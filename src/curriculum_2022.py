@@ -93,11 +93,14 @@ def save_curriculum_2022_catalog(catalog: dict[str, Any], path: Path | None = No
     )
 
 
+CURRICULUM_CATEGORIES: tuple[str, ...] = ("수학", "사회", "과학", "한국사")
+
+
 def get_catalog_summary_stats(catalog: dict[str, Any] | None = None) -> dict[str, dict[str, int]]:
-    """대분류(수학·사회·과학)별 공식 과목 수 및 NCIC 성취기준 수 통계를 반환한다."""
+    """대분류(수학·사회·과학·한국사)별 공식 과목 수 및 NCIC 성취기준 수 통계를 반환한다."""
     cat_data = (catalog or load_curriculum_2022_catalog()).get("categories", {})
     stats: dict[str, dict[str, int]] = {}
-    for cat_name in ("수학", "사회", "과학"):
+    for cat_name in CURRICULUM_CATEGORIES:
         entry = cat_data.get(cat_name, {})
         stats[cat_name] = {
             "subjects": len(entry.get("subjects") or []),
@@ -134,7 +137,7 @@ def normalize_subject_2022(
     search_cats: list[str] = []
     if subject_category in cat_map:
         search_cats.append(subject_category)
-    for c in ("수학", "사회", "과학"):
+    for c in CURRICULUM_CATEGORIES:
         if c not in search_cats and c in cat_map:
             search_cats.append(c)
 
@@ -157,13 +160,15 @@ def normalize_subject_2022(
 
 def _infer_category_from_std(code: str, subject_name: str, fallback_cat: str) -> str:
     txt = f"{code} {subject_name}"
+    if any(k in txt for k in ("한사", "한국사")):
+        return "한국사"
     if any(k in txt for k in ("공수", "수학", "대수", "미적", "확통", "확률", "기하")):
         return "수학"
     if any(k in txt for k in ("통과", "과학", "물리", "화학", "생명", "지구", "역에", "전자", "물질", "화반", "세포", "유전", "지시", "행우")):
         return "과학"
-    if any(k in txt for k in ("통사", "한사", "한국사", "사회", "지리", "역사", "윤리", "정치", "법과", "경제", "사문", "세지", "세사", "현윤", "윤사")):
+    if any(k in txt for k in ("통사", "사회", "지리", "역사", "윤리", "정치", "법과", "경제", "사문", "세지", "세사", "현윤", "윤사")):
         return "사회"
-    return fallback_cat if fallback_cat in ("수학", "사회", "과학") else "과학"
+    return fallback_cat if fallback_cat in CURRICULUM_CATEGORIES else "과학"
 
 
 def parse_ncic_curriculum_pdf(
@@ -266,7 +271,7 @@ def merge_ncic_standards_to_catalog(
     for item in extracted_standards:
         code = (item.get("code") or "").strip()
         cat = (item.get("category") or "").strip()
-        if not code or cat not in ("수학", "사회", "과학"):
+        if not code or cat not in CURRICULUM_CATEGORIES:
             continue
         cat_entry = cat_map.setdefault(cat, {"subjects": [], "shift_notes": [], "core_units": {}, "standards": []})
         stds: list[dict[str, Any]] = cat_entry.setdefault("standards", [])
