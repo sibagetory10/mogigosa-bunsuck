@@ -950,6 +950,7 @@ def _tag_and_save_single_exam_inner(
                     answer_snippets=answer_snippets,
                     answer_pdf_part=answer_pdf_part,
                     status_callback=_status,
+                    parsed_crops=target_crops,
                 )
                 extracted_by_q.update(batch_map)
                 _log(
@@ -1229,6 +1230,8 @@ def _tag_and_save_single_exam_inner(
             raw_p_text = (getattr(extracted, "passage_text", "") or "").strip()
             if p_group and len(raw_p_text) < len(kor_group_passages.get(p_group, "")) * 0.7:
                 raw_p_text = kor_group_passages[p_group]
+            if not raw_p_text:
+                raw_p_text = (getattr(cq, "shared_passage_text", "") or "").strip()
             p_topic = (getattr(extracted, "passage_topic", "") or "").strip()
             k_vocab = [v.strip() for v in (getattr(extracted, "key_vocabulary", []) or []) if v and v.strip()]
 

@@ -4012,33 +4012,51 @@ def analyze_korean_exam_pdf_batch_with_gemini(
     answer_snippets: dict[int, str] | None = None,
     answer_pdf_part: Any | None = None,
     status_callback: Callable[[str], None] | None = None,
+    parsed_crops: Sequence[Any] | None = None,
 ) -> dict[int, KoreanQuestionExtractionItem]:
     """
     국어 모의고사 문제지 PDF(및 해설지)를 일괄 분석하여
-    공통 영역인 '독서'와 '문학'(주로 1~34번) 지문 세트만 추출한다.
-    '화법과 작문', '언어와 매체' 문항은 영역 판별 후 제외 대상로 표시한다.
+    공통 영역인 '독서'와 '문학' 지문 세트만 추출한다.
+    텍스트 레이어가 있는 경우 로컬에서 이미 추출한 문항·지문 텍스트와 해설 스니펫만 경량 전송하고,
+    AI가 지문 원문(passage_text)을 중복 출력하지 않도록 해 입력·출력 토큰을 대폭 절감한다.
     """
-    # 고3/수능 시험지에서 35~45번은 화법과 작문 / 언어와 매체 선택과목 영역이므로 1~34번 우선 필터
     ordered_q = sorted({int(q) for q in target_q_nums if 1 <= int(q) <= 45})
     if not ordered_q:
         return {}
 
-    client = _build_client(api_key, timeout_seconds=150)
-    if status_callback is not None:
-        status_callback(f"📖 국어 모의고사 PDF({len(ordered_q)}문항 · 독서/문학 공통 영역) 일괄 분석 준비 중...")
+    crop_by_q: dict[int, Any] = {}
+    local_group_passages: dict[str, str] = {}
+    for cq in (parsed_crops or []):
+        qn = int(getattr(cq, "q_num", 0) or 0)
+        if qn in ordered_q:
+            crop_by_q[qn] = cq
+            gid = normalize_korean_group_id(getattr(cq, "passage_group_id", ""), qn)
+            sp = (getattr(cq, "shared_passage_text", "") or "").strip()
+            if gid and len(sp) > len(local_group_passages.get(gid, "")):
+                local_group_passages[gid] = sp
 
-    prob_part = prepare_pdf_part(
-        client,
-        prob_pdf_bytes,
-        display_name=f"{exam_name}_korean_problem.pdf",
+    # 로컬 텍스트 레이어가 충분한지 판별 (대상 문항 70% 이상에서 추출 텍스트 >= 40자)
+    text_rich_count = sum(
+        1
+        for q in ordered_q
+        if q in crop_by_q and len(re.sub(r"\s+", "", getattr(crop_by_q[q], "extracted_text", "") or "")) >= 40
     )
+    use_lightweight_text_mode = bool(crop_by_q) and (text_rich_count / max(1, len(ordered_q))) >= 0.70
 
     snippets_map = answer_snippets or {}
     snippet_lines: list[str] = []
     for q in ordered_q:
         sn = (snippets_map.get(q) or "").strip()
         if sn:
-            snippet_lines.append(f"[{q}번 해설 발췌] {sn[:600]}")
+            snippet_lines.append(f"[{q}번 해설 발췌] {sn[:500]}")
+
+    # 스니펫이 대상 문항 80% 이상을 커버하면 무거운 해설지 PDF 바이너리 첨부 생략
+    snippets_cover_mostly = (len(snippet_lines) / max(1, len(ordered_q))) >= 0.80
+
+    client = _build_client(api_key, timeout_seconds=150)
+    if status_callback is not None:
+        mode_tag = "경량 텍스트 모드" if use_lightweight_text_mode else "PDF 비전 모드"
+        status_callback(f"📖 국어 모의고사({len(ordered_q)}문항 · {mode_tag}) 일괄 분석 준비 중...")
 
     hint_section = (
         "\n[해설지 문항별 발췌]\n" + "\n".join(snippet_lines) + "\n"
@@ -4046,42 +4064,82 @@ def analyze_korean_exam_pdf_batch_with_gemini(
         else ""
     )
 
+    if use_lightweight_text_mode:
+        # 로컬 추출 텍스트로 세트별 공통 지문 1회 + 문항별 발문·선지(공통 지문 제거) 조립
+        text_blocks: list[str] = []
+        emitted_groups: set[str] = set()
+        for q in ordered_q:
+            cq = crop_by_q.get(q)
+            if cq is None:
+                continue
+            gid = normalize_korean_group_id(getattr(cq, "passage_group_id", ""), q)
+            sp_txt = local_group_passages.get(gid, "")
+            if gid and sp_txt and gid not in emitted_groups:
+                emitted_groups.add(gid)
+                text_blocks.append(f"=== [공통 지문 세트: {gid}번] ===\n{sp_txt}")
+            raw_q_txt = (getattr(cq, "extracted_text", "") or "").strip()
+            if sp_txt and sp_txt in raw_q_txt:
+                raw_q_txt = raw_q_txt.replace(sp_txt, "").strip()
+            text_blocks.append(f"[{q}번 문항 (세트:{gid or q})]\n{raw_q_txt[:1800]}")
+        problem_text_section = "\n\n".join(text_blocks)
+
+        passage_rule = (
+            "4. `passage_text`: 지문 원문은 이미 시스템에 로컬 추출되어 있으므로, **이미 지문이 제공된 문항은 `passage_text`를 반드시 빈 문자열(`\"\"`)로 비워 출력 토큰을 절약하세요.** "
+            "(단, 제공된 텍스트에 공통 지문이 전혀 누락된 문항에 한해서만 지문을 수록하세요.)\n"
+        )
+        contents: list[Any] = []
+        if answer_pdf_part is not None and not snippets_cover_mostly:
+            contents.append(answer_pdf_part)
+        prompt = (
+            f"시험 회차: {exam_name}\n"
+            f"검토 대상 문항 번호(총 {len(ordered_q)}문항): {', '.join(str(q) for q in ordered_q)}\n\n"
+            f"[문제지 추출 텍스트 (지문 및 문항)]\n{problem_text_section}\n"
+            f"{hint_section}\n"
+            "위 국어 문제지 텍스트와 해설을 바탕으로 각 문항의 영역(독서/문학/화작/언매), 세부 갈래, 세트 범위, 주제, 어휘, 정답, 해설을 JSON(questions)으로 반환하세요."
+        )
+        contents.append(prompt)
+    else:
+        prob_part = prepare_pdf_part(
+            client,
+            prob_pdf_bytes,
+            display_name=f"{exam_name}_korean_problem.pdf",
+        )
+        passage_rule = (
+            "4. `passage_text` (스캔 PDF 독서·문학 전용):\n"
+            "   - 발문과 선택지(①~⑤), `<보기>`를 제외한 **순수 국어 지문 원문**을 추출하되, "
+            "**반드시 각 세트([1~3], [4~9] 등)의 첫 번째 문항에만 1회 수록하고 같은 세트의 나머지 문항은 빈 문자열(`\"\"`)로 비워 중복 출력을 피하세요.**\n"
+        )
+        contents = [prob_part]
+        if answer_pdf_part is not None and not snippets_cover_mostly:
+            contents.append(answer_pdf_part)
+        q_list_str = ", ".join(str(q) for q in ordered_q)
+        prompt = (
+            f"시험 회차: {exam_name}\n"
+            f"검토 대상 문항 번호(총 {len(ordered_q)}문항): {q_list_str}\n"
+            f"{hint_section}\n"
+            "위 국어 문제지 PDF(및 해설지)에서 독서·문학 공통 영역 문항의 지문 세트, 주제, 어휘, 정답, 해설을 추출하여 JSON(questions)으로 반환하세요. "
+            "(화법과 작문, 언어와 매체 문항은 korean_section만 표기하고 passage_text는 비워 두세요.)"
+        )
+        contents.append(prompt)
+
     system_inst = (
         "당신은 대한민국 수능·평가원·교육청 국어 영역(제1교시) 기출 분석 전문가입니다.\n"
         "이번 수집의 핵심 목표는 **공통 영역인 '독서'와 '문학' 지문 세트만 집중 추출**하는 것입니다.\n"
-        "고3·수능 시험지의 35~45번(화법과 작문 / 언어와 매체 선택과목)이나 고1·고2 시험지의 화법·작문·문법 문항은 "
-        "`korean_section`을 `'화법과 작문'` 또는 `'언어와 매체'`로 분류하고 `passage_text`는 빈 문자열(`\"\"`)로 비우세요.\n\n"
+        "'화법과 작문', '언어와 매체' 문항은 `korean_section`을 `'화법과 작문'` 또는 `'언어와 매체'`로 분류하고 `passage_text`·`official_explanation`을 간결히 비우세요.\n\n"
         "[추출 규칙]\n"
         "1. `korean_section`: 반드시 `'독서'`, `'문학'`, `'화법과 작문'`, `'언어와 매체'` 중 하나로 정확히 분류하세요.\n"
-        "   - 고3·평가원·수능 시험지에서 35~45번은 선택과목(화법과 작문 / 언어와 매체)이므로 절대 독서/문학으로 분류하지 마세요.\n"
+        "   - 고3·평가원·수능 시험지에서 35~45번은 선택과목(화법과 작문 / 언어와 매체)이므로 독서/문학으로 분류하지 마세요.\n"
         "2. `korean_subgenre`: 독서는 `'독서론'`, `'인문·예술'`, `'사회·경제'`, `'과학·기술'`, `'주제 통합'` 중 하나로, 문학은 `'현대시'`, `'고전시가'`, `'현대소설'`, `'고전소설'`, `'극·수필'`, `'갈래 복합'` 중 하나로 적으세요.\n"
-        "3. `passage_group_id`: 시험지에 표시된 공통 지문 세트 헤더(예: `[1~3]`, `[4~9]`, `[18~21]`)를 읽어 `'1~3'`, `'4~9'`, `'18~21'` 형식으로 적으세요. 단독 문항이면 해당 문항 번호를 적으세요.\n"
-        "4. `passage_text` (독서·문학 필수):\n"
-        "   - 발문과 선택지(①~⑤), `<보기>`를 제외한 **순수 국어 지문 원문 전체**를 빠짐없이 추출하세요.\n"
-        "   - `(가)`, `(나)`, `[A]~[E]`, `㉠~㉤`, `ⓐ~ⓔ`, 시의 연/행 구분, 소설의 중략 표시, 고전 어휘 각주(`* ...`) 등 지문 내부 표지를 원문 그대로 보존하세요.\n"
-        "   - 같은 세트에 속한 문항들은 동일한 공통 지문을 공유하므로 세트 내 최소 첫 문항(가능하면 모든 세트 문항)에 완전한 `passage_text`를 수록하세요.\n"
-        "5. `passage_topic`: 지문의 핵심 주제 또는 문학 작품명·작가(예: `'한용운, 「님의 침묵」 / 이육사, 「광야」'`, `'법적 의제와 간주의 차이'`)를 1줄로 요약하세요.\n"
-        "6. `key_vocabulary`: 지문의 핵심 개념어·어휘·문학 개념 3~6개를 나열하세요.\n"
+        "3. `passage_group_id`: 시험지에 표시된 공통 지문 세트 범위(예: `'1~3'`, `'4~9'`, `'18~21'`)를 적으세요.\n"
+        + passage_rule
+        + "5. `passage_topic`: 지문의 핵심 주제 또는 문학 작품명·작가(예: `'한용운, 「님의 침묵」'`, `'법적 의제와 간주의 차이'`)를 1줄로 요약하세요.\n"
+        "6. `key_vocabulary`: 지문의 핵심 개념어·어휘·문학 개념 3~5개를 나열하세요.\n"
         "7. `question_type`: 원래 문항 유형(예: `'세부 내용 일치'`, `'핵심 논지 추론'`, `'<보기> 사례 적용'`, `'표현상 특징'`, `'서술상 특징'`, `'문맥적 어휘 의미'`).\n"
-        "8. `official_explanation`과 `answer`: 해설지 기준 핵심 풀이 근거 요약과 공식 정답(`'1'`~`'5'`)을 정확히 추출하세요."
+        "8. `official_explanation`과 `answer`: 해설지 기준 핵심 풀이 근거 요약(1~2문장)과 공식 정답(`'1'`~`'5'`)을 정확히 추출하세요."
     )
-
-    q_list_str = ", ".join(str(q) for q in ordered_q)
-    prompt = (
-        f"시험 회차: {exam_name}\n"
-        f"검토 대상 문항 번호(총 {len(ordered_q)}문항): {q_list_str}\n"
-        f"{hint_section}\n"
-        "위 국어 문제지 PDF(및 해설지)에서 독서·문학 공통 영역 문항의 지문 세트, 주제, 어휘, 정답, 해설을 추출하여 JSON(questions)으로 반환하세요. "
-        "(화법과 작문, 언어와 매체 문항은 korean_section만 표기하고 passage_text는 비워 두세요.)"
-    )
-
-    contents: list[Any] = [prob_part]
-    if answer_pdf_part is not None:
-        contents.append(answer_pdf_part)
-    contents.append(prompt)
 
     if status_callback is not None:
-        status_callback(f"⚡ {model_name} 모델로 국어 PDF({len(ordered_q)}문항 · 독서/문학) 일괄 분석 중...")
+        status_callback(f"⚡ {model_name} 모델로 국어({len(ordered_q)}문항 · 독서/문학) 일괄 분석 중...")
 
     resp = _generate_content_with_fallback(
         client=client,
@@ -4104,9 +4162,18 @@ def analyze_korean_exam_pdf_batch_with_gemini(
     for item in parsed.questions:
         if item.q_num in ordered_q and item.q_num not in seen_q:
             item.answer = _normalize_extracted_answer(item.answer)
-            item.passage_group_id = normalize_korean_group_id(item.passage_group_id, item.q_num)
+            cq_ref = crop_by_q.get(item.q_num)
+            fallback_gid = getattr(cq_ref, "passage_group_id", "") if cq_ref is not None else ""
+            item.passage_group_id = normalize_korean_group_id(item.passage_group_id or fallback_gid, item.q_num)
             if item.korean_section in ("화법과 작문", "언어와 매체"):
                 item.passage_text = ""
+            elif not (item.passage_text or "").strip():
+                # AI 출력 토큰 절약을 위해 비워둔 경우 로컬 추출 지문 자동 복원
+                local_sp = local_group_passages.get(item.passage_group_id, "")
+                if not local_sp and cq_ref is not None:
+                    local_sp = (getattr(cq_ref, "shared_passage_text", "") or "").strip()
+                if local_sp:
+                    item.passage_text = local_sp
             seen_q.add(item.q_num)
             items_list.append(item)
 
