@@ -3761,63 +3761,55 @@ with tab1:
         )
         is_dir_upload = "폴더" in upload_mode_label
         accept_mode: bool | str = "directory" if is_dir_upload else True
-        prob_up_label = (
-            "문제지 폴더 업로드 (폴더 내 모든 PDF 자동 수집)"
+        unified_up_label = (
+            "📁 모의고사 폴더 통째로 업로드 (문제지·해설지 구분 없이 한 번에 선택 — AI 자동 분류 및 표지 매칭)"
             if is_dir_upload
-            else "문제지 PDF 업로드 (1개 또는 여러 개 선택 가능)"
-        )
-        ans_up_label = (
-            "해설지 폴더 업로드 (필수 · AI(Gemini 3.5 Flash-Lite) 자동 1:1 매칭)"
-            if is_dir_upload
-            else "해설지 PDF 업로드 (필수 · 여러 개 선택 시 AI 자동 매칭)"
+            else "📄 모의고사 PDF 한 번에 업로드 (문제지 + 해설지를 구분 없이 모두 선택 — AI 자동 분류 및 표지 매칭)"
         )
 
-        col_up1, col_up2 = st.columns(2)
-        with col_up1:
-            raw_prob_uploads = st.file_uploader(
-                prob_up_label,
-                type=["pdf"],
-                accept_multiple_files=accept_mode,
-                key="tab1_prob_pdf_dir" if is_dir_upload else "tab1_prob_pdf_files",
-            )
-        with col_up2:
-            raw_ans_uploads = st.file_uploader(
-                ans_up_label,
-                type=["pdf"],
-                accept_multiple_files=accept_mode,
-                key="tab1_ans_pdf_dir" if is_dir_upload else "tab1_ans_pdf_files",
-            )
-
-        raw_prob_files = sorted(
-            [f for f in (raw_prob_uploads or []) if f.name.lower().endswith(".pdf")],
-            key=lambda f: f.name,
+        raw_all_uploads = st.file_uploader(
+            unified_up_label,
+            type=["pdf"],
+            accept_multiple_files=accept_mode,
+            key="tab1_unified_pdf_dir" if is_dir_upload else "tab1_unified_pdf_files",
         )
-        raw_ans_files = sorted(
-            [f for f in (raw_ans_uploads or []) if f.name.lower().endswith(".pdf")],
+
+        raw_all_files = sorted(
+            [f for f in (raw_all_uploads or []) if f.name.lower().endswith(".pdf")],
             key=lambda f: f.name,
         )
 
-        prob_files = list(raw_prob_files)
-        ans_files = list(raw_ans_files)
+        prob_files: list[Any] = []
+        ans_files: list[Any] = []
 
-        # 문제지 업로드 목록/폴더 안에 해설·정답 PDF가 함께 들어있고 해설지 업로더가 비어있을 때 AI(3.5 Flash-Lite) 자동 분리
-        if not raw_ans_files and len(raw_prob_files) >= 2:
+        if len(raw_all_files) == 1:
+            prob_files = [raw_all_files[0]]
+        elif len(raw_all_files) >= 2:
             split_prob_idxs, split_ans_idxs, split_source = _resolve_mixed_pdf_split_with_ai(
-                raw_prob_files, upload_gemini_key
+                raw_all_files, upload_gemini_key
             )
-            if split_ans_idxs and split_prob_idxs:
-                split_prob = [raw_prob_files[i] for i in split_prob_idxs]
-                split_ans = [raw_prob_files[i] for i in split_ans_idxs]
-                split_badge = "🤖 Gemini 3.5 Flash-Lite가 " if split_source == "ai" else "📁 "
-                auto_split_ans = st.checkbox(
-                    f"{split_badge}문제지 업로드 목록에서 해설/정답 PDF {len(split_ans)}개를 해설지로 자동 분리 매칭 "
-                    f"(문제지 {len(split_prob)}개 + 해설지 {len(split_ans)}개)",
-                    value=True,
-                    key="tab1_auto_split_ans",
+            prob_files = [raw_all_files[i] for i in split_prob_idxs]
+            ans_files = [raw_all_files[i] for i in split_ans_idxs]
+
+            # 만약 AI/파일명 분류에서 문제지가 0개이거나 해설지가 0개인 예외 상황 안내
+            split_badge = "🤖 Gemini AI 표지 판별" if split_source == "ai" else "📁 파일명 판별"
+            sc_info, sc_btn = st.columns([3.2, 1.0])
+            with sc_info:
+                st.caption(
+                    f"{split_badge}: 총 {len(raw_all_files)}개 PDF → "
+                    f"**문제지 {len(prob_files)}개** · **해설지 {len(ans_files)}개** 자동 분리 완료"
                 )
-                if auto_split_ans:
-                    prob_files = split_prob
-                    ans_files = split_ans
+            with sc_btn:
+                if st.button("🔄 AI 표지 다시 분류", key="tab1_resplit_btn", width="stretch"):
+                    raw_sig = (
+                        tuple((f.name, int(getattr(f, "size", 0))) for f in raw_all_files),
+                        bool(upload_gemini_key),
+                    )
+                    st.session_state.get("tab1_ai_split_cache", {}).pop(raw_sig, None)
+                    st.rerun()
+
+            if not prob_files and ans_files:
+                st.warning("⚠️ 업로드된 파일이 모두 해설지로 분류되었습니다. 문제지 PDF도 함께 선택해 주세요.")
 
         is_batch_queue_mode = len(prob_files) >= 2
 
