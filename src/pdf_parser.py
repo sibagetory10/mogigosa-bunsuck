@@ -13,7 +13,7 @@ from PIL import Image
 from src.models import normalize_exam_year
 
 QUESTION_START_RE = re.compile(r"^(\d{1,2})\s*\.(?!\d)\s*(.*)$")
-SHARED_PASSAGE_RE = re.compile(r"^[\[\【]\s*(\d{1,2})\s*[~\-～–—]\s*(\d{1,2})\s*(?:번)?\s*[\]\】]")
+SHARED_PASSAGE_RE = re.compile(r"^[\[\【]\s*(\d{1,2})\s*[~\-～–—∼〜]\s*(\d{1,2})\s*(?:번)?\s*[\]\】]")
 
 
 @dataclass
@@ -841,6 +841,12 @@ def parse_exam_pdf(
                 if not lines:
                     continue
 
+                # 상단 여백 헤더('16 국어', '12 국어' 등)가 있으면 그 아래부터 본문 시작점으로 제한
+                top_header_y1 = 0.055 * page_h
+                for ln in lines:
+                    if ln["y0"] < 0.105 * page_h and _is_footer_or_header_noise(ln["text"], ln["y0"], page_h):
+                        top_header_y1 = max(top_header_y1, ln["y1"] + 3.0)
+
                 # 컬럼 본문의 좌측 시작 기준 (과도한 좌측 여백 노이즈 방지를 위해 중앙값/대다수 기준 보조)
                 candidate_xs = sorted(
                     ln["x0"]
@@ -941,9 +947,11 @@ def parse_exam_pdf(
                     )
                     seen_q_nums.add(q_num)
 
-                content_boxes = _collect_content_boxes_in_column(
-                    page, page_dict, col_x0, col_x1, page_h
-                )
+                content_boxes = [
+                    b
+                    for b in _collect_content_boxes_in_column(page, page_dict, col_x0, col_x1, page_h)
+                    if b[3] > top_header_y1
+                ]
 
                 # 같은 단에 있던 지문 영역을 별도 PNG로 크롭(split_passage_and_question=True 전용)
                 if split_passage_and_question and same_col_passage_crops:
@@ -972,7 +980,7 @@ def parse_exam_pdf(
                     cont_lines = [
                         ln
                         for ln in lines
-                        if 0.055 * page_h <= ln["y0"] < first_m["y_start"] - 1.0
+                        if top_header_y1 <= ln["y0"] < first_m["y_start"] - 1.0
                         and not _is_footer_or_header_noise(ln["text"], ln["y0"], page_h)
                     ]
                     if cont_lines:
@@ -1026,7 +1034,7 @@ def parse_exam_pdf(
                     mid_lines = [
                         ln
                         for ln in lines
-                        if 0.055 * page_h <= ln["y0"] < mid_top_y - 1.0
+                        if top_header_y1 <= ln["y0"] < mid_top_y - 1.0
                         and not _is_footer_or_header_noise(ln["text"], ln["y0"], page_h)
                     ]
                     if mid_lines:
@@ -1051,6 +1059,7 @@ def parse_exam_pdf(
                     prev_col_last_q_idx = None
                 elif prev_col_last_q_idx is not None:
                     # 직전 단의 마지막 문항(예: 17번)이 현재 단 상단(첫 문항 또는 첫 세트 헤더 이전)까지 이어지는 경우 꼬리(①~⑤ 선지 등) 병합
+                    # 단, 새 지문('다음 글을 읽고 물음에 답하시오', '[N~M]')이 시작되는 경우는 절대 병합하지 않음
                     boundary_candidates: list[float] = []
                     if markers:
                         boundary_candidates.append(markers[0]["y_start"])
@@ -1061,10 +1070,15 @@ def parse_exam_pdf(
                     tail_lines = [
                         ln
                         for ln in lines
-                        if 0.055 * page_h <= ln["y0"] < top_boundary_y - 1.0
+                        if top_header_y1 <= ln["y0"] < top_boundary_y - 1.0
                         and not _is_footer_or_header_noise(ln["text"], ln["y0"], page_h)
                     ]
-                    if tail_lines:
+                    tail_head_blob = " ".join(ln["text"] for ln in tail_lines[:3])
+                    is_new_passage_start = (
+                        "다음 글을 읽고 물음에 답하시오" in tail_head_blob
+                        or any(SHARED_PASSAGE_RE.match(ln["text"]) for ln in tail_lines[:3])
+                    )
+                    if tail_lines and not is_new_passage_start and len(tail_lines) <= 18:
                         tail_top = min(ln["y0"] for ln in tail_lines) - 4.0
                         tail_boxes = [
                             b
@@ -1074,11 +1088,11 @@ def parse_exam_pdf(
                         if tail_boxes:
                             t_clip = pymupdf.Rect(
                                 max(col_x0 + 2.0, min(b[0] for b in tail_boxes) - 10.0),
-                                max(0.055 * page_h, min(tail_top, min(b[1] for b in tail_boxes)) - 6.0),
+                                max(top_header_y1, min(tail_top, min(b[1] for b in tail_boxes)) - 6.0),
                                 min(col_x1 - 2.0, max(b[2] for b in tail_boxes) + 10.0),
                                 min(top_boundary_y - 3.0, max(b[3] for b in tail_boxes) + 8.0),
                             )
-                            if t_clip.y1 > t_clip.y0 + 8.0:
+                            if 8.0 < (t_clip.y1 - t_clip.y0) <= 0.45 * page_h:
                                 t_pix = page.get_pixmap(dpi=effective_dpi, clip=t_clip, alpha=False)
                                 prev_cq = results[prev_col_last_q_idx]
                                 stitched_png, st_w, st_h = _stitch_vertical_pngs(
@@ -1132,7 +1146,7 @@ def parse_exam_pdf(
                     pad_y = 8.0
                     clip = pymupdf.Rect(
                         max(col_x0 + 2.0, min_x - pad_x),
-                        max(0.055 * page_h, min_y - pad_y),
+                        max(top_header_y1, min_y - pad_y),
                         min(col_x1 - 2.0, max_x + pad_x),
                         min(
                             0.908 * page_h if (is_last_in_col and not trailing_passage_cuts_col) else y_bottom_limit,
@@ -1214,7 +1228,9 @@ def parse_exam_pdf(
                         )
                     )
                     if is_last_in_col and not trailing_passage_cuts_col:
-                        prev_col_last_q_idx = len(results) - 1
+                        # 이미 ⑤(또는 5)) 선지까지 완결된 문항은 다음 단으로 꼬리를 이어 붙이지 않음
+                        q_has_choice_5 = ("⑤" in q_text) or bool(re.search(r"(?:^|\n)\s*5\)", q_text))
+                        prev_col_last_q_idx = None if q_has_choice_5 else (len(results) - 1)
                     elif is_last_in_col:
                         prev_col_last_q_idx = None
 
