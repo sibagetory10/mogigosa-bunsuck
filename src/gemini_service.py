@@ -3132,16 +3132,15 @@ def _validate_english_transformed_output(
                         break
             if source_passage and ans_alpha:
                 # 3. 문맥상 어휘 적절성: 5개 밑줄 단어 중 정확히 1개(정답 위치)만 원문과 다른 단어인지 검증
-                not_in_src_indices = [
-                    idx_u
-                    for idx_u, w in enumerate(u_words[:5])
-                    if re.sub(r"[^a-zA-Z\-]", "", w)
-                    and not re.search(
-                        rf"\b{re.escape(re.sub(r'[^a-zA-Z\-]', '', w).lower())}\b",
+                not_in_src_indices: list[int] = []
+                for idx_u, w in enumerate(u_words[:5]):
+                    cleaned_w = re.sub(r"[^a-zA-Z\-]", "", w).lower()
+                    if cleaned_w and not re.search(
+                        r"\b" + re.escape(cleaned_w) + r"\b",
                         source_passage,
                         flags=re.IGNORECASE,
-                    )
-                ]
+                    ):
+                        not_in_src_indices.append(idx_u)
                 if not not_in_src_indices:
                     issues.append(
                         f"문맥상 어휘 문제에서 5개 밑줄 단어({u_words[:5]})가 모두 원문 그대로입니다. "

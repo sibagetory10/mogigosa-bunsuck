@@ -248,7 +248,7 @@ def resolve_admin_config() -> AdminConfig:
         source = "st.secrets"
     elif os.environ.get("ADMIN_PASSWORD", "").strip():
         admin_pw = os.environ["ADMIN_PASSWORD"].strip()
-        if source == "미설정":
+        if source == "기본 설정":
             source = "환경변수"
 
     return AdminConfig(

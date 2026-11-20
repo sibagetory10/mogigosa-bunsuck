@@ -19,7 +19,7 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
 from src.exporters import build_exam_ai_jsonl, build_exam_html, build_exam_markdown
-from src.models import ConceptBookRecord, QuestionRecord, RewrittenQuestion, UserRecord
+from src.models import ConceptBookRecord, LEGACY_TIER_MAP, QuestionRecord, RewrittenQuestion, UserRecord
 
 DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive"]
 FOLDER_MIME = "application/vnd.google-apps.folder"
@@ -608,7 +608,7 @@ class StorageManager:
                     needs_migration = any(
                         isinstance(item, dict)
                         and (
-                            str(item.get("tier", "")).strip().upper() in ("BYOK", "ULTRA")
+                            str(item.get("tier", "")).strip().upper() in LEGACY_TIER_MAP
                             or "custom_api_key" not in item
                         )
                         for item in raw
