@@ -26,6 +26,9 @@ class CroppedQuestion:
     extracted_text: str
     passage_group_id: str = ""
     shared_passage_text: str = ""
+    passage_png_bytes: bytes = b""
+    passage_width: int = 0
+    passage_height: int = 0
 
 
 def get_pdf_page_count(pdf_bytes: bytes) -> int:
@@ -777,11 +780,16 @@ def _stitch_vertical_pngs(top_png: bytes, bottom_png: bytes, gap_px: int = 12) -
         return buf.getvalue(), w, h
 
 
-def parse_exam_pdf(pdf_bytes: bytes, dpi: int = 250) -> tuple[list[CroppedQuestion], bool]:
+def parse_exam_pdf(
+    pdf_bytes: bytes,
+    dpi: int = 250,
+    split_passage_and_question: bool = False,
+) -> tuple[list[CroppedQuestion], bool]:
     """
     2단 편집 한국어 모의고사/수능 문제지 PDF를 PyMuPDF로 분석해
     가로 중앙(page_width / 2) 기준 왼쪽 단(위->아래) 후 오른쪽 단(위->아래) 순서로
     1번~45번 전체 문항 및 세트 지문([N~M])을 고해상도(>=220 DPI) PNG로 크롭한다.
+    split_passage_and_question=True(국어 등)일 때는 공통 지문 이미지와 개별 문제 이미지를 분리해 반환한다.
     """
     effective_dpi = max(220, dpi)
     results: list[CroppedQuestion] = []
@@ -793,6 +801,29 @@ def parse_exam_pdf(pdf_bytes: bytes, dpi: int = 250) -> tuple[list[CroppedQuesti
     active_passage_group: dict | None = None
     # 이전 단 맨 아래 문항이 다음 단 상단(새 문항/새 지문 시작 전)까지 이어지는 경우(선지 등) 꼬리 병합용
     prev_col_last_q_idx: int | None = None
+
+    def _crop_region_png(
+        page_obj: pymupdf.Page,
+        c_boxes: list[tuple[float, float, float, float]],
+        c_x0: float,
+        c_x1: float,
+        p_h: float,
+        y_lo: float,
+        y_hi: float,
+    ) -> tuple[bytes, int, int] | None:
+        r_boxes = [b for b in c_boxes if b[3] > y_lo - 4.0 and b[1] < y_hi]
+        if not r_boxes:
+            return None
+        r_clip = pymupdf.Rect(
+            max(c_x0 + 2.0, min(b[0] for b in r_boxes) - 10.0),
+            max(0.055 * p_h, min(y_lo, min(b[1] for b in r_boxes)) - 6.0),
+            min(c_x1 - 2.0, max(b[2] for b in r_boxes) + 10.0),
+            min(y_hi, max(b[3] for b in r_boxes) + 8.0),
+        )
+        if r_clip.y1 <= r_clip.y0 + 6.0:
+            return None
+        r_pix = page_obj.get_pixmap(dpi=effective_dpi, clip=r_clip, alpha=False)
+        return r_pix.tobytes("png"), r_pix.width, r_pix.height
 
     with pymupdf.open(stream=pdf_bytes, filetype="pdf") as doc:
         for page_idx in range(doc.page_count):
@@ -825,6 +856,7 @@ def parse_exam_pdf(pdf_bytes: bytes, dpi: int = 250) -> tuple[list[CroppedQuesti
                 pending_passage_y0: float | None = None
                 pending_passage_start_q: int | None = None
                 pending_passage_end_q: int | None = None
+                same_col_passage_crops: list[tuple[str, float, float]] = []
 
                 for ln in lines:
                     txt = ln["text"]
@@ -873,13 +905,21 @@ def parse_exam_pdf(pdf_bytes: bytes, dpi: int = 250) -> tuple[list[CroppedQuesti
                             if pending_passage_y0 - 2.0 <= l_item["y0"] < ln["y0"] - 1.0
                             and not _is_footer_or_header_noise(l_item["text"], l_item["y0"], page_h)
                         ).strip()
+                        grp_id = f"{pending_passage_start_q}~{pending_passage_end_q}"
                         active_passage_group = {
                             "start_q": pending_passage_start_q,
                             "end_q": pending_passage_end_q,
-                            "group_id": f"{pending_passage_start_q}~{pending_passage_end_q}",
+                            "group_id": grp_id,
                             "text": same_col_shared_txt,
+                            "png_bytes": b"",
+                            "width": 0,
+                            "height": 0,
                         }
-                        start_y = min(start_y, pending_passage_y0)
+                        if split_passage_and_question:
+                            # 지문과 문제를 분리할 때는 지문 영역을 별도 기록하고 문항은 번호 시작점(ln["y0"])부터 크롭
+                            same_col_passage_crops.append((grp_id, pending_passage_y0, ln["y0"] - 3.0))
+                        else:
+                            start_y = min(start_y, pending_passage_y0)
                         pending_passage_y0 = None
                         pending_passage_start_q = None
                         pending_passage_end_q = None
@@ -905,8 +945,24 @@ def parse_exam_pdf(pdf_bytes: bytes, dpi: int = 250) -> tuple[list[CroppedQuesti
                     page, page_dict, col_x0, col_x1, page_h
                 )
 
-                # 직전 단에서 이월된 세트 지문(예: [43~45] (A))이 현재 단 상단에서 (B)(C)(D) 등으로 이어진 뒤 첫 문항(43.)이 나오는 경우,
-                # 첫 문항 위의 이어지는 지문 영역과 텍스트를 첫 문항 및 공통 지문에 자동 병합한다.
+                # 같은 단에 있던 지문 영역을 별도 PNG로 크롭(split_passage_and_question=True 전용)
+                if split_passage_and_question and same_col_passage_crops:
+                    for s_gid, py0, py1 in same_col_passage_crops:
+                        cropped_p = _crop_region_png(page, content_boxes, col_x0, col_x1, page_h, py0, py1)
+                        if cropped_p:
+                            p_b, p_w, p_h_px = cropped_p
+                            if active_passage_group and active_passage_group.get("group_id") == s_gid:
+                                active_passage_group["png_bytes"] = p_b
+                                active_passage_group["width"] = p_w
+                                active_passage_group["height"] = p_h_px
+                            for m_item in markers:
+                                mg = m_item.get("passage_group")
+                                if mg and mg.get("group_id") == s_gid:
+                                    mg["png_bytes"] = p_b
+                                    mg["width"] = p_w
+                                    mg["height"] = p_h_px
+
+                # 직전 단에서 이월된 세트 지문(예: [43~45] (A))이 현재 단 상단에서 (B)(C)(D) 등으로 이어진 뒤 첫 문항(43.)이 나오는 경우
                 if (
                     markers
                     and carried_passage is not None
@@ -928,7 +984,30 @@ def parse_exam_pdf(pdf_bytes: bytes, dpi: int = 250) -> tuple[list[CroppedQuesti
                                 and active_passage_group["start_q"] == carried_passage["start_q"]
                             ):
                                 active_passage_group["text"] = carried_passage["text"]
-                        first_m["y_start"] = min(first_m["y_start"], min(ln["y0"] for ln in cont_lines))
+                        if split_passage_and_question:
+                            # 이어지는 지문 이미지를 carried_passage 지문 이미지 아래에 이어 붙임 (문제 이미지에는 안 붙임)
+                            cont_crop = _crop_region_png(
+                                page,
+                                content_boxes,
+                                col_x0,
+                                col_x1,
+                                page_h,
+                                min(ln["y0"] for ln in cont_lines),
+                                first_m["y_start"] - 3.0,
+                            )
+                            if cont_crop:
+                                st_p, st_pw, st_ph = _stitch_vertical_pngs(
+                                    carried_passage["png_bytes"], cont_crop[0]
+                                )
+                                carried_passage["png_bytes"] = st_p
+                                carried_passage["width"] = st_pw
+                                carried_passage["height"] = st_ph
+                                if active_passage_group and active_passage_group["start_q"] == carried_passage["start_q"]:
+                                    active_passage_group["png_bytes"] = st_p
+                                    active_passage_group["width"] = st_pw
+                                    active_passage_group["height"] = st_ph
+                        else:
+                            first_m["y_start"] = min(first_m["y_start"], min(ln["y0"] for ln in cont_lines))
                     if (
                         active_passage_group is not None
                         and active_passage_group["start_q"] <= first_m["q_num"] <= active_passage_group["end_q"]
@@ -936,6 +1015,39 @@ def parse_exam_pdf(pdf_bytes: bytes, dpi: int = 250) -> tuple[list[CroppedQuesti
                         for m_item in markers:
                             if active_passage_group["start_q"] <= m_item["q_num"] <= active_passage_group["end_q"]:
                                 m_item["passage_group"] = dict(active_passage_group)
+                    prev_col_last_q_idx = None
+                elif (
+                    not markers
+                    and carried_passage is not None
+                    and pending_passage_y0 is None
+                ):
+                    # 한 단 전체가 이어지는 지문으로만 채워져 있고 문항이 하나도 없는 경우 (긴 국어 지문 대응)
+                    mid_top_y = first_passage_y0_in_col if first_passage_y0_in_col is not None else 0.902 * page_h
+                    mid_lines = [
+                        ln
+                        for ln in lines
+                        if 0.055 * page_h <= ln["y0"] < mid_top_y - 1.0
+                        and not _is_footer_or_header_noise(ln["text"], ln["y0"], page_h)
+                    ]
+                    if mid_lines:
+                        mid_txt = "\n".join(ln["text"] for ln in mid_lines).strip()
+                        if mid_txt:
+                            carried_passage["text"] = f"{carried_passage.get('text', '')}\n{mid_txt}".strip()
+                        mid_crop = _crop_region_png(
+                            page, content_boxes, col_x0, col_x1, page_h, min(ln["y0"] for ln in mid_lines), mid_top_y
+                        )
+                        if mid_crop:
+                            st_p, st_pw, st_ph = _stitch_vertical_pngs(
+                                carried_passage["png_bytes"], mid_crop[0]
+                            )
+                            carried_passage["png_bytes"] = st_p
+                            carried_passage["width"] = st_pw
+                            carried_passage["height"] = st_ph
+                            if active_passage_group and active_passage_group["start_q"] == carried_passage["start_q"]:
+                                active_passage_group["text"] = carried_passage["text"]
+                                active_passage_group["png_bytes"] = st_p
+                                active_passage_group["width"] = st_pw
+                                active_passage_group["height"] = st_ph
                     prev_col_last_q_idx = None
                 elif prev_col_last_q_idx is not None:
                     # 직전 단의 마지막 문항(예: 17번)이 현재 단 상단(첫 문항 또는 첫 세트 헤더 이전)까지 이어지는 경우 꼬리(①~⑤ 선지 등) 병합
@@ -1044,15 +1156,24 @@ def parse_exam_pdf(pdf_bytes: bytes, dpi: int = 250) -> tuple[list[CroppedQuesti
                         and not _is_footer_or_header_noise(ln["text"], ln["y0"], page_h)
                     )
 
-                    # 직전 단에서 이월된 세트 지문이 현재 문항 번호 구간(start_q <= q_num <= end_q)에 속할 때만 첫 문항 상단에 이미지 결합
+                    q_passage_png = b""
+                    q_passage_w = 0
+                    q_passage_h = 0
+
+                    # 직전 단에서 이월된 세트 지문이 현재 문항 번호 구간(start_q <= q_num <= end_q)에 속할 때
                     if (
                         carried_passage is not None
                         and carried_passage["start_q"] <= marker["q_num"] <= carried_passage["end_q"]
                     ):
-                        png_out, out_w, out_h = _stitch_vertical_pngs(
-                            carried_passage["png_bytes"],
-                            png_out,
-                        )
+                        if split_passage_and_question:
+                            q_passage_png = carried_passage.get("png_bytes", b"")
+                            with Image.open(io.BytesIO(q_passage_png)) as im_p:
+                                q_passage_w, q_passage_h = im_p.size
+                        else:
+                            png_out, out_w, out_h = _stitch_vertical_pngs(
+                                carried_passage["png_bytes"],
+                                png_out,
+                            )
                         if carried_passage.get("text"):
                             q_text = f"{carried_passage['text']}\n\n{q_text}".strip()
                         carried_passage = None
@@ -1072,6 +1193,10 @@ def parse_exam_pdf(pdf_bytes: bytes, dpi: int = 250) -> tuple[list[CroppedQuesti
                         q_shared_text = str(m_group.get("text") or "").strip()
                         if q_shared_text and q_shared_text not in q_text:
                             q_text = f"{q_shared_text}\n\n{q_text}".strip()
+                        if split_passage_and_question and not q_passage_png and m_group.get("png_bytes"):
+                            q_passage_png = m_group["png_bytes"]
+                            q_passage_w = int(m_group.get("width") or 0)
+                            q_passage_h = int(m_group.get("height") or 0)
 
                     results.append(
                         CroppedQuestion(
@@ -1083,6 +1208,9 @@ def parse_exam_pdf(pdf_bytes: bytes, dpi: int = 250) -> tuple[list[CroppedQuesti
                             extracted_text=q_text,
                             passage_group_id=q_group_id,
                             shared_passage_text=q_shared_text,
+                            passage_png_bytes=q_passage_png,
+                            passage_width=q_passage_w,
+                            passage_height=q_passage_h,
                         )
                     )
                     if is_last_in_col and not trailing_passage_cuts_col:

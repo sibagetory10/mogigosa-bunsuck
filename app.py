@@ -643,7 +643,12 @@ def _crop_single_exam_pdf(
     progress_cb: Callable[[float], None] | None = None,
 ) -> tuple[list[CroppedQuestion], int, bool]:
     """단일 문제지 PDF를 2단 편집 기준으로 크롭하고, 스캔·누락 의심 페이지는 순차 Vision 보완한다."""
-    crops, has_text = parse_exam_pdf(prob_bytes, dpi=220)
+    is_korean_hint = "국어" in (subject_hint or "")
+    crops, has_text = parse_exam_pdf(
+        prob_bytes,
+        dpi=220,
+        split_passage_and_question=is_korean_hint,
+    )
     total_p = get_pdf_page_count(prob_bytes)
 
     if use_vision_fallback and api_key and _ensure_token_quota(show_error=False):
@@ -1217,12 +1222,30 @@ def _tag_and_save_single_exam_inner(
             kor_sub = (getattr(extracted, "korean_subgenre", "") or "").strip()
             kor_qtype = (getattr(extracted, "question_type", "") or "").strip() or kor_sec
             curr_subj = f"{kor_sec}({kor_sub})" if kor_sub else kor_sec
-            p_group = normalize_korean_group_id(getattr(extracted, "passage_group_id", ""), cq.q_num)
+            p_group = normalize_korean_group_id(
+                getattr(extracted, "passage_group_id", "") or getattr(cq, "passage_group_id", ""),
+                cq.q_num,
+            )
             raw_p_text = (getattr(extracted, "passage_text", "") or "").strip()
             if p_group and len(raw_p_text) < len(kor_group_passages.get(p_group, "")) * 0.7:
                 raw_p_text = kor_group_passages[p_group]
             p_topic = (getattr(extracted, "passage_topic", "") or "").strip()
             k_vocab = [v.strip() for v in (getattr(extracted, "key_vocabulary", []) or []) if v and v.strip()]
+
+            p_img_filename = old_rec.passage_image_filename if (old_rec is not None and getattr(old_rec, "passage_image_filename", "")) else ""
+            cq_passage_png = getattr(cq, "passage_png_bytes", b"") or b""
+            if cq_passage_png and p_group:
+                safe_grp = re.sub(r"[^0-9_~]+", "", p_group).replace("~", "_")
+                p_img_filename = f"{safe_exam}__P{safe_grp}.png"
+                if p_img_filename not in pending_crop_files:
+                    storage.save_crop_png(
+                        p_img_filename,
+                        cq_passage_png,
+                        subject_category=meta["subject_category"],
+                        exam_name=meta["exam_name"],
+                        sync_drive=False,
+                    )
+                    pending_crop_files.append(p_img_filename)
 
             record = QuestionRecord(
                 id=q_id,
@@ -1252,6 +1275,7 @@ def _tag_and_save_single_exam_inner(
                 passage_topic=p_topic,
                 key_vocabulary=k_vocab,
                 image_filename=img_filename,
+                passage_image_filename=p_img_filename,
                 source_pdf=eff_source_pdf,
                 answer_pdf=eff_answer_pdf,
                 created_at=now_iso,
@@ -1419,6 +1443,16 @@ def _render_question_tag_details(
         if vocab_list:
             st.markdown("**핵심 어휘·개념 (`key_vocabulary`)**")
             render_chips(vocab_list, variant="amber")
+        p_img_fn = (getattr(rec, "passage_image_filename", "") or "").strip()
+        if p_img_fn:
+            p_img_bytes = storage.get_crop_bytes(
+                p_img_fn,
+                subject_category=rec.subject_category,
+                exam_name=rec.exam_name,
+            )
+            if p_img_bytes:
+                with st.expander(f"🖼️ 분리된 공통 지문 이미지 (`{grp_id or p_img_fn}`) 보기", expanded=False):
+                    st.image(p_img_bytes, caption=f"[{grp_id}] 공통 지문", width="stretch")
         if passage_txt:
             with st.expander("📖 추출된 국어 지문 원문 (`passage_text`) 보기", expanded=False):
                 st.markdown(
@@ -4385,6 +4419,28 @@ with tab1:
         st.markdown(f"### 2️⃣ 크롭 문항 확인 & 2022 원리·용어 분해 태깅 (`{meta['exam_name']}`)")
 
         with st.expander(f"🖼️ 크롭된 문항 미리보기 ({len(parsed_crops)}문항)", expanded=False):
+            seen_p_groups: dict[str, CroppedQuestion] = {}
+            for cq in parsed_crops:
+                p_b = getattr(cq, "passage_png_bytes", b"") or b""
+                p_g = getattr(cq, "passage_group_id", "") or ""
+                if p_b and p_g and p_g not in seen_p_groups:
+                    seen_p_groups[p_g] = cq
+
+            if seen_p_groups:
+                st.markdown(f"**📖 분리된 공통 지문 이미지 ({len(seen_p_groups)}개 세트)**")
+                p_list = list(seen_p_groups.items())
+                for idx in range(0, len(p_list), 3):
+                    p_cols = st.columns(3)
+                    for col_i, (p_gid, p_cq) in enumerate(p_list[idx : idx + 3]):
+                        with p_cols[col_i]:
+                            st.image(
+                                p_cq.passage_png_bytes,
+                                caption=f"[{p_gid}번] 공통 지문 ({p_cq.passage_width}x{p_cq.passage_height}px)",
+                                width="stretch",
+                            )
+                st.markdown("---")
+                st.markdown(f"**📝 문항별 크롭 이미지 (문제만 · {len(parsed_crops)}문항)**")
+
             cols_per_row = 3
             for idx in range(0, len(parsed_crops), cols_per_row):
                 row_cols = st.columns(cols_per_row)

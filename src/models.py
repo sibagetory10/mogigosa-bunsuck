@@ -149,6 +149,10 @@ class QuestionRecord(BaseModel):
         description="영어 지문 핵심 어휘 목록 (예: ['resilience: 회복탄력성'])",
     )
     image_filename: str = Field(default="", description="크롭된 문항 PNG 파일명")
+    passage_image_filename: str = Field(
+        default="",
+        description="세트 공통 지문 분리 크롭 PNG 파일명 (국어 등 지문·문제 분리 저장용)",
+    )
     source_pdf: str = Field(default="", description="원본 문제지 PDF 파일명")
     answer_pdf: str = Field(default="", description="원본 해설지 PDF 파일명")
     created_at: str = Field(default="", description="생성 시각 (ISO 8601)")
