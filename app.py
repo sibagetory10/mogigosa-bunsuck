@@ -5467,33 +5467,57 @@ def _render_tab2_concept_source_tabs() -> None:
                     f"추출 페이지 구간: `{chosen_book.page_ranges_spec}`"
                 )
 
-                with st.form(key=f"tab2_unit_select_form_{chosen_book.id}"):
+                all_unit_key = f"sel_all_units_{chosen_book.id}"
+                unit_chk_keys = [f"unit_chk_{chosen_book.id}_{u_i}" for u_i in range(len(chosen_book.units))]
+                if all_unit_key not in st.session_state:
+                    st.session_state[all_unit_key] = False
+                for uk in unit_chk_keys:
+                    if uk not in st.session_state:
+                        st.session_state[uk] = False
+
+                def _on_toggle_all_units(
+                    _all_key: str = all_unit_key,
+                    _unit_keys: list[str] = unit_chk_keys,
+                ) -> None:
+                    target_val = bool(st.session_state.get(_all_key, False))
+                    for _uk in _unit_keys:
+                        st.session_state[_uk] = target_val
+
+                def _on_toggle_single_unit(
+                    _all_key: str = all_unit_key,
+                    _unit_keys: list[str] = unit_chk_keys,
+                ) -> None:
+                    st.session_state[_all_key] = bool(_unit_keys) and all(
+                        bool(st.session_state.get(_uk, False)) for _uk in _unit_keys
+                    )
+
+                with st.container(border=True):
                     st.markdown("**✅ 출제 및 개조 기준으로 사용할 단원을 체크한 뒤 아래 적용 버튼을 누르세요:**")
-                    select_all_units = st.checkbox(
-                        "전체 단원 일괄 선택 (체크 후 적용 시 전체 단원 반영)",
-                        value=False,
-                        key=f"sel_all_units_{chosen_book.id}",
+                    st.checkbox(
+                        "전체 단원 선택 / 해제",
+                        key=all_unit_key,
+                        on_change=_on_toggle_all_units,
                     )
                     selected_units_list: list[ConceptUnit] = []
                     for u_i, unit_obj in enumerate(chosen_book.units):
                         checked = st.checkbox(
                             f"{unit_obj.unit_name} ({unit_obj.page_range}) — 핵심개념 {len(unit_obj.core_concepts)}개 · 허용용어 {len(unit_obj.allowed_terms_and_units)}개",
-                            value=False,
-                            key=f"unit_chk_{chosen_book.id}_{u_i}",
+                            key=unit_chk_keys[u_i],
+                            on_change=_on_toggle_single_unit,
                         )
                         if checked:
                             selected_units_list.append(unit_obj)
 
-                    apply_units_btn = st.form_submit_button(
+                    st.caption(f"현재 선택된 단원: **{len(selected_units_list)} / {len(chosen_book.units)}개**")
+                    apply_units_btn = st.button(
                         "📚 선택한 단원으로 지식 화이트리스트 즉시 적용",
                         type="primary",
                         width="stretch",
+                        key=f"apply_units_btn_{chosen_book.id}",
                     )
 
                 if apply_units_btn:
-                    effective_units = (
-                        list(chosen_book.units) if select_all_units else selected_units_list
-                    )
+                    effective_units = selected_units_list
                     if not effective_units:
                         st.error("최소 1개 이상의 단원을 체크해 주세요.")
                     else:
