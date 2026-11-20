@@ -23,7 +23,7 @@ from src.models import ConceptBookRecord, LEGACY_TIER_MAP, QuestionRecord, Rewri
 
 DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive"]
 FOLDER_MIME = "application/vnd.google-apps.folder"
-KNOWN_SUBJECT_FOLDERS = ("수학", "사회", "과학", "한국사", "영어")
+KNOWN_SUBJECT_FOLDERS = ("수학", "사회", "과학", "한국사", "국어", "영어")
 
 
 def _safe_segment(name: str) -> str:

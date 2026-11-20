@@ -38,6 +38,7 @@ from src.models import (
     BatchEnglishExamExtractionOutput,
     BatchExamExtractionOutput,
     BatchFilePairingOutput,
+    BatchKoreanExamExtractionOutput,
     BatchMatchResult,
     BatchQuestionTagItem,
     ConceptBookCoverMetadata,
@@ -48,7 +49,11 @@ from src.models import (
     EnglishQuestionExtractionItem,
     EnglishSingleExtractionOutput,
     ExamHeaderMetadata,
+    KoreanQuestionExtractionItem,
+    KoreanSetReconstructionOutput,
+    KoreanSingleExtractionOutput,
     normalize_english_group_id,
+    normalize_korean_group_id,
     MixedPdfClassificationOutput,
     QuestionExtractionOutput,
     QuestionMatchJudgment,
@@ -1947,8 +1952,8 @@ def extract_exam_header_metadata(
         "1) year: 4자리 시행 년도 숫자 문자열 (예: '2026', '2025').\n"
         "2) month: 시행 월 문자열 ('3월', '4월', '5월', '6월', '7월', '9월', '10월', '11월' 등. 대학수학능력시험 본시험은 '11월').\n"
         "3) grade: 학년 문자열 ('고1', '고2', '고3' 중 하나. '제1학년'/'고1'→'고1', '제2학년'/'고2'→'고2', '제3학년'/'고3'/수능/모의평가는 '고3').\n"
-        "4) subject: 과목명 (예: '한국사', '통합과학', '통합사회', '물리학Ⅰ', '화학Ⅰ', '생명과학Ⅰ', '지구과학Ⅰ', '수학', '영어', '경제', '사회·문화' 등). 영역명('과학탐구 영역')과 세부 과목명(예: '물리학Ⅰ')이 같이 있으면 세부 과목명을 우선 적으세요.\n"
-        "5) exam_title: 반드시 '{year}년 {month} {grade} {subject}' 형식으로 조합 (예: '2025년 9월 고1 통합과학', '2026년 3월 고3 한국사')."
+        "4) subject: 과목명 (예: '국어', '한국사', '통합과학', '통합사회', '물리학Ⅰ', '화학Ⅰ', '생명과학Ⅰ', '지구과학Ⅰ', '수학', '영어', '경제', '사회·문화' 등). 영역명('과학탐구 영역')과 세부 과목명(예: '물리학Ⅰ')이 같이 있으면 세부 과목명을 우선 적으세요.\n"
+        "5) exam_title: 반드시 '{year}년 {month} {grade} {subject}' 형식으로 조합 (예: '2025년 9월 고1 통합과학', '2026년 3월 고3 한국사', '2026년 3월 고3 국어')."
     )
 
     text_excerpt = (first_page_text or "").strip()[:3000]
@@ -3960,3 +3965,326 @@ def chat_followup_with_english(
         fast_mode=True,
     )
     return format_explanation_text(getattr(resp, "text", "") or "", for_markdown=True)
+
+
+# ===========================================================================
+# 국어 영역 (독서 · 문학 공통 지문 세트) 전용 추출 & 전체 문항 재구성
+# ===========================================================================
+def _sync_korean_group_passages(items: list[KoreanQuestionExtractionItem]) -> None:
+    """동일한 passage_group_id를 공유하는 국어 세트 문항들의 지문·주제·세부 갈래를 동기화한다."""
+    best_passage: dict[str, str] = {}
+    best_topic: dict[str, str] = {}
+    best_subgenre: dict[str, str] = {}
+    for item in items:
+        gid = normalize_korean_group_id(item.passage_group_id, item.q_num)
+        item.passage_group_id = gid
+        if not gid:
+            continue
+        p_txt = (item.passage_text or "").strip()
+        if len(p_txt) > len(best_passage.get(gid, "")):
+            best_passage[gid] = p_txt
+        t_txt = (item.passage_topic or "").strip()
+        if len(t_txt) > len(best_topic.get(gid, "")):
+            best_topic[gid] = t_txt
+        sg_txt = (item.korean_subgenre or "").strip()
+        if len(sg_txt) > len(best_subgenre.get(gid, "")):
+            best_subgenre[gid] = sg_txt
+
+    for item in items:
+        gid = item.passage_group_id
+        if not gid:
+            continue
+        if gid in best_passage and best_passage[gid]:
+            if len((item.passage_text or "").strip()) < len(best_passage[gid]) * 0.7:
+                item.passage_text = best_passage[gid]
+        if not (item.passage_topic or "").strip() and gid in best_topic:
+            item.passage_topic = best_topic[gid]
+        if not (item.korean_subgenre or "").strip() and gid in best_subgenre:
+            item.korean_subgenre = best_subgenre[gid]
+
+
+def analyze_korean_exam_pdf_batch_with_gemini(
+    api_key: str,
+    model_name: str,
+    prob_pdf_bytes: bytes,
+    target_q_nums: list[int],
+    exam_name: str,
+    answer_snippets: dict[int, str] | None = None,
+    answer_pdf_part: Any | None = None,
+    status_callback: Callable[[str], None] | None = None,
+) -> dict[int, KoreanQuestionExtractionItem]:
+    """
+    국어 모의고사 문제지 PDF(및 해설지)를 일괄 분석하여
+    공통 영역인 '독서'와 '문학'(주로 1~34번) 지문 세트만 추출한다.
+    '화법과 작문', '언어와 매체' 문항은 영역 판별 후 제외 대상로 표시한다.
+    """
+    # 고3/수능 시험지에서 35~45번은 화법과 작문 / 언어와 매체 선택과목 영역이므로 1~34번 우선 필터
+    ordered_q = sorted({int(q) for q in target_q_nums if 1 <= int(q) <= 45})
+    if not ordered_q:
+        return {}
+
+    client = _build_client(api_key, timeout_seconds=150)
+    if status_callback is not None:
+        status_callback(f"📖 국어 모의고사 PDF({len(ordered_q)}문항 · 독서/문학 공통 영역) 일괄 분석 준비 중...")
+
+    prob_part = prepare_pdf_part(
+        client,
+        prob_pdf_bytes,
+        display_name=f"{exam_name}_korean_problem.pdf",
+    )
+
+    snippets_map = answer_snippets or {}
+    snippet_lines: list[str] = []
+    for q in ordered_q:
+        sn = (snippets_map.get(q) or "").strip()
+        if sn:
+            snippet_lines.append(f"[{q}번 해설 발췌] {sn[:600]}")
+
+    hint_section = (
+        "\n[해설지 문항별 발췌]\n" + "\n".join(snippet_lines) + "\n"
+        if snippet_lines
+        else ""
+    )
+
+    system_inst = (
+        "당신은 대한민국 수능·평가원·교육청 국어 영역(제1교시) 기출 분석 전문가입니다.\n"
+        "이번 수집의 핵심 목표는 **공통 영역인 '독서'와 '문학' 지문 세트만 집중 추출**하는 것입니다.\n"
+        "고3·수능 시험지의 35~45번(화법과 작문 / 언어와 매체 선택과목)이나 고1·고2 시험지의 화법·작문·문법 문항은 "
+        "`korean_section`을 `'화법과 작문'` 또는 `'언어와 매체'`로 분류하고 `passage_text`는 빈 문자열(`\"\"`)로 비우세요.\n\n"
+        "[추출 규칙]\n"
+        "1. `korean_section`: 반드시 `'독서'`, `'문학'`, `'화법과 작문'`, `'언어와 매체'` 중 하나로 정확히 분류하세요.\n"
+        "   - 고3·평가원·수능 시험지에서 35~45번은 선택과목(화법과 작문 / 언어와 매체)이므로 절대 독서/문학으로 분류하지 마세요.\n"
+        "2. `korean_subgenre`: 독서는 `'독서론'`, `'인문·예술'`, `'사회·경제'`, `'과학·기술'`, `'주제 통합'` 중 하나로, 문학은 `'현대시'`, `'고전시가'`, `'현대소설'`, `'고전소설'`, `'극·수필'`, `'갈래 복합'` 중 하나로 적으세요.\n"
+        "3. `passage_group_id`: 시험지에 표시된 공통 지문 세트 헤더(예: `[1~3]`, `[4~9]`, `[18~21]`)를 읽어 `'1~3'`, `'4~9'`, `'18~21'` 형식으로 적으세요. 단독 문항이면 해당 문항 번호를 적으세요.\n"
+        "4. `passage_text` (독서·문학 필수):\n"
+        "   - 발문과 선택지(①~⑤), `<보기>`를 제외한 **순수 국어 지문 원문 전체**를 빠짐없이 추출하세요.\n"
+        "   - `(가)`, `(나)`, `[A]~[E]`, `㉠~㉤`, `ⓐ~ⓔ`, 시의 연/행 구분, 소설의 중략 표시, 고전 어휘 각주(`* ...`) 등 지문 내부 표지를 원문 그대로 보존하세요.\n"
+        "   - 같은 세트에 속한 문항들은 동일한 공통 지문을 공유하므로 세트 내 최소 첫 문항(가능하면 모든 세트 문항)에 완전한 `passage_text`를 수록하세요.\n"
+        "5. `passage_topic`: 지문의 핵심 주제 또는 문학 작품명·작가(예: `'한용운, 「님의 침묵」 / 이육사, 「광야」'`, `'법적 의제와 간주의 차이'`)를 1줄로 요약하세요.\n"
+        "6. `key_vocabulary`: 지문의 핵심 개념어·어휘·문학 개념 3~6개를 나열하세요.\n"
+        "7. `question_type`: 원래 문항 유형(예: `'세부 내용 일치'`, `'핵심 논지 추론'`, `'<보기> 사례 적용'`, `'표현상 특징'`, `'서술상 특징'`, `'문맥적 어휘 의미'`).\n"
+        "8. `official_explanation`과 `answer`: 해설지 기준 핵심 풀이 근거 요약과 공식 정답(`'1'`~`'5'`)을 정확히 추출하세요."
+    )
+
+    q_list_str = ", ".join(str(q) for q in ordered_q)
+    prompt = (
+        f"시험 회차: {exam_name}\n"
+        f"검토 대상 문항 번호(총 {len(ordered_q)}문항): {q_list_str}\n"
+        f"{hint_section}\n"
+        "위 국어 문제지 PDF(및 해설지)에서 독서·문학 공통 영역 문항의 지문 세트, 주제, 어휘, 정답, 해설을 추출하여 JSON(questions)으로 반환하세요. "
+        "(화법과 작문, 언어와 매체 문항은 korean_section만 표기하고 passage_text는 비워 두세요.)"
+    )
+
+    contents: list[Any] = [prob_part]
+    if answer_pdf_part is not None:
+        contents.append(answer_pdf_part)
+    contents.append(prompt)
+
+    if status_callback is not None:
+        status_callback(f"⚡ {model_name} 모델로 국어 PDF({len(ordered_q)}문항 · 독서/문학) 일괄 분석 중...")
+
+    resp = _generate_content_with_fallback(
+        client=client,
+        model_name=model_name,
+        contents=contents,
+        config=types.GenerateContentConfig(
+            system_instruction=system_inst,
+            response_mime_type="application/json",
+            response_schema=BatchKoreanExamExtractionOutput,
+            temperature=0.1,
+            max_output_tokens=32768,
+        ),
+        fast_mode=True,
+        status_callback=status_callback,
+    )
+    parsed = _parse_structured(resp, BatchKoreanExamExtractionOutput)
+
+    items_list: list[KoreanQuestionExtractionItem] = []
+    seen_q: set[int] = set()
+    for item in parsed.questions:
+        if item.q_num in ordered_q and item.q_num not in seen_q:
+            item.answer = _normalize_extracted_answer(item.answer)
+            item.passage_group_id = normalize_korean_group_id(item.passage_group_id, item.q_num)
+            if item.korean_section in ("화법과 작문", "언어와 매체"):
+                item.passage_text = ""
+            seen_q.add(item.q_num)
+            items_list.append(item)
+
+    _sync_korean_group_passages(items_list)
+    return {it.q_num: it for it in items_list}
+
+
+def analyze_korean_question_with_gemini(
+    api_key: str,
+    model_name: str,
+    crop_png_bytes: bytes | None,
+    q_num: int,
+    exam_name: str,
+    answer_pdf_part: Any | None = None,
+    answer_text_hint: str = "",
+    question_text_hint: str = "",
+    shared_passage_hint: str = "",
+) -> KoreanSingleExtractionOutput:
+    """국어 단일 누락 문항 보완 추출 (독서·문학 판별 및 지문·정답 추출)."""
+    client = _build_client(api_key, timeout_seconds=45)
+    system_inst = (
+        "당신은 대한민국 수능·모의고사 국어 영역 기출 분석 전문가입니다.\n"
+        "제공된 문항 이미지/텍스트와 해설을 보고 영역(`독서`, `문학`, `화법과 작문`, `언어와 매체`), "
+        "세부 갈래, 세트 범위(`passage_group_id`), 순수 지문 원문(`passage_text`), 주제/작품명, 핵심 어휘, 해설, 정답(`'1'`~`'5'`)을 추출하세요.\n"
+        "화법과 작문, 언어와 매체 문항이면 `passage_text`는 빈 문자열로 두세요."
+    )
+    hint_parts: list[str] = [f"시험 회차: {exam_name}", f"문항 번호: {q_num}번"]
+    if shared_passage_hint.strip():
+        hint_parts.append(f"[동일 세트 공통 지문 참고]\n{shared_passage_hint.strip()}")
+    if question_text_hint.strip():
+        hint_parts.append(f"[추출 텍스트 참고]\n{question_text_hint.strip()[:2500]}")
+    if answer_text_hint.strip():
+        hint_parts.append(f"[해설지 발췌]\n{answer_text_hint.strip()[:900]}")
+
+    contents: list[Any] = []
+    if crop_png_bytes:
+        opt_png = optimize_image_for_vision(crop_png_bytes, max_width=1400)
+        contents.append(types.Part.from_bytes(data=opt_png, mime_type="image/png"))
+    if answer_pdf_part is not None and not answer_text_hint.strip():
+        contents.append(answer_pdf_part)
+    contents.append("\n\n".join(hint_parts))
+
+    resp = _generate_content_with_fallback(
+        client=client,
+        model_name=model_name,
+        contents=contents,
+        config=types.GenerateContentConfig(
+            system_instruction=system_inst,
+            response_mime_type="application/json",
+            response_schema=KoreanSingleExtractionOutput,
+            temperature=0.1,
+        ),
+        fast_mode=True,
+    )
+    out = _parse_structured(resp, KoreanSingleExtractionOutput)
+    out.answer = _normalize_extracted_answer(out.answer)
+    out.passage_group_id = normalize_korean_group_id(out.passage_group_id, q_num)
+    if out.korean_section in ("화법과 작문", "언어와 매체"):
+        out.passage_text = ""
+    return out
+
+
+def generate_korean_set_reconstruction(
+    api_key: str,
+    model_name: str,
+    source_records: list[QuestionRecord],
+    passage_text: str,
+    korean_section: str = "독서",
+    korean_subgenre: str = "",
+    passage_topic: str = "",
+) -> list[tuple[QuestionRecord, RewrittenQuestion]]:
+    """
+    국어 지문 1개 세트(원본 문항 수 N개, 보통 3~6문항)를 받아
+    지문 전체에서 핵심 출제 포인트를 자유 유형으로 새로 설계하여 N개의 수능형 국어 문항 세트를 일괄 생성한다.
+    반환되는 각 (QuestionRecord, RewrittenQuestion) 쌍 중 첫 문항의 rewritten_stem 상단에
+    세트 공통 헤더 및 지문 원문을 배치하여 모드 A(PDF)·모드 B(웹 풀기)에서 1회만 출력되도록 구성한다.
+    """
+    ordered_recs = sorted(source_records, key=lambda r: r.q_num)
+    if not ordered_recs:
+        return []
+
+    n_questions = len(ordered_recs)
+    clean_passage = (passage_text or "").strip()
+    if not clean_passage:
+        raise ValueError("국어 지문 원문(passage_text)이 비어 있어 세트 문항을 재구성할 수 없습니다.")
+
+    client = _build_client(api_key, timeout_seconds=120)
+    orig_summary_lines = [
+        f"- 원본 {r.q_num}번 ({r.unit_name or '기출'}): 핵심={'; '.join(r.core_principles[:2])} | 정답={r.answer}"
+        for r in ordered_recs
+    ]
+    orig_summary_block = "\n".join(orig_summary_lines)
+
+    if korean_section == "문학":
+        type_guide = (
+            "문학 영역 추천 유형을 지문 특성에 맞게 자유롭게 배분하세요: "
+            "표현상·서술상 특징, 시적 화자/서술자 및 인물의 정서·태도, 구절·소재(㉠~㉤/ⓐ~ⓔ 등)의 함축적 의미, "
+            "<보기> 외적 준거(비평문·창작 배경) 기반 작품 감상 적절성, (가)/(나) 작품 간 비교·공통점과 차이점."
+        )
+    else:
+        type_guide = (
+            "독서(비문학) 영역 추천 유형을 지문 특성에 맞게 자유롭게 배분하세요: "
+            "글의 전개 방식·서술상 특징, 세부 내용 일치·불일치, 핵심 논지·개념 간 관계 추론, "
+            "<보기>의 구체적 사례/상황에 지문 원리 적용 추론, 특정 문맥 어휘/구절(ⓐ~ⓔ, ㉠~㉤)의 문맥적 의미."
+        )
+
+    system_inst = (
+        "당신은 대한민국 수능·평가원 국어 영역 최고 수준 문항 출제위원입니다.\n"
+        f"주어진 [{korean_section} · {korean_subgenre or '공통'}] 지문을 바탕으로, 기존 기출 문항을 그대로 베끼지 말고 "
+        f"**총 {n_questions}개의 고품질 수능 국어 세트 문항**을 자유 유형으로 새롭게 창작하세요.\n\n"
+        "[출제 절대 원칙]\n"
+        "1. **지문 100% 근거 원칙**: 모든 문항과 선지의 정오 판정은 반드시 아래 [공통 지문 원문]에 직접 명시되거나 논리적으로 도출 가능한 사실에만 근거해야 합니다. 지문에 없는 외부 지식을 정답 근거로 쓰지 마세요.\n"
+        "2. **지문 표지 정밀 연동**: 지문 원문에 `[A]`, `(가)`, `(나)`, `㉠~㉤`, `ⓐ~ⓔ` 같은 표지가 있으면 발문이나 선지에서 해당 표지를 정확히 참조하세요. 지문에 없는 표지(예: 지문에 `㉮`가 없는데 `㉮`를 묻기)를 절대 지어내지 마세요.\n"
+        f"3. **자유 유형 균형 출제 ({n_questions}문항)**: {type_guide}\n"
+        "   - 최소 1문항 이상은 구체적인 `<보기>` 박스를 포함한 고난도 적용·감상 문항으로 출제하세요.\n"
+        "4. **발문·<보기> 형식**: `stem`에는 각 문항의 발문(예: `윗글에 대한 이해로 가장 적절한 것은?`)과 필요한 경우 `<보기>\\n...` 박스만 작성하세요. **공통 지문 본문은 `stem`에 반복해서 넣지 마세요.**\n"
+        "5. **선지 5개(`choices`) & 정답 분산**: `choices`는 선지 번호(①~⑤)를 제외한 5개 문자열 리스트로 작성하고, `answer`는 `'1'`~`'5'` 중 단일 숫자 문자열로 적되 정답 번호가 한 번호에 몰리지 않게 골고루 배치하세요.\n"
+        "6. **정교한 해설(`explanation`)**: 정답 선지가 왜 지문과 일치하는지, 그리고 나머지 4개 오답 선지가 지문의 어떤 부분과 어긋나는지(인과 도치, 주체 오류, 범위 과장 등) 선지별로 명확히 설명하세요."
+    )
+
+    prompt = (
+        f"[지문 정보]\n"
+        f"- 시험 출처: {ordered_recs[0].exam_name}\n"
+        f"- 영역/갈래: {korean_section} ({korean_subgenre or '공통'})\n"
+        f"- 주제/작품: {passage_topic or ordered_recs[0].passage_topic}\n"
+        f"- 생성할 문항 수: 정확히 {n_questions}문항 (slot_index 1 ~ {n_questions})\n\n"
+        f"[공통 지문 원문]\n{clean_passage}\n\n"
+        f"[원본 세트 구성 참고 (소재·난이도 참고용, 그대로 복제하지 말고 자유롭게 새 문항 창작)]\n{orig_summary_block}\n\n"
+        f"위 지문을 바탕으로 정확히 {n_questions}개의 새로운 수능형 국어 세트 문항을 JSON(set_intro, questions)으로 생성하세요."
+    )
+
+    resp = _generate_content_with_fallback(
+        client=client,
+        model_name=model_name,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            system_instruction=system_inst,
+            response_mime_type="application/json",
+            response_schema=KoreanSetReconstructionOutput,
+            temperature=0.35,
+            max_output_tokens=16384,
+        ),
+        fast_mode=True,
+    )
+    parsed = _parse_structured(resp, KoreanSetReconstructionOutput)
+    gen_qs = sorted(parsed.questions or [], key=lambda x: x.slot_index)[:n_questions]
+    if not gen_qs:
+        raise ValueError("AI가 국어 세트 문항을 생성하지 못했습니다. 다시 시도해 주세요.")
+
+    set_intro_txt = (parsed.set_intro or "").strip() or f"[1~{len(gen_qs)}] 다음 글을 읽고 물음에 답하시오."
+    results: list[tuple[QuestionRecord, RewrittenQuestion]] = []
+    for idx, gq in enumerate(gen_qs):
+        base_rec = ordered_recs[idx] if idx < len(ordered_recs) else ordered_recs[-1]
+        clean_choices = [re.sub(r"^[①②③④⑤]\s*", "", (c or "").strip()) for c in (gq.choices or []) if (c or "").strip()]
+        while len(clean_choices) < 5:
+            clean_choices.append("(선지 보완 필요)")
+        clean_choices = clean_choices[:5]
+
+        clean_stem = (gq.stem or "").strip()
+        if idx == 0:
+            full_stem = f"{set_intro_txt}\n\n{clean_passage}\n\n{clean_stem}"
+        else:
+            full_stem = clean_stem
+
+        norm_ans = _normalize_extracted_answer(gq.answer)
+        rw = RewrittenQuestion(
+            original_question_id=base_rec.id,
+            rewritten_stem=full_stem,
+            rewritten_choices=clean_choices,
+            replaced_terms_map=[],
+            pdf_grounded_explanation=format_explanation_text(gq.explanation, for_markdown=False),
+            preserved_answer=norm_ans,
+            self_verification_note=f"국어 {korean_section} 지문 세트 자유 유형 재구성 완료 ({gq.question_type_label})",
+            visual_term_note="",
+            target_question_type=gq.question_type_label.strip() or "국어 세트 재구성",
+            subject_domain="국어",
+        )
+        results.append((base_rec, rw))
+
+    return results
+

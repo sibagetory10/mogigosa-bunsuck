@@ -90,6 +90,8 @@ from src.gemini_service import (
     analyze_english_exam_pdf_batch_with_gemini,
     analyze_english_question_with_gemini,
     analyze_exam_pdf_batch_with_gemini,
+    analyze_korean_exam_pdf_batch_with_gemini,
+    analyze_korean_question_with_gemini,
     analyze_question_with_gemini,
     bind_usage_tracker,
     build_gemini_client,
@@ -104,6 +106,7 @@ from src.gemini_service import (
     extract_exam_header_metadata,
     generate_english_explanation,
     generate_english_transformed_question,
+    generate_korean_set_reconstruction,
     generate_pdf_grounded_explanation,
     has_active_usage_tracker,
     match_problem_and_answer_pdfs_with_ai,
@@ -126,6 +129,7 @@ from src.models import (
     normalize_english_group_id,
     normalize_exam_title_year,
     normalize_exam_year,
+    normalize_korean_group_id,
     resolve_question_concept_reference,
 )
 from src.pdf_generator import generate_custom_exam_pdf
@@ -839,6 +843,7 @@ def _tag_and_save_single_exam_inner(
     batch_t0 = time.perf_counter()
     extracted_by_q: dict[int, Any] = {}
     is_english_exam = meta["subject_category"] == "영어"
+    is_korean_exam = meta["subject_category"] == "국어"
 
     if is_english_exam:
         if meta.get("prob_bytes"):
@@ -924,8 +929,91 @@ def _tag_and_save_single_exam_inner(
             ).strip()
             if len(cand_p) > len(eng_group_passages.get(gid, "")):
                 eng_group_passages[gid] = cand_p
+    elif is_korean_exam:
+        eng_group_passages = {}
+        if meta.get("prob_bytes"):
+            _status(
+                f"📖 국어 문제지 PDF({len(target_crops)}문항 · 독서/문학 공통 지문 세트) 일괄 분석 중 (모델: {tagging_model_label})..."
+            )
+            try:
+                batch_map = analyze_korean_exam_pdf_batch_with_gemini(
+                    api_key=api_key,
+                    model_name=tagging_model,
+                    prob_pdf_bytes=meta["prob_bytes"],
+                    target_q_nums=[c.q_num for c in target_crops],
+                    exam_name=meta["exam_name"],
+                    answer_snippets=answer_snippets,
+                    answer_pdf_part=answer_pdf_part,
+                    status_callback=_status,
+                )
+                extracted_by_q.update(batch_map)
+                _log(
+                    f"⚡ 국어 PDF 일괄 추출 완료: {len(batch_map)}/{len(target_crops)}문항 "
+                    f"({time.perf_counter() - batch_t0:.1f}초 · {tagging_model_label})"
+                )
+            except Exception as exc:
+                _log(f"⚠️ 국어 PDF 일괄 추출 실패 → 개별 문항 보완 모드로 전환: {exc}")
+        _prog(0.65)
+
+        missing_crops = [c for c in target_crops if c.q_num not in extracted_by_q]
+        if missing_crops:
+            _status(f"🔁 누락된 국어 {len(missing_crops)}개 문항 보완 추출 중 ({tagging_model_label})...")
+
+            def _analyze_kor_worker(cq_item: CroppedQuestion) -> tuple[CroppedQuestion, Any, float]:
+                t_start = time.perf_counter()
+                q_ans_hint = answer_snippets.get(cq_item.q_num, "")
+                extracted_out = analyze_korean_question_with_gemini(
+                    api_key=api_key,
+                    model_name=tagging_model,
+                    crop_png_bytes=cq_item.png_bytes,
+                    q_num=cq_item.q_num,
+                    exam_name=meta["exam_name"],
+                    answer_pdf_part=answer_pdf_part,
+                    answer_text_hint=q_ans_hint,
+                    question_text_hint=cq_item.extracted_text or "",
+                    shared_passage_hint=(getattr(cq_item, "shared_passage_text", "") or ""),
+                )
+                return cq_item, extracted_out, time.perf_counter() - t_start
+
+            done_cnt = 0
+            total_missing = len(missing_crops)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+                future_to_cq = {
+                    submit_with_usage_context(executor, _analyze_kor_worker, cq): cq
+                    for cq in missing_crops
+                }
+                for fut in concurrent.futures.as_completed(future_to_cq):
+                    cq = future_to_cq[fut]
+                    done_cnt += 1
+                    try:
+                        _, extracted, elapsed_s = fut.result()
+                        extracted_by_q[cq.q_num] = extracted
+                        _log(f"✅ 국어 {cq.q_num}번 보완 추출 완료 ({extracted.korean_section} · 정답: {extracted.answer} · {elapsed_s:.1f}초)")
+                    except Exception as exc:
+                        err_msg = f"{cq.q_num}번 오류 (건너뜀): {exc}"
+                        failed_q_nums.append(cq.q_num)
+                        errors.append(err_msg)
+                        _log(f"❌ {err_msg}")
+                    _prog(0.65 + 0.20 * (done_cnt / max(1, total_missing)))
+
+        # 화법과 작문 / 언어와 매체 제외 및 독서·문학 공통 지문 세트 동기화
+        kor_group_passages: dict[str, str] = {}
+        excluded_kor_qs: list[int] = []
+        for q_n, ext in list(extracted_by_q.items()):
+            sec = getattr(ext, "korean_section", "")
+            if sec in ("화법과 작문", "언어와 매체"):
+                excluded_kor_qs.append(q_n)
+                extracted_by_q.pop(q_n, None)
+                continue
+            gid = normalize_korean_group_id(getattr(ext, "passage_group_id", ""), q_n)
+            p_txt = (getattr(ext, "passage_text", "") or "").strip()
+            if gid and len(p_txt) > len(kor_group_passages.get(gid, "")):
+                kor_group_passages[gid] = p_txt
+        if excluded_kor_qs:
+            _log(f"ℹ️ 화법과 작문 · 언어와 매체 {len(excluded_kor_qs)}문항은 설정에 따라 제외되었습니다 ({sorted(excluded_kor_qs)[:6]}...).")
     else:
         eng_group_passages = {}
+        kor_group_passages = {}
         concept_books = storage.load_concept_books()
         grounding_ctx = build_tagging_grounding_context(
             subject_category=meta["subject_category"],
@@ -1124,6 +1212,50 @@ def _tag_and_save_single_exam_inner(
                 answer_pdf=eff_answer_pdf,
                 created_at=now_iso,
             )
+        elif is_korean_exam:
+            kor_sec = getattr(extracted, "korean_section", "") or "독서"
+            kor_sub = (getattr(extracted, "korean_subgenre", "") or "").strip()
+            kor_qtype = (getattr(extracted, "question_type", "") or "").strip() or kor_sec
+            curr_subj = f"{kor_sec}({kor_sub})" if kor_sub else kor_sec
+            p_group = normalize_korean_group_id(getattr(extracted, "passage_group_id", ""), cq.q_num)
+            raw_p_text = (getattr(extracted, "passage_text", "") or "").strip()
+            if p_group and len(raw_p_text) < len(kor_group_passages.get(p_group, "")) * 0.7:
+                raw_p_text = kor_group_passages[p_group]
+            p_topic = (getattr(extracted, "passage_topic", "") or "").strip()
+            k_vocab = [v.strip() for v in (getattr(extracted, "key_vocabulary", []) or []) if v and v.strip()]
+
+            record = QuestionRecord(
+                id=q_id,
+                exam_name=meta["exam_name"],
+                q_num=cq.q_num,
+                subject_category="국어",
+                curriculum_subject=curr_subj,
+                unit_name=kor_qtype,
+                min_grade=1,
+                core_principles=[p_topic] if p_topic else [kor_qtype],
+                required_terms=k_vocab,
+                advanced_terms=[],
+                basic_terms=k_vocab,
+                standard_code="",
+                standard_codes=[],
+                grade_evidence="",
+                needs_review=False,
+                review_notes=[],
+                is_single_concept=True,
+                answer=extracted.answer,
+                official_explanation=extracted.official_explanation,
+                question_text=re.sub(r"\s+", " ", (cq.extracted_text or "")).strip(),
+                english_section="",
+                english_question_type=kor_qtype,
+                passage_text=raw_p_text,
+                passage_group_id=p_group,
+                passage_topic=p_topic,
+                key_vocabulary=k_vocab,
+                image_filename=img_filename,
+                source_pdf=eff_source_pdf,
+                answer_pdf=eff_answer_pdf,
+                created_at=now_iso,
+            )
         else:
             record = QuestionRecord(
                 id=q_id,
@@ -1262,6 +1394,79 @@ def _render_question_tag_details(
                 storage.save_db(all_recs, target_exams={rec.exam_name})
                 _build_cached_exam_exports.clear()
                 st.success("영어 문항 정보를 저장했습니다.")
+                st.rerun()
+
+        if allow_delete:
+            if st.button("이 문항 삭제", key=f"{key_prefix}_del_{rec.id}"):
+                storage.delete_question(rec.id)
+                _build_cached_exam_exports.clear()
+                st.rerun()
+        return
+
+    if rec.subject_category == "국어":
+        kor_sub = rec.curriculum_subject or "독서"
+        kor_qtype = getattr(rec, "english_question_type", "") or rec.unit_name
+        grp_id = normalize_korean_group_id(getattr(rec, "passage_group_id", ""), rec.q_num)
+        topic = getattr(rec, "passage_topic", "") or "-"
+        vocab_list = list(getattr(rec, "key_vocabulary", []) or rec.required_terms or [])
+        passage_txt = (getattr(rec, "passage_text", "") or "").strip()
+
+        badge_bits = [f"**영역/갈래:** `{kor_sub}`", f"**원래 유형:** `{kor_qtype}`"]
+        if grp_id:
+            badge_bits.append(f"**지문 세트:** `[{grp_id}]`")
+        st.caption(" · ".join(badge_bits))
+        st.write(f"**지문 주제·작품 (`passage_topic`):** {topic}")
+        if vocab_list:
+            st.markdown("**핵심 어휘·개념 (`key_vocabulary`)**")
+            render_chips(vocab_list, variant="amber")
+        if passage_txt:
+            with st.expander("📖 추출된 국어 지문 원문 (`passage_text`) 보기", expanded=False):
+                st.markdown(
+                    f"<div class='eng-given-box' style='white-space:pre-wrap;'>{_html.escape(passage_txt)}</div>",
+                    unsafe_allow_html=True,
+                )
+        st.write(f"**공식 해설 요약:** {rec.official_explanation}")
+
+        with st.expander("✏️ 국어 갈래·유형·주제·지문 원문·정답 빠른 수정", expanded=False):
+            kc1, kc2, kc3 = st.columns([1.2, 1.8, 0.8])
+            with kc1:
+                new_kor_type = st.text_input(
+                    "원래 문항 유형",
+                    value=kor_qtype,
+                    key=f"{key_prefix}_edit_kor_type_{rec.id}",
+                )
+            with kc2:
+                new_kor_topic = st.text_input(
+                    "지문 주제·작품",
+                    value="" if topic == "-" else topic,
+                    key=f"{key_prefix}_edit_kor_topic_{rec.id}",
+                )
+            with kc3:
+                new_kor_ans = st.text_input(
+                    "정답",
+                    value=rec.answer,
+                    key=f"{key_prefix}_edit_kor_ans_{rec.id}",
+                )
+            new_kor_passage = st.text_area(
+                "국어 지문 원문 (passage_text)",
+                value=passage_txt,
+                height=140,
+                key=f"{key_prefix}_edit_kor_passage_{rec.id}",
+            )
+            if st.button("💾 국어 문항 수정 저장", key=f"{key_prefix}_save_kor_edit_{rec.id}"):
+                all_recs = storage.load_db()
+                for r in all_recs:
+                    if r.id == rec.id:
+                        r.english_question_type = new_kor_type.strip() or r.english_question_type
+                        r.unit_name = r.english_question_type or r.unit_name
+                        r.passage_topic = new_kor_topic.strip()
+                        r.core_principles = [r.passage_topic] if r.passage_topic else [r.unit_name]
+                        r.answer = new_kor_ans.strip() or r.answer
+                        r.passage_text = new_kor_passage.strip()
+                        break
+                storage.save_db(all_recs, target_exams={rec.exam_name})
+                _build_cached_exam_exports.clear()
+                st.success("국어 문항 정보를 저장했습니다.")
                 st.rerun()
 
         if allow_delete:
@@ -2871,12 +3076,13 @@ def _build_recommended_exam_catalog() -> list[dict[str, str]]:
         (
             "고1",
             ["3월", "6월", "9월", "10월"],
-            [("영어", "영어"), ("수학", "수학"), ("한국사", "한국사"), ("과학", "통합과학"), ("사회", "통합사회")],
+            [("국어", "국어"), ("영어", "영어"), ("수학", "수학"), ("한국사", "한국사"), ("과학", "통합과학"), ("사회", "통합사회")],
         ),
         (
             "고2",
             ["3월", "6월", "9월", "10월"],
             [
+                ("국어", "국어"),
                 ("영어", "영어"),
                 ("수학", "수학"),
                 ("한국사", "한국사"),
@@ -2890,6 +3096,7 @@ def _build_recommended_exam_catalog() -> list[dict[str, str]]:
             "고3",
             ["3월", "6월", "9월", "10월", "11월(수능)"],
             [
+                ("국어", "국어"),
                 ("영어", "영어"),
                 ("수학", "수학"),
                 ("한국사", "한국사"),
@@ -2957,7 +3164,7 @@ def _render_exam_coverage_board() -> None:
         with fc1:
             f_subj = st.selectbox(
                 "과목 필터",
-                options=["전체", "영어", "수학", "한국사", "과학", "사회"],
+                options=["전체", "국어", "영어", "수학", "한국사", "과학", "사회"],
                 key="cov_board_subj",
             )
         with fc2:
@@ -4065,7 +4272,7 @@ with tab1:
             with col_meta1:
                 subject_cat = st.selectbox(
                     "과목 (대분류)",
-                    options=["과학", "수학", "사회", "한국사", "영어"],
+                    options=["과학", "수학", "사회", "한국사", "국어", "영어"],
                     key="tab1_subject_cat",
                 )
             with col_meta2:
@@ -4425,7 +4632,7 @@ with tab1:
             key=lambda m: int(re.sub(r"[^0-9]", "", m) or 0),
         )
         avail_grades = ["고1", "고2", "고3"]
-        avail_subjects = ["수학", "사회", "과학", "한국사", "영어"]
+        avail_subjects = ["수학", "사회", "과학", "한국사", "국어", "영어"]
 
         with st.form("db_search_form", border=True):
             sc1, sc2, sc3, sc4 = st.columns(4)
@@ -5649,25 +5856,226 @@ def _render_tab2_concept_source_tabs() -> None:
                                 st.error(f"화이트리스트 추출 실패: {exc}")
 
 
+def _render_tab2_korean_transform_section() -> None:
+    """[탭 2 - 국어 모드] DB에 저장된 국어 독서·문학 지문 세트를 선택해 세트 전체 문항을 자유 유형으로 재구성한다."""
+    st.subheader("1️⃣ 국어(독서 · 문학) 기출 지문 세트 선택 & 전체 문항 재구성")
+    max_batch_q = get_max_batch_questions(current_user)
+    user_max_jobs = None if max_batch_q is None else max_batch_q
+    max_limit_badge = "제한 없음" if user_max_jobs is None else f"1회 최대 **{user_max_jobs}문항**까지"
+    st.caption(
+        f"💡 **[탭 1]**에서 수집한 국어 공통 영역(**독서 · 문학**) 지문 세트를 선택하면, "
+        f"해당 지문에 딸린 문항 수(3~6문항)만큼 AI가 지문 전체의 핵심 출제 포인트를 바탕으로 **자유 유형 세트 문항을 일괄 재창작**합니다. ({max_limit_badge})"
+    )
+
+    all_db = storage.load_db()
+    kor_recs = [
+        r
+        for r in all_db
+        if r.subject_category == "국어"
+        and bool((getattr(r, "passage_text", "") or "").strip())
+    ]
+
+    if not kor_recs:
+        st.info(
+            "아직 DB에 저장된 **국어(독서·문학) 지문 세트**가 없습니다. "
+            "**[📥 탭 1]**에서 국어 모의고사 문제지+해설지 PDF를 먼저 수집·추출해 주세요."
+        )
+        return
+
+    # (exam_name, passage_group_id) 단위로 세트 묶기
+    sets_map: dict[tuple[str, str], dict[str, Any]] = {}
+    for r in sorted(kor_recs, key=lambda x: (x.exam_name, x.q_num)):
+        gid = normalize_korean_group_id(getattr(r, "passage_group_id", ""), r.q_num)
+        key = (r.exam_name, gid)
+        entry = sets_map.setdefault(
+            key,
+            {
+                "exam_name": r.exam_name,
+                "group_id": gid,
+                "records": [],
+                "passage_text": "",
+                "passage_topic": "",
+                "curr_subj": r.curriculum_subject or "독서",
+            },
+        )
+        entry["records"].append(r)
+        p_txt = (getattr(r, "passage_text", "") or "").strip()
+        if len(p_txt) > len(entry["passage_text"]):
+            entry["passage_text"] = p_txt
+        t_txt = (getattr(r, "passage_topic", "") or "").strip()
+        if len(t_txt) > len(entry["passage_topic"]):
+            entry["passage_topic"] = t_txt
+
+    set_entries = sorted(
+        sets_map.values(),
+        key=lambda e: (e["exam_name"], min(x.q_num for x in e["records"])),
+    )
+
+    fc1, fc2, fc3 = st.columns([1.2, 1.0, 1.4])
+    avail_kor_exams = sorted({e["exam_name"] for e in set_entries}, reverse=True)
+    with fc1:
+        sel_kor_exam = st.selectbox(
+            "모의고사 회차 필터",
+            options=["전체"] + avail_kor_exams,
+            key="tab2_kor_filter_exam",
+        )
+    with fc2:
+        sel_kor_sec = st.selectbox(
+            "영역 필터",
+            options=["전체", "독서", "문학"],
+            key="tab2_kor_filter_sec",
+        )
+    with fc3:
+        kor_kw = st.text_input(
+            "주제·작품명·본문 키워드 검색",
+            placeholder="예: 박완서, 현대시, 논리실증주의, 법...",
+            key="tab2_kor_filter_kw",
+        )
+
+    kw_low = (kor_kw or "").strip().lower()
+    filtered_sets: list[dict[str, Any]] = []
+    for e in set_entries:
+        if sel_kor_exam != "전체" and e["exam_name"] != sel_kor_exam:
+            continue
+        sec_label = "문학" if "문학" in e["curr_subj"] else "독서"
+        if sel_kor_sec != "전체" and sec_label != sel_kor_sec:
+            continue
+        if kw_low:
+            blob = " ".join(
+                [e["exam_name"], e["curr_subj"], e["passage_topic"], e["passage_text"]]
+            ).lower()
+            if kw_low not in blob:
+                continue
+        filtered_sets.append(e)
+
+    if not filtered_sets:
+        st.warning("조건에 맞는 국어 지문 세트가 없습니다. 필터를 조정해 주세요.")
+        return
+
+    st.caption(f"총 **{len(filtered_sets)}개** 국어 지문 세트가 조회되었습니다. 재구성할 세트를 체크한 뒤 실행 버튼을 누르세요.")
+
+    with st.form("tab2_kor_set_transform_form", border=True):
+        selected_set_indices: list[int] = []
+        for idx, s_entry in enumerate(filtered_sets):
+            q_nums = [r.q_num for r in s_entry["records"]]
+            sec_tag = s_entry["curr_subj"]
+            topic_tag = s_entry["passage_topic"] or "주제 미상"
+            set_label = f"[{s_entry['exam_name']}] [{s_entry['group_id']}번] ({sec_tag} · {len(q_nums)}문항) — {topic_tag}"
+            is_chk = st.checkbox(
+                set_label,
+                value=False,
+                key=f"tab2_kor_set_chk_{s_entry['exam_name']}_{s_entry['group_id']}_{idx}",
+            )
+            if is_chk:
+                selected_set_indices.append(idx)
+            with st.expander(f"📄 지문 미리보기: {s_entry['exam_name']} [{s_entry['group_id']}번]", expanded=False):
+                st.text(s_entry["passage_text"][:1500] + ("..." if len(s_entry["passage_text"]) > 1500 else ""))
+
+        run_kor_btn = st.form_submit_button(
+            "🚀 선택한 국어 지문 세트 전체 문항 재구성 실행",
+            type="primary",
+            width="stretch",
+        )
+
+    if run_kor_btn:
+        if not selected_set_indices:
+            st.error("최소 1개 이상의 국어 지문 세트를 체크해 주세요.")
+            return
+
+        chosen_sets = [filtered_sets[i] for i in selected_set_indices]
+        total_est_q = sum(len(s["records"]) for s in chosen_sets)
+        if user_max_jobs is not None and total_est_q > user_max_jobs:
+            st.warning(
+                f"⚠️ 현재 등급은 1회 실행당 최대 {user_max_jobs}문항까지만 생성됩니다. "
+                f"(선택 세트 총 {total_est_q}문항 → 앞의 세트부터 최대 {user_max_jobs}문항 범위 내로 제한)"
+            )
+            trimmed_sets: list[dict[str, Any]] = []
+            acc = 0
+            for s in chosen_sets:
+                if acc + len(s["records"]) <= user_max_jobs or not trimmed_sets:
+                    trimmed_sets.append(s)
+                    acc += len(s["records"])
+                else:
+                    break
+            chosen_sets = trimmed_sets
+
+        kor_api_key, kor_key_label = resolve_active_gemini_api_key(
+            current_user, creds.gemini_api_key, model_name=EXAM_TAGGING_MODEL
+        )
+        if not kor_api_key:
+            st.error(f"사용 가능한 Gemini API 키({kor_key_label})가 설정되지 않았습니다.")
+            return
+        if not _ensure_token_quota():
+            return
+
+        new_matched: list[dict[str, Any]] = []
+        with _usage_scope():
+            with st.spinner(f"🤖 {MODEL_LABELS.get(EXAM_TAGGING_MODEL, EXAM_TAGGING_MODEL)}로 국어 지문 세트({len(chosen_sets)}개 세트) 재구성 중..."):
+                for s_entry in chosen_sets:
+                    curr_subj = s_entry["curr_subj"]
+                    kor_sec = "문학" if "문학" in curr_subj else "독서"
+                    m_sub = re.search(r"\(([^)]+)\)", curr_subj)
+                    kor_sub = m_sub.group(1) if m_sub else ""
+                    try:
+                        pairs = generate_korean_set_reconstruction(
+                            api_key=kor_api_key,
+                            model_name=EXAM_TAGGING_MODEL,
+                            source_records=s_entry["records"],
+                            passage_text=s_entry["passage_text"],
+                            korean_section=kor_sec,
+                            korean_subgenre=kor_sub,
+                            passage_topic=s_entry["passage_topic"],
+                        )
+                        for rec, rw in pairs:
+                            new_matched.append(
+                                {
+                                    "question": rec,
+                                    "rewritten": rw,
+                                    "concept_ref": f"출처: {s_entry['exam_name']} [{s_entry['group_id']}번]",
+                                    "korean_meta": {
+                                        "section": kor_sec,
+                                        "subgenre": kor_sub,
+                                        "group_id": s_entry["group_id"],
+                                    },
+                                }
+                            )
+                    except Exception as exc:
+                        st.error(f"[{s_entry['exam_name']} {s_entry['group_id']}번] 세트 재구성 실패: {exc}")
+
+        if new_matched:
+            st.session_state["matched_items"] = new_matched
+            st.session_state["generated_exam_pdf"] = None
+            st.session_state["generated_exam_pdf_sig"] = ""
+            st.session_state["web_quiz_answers"] = {}
+            st.session_state["web_quiz_graded"] = False
+            st.session_state["web_quiz_ai_exps"] = {}
+            st.success(f"🎯 총 {len(chosen_sets)}개 지문 세트({len(new_matched)}문항) 재구성 완료! 아래 [모드 A] PDF 또는 [모드 B] 웹 풀기를 이용해 주세요.")
+
+
 with tab2:
     tab2_domain_mode = st.radio(
         "작업 과목 모드 선택",
         options=[
             "📚 수학 · 사회 · 과학 · 한국사 (개념서 범위 추출 & 상위 용어 개조)",
+            "📖 국어 (독서·문학 지문 세트 선택 & 전체 문항 재구성)",
             "🔤 영어 (기출 지문 선택 & 수능 독해 유형 변형)",
         ],
         horizontal=True,
         key="tab2_domain_mode",
     )
     is_tab2_english_mode = tab2_domain_mode.startswith("🔤")
+    is_tab2_korean_mode = tab2_domain_mode.startswith("📖")
+    is_tab2_concept_mode = not is_tab2_english_mode and not is_tab2_korean_mode
     if is_tab2_english_mode:
         _render_tab2_english_transform_section()
+    elif is_tab2_korean_mode:
+        _render_tab2_korean_transform_section()
     else:
         _render_tab2_concept_source_tabs()
 
     # 추출된 화이트리스트 표시
     whitelist: ConceptWhitelist | None = st.session_state.get("concept_whitelist")
-    if (not is_tab2_english_mode) and (whitelist is not None):
+    if is_tab2_concept_mode and (whitelist is not None):
         st.markdown("### 📋 현재 적용된 개념서 지식 화이트리스트 (이 범위만 학습한 것으로 간주)")
         with st.container(border=True):
             book_badge = f"**기준 교재:** `{whitelist.book_title}` | " if whitelist.book_title else ""
@@ -5767,10 +6175,10 @@ with tab2:
                 elif not db_list:
                     st.warning("저장된 기출 DB가 비어 있습니다. 먼저 [탭 1]에서 모의고사를 수집·태깅해 주세요.")
                 else:
-                    # 1차 메타데이터 필터링 (비영어 과목 전용 · 과거 '사회'로 저장된 한국사 문항 호환 포함)
+                    # 1차 메타데이터 필터링 (비영어·비국어 과목 전용 · 과거 '사회'로 저장된 한국사 문항 호환 포함)
                     candidates: list[QuestionRecord] = []
                     for r in db_list:
-                        if r.subject_category == "영어":
+                        if r.subject_category in ("영어", "국어"):
                             continue
                         is_history_rec = (
                             r.subject_category == "한국사"
@@ -5961,7 +6369,7 @@ with tab2:
     # 결과 활용 2가지 모드 (모드 A: PDF 다운로드 / 모드 B: 웹에서 풀기 + AI 해설)
     # -----------------------------------------------------------------------
     matched_items: list[dict[str, Any]] = st.session_state.get("matched_items") or []
-    if (not is_tab2_english_mode) and st.session_state.get("match_diagnostics"):
+    if is_tab2_concept_mode and st.session_state.get("match_diagnostics"):
         with st.expander("🔎 후보 문항 매칭/제외 판정 근거 상세 보기", expanded=False):
             for q, j in st.session_state["match_diagnostics"]:
                 icon = "🟢" if j.is_solvable_by_pdf_only and not j.needs_rewriting else ("🔵" if j.is_solvable_by_pdf_only else "⚪")
@@ -6035,10 +6443,20 @@ with tab2:
                         or bool(it.get("english_meta"))
                         for it in matched_items
                     )
+                    is_all_kor_matched = bool(matched_items) and all(
+                        it["question"].subject_category == "국어"
+                        or getattr(it.get("rewritten"), "subject_domain", "") == "국어"
+                        or bool(it.get("korean_meta"))
+                        for it in matched_items
+                    )
                     default_pdf_title = (
                         "수능·모의고사 영어 지문 맞춤형 변형 모의고사"
                         if is_all_eng_matched
-                        else "2022 개정 교육과정 개념서 맞춤형 기출 모의고사"
+                        else (
+                            "수능·모의고사 국어(독서·문학) 지문 세트 변형 모의고사"
+                            if is_all_kor_matched
+                            else "2022 개정 교육과정 개념서 맞춤형 기출 모의고사"
+                        )
                     )
                     with st.form("tab2_mode_a_pdf_form", border=False):
                         pdf_title = st.text_input(
@@ -6053,8 +6471,9 @@ with tab2:
                                 horizontal=True,
                             )
                         with pa_c2:
-                            if is_all_eng_matched:
-                                st.caption("📌 영어 변형 시험지는 원본 이미지를 제외하고 기출 출처(회차·번호)만 표기됩니다.")
+                            if is_all_eng_matched or is_all_kor_matched:
+                                subj_lbl = "영어" if is_all_eng_matched else "국어"
+                                st.caption(f"📌 {subj_lbl} 변형 시험지는 원본 이미지를 제외하고 기출 출처(회차·번호)만 표기됩니다.")
                                 include_orig_fig = False
                             else:
                                 include_orig_fig = st.checkbox(

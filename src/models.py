@@ -5,7 +5,7 @@ from datetime import datetime
 from typing import Any, Literal
 from pydantic import BaseModel, Field, field_validator
 
-SubjectCategory = Literal["수학", "사회", "과학", "한국사", "영어"]
+SubjectCategory = Literal["수학", "사회", "과학", "한국사", "국어", "영어"]
 
 ENGLISH_DEFAULT_EXCLUDED_Q_NUMS: frozenset[int] = frozenset({18, 19, 25, 26, 27, 28, 43, 44, 45})
 
@@ -23,6 +23,18 @@ ENGLISH_SHARED_PASSAGE_SETS: dict[int, str] = {
 def normalize_english_group_id(q_num: int, raw_group: str = "") -> str:
     """영어 세트 지문 그룹 ID를 문항 번호 기준으로 정규화한다 (41~42, 43~45 외에는 항상 빈 문자열)."""
     return ENGLISH_SHARED_PASSAGE_SETS.get(int(q_num), "")
+
+
+def normalize_korean_group_id(raw_group: str = "", q_num: int = 0) -> str:
+    """국어 세트 지문 그룹 ID('[4~9]', '4-9', '4~9' 등)를 '4~9' 형식으로 정규화한다."""
+    s = re.sub(r"[\[\]\s번]+", "", (raw_group or "").strip()).replace("-", "~")
+    m = re.match(r"^(\d{1,2})~(\d{1,2})$", s)
+    if m:
+        a, b = int(m.group(1)), int(m.group(2))
+        if a <= b:
+            return f"{a}~{b}"
+        return f"{b}~{a}"
+    return str(int(q_num)) if q_num > 0 else ""
 
 ENGLISH_TRANSFORM_TYPES: tuple[str, ...] = (
     "함축적 의미 추론",
@@ -52,12 +64,12 @@ def _coerce_grade_int(value: Any) -> int:
 
 
 class QuestionRecord(BaseModel):
-    """저장소에 영구 보관되는 단일 기출 문항 스키마 (2022 개정 교육과정 기준 및 영어 전용 확장 포함)."""
+    """저장소에 영구 보관되는 단일 기출 문항 스키마 (2022 개정 교육과정 기준 및 영어·국어 전용 확장 포함)."""
 
     id: str = Field(..., description="고유 문항 ID (예: 2026_고3_6월_화학__Q05)")
     exam_name: str = Field(..., description="시험 회차명 (예: 2026_고3_6월_화학)")
     q_num: int = Field(..., ge=1, description="문항 번호")
-    subject_category: Literal["수학", "사회", "과학", "한국사", "영어"] = Field(..., description="대분류 과목")
+    subject_category: Literal["수학", "사회", "과학", "한국사", "국어", "영어"] = Field(..., description="대분류 과목")
     curriculum_subject: str = Field(..., description="2022 개정 교육과정 세부 과목명")
     unit_name: str = Field(..., description="단원명")
     min_grade: int = Field(default=1, ge=1, le=3, description="최저 학년 수준 (1=고1, 2=고2, 3=고3)")
@@ -405,7 +417,7 @@ class RewrittenQuestion(BaseModel):
     )
     subject_domain: str = Field(
         default="",
-        description="개조/변형 도메인 구분 (''=개념서 기반 개조, '영어'=영어 수능형 지문 변형)",
+        description="개조/변형 도메인 구분 (''=개념서 기반 개조, '영어'=영어 수능형 지문 변형, '국어'=국어 지문 세트 재구성)",
     )
 
 
@@ -456,6 +468,92 @@ class BatchEnglishExamExtractionOutput(BaseModel):
     """영어 모의고사 PDF 전체 일괄 추출 출력 스키마."""
 
     questions: list[EnglishQuestionExtractionItem] = Field(default_factory=list)
+
+
+class KoreanSingleExtractionOutput(BaseModel):
+    """국어 기출 단일 문항 추출 스키마 (독서·문학 공통 영역 지문 세트 중심 추출)."""
+
+    korean_section: Literal["독서", "문학", "화법과 작문", "언어와 매체"] = Field(
+        ...,
+        description="영역 구분 ('독서' | '문학' | '화법과 작문' | '언어와 매체')",
+    )
+    korean_subgenre: str = Field(
+        default="",
+        description="세부 갈래 (예: 독서론, 인문·예술, 사회·경제, 과학·기술, 주제 통합, 현대시, 고전시가, 현대소설, 고전소설, 극·수필, 갈래 복합)",
+    )
+    question_type: str = Field(
+        default="",
+        description="원래 문항 유형 (예: 세부 내용 일치, 핵심 논지 추론, <보기> 사례 적용, 서술상 특징, 표현상 특징, 문맥적 어휘 의미)",
+    )
+    passage_group_id: str = Field(
+        default="",
+        description="공통 지문 세트 범위 (예: '1~3', '4~9', '18~21', 단독 문항은 해당 번호 문자열)",
+    )
+    passage_text: str = Field(
+        default="",
+        description="발문과 선지를 제외한 순수 국어 지문 원문 ((가)/(나) 구분, [A]~[E], ㉠~㉤, ⓐ~ⓔ 표지 포함; 화작/언매는 빈 문자열)",
+    )
+    passage_topic: str = Field(
+        default="",
+        description="지문 핵심 주제 또는 작품명·작가 1줄 요약 (예: '박완서, 「나목」', '카르납의 논리실증주의')",
+    )
+    key_vocabulary: list[str] = Field(
+        default_factory=list,
+        description="지문 내 핵심 어휘·문학적 개념어 3~6개 목록",
+    )
+    official_explanation: str = Field(
+        ...,
+        description="해설지 기준 핵심 풀이 및 정답 근거 요약",
+    )
+    answer: str = Field(
+        ...,
+        description="공식 정답 ('1'~'5' 단일 숫자 문자열)",
+    )
+
+
+class KoreanQuestionExtractionItem(KoreanSingleExtractionOutput):
+    """국어 모의고사 전체 PDF 일괄 추출 시 문항 번호가 포함된 항목."""
+
+    q_num: int = Field(..., ge=1, le=45, description="문항 번호 (1~45)")
+
+
+class BatchKoreanExamExtractionOutput(BaseModel):
+    """국어 모의고사 PDF 전체 일괄 추출 출력 스키마."""
+
+    questions: list[KoreanQuestionExtractionItem] = Field(default_factory=list)
+
+
+class KoreanSetQuestionOutput(BaseModel):
+    """국어 지문 세트 전체 재구성 시 생성되는 개별 문항."""
+
+    slot_index: int = Field(..., ge=1, description="세트 내 문항 순번 (1부터 시작)")
+    question_type_label: str = Field(
+        ...,
+        description="새로 출제한 문항 유형 (예: 세부 내용 일치, 핵심 논지 추론, <보기> 적용, 표현·서술상 특징, 문맥 어휘)",
+    )
+    stem: str = Field(
+        ...,
+        description="발문 및 필요 시 <보기> 박스 포함 문항 본문 (공통 지문 본문은 포함하지 않음)",
+    )
+    choices: list[str] = Field(
+        ...,
+        description="①~⑤ 선지 번호를 제외한 5개 선지 텍스트 리스트",
+    )
+    answer: str = Field(..., description="정답 ('1'~'5' 단일 숫자 문자열)")
+    explanation: str = Field(
+        ...,
+        description="지문 근거를 바탕으로 한 단계별 정답 근거 및 오답 선지 소거 해설",
+    )
+
+
+class KoreanSetReconstructionOutput(BaseModel):
+    """국어 지문 1개 세트에 대한 전체 문항(3~6문항) 자유 유형 재구성 출력 스키마."""
+
+    set_intro: str = Field(
+        ...,
+        description="세트 공통 발문 (예: '[1~4] 다음 글을 읽고 물음에 답하시오.')",
+    )
+    questions: list[KoreanSetQuestionOutput] = Field(default_factory=list)
 
 
 class ExamHeaderMetadata(BaseModel):
@@ -526,6 +624,10 @@ def infer_subject_category(
     # 1) 한국사 최우선 매칭 (독립 대분류)
     if any(k in c_nospace for k in ("한국사", "한국근현대사")):
         return "한국사"
+
+    # 2) 국어 매칭 (독서·문학·화법과작문·언어와매체)
+    if any(k in c_nospace for k in ("국어", "독서", "문학", "화법과작문", "언어와매체", "화작", "언매")):
+        return "국어"
 
     # 2) 구체적인 과목명 매칭 (사회탐구 / 과학탐구 / 수학 / 영어)
     social_exact = (
