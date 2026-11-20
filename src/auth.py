@@ -33,8 +33,8 @@ VALID_TIERS: tuple[TierType, ...] = ("FREE", "CUSTOM", "PRO", "ULTRA", "ADMIN")
 TIER_LABELS: dict[TierType, str] = {
     "FREE": "무료 (0원)",
     "CUSTOM": "개인 키 (0원)",
-    "PRO": "PRO (1,990원/월)",
-    "ULTRA": "ULTRA (4,900원/월)",
+    "PRO": "PRO (9,900원/월)",
+    "ULTRA": "ULTRA (19,900원/월)",
     "ADMIN": "최고 관리자",
 }
 USERNAME_RE = re.compile(r"^[A-Za-z0-9_.\-]{3,30}$")

@@ -2118,8 +2118,8 @@ def _render_admin_panel() -> None:
     m1.metric("전체 회원", f"{len(users_list)}명")
     m2.metric("FREE (0원)", f"{tier_counts['FREE']}명")
     m3.metric("CUSTOM (0원)", f"{tier_counts['CUSTOM']}명")
-    m4.metric("PRO (1,990원)", f"{tier_counts['PRO']}명")
-    m5.metric("ULTRA (4,900원)", f"{tier_counts['ULTRA']}명")
+    m4.metric("PRO (9,900원/월)", f"{tier_counts['PRO']}명")
+    m5.metric("ULTRA (19,900원/월)", f"{tier_counts['ULTRA']}명")
     m6.metric("ADMIN", f"{tier_counts['ADMIN']}명")
 
     filtered_users = [
@@ -2727,14 +2727,14 @@ if current_user is None:
             st.write("- 승인 없이 즉시 전환")
     with t_col3:
         with st.container(border=True):
-            st.markdown("<span class='tier-badge tier-PRO'>PRO · 1,990원/월</span>", unsafe_allow_html=True)
+            st.markdown("<span class='tier-badge tier-PRO'>PRO · 9,900원/월</span>", unsafe_allow_html=True)
             st.markdown("#### 스탠다드 유료")
             st.write("- **3.5 Flash-Lite 무제한** · 1회 제한 없음")
             st.write(f"- 고급 모델(3.8/Hydrogen) **주간 {PRO_WEEKLY_PREMIUM_LIMIT}문항**")
             st.write("- **공용 개념서 DB** 이용 가능")
     with t_col4:
         with st.container(border=True):
-            st.markdown("<span class='tier-badge tier-ULTRA'>ULTRA · 4,900원/월</span>", unsafe_allow_html=True)
+            st.markdown("<span class='tier-badge tier-ULTRA'>ULTRA · 19,900원/월</span>", unsafe_allow_html=True)
             st.markdown("#### 무제한 유료")
             st.write("- PRO 모든 혜택 포함")
             st.write(f"- 고급 모델(3.8/Hydrogen) **주간 {ULTRA_WEEKLY_PREMIUM_LIMIT}문항**")
