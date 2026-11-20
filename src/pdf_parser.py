@@ -665,6 +665,45 @@ def _extract_lines_in_column(
     return lines
 
 
+def _is_footer_or_header_noise(text: str, y0: float, page_h: float) -> bool:
+    # 본문 중앙에서 우연히 단어가 겹치는 오탐을 막기 위해 상·하단 여백 구간 위주로 필터링
+    t = (text or "").strip()
+    in_top_margin = y0 < 0.095 * page_h
+    in_bottom_margin = y0 > 0.895 * page_h
+    in_margin = in_top_margin or in_bottom_margin
+
+    always_noise = (
+        "이 문제지에 관한 저작권",
+        "한국교육과정평가원",
+        "답안지의 해당란에",
+    )
+    if any(p in t for p in always_noise):
+        return True
+    if not in_margin:
+        return False
+
+    # 상·하단 여백의 단독 쪽수('[10]', '12', '6') 또는 '12 국어', '국어 11', '영역 7' 등
+    if re.match(r"^\[?\s*\d{1,2}\s*\]?$", t):
+        return True
+    if re.match(r"^(?:\d{1,2}\s+)?(?:국어|수학|영어|한국사|사회탐구|과학탐구|직업탐구|제2외국어)(?:\s+\d{1,2})?$", t):
+        return True
+    if re.match(r"^(?:영역\s*\d{1,2}|\d{1,2}\s*영역)$", t):
+        return True
+
+    margin_noise = (
+        "학년도 대학수학능력시험",
+        "전국연합학력평가",
+        "모의평가 문제지",
+        "확인 사항",
+        "제 1 교시",
+        "제 2 교시",
+        "제 3 교시",
+        "제 4 교시",
+        "영역",
+    )
+    return any(p in t for p in margin_noise)
+
+
 def _collect_content_boxes_in_column(
     page: pymupdf.Page,
     page_dict: dict,
@@ -672,19 +711,22 @@ def _collect_content_boxes_in_column(
     col_x1: float,
     page_h: float,
 ) -> list[tuple[float, float, float, float]]:
-    """정밀 크롭 경계 계산을 위해 컬럼 내 텍스트/이미지/도형 박스를 수집한다."""
+    """정밀 크롭 경계 계산을 위해 컬럼 내 텍스트/이미지/도형 박스를 수집한다 (상·하단 헤더/푸터 제외)."""
     boxes: list[tuple[float, float, float, float]] = []
 
     for block in page_dict.get("blocks", []):
         btype = block.get("type")
         bx0, by0, bx1, by1 = block["bbox"]
-        if by1 < 0.035 * page_h or by0 > 0.94 * page_h:
+        if by1 < 0.055 * page_h or by0 > 0.905 * page_h:
             continue
 
         if btype == 0:
             for ln in block.get("lines", []):
                 lx0, ly0, lx1, ly1 = ln["bbox"]
-                if ly1 < 0.035 * page_h or ly0 > 0.94 * page_h:
+                if ly1 < 0.055 * page_h or ly0 > 0.905 * page_h:
+                    continue
+                ln_text = "".join(sp.get("text", "") for sp in ln.get("spans", [])).strip()
+                if not ln_text or _is_footer_or_header_noise(ln_text, ly0, page_h):
                     continue
                 for sp in ln.get("spans", []):
                     if not sp.get("text", "").strip():
@@ -709,40 +751,17 @@ def _collect_content_boxes_in_column(
             continue
         if rw > 0.85 * page.rect.width:
             continue
+        # 상·하단 헤더/푸터 가로 구분선 및 페이지 번호 박스 제외
+        if rect.y1 < 0.095 * page_h and rh < 6.0 and rw > 0.25 * (col_x1 - col_x0):
+            continue
         dcx = (rect.x0 + rect.x1) / 2.0
         if not (col_x0 <= dcx <= col_x1):
             continue
-        if rect.y1 < 0.04 * page_h or rect.y0 > 0.935 * page_h:
+        if rect.y1 < 0.055 * page_h or rect.y0 > 0.90 * page_h:
             continue
         boxes.append((max(col_x0, rect.x0), rect.y0, min(col_x1, rect.x1), rect.y1))
 
     return boxes
-
-
-def _is_footer_or_header_noise(text: str, y0: float, page_h: float) -> bool:
-    # 본문 중앙에서 우연히 단어가 겹치는 오탐을 막기 위해 상·하단 여백 구간 위주로 필터링
-    in_margin = y0 < 0.11 * page_h or y0 > 0.91 * page_h
-    always_noise = (
-        "이 문제지에 관한 저작권",
-        "한국교육과정평가원",
-        "답안지의 해당란에",
-    )
-    if any(p in text for p in always_noise):
-        return True
-    if not in_margin:
-        return False
-    margin_noise = (
-        "학년도 대학수학능력시험",
-        "전국연합학력평가",
-        "모의평가 문제지",
-        "확인 사항",
-        "제 1 교시",
-        "제 2 교시",
-        "제 3 교시",
-        "제 4 교시",
-        "영역",
-    )
-    return any(p in text for p in margin_noise)
 
 
 def _stitch_vertical_pngs(top_png: bytes, bottom_png: bytes, gap_px: int = 12) -> tuple[bytes, int, int]:
@@ -772,6 +791,8 @@ def parse_exam_pdf(pdf_bytes: bytes, dpi: int = 250) -> tuple[list[CroppedQuesti
     # 이전 단(또는 이전 페이지) 끝에서 미처 첫 문항을 만나지 못한 세트 지문 [N~M] 이월용 및 세트 문항 공통 텍스트 유지용
     carried_passage: dict | None = None
     active_passage_group: dict | None = None
+    # 이전 단 맨 아래 문항이 다음 단 상단(새 문항/새 지문 시작 전)까지 이어지는 경우(선지 등) 꼬리 병합용
+    prev_col_last_q_idx: int | None = None
 
     with pymupdf.open(stream=pdf_bytes, filetype="pdf") as doc:
         for page_idx in range(doc.page_count):
@@ -800,6 +821,7 @@ def parse_exam_pdf(pdf_bytes: bytes, dpi: int = 250) -> tuple[list[CroppedQuesti
                 max_allowed_x0 = max(col_x0 + 0.34 * col_w, ref_q_x0 + 48.0)
 
                 markers: list[dict] = []
+                first_passage_y0_in_col: float | None = None
                 pending_passage_y0: float | None = None
                 pending_passage_start_q: int | None = None
                 pending_passage_end_q: int | None = None
@@ -815,6 +837,8 @@ def parse_exam_pdf(pdf_bytes: bytes, dpi: int = 250) -> tuple[list[CroppedQuesti
                         p_start = int(pm.group(1))
                         p_end = int(pm.group(2))
                         if 1 <= p_start <= p_end <= 45:
+                            if first_passage_y0_in_col is None:
+                                first_passage_y0_in_col = ln["y0"]
                             pending_passage_y0 = ln["y0"]
                             pending_passage_start_q = p_start
                             pending_passage_end_q = p_end
@@ -847,6 +871,7 @@ def parse_exam_pdf(pdf_bytes: bytes, dpi: int = 250) -> tuple[list[CroppedQuesti
                             l_item["text"]
                             for l_item in lines
                             if pending_passage_y0 - 2.0 <= l_item["y0"] < ln["y0"] - 1.0
+                            and not _is_footer_or_header_noise(l_item["text"], l_item["y0"], page_h)
                         ).strip()
                         active_passage_group = {
                             "start_q": pending_passage_start_q,
@@ -891,7 +916,7 @@ def parse_exam_pdf(pdf_bytes: bytes, dpi: int = 250) -> tuple[list[CroppedQuesti
                     cont_lines = [
                         ln
                         for ln in lines
-                        if 0.05 * page_h <= ln["y0"] < first_m["y_start"] - 1.0
+                        if 0.055 * page_h <= ln["y0"] < first_m["y_start"] - 1.0
                         and not _is_footer_or_header_noise(ln["text"], ln["y0"], page_h)
                     ]
                     if cont_lines:
@@ -911,6 +936,49 @@ def parse_exam_pdf(pdf_bytes: bytes, dpi: int = 250) -> tuple[list[CroppedQuesti
                         for m_item in markers:
                             if active_passage_group["start_q"] <= m_item["q_num"] <= active_passage_group["end_q"]:
                                 m_item["passage_group"] = dict(active_passage_group)
+                    prev_col_last_q_idx = None
+                elif prev_col_last_q_idx is not None:
+                    # 직전 단의 마지막 문항(예: 17번)이 현재 단 상단(첫 문항 또는 첫 세트 헤더 이전)까지 이어지는 경우 꼬리(①~⑤ 선지 등) 병합
+                    boundary_candidates: list[float] = []
+                    if markers:
+                        boundary_candidates.append(markers[0]["y_start"])
+                    if first_passage_y0_in_col is not None:
+                        boundary_candidates.append(first_passage_y0_in_col)
+                    top_boundary_y = min(boundary_candidates) if boundary_candidates else (0.905 * page_h)
+
+                    tail_lines = [
+                        ln
+                        for ln in lines
+                        if 0.055 * page_h <= ln["y0"] < top_boundary_y - 1.0
+                        and not _is_footer_or_header_noise(ln["text"], ln["y0"], page_h)
+                    ]
+                    if tail_lines:
+                        tail_top = min(ln["y0"] for ln in tail_lines) - 4.0
+                        tail_boxes = [
+                            b
+                            for b in content_boxes
+                            if b[3] > tail_top and b[1] < top_boundary_y - 4.0
+                        ]
+                        if tail_boxes:
+                            t_clip = pymupdf.Rect(
+                                max(col_x0 + 2.0, min(b[0] for b in tail_boxes) - 10.0),
+                                max(0.055 * page_h, min(tail_top, min(b[1] for b in tail_boxes)) - 6.0),
+                                min(col_x1 - 2.0, max(b[2] for b in tail_boxes) + 10.0),
+                                min(top_boundary_y - 3.0, max(b[3] for b in tail_boxes) + 8.0),
+                            )
+                            if t_clip.y1 > t_clip.y0 + 8.0:
+                                t_pix = page.get_pixmap(dpi=effective_dpi, clip=t_clip, alpha=False)
+                                prev_cq = results[prev_col_last_q_idx]
+                                stitched_png, st_w, st_h = _stitch_vertical_pngs(
+                                    prev_cq.png_bytes, t_pix.tobytes("png")
+                                )
+                                prev_cq.png_bytes = stitched_png
+                                prev_cq.width = st_w
+                                prev_cq.height = st_h
+                                tail_txt = "\n".join(ln["text"] for ln in tail_lines).strip()
+                                if tail_txt:
+                                    prev_cq.extracted_text = f"{prev_cq.extracted_text}\n{tail_txt}".strip()
+                    prev_col_last_q_idx = None
 
                 for i, marker in enumerate(markers):
                     is_last_in_col = i == len(markers) - 1
@@ -925,8 +993,8 @@ def parse_exam_pdf(pdf_bytes: bytes, dpi: int = 250) -> tuple[list[CroppedQuesti
                     elif trailing_passage_cuts_col:
                         y_bottom_limit = pending_passage_y0 - 6.0
                     else:
-                        # 각 단 맨 아래 문항은 쪽번호/저작권 위쪽 약 0.93*H까지 넉넉히 확보
-                        y_bottom_limit = 0.93 * page_h
+                        # 각 단 맨 아래 문항은 하단 푸터('12 국어', '영역 7', 쪽번호) 위쪽까지만 확보
+                        y_bottom_limit = 0.905 * page_h
 
                     matched_boxes = [
                         b
@@ -945,24 +1013,22 @@ def parse_exam_pdf(pdf_bytes: bytes, dpi: int = 250) -> tuple[list[CroppedQuesti
                         max_x = col_x1 - 8.0
                         max_y = y_bottom_limit
 
-                    if is_last_in_col and not trailing_passage_cuts_col:
-                        max_y = max(max_y, 0.93 * page_h)
-                    elif max_y - min_y < 40.0:
+                    if max_y - min_y < 40.0:
                         max_y = min(y_bottom_limit, min_y + 120.0)
 
                     pad_x = 12.0
                     pad_y = 8.0
                     clip = pymupdf.Rect(
                         max(col_x0 + 2.0, min_x - pad_x),
-                        max(8.0, min_y - pad_y),
+                        max(0.055 * page_h, min_y - pad_y),
                         min(col_x1 - 2.0, max_x + pad_x),
                         min(
-                            0.935 * page_h if (is_last_in_col and not trailing_passage_cuts_col) else y_bottom_limit,
+                            0.908 * page_h if (is_last_in_col and not trailing_passage_cuts_col) else y_bottom_limit,
                             max_y + pad_y,
                         ),
                     )
                     if clip.y1 <= clip.y0:
-                        clip.y1 = min(0.935 * page_h, clip.y0 + 120.0)
+                        clip.y1 = min(0.908 * page_h, clip.y0 + 120.0)
 
                     if clip.width < 0.30 * page_w:
                         clip.x0 = max(col_x0 + 4.0, col_x0 + 12.0)
@@ -975,6 +1041,7 @@ def parse_exam_pdf(pdf_bytes: bytes, dpi: int = 250) -> tuple[list[CroppedQuesti
                         ln["text"]
                         for ln in lines
                         if ln["y1"] >= clip.y0 and ln["y0"] <= clip.y1
+                        and not _is_footer_or_header_noise(ln["text"], ln["y0"], page_h)
                     )
 
                     # 직전 단에서 이월된 세트 지문이 현재 문항 번호 구간(start_q <= q_num <= end_q)에 속할 때만 첫 문항 상단에 이미지 결합
@@ -1018,6 +1085,10 @@ def parse_exam_pdf(pdf_bytes: bytes, dpi: int = 250) -> tuple[list[CroppedQuesti
                             shared_passage_text=q_shared_text,
                         )
                     )
+                    if is_last_in_col and not trailing_passage_cuts_col:
+                        prev_col_last_q_idx = len(results) - 1
+                    elif is_last_in_col:
+                        prev_col_last_q_idx = None
 
                 # 현재 단의 모든 문항을 먼저 처리한 뒤, 단 하단에 미처 첫 문항을 만나지 못한 [N~M] 지문이 남아 있으면 다음 단으로 이월한다.
                 if (
@@ -1025,7 +1096,7 @@ def parse_exam_pdf(pdf_bytes: bytes, dpi: int = 250) -> tuple[list[CroppedQuesti
                     and pending_passage_start_q is not None
                     and pending_passage_end_q is not None
                 ):
-                    p_bottom = 0.902 * page_h
+                    p_bottom = 0.895 * page_h
                     p_boxes = [
                         b
                         for b in content_boxes
@@ -1034,9 +1105,9 @@ def parse_exam_pdf(pdf_bytes: bytes, dpi: int = 250) -> tuple[list[CroppedQuesti
                     if p_boxes:
                         p_clip = pymupdf.Rect(
                             max(col_x0 + 2.0, min(b[0] for b in p_boxes) - 10.0),
-                            max(8.0, min(pending_passage_y0, min(b[1] for b in p_boxes)) - 6.0),
+                            max(0.055 * page_h, min(pending_passage_y0, min(b[1] for b in p_boxes)) - 6.0),
                             min(col_x1 - 2.0, max(b[2] for b in p_boxes) + 10.0),
-                            min(0.908 * page_h, max(b[3] for b in p_boxes) + 8.0),
+                            min(0.902 * page_h, max(b[3] for b in p_boxes) + 8.0),
                         )
                         p_pix = page.get_pixmap(dpi=effective_dpi, clip=p_clip, alpha=False)
                         p_txt = "\n".join(
@@ -1060,6 +1131,7 @@ def parse_exam_pdf(pdf_bytes: bytes, dpi: int = 250) -> tuple[list[CroppedQuesti
                             "group_id": grp_str,
                             "text": p_txt,
                         }
+                        prev_col_last_q_idx = None
 
     results.sort(key=lambda r: r.q_num)
     has_text_layer = total_text_chars >= 60
