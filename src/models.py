@@ -560,6 +560,48 @@ class KoreanSetReconstructionOutput(BaseModel):
     questions: list[KoreanSetQuestionOutput] = Field(default_factory=list)
 
 
+class KoreanParagraphSummary(BaseModel):
+    """국어 지문의 문단/연/장면별 핵심 요약."""
+
+    label: str = Field(..., description="구분 라벨 (예: '1문단', '(가) 1연', '[A] 부분')")
+    summary: str = Field(..., description="해당 문단/연의 핵심 내용 1~2문장 요약")
+    key_point: str = Field(default="", description="핵심 논지·전개 기능 또는 표현 포인트 1줄")
+
+
+class KoreanMarkerVocabItem(BaseModel):
+    """지문 내 기호(㉠~㉤, ⓐ~ⓔ) 및 핵심 어휘/개념 해설."""
+
+    term: str = Field(..., description="기호 또는 핵심 어휘 (예: '㉠', 'ⓐ 반증', '의제와 간주')")
+    meaning: str = Field(..., description="문맥적 의미, 지시 대상 또는 개념 설명")
+
+
+class KoreanPassageAnalysisOutput(BaseModel):
+    """수능·학원형 국어 지문 정밀 분석지 구조화 출력 스키마."""
+
+    title: str = Field(..., description="분석지 제목 (예: '법적 의제와 간주의 차이' 또는 '오세영, 「보석 1」 외')")
+    core_theme: str = Field(..., description="지문 전체의 핵심 주제 · 중심 화제(또는 작품 주제 의식) 1~2문장")
+    structure_flow: str = Field(
+        ...,
+        description="지문 전체 논리 전개 구조 또는 작품 시상 전개·서사 흐름 요약 (화살표 → 활용)",
+    )
+    paragraph_summaries: list[KoreanParagraphSummary] = Field(
+        default_factory=list,
+        description="문단별(독서) 또는 연·장면별(문학) 핵심 요약 리스트",
+    )
+    marker_and_vocab_notes: list[KoreanMarkerVocabItem] = Field(
+        default_factory=list,
+        description="지문 속 ㉠~㉤, ⓐ~ⓔ 표지 및 핵심 어휘·개념어 해설 리스트",
+    )
+    area_specific_notes: list[str] = Field(
+        default_factory=list,
+        description="영역별 핵심 정리 (독서: 개념 대조·인과관계 / 문학: 화자·정서·태도·표현상 특징 / 화작·언매: 말하기 전략·문법 원리)",
+    )
+    exam_checkpoints: list[str] = Field(
+        default_factory=list,
+        description="수능·내신 출제 예상 포인트 및 오답 함정 주의사항 3~5개",
+    )
+
+
 class ExamHeaderMetadata(BaseModel):
     year: str = Field(..., description="시행 년도 (예: '2026')")
     month: str = Field(..., description="시행 월 (예: '3월', '6월', '9월', '11월')")

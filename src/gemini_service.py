@@ -49,6 +49,7 @@ from src.models import (
     EnglishQuestionExtractionItem,
     EnglishSingleExtractionOutput,
     ExamHeaderMetadata,
+    KoreanPassageAnalysisOutput,
     KoreanQuestionExtractionItem,
     KoreanSetReconstructionOutput,
     KoreanSingleExtractionOutput,
@@ -4361,4 +4362,82 @@ def generate_korean_set_reconstruction(
         results.append((base_rec, rw))
 
     return results
+
+
+def generate_korean_passage_analysis(
+    api_key: str,
+    model_name: str,
+    exam_name: str,
+    group_id: str,
+    passage_text: str,
+    korean_section: str = "독서",
+    korean_subgenre: str = "",
+    passage_topic: str = "",
+) -> KoreanPassageAnalysisOutput:
+    """
+    국어 지문 1개 세트를 수능·학원형 정밀 지문 분석지(핵심 주제, 구조 흐름, 문단/연별 요약,
+    ㉠~㉤·ⓐ~ⓔ 표지 및 어휘 해설, 영역별 정리, 출제 포인트)로 구조화 분석한다.
+    """
+    clean_passage = (passage_text or "").strip()
+    if not clean_passage:
+        raise ValueError("분석할 국어 지문 원문(passage_text)이 비어 있습니다.")
+
+    client = _build_client(api_key, timeout_seconds=90)
+    if korean_section == "문학":
+        area_guide = (
+            "문학 영역이므로 화자/서술자의 위치와 정서·태도 변화, 핵심 시어·소재의 상징적 의미, "
+            "표현상·서술상 특징(비유, 대비, 역설, 시점, 서술 방식 등), (가)/(나) 작품 간 비교 포인트를 정밀 정리하세요."
+        )
+    elif korean_section == "화법과 작문":
+        area_guide = (
+            "화법과 작문 영역이므로 발표/대화 참여자의 말하기 전략, 청자 반응, 초고의 전개 구조 및 고쳐쓰기·자료 활용 포인트를 정리하세요."
+        )
+    elif korean_section == "언어와 매체":
+        area_guide = (
+            "언어와 매체 영역이므로 핵심 국어 문법 개념·원리(음운, 품사, 문장, 중세국어 등) 또는 매체 언어 특성·정보 전달 방식을 정리하세요."
+        )
+    else:
+        area_guide = (
+            "독서(비문학) 영역이므로 중심 화제와 핵심 개념 간 관계(대조, 인과, 비례/반비례, 한계와 의의), "
+            "문단별 논지 전개 흐름과 구체적 사례 적용 원리를 정밀 정리하세요."
+        )
+
+    system_inst = (
+        "당신은 대한민국 대치동/수능 국어 영역 일타 강사 수준의 정밀 지문 분석가입니다.\n"
+        f"주어진 [{korean_section} · {korean_subgenre or '공통'}] 지문 원문만을 100% 근거로 하여, "
+        "학생과 강사가 바로 수업·복습에 활용할 수 있는 **수능·학원형 정밀 지문 분석지**를 JSON으로 작성하세요.\n\n"
+        "[작성 규칙]\n"
+        "1. `title`: 지문의 핵심 제목이나 작품명·작가를 간결하게 적으세요.\n"
+        "2. `core_theme`: 지문 전체의 핵심 주제(또는 작품 주제 의식)를 1~2문장으로 명확히 요약하세요.\n"
+        "3. `structure_flow`: 글 전체의 논리 흐름이나 시상/서사 전개를 `도입(...) → 전개(...) → 심화/전환(...) → 결론(...)` 형태로 한눈에 보이게 정리하세요.\n"
+        "4. `paragraph_summaries`: 독서는 문단별(1문단, 2문단...)로, 문학은 작품·연·장면별((가) 1연, (나) 도입...)로 빠짐없이 요약하세요.\n"
+        "5. `marker_and_vocab_notes`: 지문 안에 등장하는 `㉠~㉤`, `ⓐ~ⓔ`, `[A]~[E]` 표지(있는 경우 모두 포함)와 핵심 어휘·개념어를 뽑아 문맥적 의미를 정확히 풀이하세요.\n"
+        f"6. `area_specific_notes`: {area_guide}\n"
+        "7. `exam_checkpoints`: 실제 모의고사·내신에서 자주 출제되는 포인트와 선지 함정 주의사항 3~5개를 작성하세요."
+    )
+
+    prompt = (
+        f"[지문 정보]\n"
+        f"- 출처: {exam_name} [{group_id}번]\n"
+        f"- 영역/갈래: {korean_section} ({korean_subgenre or '공통'})\n"
+        f"- 참고 주제/작품: {passage_topic or '-'}\n\n"
+        f"[지문 원문]\n{clean_passage}\n\n"
+        "위 지문을 바탕으로 정밀 지문 분석지 JSON을 작성하세요."
+    )
+
+    resp = _generate_content_with_fallback(
+        client=client,
+        model_name=model_name,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            system_instruction=system_inst,
+            response_mime_type="application/json",
+            response_schema=KoreanPassageAnalysisOutput,
+            temperature=0.2,
+            max_output_tokens=8192,
+        ),
+        fast_mode=True,
+    )
+    return _parse_structured(resp, KoreanPassageAnalysisOutput)
+
 

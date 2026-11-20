@@ -106,6 +106,7 @@ from src.gemini_service import (
     extract_exam_header_metadata,
     generate_english_explanation,
     generate_english_transformed_question,
+    generate_korean_passage_analysis,
     generate_korean_set_reconstruction,
     generate_pdf_grounded_explanation,
     has_active_usage_tracker,
@@ -132,7 +133,7 @@ from src.models import (
     normalize_korean_group_id,
     resolve_question_concept_reference,
 )
-from src.pdf_generator import generate_custom_exam_pdf
+from src.pdf_generator import generate_custom_exam_pdf, generate_korean_passage_analysis_pdf
 from src.pdf_parser import (
     CroppedQuestion,
     crop_normalized_box,
@@ -6023,11 +6024,19 @@ def _render_tab2_korean_transform_section() -> None:
             with st.expander(f"📄 지문 미리보기: {s_entry['exam_name']} [{s_entry['group_id']}번]", expanded=False):
                 st.text(s_entry["passage_text"][:1500] + ("..." if len(s_entry["passage_text"]) > 1500 else ""))
 
-        run_kor_btn = st.form_submit_button(
-            "🚀 선택한 국어 지문 세트 전체 문항 재구성 실행",
-            type="primary",
-            width="stretch",
-        )
+        kb_c1, kb_c2 = st.columns(2)
+        with kb_c1:
+            run_kor_btn = st.form_submit_button(
+                "🚀 선택한 국어 지문 세트 변형문제 생성",
+                type="primary",
+                width="stretch",
+            )
+        with kb_c2:
+            run_kor_analysis_btn = st.form_submit_button(
+                "📑 선택한 지문 분석지 PDF 생성",
+                type="secondary",
+                width="stretch",
+            )
 
     if run_kor_btn:
         if not selected_set_indices:
@@ -6062,7 +6071,7 @@ def _render_tab2_korean_transform_section() -> None:
 
         new_matched: list[dict[str, Any]] = []
         with _usage_scope():
-            with st.spinner(f"🤖 {MODEL_LABELS.get(EXAM_TAGGING_MODEL, EXAM_TAGGING_MODEL)}로 국어 지문 세트({len(chosen_sets)}개 세트) 재구성 중..."):
+            with st.spinner(f"🤖 {MODEL_LABELS.get(EXAM_TAGGING_MODEL, EXAM_TAGGING_MODEL)}로 국어 지문 세트({len(chosen_sets)}개 세트) 변형문제 생성 중..."):
                 for s_entry in chosen_sets:
                     curr_subj = s_entry["curr_subj"]
                     kor_sec = _classify_kor_sec(curr_subj)
@@ -6101,7 +6110,106 @@ def _render_tab2_korean_transform_section() -> None:
             st.session_state["web_quiz_answers"] = {}
             st.session_state["web_quiz_graded"] = False
             st.session_state["web_quiz_ai_exps"] = {}
-            st.success(f"🎯 총 {len(chosen_sets)}개 지문 세트({len(new_matched)}문항) 재구성 완료! 아래 [모드 A] PDF 또는 [모드 B] 웹 풀기를 이용해 주세요.")
+            st.success(f"🎯 총 {len(chosen_sets)}개 지문 세트({len(new_matched)}문항) 변형문제 생성 완료! 아래 [모드 A] PDF 또는 [모드 B] 웹 풀기를 이용해 주세요.")
+
+    if run_kor_analysis_btn:
+        if not selected_set_indices:
+            st.error("분석지를 생성할 국어 지문 세트를 최소 1개 이상 체크해 주세요.")
+            return
+
+        chosen_sets = [filtered_sets[i] for i in selected_set_indices]
+        kor_api_key, kor_key_label = resolve_active_gemini_api_key(
+            current_user, creds.gemini_api_key, model_name=EXAM_TAGGING_MODEL
+        )
+        if not kor_api_key:
+            st.error(f"사용 가능한 Gemini API 키({kor_key_label})가 설정되지 않았습니다.")
+            return
+        if not _ensure_token_quota():
+            return
+
+        analyses_list: list[dict[str, Any]] = []
+        with _usage_scope():
+            with st.spinner(f"📑 {MODEL_LABELS.get(EXAM_TAGGING_MODEL, EXAM_TAGGING_MODEL)}로 국어 지문 분석지({len(chosen_sets)}개 세트) 생성 중..."):
+                for s_entry in chosen_sets:
+                    curr_subj = s_entry["curr_subj"]
+                    kor_sec = _classify_kor_sec(curr_subj)
+                    m_sub = re.search(r"\(([^)]+)\)", curr_subj)
+                    kor_sub = m_sub.group(1) if m_sub else ""
+                    try:
+                        an_out = generate_korean_passage_analysis(
+                            api_key=kor_api_key,
+                            model_name=EXAM_TAGGING_MODEL,
+                            exam_name=s_entry["exam_name"],
+                            group_id=s_entry["group_id"],
+                            passage_text=s_entry["passage_text"],
+                            korean_section=kor_sec,
+                            korean_subgenre=kor_sub,
+                            passage_topic=s_entry["passage_topic"],
+                        )
+                        analyses_list.append(
+                            {
+                                "exam_name": s_entry["exam_name"],
+                                "group_id": s_entry["group_id"],
+                                "section_label": curr_subj,
+                                "passage_text": s_entry["passage_text"],
+                                "analysis": an_out,
+                            }
+                        )
+                    except Exception as exc:
+                        st.error(f"[{s_entry['exam_name']} {s_entry['group_id']}번] 지문 분석 실패: {exc}")
+
+        if analyses_list:
+            try:
+                pdf_bytes = generate_korean_passage_analysis_pdf(analyses_list)
+                st.session_state["kor_analysis_results"] = analyses_list
+                st.session_state["kor_analysis_pdf"] = pdf_bytes
+                st.success(f"📑 총 {len(analyses_list)}개 국어 지문 정밀 분석지 PDF가 생성되었습니다!")
+            except Exception as exc:
+                st.error(f"분석지 PDF 렌더링 실패: {exc}")
+
+    saved_analyses: list[dict[str, Any]] = st.session_state.get("kor_analysis_results") or []
+    saved_analysis_pdf: bytes | None = st.session_state.get("kor_analysis_pdf")
+    if saved_analyses and saved_analysis_pdf:
+        st.markdown("#### 📑 생성된 국어 정밀 지문 분석지 (수능·학원형)")
+        with st.container(border=True):
+            dl_c1, dl_c2 = st.columns([2.2, 1.0])
+            with dl_c1:
+                st.write(f"총 **{len(saved_analyses)}개** 지문 세트 분석 완료 (핵심 주제 · 전개 흐름 · 문단별 요약 · 표지/어휘 · 출제 포인트 포함)")
+            with dl_c2:
+                st.download_button(
+                    "📥 지문 분석지 PDF 다운로드",
+                    data=saved_analysis_pdf,
+                    file_name="국어_정밀_지문_분석지.pdf",
+                    mime="application/pdf",
+                    type="primary",
+                    width="stretch",
+                    key="kor_analysis_pdf_dl_btn",
+                )
+            for idx_a, an_item in enumerate(saved_analyses, start=1):
+                an = an_item["analysis"]
+                with st.expander(
+                    f"{idx_a}. [{an_item['exam_name']} · {an_item['group_id']}번] {an.title} ({an_item['section_label']})",
+                    expanded=(idx_a == 1),
+                ):
+                    st.info(f"**핵심 주제:** {an.core_theme}")
+                    st.success(f"**전개 흐름:** {an.structure_flow}")
+                    if an.paragraph_summaries:
+                        st.markdown("**📌 문단 · 연별 요약**")
+                        for ps in an.paragraph_summaries:
+                            kp = f" *(포인트: {ps.key_point})*" if ps.key_point else ""
+                            st.write(f"- **[{ps.label}]** {ps.summary}{kp}")
+                    if an.marker_and_vocab_notes:
+                        st.markdown("**🔖 표지(㉠~㉤ · ⓐ~ⓔ) 및 핵심 어휘**")
+                        for mv in an.marker_and_vocab_notes:
+                            st.write(f"- **`{mv.term}`**: {mv.meaning}")
+                    if an.area_specific_notes:
+                        st.markdown(f"**📖 영역별 핵심 정리 ({an_item['section_label']})**")
+                        for note in an.area_specific_notes:
+                            st.write(f"- {note}")
+                    if an.exam_checkpoints:
+                        st.markdown("**⚠️ 출제 예상 포인트 및 오답 주의사항**")
+                        for cp in an.exam_checkpoints:
+                            st.write(f"- {cp}")
 
 
 with tab2:
@@ -6109,7 +6217,7 @@ with tab2:
         "작업 과목 모드 선택",
         options=[
             "📚 수학 · 사회 · 과학 · 한국사 (개념서 범위 추출 & 상위 용어 개조)",
-            "📖 국어 (독서·문학 지문 세트 선택 & 전체 문항 재구성)",
+            "📖 국어 (지문 분석지 PDF & 변형문제 세트 생성)",
             "🔤 영어 (기출 지문 선택 & 수능 독해 유형 변형)",
         ],
         horizontal=True,

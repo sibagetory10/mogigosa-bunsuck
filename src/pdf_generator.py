@@ -926,3 +926,232 @@ def generate_custom_exam_pdf(
     out_bytes = doc.tobytes(deflate=True, garbage=3)
     doc.close()
     return out_bytes
+
+
+def generate_korean_passage_analysis_pdf(
+    analyses: list[dict[str, Any]],
+    doc_title: str = "수능·모의고사 국어 정밀 지문 분석지",
+) -> bytes:
+    """
+    국어 지문 분석 결과(KoreanPassageAnalysisOutput + 원문 지문 + 출처 메타) 리스트를
+    수능·학원형 정밀 지문 분석지 PDF로 렌더링한다 (PyMuPDF Story 기반 자동 페이지 넘김).
+    """
+    if not analyses:
+        raise ValueError("생성할 국어 지문 분석 데이터가 없습니다.")
+
+    analysis_css = """
+    body {
+        font-family: "NanumGothic", "Malgun Gothic", sans-serif;
+        font-size: 9.5pt;
+        line-height: 1.56;
+        color: #0F172A;
+    }
+    .hdr-banner {
+        border: 1.4pt solid #1E293B;
+        border-radius: 5pt;
+        background-color: #F8FAFC;
+        padding: 9pt 12pt;
+        margin-bottom: 12pt;
+    }
+    .hdr-sub {
+        font-size: 8.2pt;
+        font-weight: bold;
+        color: #1D4ED8;
+    }
+    .hdr-title {
+        font-size: 14.5pt;
+        font-weight: bold;
+        color: #0F172A;
+        margin-top: 2pt;
+    }
+    .hdr-meta {
+        font-size: 8.2pt;
+        color: #475569;
+        margin-top: 3pt;
+    }
+    .sec-title {
+        font-size: 10.5pt;
+        font-weight: bold;
+        color: #1E3A8A;
+        border-left: 3.5pt solid #2563EB;
+        padding-left: 6pt;
+        margin-top: 10pt;
+        margin-bottom: 5pt;
+    }
+    .theme-box {
+        background-color: #EFF6FF;
+        border: 0.9pt solid #93C5FD;
+        border-radius: 4pt;
+        padding: 7pt 10pt;
+        margin-bottom: 8pt;
+    }
+    .flow-box {
+        background-color: #F0FDF4;
+        border: 0.9pt solid #86EFAC;
+        border-radius: 4pt;
+        padding: 7pt 10pt;
+        margin-bottom: 8pt;
+    }
+    .passage-box {
+        background-color: #FAFAFA;
+        border: 0.8pt solid #CBD5E1;
+        border-radius: 4pt;
+        padding: 8pt 10pt;
+        font-size: 9.0pt;
+        line-height: 1.60;
+        margin-bottom: 10pt;
+    }
+    .para-card {
+        border-bottom: 0.6pt solid #E2E8F0;
+        padding: 4pt 0;
+    }
+    .para-lbl {
+        font-weight: bold;
+        color: #1E40AF;
+    }
+    .para-kp {
+        color: #0F766E;
+        font-size: 8.8pt;
+        margin-top: 1.5pt;
+    }
+    .vocab-tbl {
+        width: 100%;
+        border-collapse: collapse;
+        margin-bottom: 8pt;
+        font-size: 8.9pt;
+    }
+    .vocab-tbl th {
+        background-color: #F1F5F9;
+        border: 0.7pt solid #CBD5E1;
+        padding: 4pt 6pt;
+        text-align: left;
+        font-weight: bold;
+        color: #1E293B;
+    }
+    .vocab-tbl td {
+        border: 0.7pt solid #CBD5E1;
+        padding: 4pt 6pt;
+        vertical-align: top;
+    }
+    .term-col {
+        width: 24%;
+        font-weight: bold;
+        color: #B45309;
+    }
+    .checkpoint-box {
+        background-color: #FFFBEB;
+        border: 0.9pt solid #FCD34D;
+        border-radius: 4pt;
+        padding: 7pt 10pt;
+        margin-bottom: 10pt;
+    }
+    .note-li {
+        margin-bottom: 3pt;
+    }
+    .page-break {
+        page-break-before: always;
+    }
+    """
+
+    sections_html: list[str] = []
+    today_str = datetime.now().strftime("%Y.%m.%d")
+
+    for idx, item in enumerate(analyses):
+        an = item["analysis"]
+        exam_name = item.get("exam_name", "")
+        group_id = item.get("group_id", "")
+        section_label = item.get("section_label", "독서")
+        passage_text = (item.get("passage_text", "") or "").strip()
+
+        pb_cls = " class='page-break'" if idx > 0 else ""
+        banner_html = f"""
+        <div{pb_cls}>
+          <div class="hdr-banner">
+            <div class="hdr-sub">{html.escape(doc_title)} · {html.escape(section_label)}</div>
+            <div class="hdr-title">{html.escape(an.title)}</div>
+            <div class="hdr-meta">출처: {html.escape(exam_name)} [{html.escape(group_id)}번] &nbsp;|&nbsp; 생성일: {today_str}</div>
+          </div>
+        """
+
+        theme_html = f"""
+          <div class="sec-title">1. 핵심 주제 및 논리 · 시상 전개</div>
+          <div class="theme-box"><b>핵심 주제:</b> {html.escape(an.core_theme)}</div>
+          <div class="flow-box"><b>전개 흐름:</b> {html.escape(an.structure_flow)}</div>
+        """
+
+        para_rows = []
+        for ps in (an.paragraph_summaries or []):
+            kp_html = f"<div class='para-kp'>▸ 포인트: {html.escape(ps.key_point)}</div>" if ps.key_point else ""
+            para_rows.append(
+                f"<div class='para-card'><span class='para-lbl'>[{html.escape(ps.label)}]</span> "
+                f"{html.escape(ps.summary)}{kp_html}</div>"
+            )
+        para_html = (
+            "<div class='sec-title'>2. 문단 · 연별 정밀 요약</div>" + "".join(para_rows)
+            if para_rows
+            else ""
+        )
+
+        vocab_rows = []
+        for mv in (an.marker_and_vocab_notes or []):
+            vocab_rows.append(
+                f"<tr><td class='term-col'>{html.escape(mv.term)}</td><td>{html.escape(mv.meaning)}</td></tr>"
+            )
+        vocab_html = (
+            "<div class='sec-title'>3. 핵심 표지(㉠~㉤ · ⓐ~ⓔ) 및 어휘 · 개념 풀이</div>"
+            "<table class='vocab-tbl'><tr><th>표지 / 어휘</th><th>문맥적 의미 및 설명</th></tr>"
+            + "".join(vocab_rows)
+            + "</table>"
+            if vocab_rows
+            else ""
+        )
+
+        area_items = "".join(
+            f"<div class='note-li'>• {html.escape(n)}</div>"
+            for n in (an.area_specific_notes or [])
+            if n.strip()
+        )
+        area_html = (
+            f"<div class='sec-title'>4. 영역별 핵심 정리 ({html.escape(section_label)})</div>{area_items}"
+            if area_items
+            else ""
+        )
+
+        cp_items = "".join(
+            f"<div class='note-li'>★ {html.escape(c)}</div>"
+            for c in (an.exam_checkpoints or [])
+            if c.strip()
+        )
+        cp_html = (
+            f"<div class='sec-title'>5. 출제 예상 포인트 및 오답 주의사항</div><div class='checkpoint-box'>{cp_items}</div>"
+            if cp_items
+            else ""
+        )
+
+        p_escaped = "<br/>".join(html.escape(ln) for ln in passage_text.splitlines())
+        passage_html = (
+            f"<div class='sec-title'>6. 원문 지문 전체</div><div class='passage-box'>{p_escaped}</div>"
+            if p_escaped
+            else ""
+        )
+
+        sections_html.append(
+            f"{banner_html}{theme_html}{para_html}{vocab_html}{area_html}{cp_html}{passage_html}</div>"
+        )
+
+    full_html = f"<html><body>{''.join(sections_html)}</body></html>"
+    story = pymupdf.Story(html=full_html, user_css=analysis_css)
+    writer_buf = io.BytesIO()
+    mediabox = pymupdf.paper_rect("a4")
+    where = mediabox + (36, 40, -36, -42)
+
+    writer = pymupdf.DocumentWriter(writer_buf)
+    more = True
+    while more:
+        dev = writer.begin_page(mediabox)
+        more, _ = story.place(where)
+        story.draw(dev, None)
+        writer.end_page()
+    writer.close()
+    return writer_buf.getvalue()
+
