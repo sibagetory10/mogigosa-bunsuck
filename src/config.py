@@ -39,7 +39,7 @@ MODEL_TOKEN_PRICING_USD_PER_1M: dict[str, dict[str, float]] = {
         "output": FLASH_LITE_OUTPUT_USD_PER_1M,
     },
 }
-DEFAULT_USD_TO_KRW: float = 1400.0
+DEFAULT_USD_TO_KRW: float = 1335.0
 
 
 def resolve_api_model_name(model_choice: str | None) -> str:
@@ -49,7 +49,7 @@ def resolve_api_model_name(model_choice: str | None) -> str:
 
 
 def resolve_usd_to_krw_rate() -> float:
-    """st.secrets('USD_TO_KRW') -> 환경변수 -> 기본값(1400.0) 순으로 USD->KRW 환율을 로드한다."""
+    """st.secrets('USD_TO_KRW') -> 환경변수 -> 기본값(1335.0) 순으로 USD->KRW 환율을 로드한다."""
     raw = _safe_get_secret(["USD_TO_KRW", "usd_to_krw"])
     if raw is None:
         raw = os.environ.get("USD_TO_KRW", "").strip() or None
@@ -61,6 +61,20 @@ def resolve_usd_to_krw_rate() -> float:
         except (ValueError, TypeError):
             pass
     return DEFAULT_USD_TO_KRW
+
+
+def resolve_billing_api_key() -> str:
+    """선택 사항인 Google Cloud Billing Catalog API 키(st.secrets 또는 환경변수)를 로드한다."""
+    sec_val = _safe_get_secret(
+        ["GOOGLE_BILLING_API_KEY", "CLOUD_BILLING_API_KEY", "google_billing_api_key"]
+    )
+    if isinstance(sec_val, str) and sec_val.strip():
+        return sec_val.strip()
+    for env_k in ("GOOGLE_BILLING_API_KEY", "CLOUD_BILLING_API_KEY"):
+        v = os.environ.get(env_k, "").strip()
+        if v:
+            return v
+    return ""
 
 
 @dataclass

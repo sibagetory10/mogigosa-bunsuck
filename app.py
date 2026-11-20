@@ -70,6 +70,7 @@ from src.config import (
     FLASH_LITE_MODEL,
     FLASH_LITE_OUTPUT_USD_PER_1M,
     MODEL_LABELS,
+    resolve_billing_api_key,
     resolve_credentials,
     resolve_usd_to_krw_rate,
 )
@@ -82,6 +83,7 @@ from src.curriculum_2022 import (
 )
 from src.ebsi_fetcher import attempt_ebsi_pdf_fetch
 from src.exporters import build_exam_ai_jsonl, build_exam_html, build_exam_markdown
+from src.fx_rate import get_daily_gemini_fx_rate, start_daily_midnight_fx_scheduler
 from src.gemini_service import (
     ForbiddenTermRemainingError,
     TokenUsageRecord,
@@ -1435,6 +1437,8 @@ storage = _get_cached_storage(
     _service_account_info=creds.service_account_info,
     _oauth_info=creds.oauth_credentials_info,
 )
+_fx_api_keys = [k for k in (resolve_billing_api_key(), creds.gemini_api_key) if k]
+start_daily_midnight_fx_scheduler(cache_dir=storage.local_root, api_keys=_fx_api_keys)
 sync_fingerprint = f"{creds.drive_folder_id}:{storage.drive_auth_mode}:{sa_fingerprint}"
 if storage.drive_connected and st.session_state["drive_sync_key"] != sync_fingerprint:
     sync_out = _run_startup_drive_sync(storage, sync_fingerprint)
@@ -2275,11 +2279,19 @@ def _render_admin_panel() -> None:
     m6.metric("ADMIN", f"{tier_counts['ADMIN']}명")
 
     # ------------------------------------------------------------------
-    # 💰 실제 API 토큰 사용량 & 원화(₩) 환산 대시보드
+    # 💰 실제 API 토큰 사용량 & 원화(₩) 환산 대시보드 (매일 00:00 KST 자동 환율 적용)
     # ------------------------------------------------------------------
     current_month = get_kst_month_str()
+    fx_api_keys = [k for k in (resolve_billing_api_key(), creds.gemini_api_key) if k]
+    force_fx_now = bool(st.session_state.pop("admin_force_fx_refresh", False))
+    fx_info = get_daily_gemini_fx_rate(
+        cache_dir=storage.local_root,
+        api_keys=fx_api_keys,
+        force_refresh=force_fx_now,
+    )
+
     with st.container(border=True):
-        rate_c1, rate_c2 = st.columns([2.4, 1.0])
+        rate_c1, rate_c2 = st.columns([2.2, 1.2])
         with rate_c1:
             st.markdown(f"#### 💰 API 토큰 사용량 & 원화(₩) 환산 ({current_month} KST 기준)")
             st.caption(
@@ -2288,18 +2300,27 @@ def _render_admin_panel() -> None:
                 f"캐시 `${FLASH_LITE_CACHED_INPUT_USD_PER_1M:.2f}` · "
                 f"출력(+사고) `${FLASH_LITE_OUTPUT_USD_PER_1M:.2f}` / 1M 토큰"
             )
-        with rate_c2:
-            usd_to_krw = float(
-                st.number_input(
-                    "적용 환율 (1 USD → KRW)",
-                    min_value=500.0,
-                    max_value=5000.0,
-                    value=float(resolve_usd_to_krw_rate()),
-                    step=10.0,
-                    format="%.0f",
-                    key="admin_usd_to_krw_rate",
-                )
+            badge_icon = "✅" if fx_info.is_google_official else "💱"
+            ref_part = f" · 기준일 `{fx_info.reference_date}`" if fx_info.reference_date else ""
+            st.caption(
+                f"{badge_icon} **자동 적용 환율: 1 USD = ₩{fx_info.rate:,.2f}** "
+                f"({fx_info.source}{ref_part}) | "
+                f"최근 확인: `{fx_info.checked_at}` · **자동 갱신: 매일 00:00 KST**"
             )
+        with rate_c2:
+            include_vat = st.checkbox(
+                "🇰🇷 한국 부가가치세(VAT 10%) 포함",
+                value=True,
+                key="admin_include_kr_vat",
+                help="대한민국 Google Cloud / Gemini API 결제 계정(Google Cloud Korea LLC)은 환산 원화 금액에 VAT 10%가 별도 청구됩니다.",
+            )
+            if st.button("🔄 환율 지금 다시 확인", key="admin_refresh_fx_btn", width="stretch"):
+                st.session_state["admin_force_fx_refresh"] = True
+                st.rerun()
+
+        vat_mult = 1.10 if include_vat else 1.0
+        usd_to_krw = float(fx_info.rate) * vat_mult
+        vat_label = "VAT 10% 포함" if include_vat else "VAT 별도"
 
         def _u_month_attr(u_obj: Any, attr: str, default: Any = 0) -> Any:
             if getattr(u_obj, "last_used_month", "") != current_month:
@@ -2333,9 +2354,9 @@ def _render_admin_panel() -> None:
         k1.metric(
             "이번 달 서버 API 비용",
             format_krw(month_server_usd, usd_to_krw),
-            help=f"서버 키 부담분 기준 (${month_server_usd:.4f} / 개인키 포함 전체 ${month_all_usd:.4f})",
+            help=f"서버 키 부담분 기준 (${month_server_usd:.4f} · {vat_label} / 개인키 포함 전체 ${month_all_usd:.4f})",
         )
-        k1.caption(f"USD `${month_server_usd:.4f}` (개인키 제외)")
+        k1.caption(f"USD `${month_server_usd:.4f}` ({vat_label} · 개인키 제외)")
         k2.metric(
             "이번 달 전체 사용 토큰",
             f"{month_total_tok_sum:,}",
@@ -2346,7 +2367,7 @@ def _render_admin_panel() -> None:
         k3.metric(
             "누적 서버 API 비용",
             format_krw(total_server_usd, usd_to_krw),
-            help=f"전체 누적 서버 키 부담분 (${total_server_usd:.4f} / 개인키 포함 전체 ${total_all_usd:.4f})",
+            help=f"전체 누적 서버 키 부담분 (${total_server_usd:.4f} · {vat_label} / 개인키 포함 전체 ${total_all_usd:.4f})",
         )
         k3.caption(f"USD `${total_server_usd:.4f}` · 누적 {total_tok_sum:,} 토큰")
         k4.metric(
