@@ -8,38 +8,59 @@ from typing import Any
 
 import streamlit as st
 
-HYDROGEN_MODEL: str = "gemini-4-hydrogen"
-HYDROGEN_LABEL: str = "Gemini 4 Hydrogen (낮음)"
+FLASH_LITE_MODEL: str = "gemini-3.5-flash-lite"
+FLASH_LITE_LABEL: str = "Gemini 3.5 Flash-Lite"
+
+# 하위 호환용 별칭 (전 기능 gemini-3.5-flash-lite 단일 모델 통일)
+HYDROGEN_MODEL: str = FLASH_LITE_MODEL
+HYDROGEN_LABEL: str = FLASH_LITE_LABEL
 
 AVAILABLE_MODELS: list[str] = [
-    "gemini-3.5-flash",
-    "gemini-3.5-flash-lite",
-    HYDROGEN_MODEL,
-    "gemini-3.8-flash",
+    FLASH_LITE_MODEL,
 ]
 MODEL_LABELS: dict[str, str] = {
-    "gemini-3.5-flash": "Gemini 3.5 Flash",
-    "gemini-3.5-flash-lite": "Gemini 3.5 Flash-Lite",
-    HYDROGEN_MODEL: HYDROGEN_LABEL,
-    "gemini-3.8-flash": "Gemini 3.8 Flash",
+    FLASH_LITE_MODEL: FLASH_LITE_LABEL,
 }
-DEFAULT_MODEL: str = "gemini-3.5-flash"
-EXAM_TAGGING_MODEL: str = "gemini-3.5-flash-lite"
-EXAM_NO_ANSWER_SOLVER_MODEL: str = "gemini-3.8-flash"
-CONCEPT_DB_BUILD_MODEL: str = "gemini-3.8-flash"
-CONCEPT_SCOPE_MODEL: str = "gemini-3.5-flash-lite"
-REWRITE_MODEL: str = HYDROGEN_MODEL
+DEFAULT_MODEL: str = FLASH_LITE_MODEL
+EXAM_TAGGING_MODEL: str = FLASH_LITE_MODEL
+EXAM_NO_ANSWER_SOLVER_MODEL: str = FLASH_LITE_MODEL
+CONCEPT_DB_BUILD_MODEL: str = FLASH_LITE_MODEL
+CONCEPT_SCOPE_MODEL: str = FLASH_LITE_MODEL
+REWRITE_MODEL: str = FLASH_LITE_MODEL
+
+# Gemini 3.5 Flash-Lite 공식 API 단가 (USD / 1M tokens, 출력 단가는 사고 토큰 포함)
+FLASH_LITE_INPUT_USD_PER_1M: float = 0.30
+FLASH_LITE_CACHED_INPUT_USD_PER_1M: float = 0.03
+FLASH_LITE_OUTPUT_USD_PER_1M: float = 2.50
+MODEL_TOKEN_PRICING_USD_PER_1M: dict[str, dict[str, float]] = {
+    FLASH_LITE_MODEL: {
+        "input": FLASH_LITE_INPUT_USD_PER_1M,
+        "cached_input": FLASH_LITE_CACHED_INPUT_USD_PER_1M,
+        "output": FLASH_LITE_OUTPUT_USD_PER_1M,
+    },
+}
+DEFAULT_USD_TO_KRW: float = 1400.0
 
 
 def resolve_api_model_name(model_choice: str | None) -> str:
-    """UI 표시명 또는 모델 ID를 실제 Gemini API 모델명으로 정규화한다."""
-    raw = (model_choice or "").strip()
-    if not raw:
-        return DEFAULT_MODEL
-    for model_id, label in MODEL_LABELS.items():
-        if raw == label:
-            return model_id
-    return raw
+    """모든 모델 요청을 단일 모델(gemini-3.5-flash-lite)로 정규화한다."""
+    _ = model_choice
+    return FLASH_LITE_MODEL
+
+
+def resolve_usd_to_krw_rate() -> float:
+    """st.secrets('USD_TO_KRW') -> 환경변수 -> 기본값(1400.0) 순으로 USD->KRW 환율을 로드한다."""
+    raw = _safe_get_secret(["USD_TO_KRW", "usd_to_krw"])
+    if raw is None:
+        raw = os.environ.get("USD_TO_KRW", "").strip() or None
+    if raw is not None:
+        try:
+            val = float(str(raw).replace(",", "").strip())
+            if 500.0 <= val <= 5000.0:
+                return val
+        except (ValueError, TypeError):
+            pass
+    return DEFAULT_USD_TO_KRW
 
 
 @dataclass

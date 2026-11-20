@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import concurrent.futures
+import contextlib
+import contextvars
 import hashlib
 import io
 import json
@@ -8,14 +10,24 @@ import random
 import re
 import threading
 import time
-from typing import Any, Callable, Sequence, TypeVar
+from dataclasses import dataclass
+from typing import Any, Callable, Iterator, Sequence, TypeVar
 
 from google import genai
 from google.genai import types
 from PIL import Image
 from pydantic import BaseModel, Field
 
-from src.config import DEFAULT_MODEL, EXAM_TAGGING_MODEL, HYDROGEN_MODEL, resolve_api_model_name
+from src.config import (
+    DEFAULT_MODEL,
+    EXAM_TAGGING_MODEL,
+    FLASH_LITE_CACHED_INPUT_USD_PER_1M,
+    FLASH_LITE_INPUT_USD_PER_1M,
+    FLASH_LITE_MODEL,
+    FLASH_LITE_OUTPUT_USD_PER_1M,
+    MODEL_TOKEN_PRICING_USD_PER_1M,
+    resolve_api_model_name,
+)
 from src.curriculum_2022 import (
     build_tagging_grounding_context,
     validate_and_normalize_extracted_tag,
@@ -116,20 +128,132 @@ def optimize_image_for_vision(png_bytes: bytes, max_width: int = MAX_VISION_IMAG
 
 
 FALLBACK_MODEL_ORDER: tuple[str, ...] = (
-    "gemini-3.5-flash",
-    "gemini-3.5-flash-lite",
+    FLASH_LITE_MODEL,
 )
 RATE_LIMIT_FALLBACK_ORDER: tuple[str, ...] = (
-    "gemini-3.5-flash",
-    "gemini-3.5-flash-lite",
+    FLASH_LITE_MODEL,
 )
 OVERLOAD_RETRY_DELAYS: tuple[float, ...] = (2.0, 4.0, 6.0)
 
 
+@dataclass
+class TokenUsageRecord:
+    """단일 Gemini API 호출에서 실제 소비된 토큰 수와 USD 비용."""
+
+    model_name: str
+    prompt_tokens: int = 0  # 일반 입력 토큰(캐시 제외)
+    cached_tokens: int = 0  # 캐시 히트 입력 토큰
+    output_tokens: int = 0  # 출력 + 사고(thoughts) 토큰
+    total_tokens: int = 0
+    cost_usd: float = 0.0
+
+
+_ACTIVE_USAGE_RECORDER: contextvars.ContextVar[Callable[[TokenUsageRecord], None] | None] = (
+    contextvars.ContextVar("mogigosa_active_usage_recorder", default=None)
+)
+
+
+def calculate_token_cost_usd(
+    prompt_tokens: int,
+    cached_tokens: int,
+    output_tokens: int,
+    model_name: str = FLASH_LITE_MODEL,
+) -> float:
+    """실제 토큰 수(일반 입력 / 캐시 입력 / 출력+사고)를 모델 단가(USD)로 계산한다."""
+    resolved = resolve_api_model_name(model_name)
+    rates = MODEL_TOKEN_PRICING_USD_PER_1M.get(
+        resolved,
+        {
+            "input": FLASH_LITE_INPUT_USD_PER_1M,
+            "cached_input": FLASH_LITE_CACHED_INPUT_USD_PER_1M,
+            "output": FLASH_LITE_OUTPUT_USD_PER_1M,
+        },
+    )
+    non_cached_in = max(0, int(prompt_tokens or 0))
+    cached_in = max(0, int(cached_tokens or 0))
+    out_tok = max(0, int(output_tokens or 0))
+    usd = (
+        (non_cached_in * rates["input"])
+        + (cached_in * rates["cached_input"])
+        + (out_tok * rates["output"])
+    ) / 1_000_000.0
+    return max(0.0, usd)
+
+
+def extract_usage_from_response(response: Any, model_name: str = FLASH_LITE_MODEL) -> TokenUsageRecord:
+    """Gemini 응답의 usage_metadata에서 실제 토큰 수와 USD 예상 비용을 추출한다."""
+    resolved = resolve_api_model_name(model_name)
+    um = getattr(response, "usage_metadata", None)
+    if um is None:
+        return TokenUsageRecord(model_name=resolved)
+
+    raw_prompt = int(getattr(um, "prompt_token_count", 0) or 0)
+    cached = int(getattr(um, "cached_content_token_count", 0) or 0)
+    non_cached_prompt = max(0, raw_prompt - cached)
+    candidates = int(getattr(um, "candidates_token_count", 0) or 0)
+    thoughts = int(getattr(um, "thoughts_token_count", 0) or 0)
+    output_total = max(0, candidates + thoughts)
+    reported_total = int(getattr(um, "total_token_count", 0) or 0)
+    total_tokens = max(reported_total, raw_prompt + output_total)
+
+    cost_usd = calculate_token_cost_usd(
+        prompt_tokens=non_cached_prompt,
+        cached_tokens=cached,
+        output_tokens=output_total,
+        model_name=resolved,
+    )
+    return TokenUsageRecord(
+        model_name=resolved,
+        prompt_tokens=non_cached_prompt,
+        cached_tokens=cached,
+        output_tokens=output_total,
+        total_tokens=total_tokens,
+        cost_usd=cost_usd,
+    )
+
+
+def has_active_usage_tracker() -> bool:
+    """현재 실행 컨텍스트에 활성 토큰 추적 콜백이 바인딩되어 있는지 반환한다."""
+    return _ACTIVE_USAGE_RECORDER.get() is not None
+
+
+@contextlib.contextmanager
+def bind_usage_tracker(recorder: Callable[[TokenUsageRecord], None] | None) -> Iterator[None]:
+    """현재 실행 컨텍스트의 모든 Gemini API 호출에서 실제 토큰 사용량을 수집할 콜백을 바인딩한다."""
+    token = _ACTIVE_USAGE_RECORDER.set(recorder)
+    try:
+        yield
+    finally:
+        _ACTIVE_USAGE_RECORDER.reset(token)
+
+
+def submit_with_usage_context(
+    executor: concurrent.futures.ThreadPoolExecutor,
+    fn: Callable[..., T],
+    *args: Any,
+    **kwargs: Any,
+) -> concurrent.futures.Future[T]:
+    """ThreadPoolExecutor 워커 스레드에도 현재 토큰 추적 컨텍스트(ContextVar)를 그대로 전파해 실행한다."""
+    ctx = contextvars.copy_context()
+    return executor.submit(ctx.run, fn, *args, **kwargs)
+
+
+def _emit_usage_from_response(response: Any, model_name: str) -> None:
+    recorder = _ACTIVE_USAGE_RECORDER.get()
+    if recorder is None:
+        return
+    try:
+        usage = extract_usage_from_response(response, model_name=model_name)
+        if usage.total_tokens > 0 or usage.prompt_tokens > 0 or usage.output_tokens > 0:
+            recorder(usage)
+    except Exception:
+        pass
+
+
 def build_model_fallback_chain(model_name: str) -> list[str]:
-    """주 모델에서 503 등이 반복될 경우 순차 전환할 폴백 모델 체인을 구성한다."""
-    primary = resolve_api_model_name(model_name) or DEFAULT_MODEL
-    return [primary] + [m for m in FALLBACK_MODEL_ORDER if m != primary]
+    """전 기능 gemini-3.5-flash-lite 단일 모델 체인을 반환한다."""
+    _ = model_name
+    return [FLASH_LITE_MODEL]
 
 
 def _is_fatal_config_or_auth_error(msg: str) -> bool:
@@ -225,14 +349,6 @@ def _clone_config_for_model(
     fast_mode: bool = False,
 ) -> types.GenerateContentConfig | None:
     resolved_model = resolve_api_model_name(cand_model)
-    if resolved_model == HYDROGEN_MODEL:
-        if config is not None and getattr(config, "thinking_config", None) is not None:
-            return config
-        return _with_thinking_config(
-            config,
-            types.ThinkingConfig(thinking_level="LOW"),
-        )
-
     if _is_flash_lite_model(resolved_model):
         # 3.5 Flash-Lite 호출 시 fast_mode·config 여부와 무관하게 항상 최소 토큰(MINIMAL 사고 + 저해상도 미디어) 강제 적용
         base_cfg = config if config is not None else types.GenerateContentConfig()
@@ -285,78 +401,7 @@ def _build_400_recovery_configs(
         recovery_configs.append(config)
         return recovery_configs
 
-    base_cfg = (
-        eff_cfg.model_copy(update={"media_resolution": None})
-        if (is_media_err and eff_cfg is not None)
-        else eff_cfg
-    )
-    if is_media_err and not is_thinking_err and base_cfg is not None:
-        recovery_configs.append(base_cfg)
-
-    if is_thinking_err:
-        cur_level = getattr(
-            getattr(base_cfg if base_cfg is not None else config, "thinking_config", None),
-            "thinking_level",
-            None,
-        )
-        if cand_model == HYDROGEN_MODEL:
-            t_target = base_cfg if base_cfg is not None else config
-            if cur_level == types.ThinkingLevel.MINIMAL:
-                recovery_configs.append(
-                    _with_thinking_config(t_target, types.ThinkingConfig(thinking_budget=0))
-                )
-                recovery_configs.append(
-                    _with_thinking_config(
-                        t_target,
-                        types.ThinkingConfig(
-                            thinking_level=types.ThinkingLevel.LOW,
-                            include_thoughts=False,
-                        ),
-                    )
-                )
-                if t_target is not None:
-                    recovery_configs.append(t_target.model_copy(update={"thinking_config": None}))
-            else:
-                recovery_configs.append(
-                    _with_thinking_config(t_target, types.ThinkingConfig(thinking_budget=256))
-                )
-        elif base_cfg is not None:
-            if cur_level == types.ThinkingLevel.HIGH:
-                recovery_configs.append(
-                    base_cfg.model_copy(
-                        update={
-                            "thinking_config": types.ThinkingConfig(
-                                thinking_level=types.ThinkingLevel.MEDIUM,
-                                include_thoughts=False,
-                            )
-                        }
-                    )
-                )
-            elif cur_level == types.ThinkingLevel.MINIMAL:
-                recovery_configs.append(
-                    base_cfg.model_copy(
-                        update={"thinking_config": types.ThinkingConfig(thinking_budget=0)}
-                    )
-                )
-                recovery_configs.append(
-                    base_cfg.model_copy(
-                        update={
-                            "thinking_config": types.ThinkingConfig(
-                                thinking_level=types.ThinkingLevel.LOW,
-                                include_thoughts=False,
-                            )
-                        }
-                    )
-                )
-            if cur_level != types.ThinkingLevel.MINIMAL:
-                recovery_configs.append(
-                    base_cfg.model_copy(
-                        update={"thinking_config": types.ThinkingConfig(thinking_budget=2048)}
-                    )
-                )
-            recovery_configs.append(base_cfg.model_copy(update={"thinking_config": None}))
-
-    if config is not None or cand_model == HYDROGEN_MODEL or eff_cfg is not None:
+    if config is not None or eff_cfg is not None:
         recovery_configs.append(config)
     return recovery_configs
 
@@ -417,11 +462,13 @@ def _generate_content_with_fallback(
                 )
             eff_cfg = _clone_config_for_model(config, cand_model, fast_mode=fast_mode)
             try:
-                return client.models.generate_content(
+                resp = client.models.generate_content(
                     model=cand_model,
                     contents=contents,
                     config=eff_cfg,
                 )
+                _emit_usage_from_response(resp, cand_model)
+                return resp
             except Exception as exc:
                 last_err = exc
                 msg = str(exc).lower()
@@ -429,11 +476,13 @@ def _generate_content_with_fallback(
                 recovery_configs = _build_400_recovery_configs(config, eff_cfg, cand_model, msg)
                 for rec_cfg in recovery_configs:
                     try:
-                        return client.models.generate_content(
+                        rec_resp = client.models.generate_content(
                             model=cand_model,
                             contents=contents,
                             config=rec_cfg,
                         )
+                        _emit_usage_from_response(rec_resp, cand_model)
+                        return rec_resp
                     except Exception as exc2:
                         last_err = exc2
                         msg = str(exc2).lower()
@@ -1173,7 +1222,10 @@ def detect_concept_pages_with_ai(
             return b_pages, out_parsed
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=min(2, max(1, len(batches)))) as ex:
-            fut_to_pages = {ex.submit(_detect_text_batch, b): [int(e["page"]) for e in b] for b in batches}
+            fut_to_pages = {
+                submit_with_usage_context(ex, _detect_text_batch, b): [int(e["page"]) for e in b]
+                for b in batches
+            }
             for fut, b_pages in fut_to_pages.items():
                 try:
                     _, parsed = fut.result()
@@ -1237,7 +1289,9 @@ def detect_concept_pages_with_ai(
             return _run_chunk_with_backoff(_call, b_label, max_retries=2, status_callback=status_callback)
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=min(2, max(1, len(page_batches)))) as ex:
-            fut_to_pages = {ex.submit(_detect_scan_batch, bp): bp for bp in page_batches}
+            fut_to_pages = {
+                submit_with_usage_context(ex, _detect_scan_batch, bp): bp for bp in page_batches
+            }
             for fut, bp in fut_to_pages.items():
                 try:
                     parsed = fut.result()
@@ -1428,7 +1482,8 @@ def extract_concept_book_units(
         detected_grade = ""
         worker_limit = 4 if is_text_rich_book else 2
         with concurrent.futures.ThreadPoolExecutor(max_workers=min(worker_limit, len(chunk_specs))) as ex:
-            results = list(ex.map(lambda sp: _run_chunk(*sp), chunk_specs))
+            futs = [submit_with_usage_context(ex, _run_chunk, *sp) for sp in chunk_specs]
+            results = [f.result() for f in futs]
 
         for sub_out in results:
             collected_units.extend(sub_out.units)

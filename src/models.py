@@ -684,9 +684,32 @@ class UserRecord(BaseModel):
     weekly_premium_count: int = Field(
         default=0,
         ge=0,
-        description="PRO 등급 주간 고급 모델(3.8/Hydrogen) 사용 횟수",
+        description="하위 호환용 레거시 주간 고급 모델 사용 횟수",
     )
     last_used_week: str = Field(default="", description="마지막 주간 사용 주차 (YYYY-Www, KST)")
+
+    # 실제 Gemini API 토큰 사용량 및 USD 예상 비용 (월간 KST YYYY-MM 자동 초기화 + 전체 누적)
+    last_used_month: str = Field(default="", description="마지막 토큰 사용 월 (YYYY-MM, KST)")
+    monthly_prompt_tokens: int = Field(default=0, ge=0, description="이번 달 일반 입력 토큰(캐시 제외)")
+    monthly_cached_tokens: int = Field(default=0, ge=0, description="이번 달 캐시 입력 토큰")
+    monthly_output_tokens: int = Field(default=0, ge=0, description="이번 달 출력+사고 토큰")
+    monthly_total_tokens: int = Field(default=0, ge=0, description="이번 달 총 사용 토큰")
+    monthly_api_calls: int = Field(default=0, ge=0, description="이번 달 API 호출 횟수")
+    monthly_cost_usd: float = Field(default=0.0, ge=0.0, description="이번 달 전체 예상 API 비용 (USD)")
+    monthly_server_cost_usd: float = Field(
+        default=0.0, ge=0.0, description="이번 달 서버 API 키 부담 비용 (USD)"
+    )
+
+    total_prompt_tokens: int = Field(default=0, ge=0, description="누적 일반 입력 토큰(캐시 제외)")
+    total_cached_tokens: int = Field(default=0, ge=0, description="누적 캐시 입력 토큰")
+    total_output_tokens: int = Field(default=0, ge=0, description="누적 출력+사고 토큰")
+    total_total_tokens: int = Field(default=0, ge=0, description="누적 총 사용 토큰")
+    total_api_calls: int = Field(default=0, ge=0, description="누적 API 호출 횟수")
+    total_cost_usd: float = Field(default=0.0, ge=0.0, description="누적 전체 예상 API 비용 (USD)")
+    total_server_cost_usd: float = Field(
+        default=0.0, ge=0.0, description="누적 서버 API 키 부담 비용 (USD)"
+    )
+
     created_at: str = Field(default="", description="가입 시각 (ISO 8601)")
 
     @field_validator("tier", mode="before")

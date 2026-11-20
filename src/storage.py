@@ -628,7 +628,7 @@ class StorageManager:
                 "기존 사용자 목록을 빈 리스트([])로 덮어쓰는 데이터 증발을 방지하기 위해 중단합니다."
             )
 
-    def save_users(self, users: list[UserRecord]) -> str | None:
+    def save_users(self, users: list[UserRecord], sync_drive: bool = True) -> str | None:
         with self._lock:
             if not users and self.users_path.exists() and self.users_path.stat().st_size > 2:
                 raise ValueError("기존 users.json 데이터 증발 방지: 빈 사용자 목록으로 저장을 시도할 수 없습니다.")
@@ -637,7 +637,7 @@ class StorageManager:
             raw_text = json.dumps(payload, ensure_ascii=False, indent=2)
             _atomic_write_text(self.users_path, raw_text, encoding="utf-8")
 
-            if self.drive_connected:
+            if sync_drive and self.drive_connected:
                 try:
                     self._upsert_drive_file(
                         self.drive_folder_id,

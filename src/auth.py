@@ -11,7 +11,12 @@ import time
 from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 
-from src.config import _safe_get_secret, resolve_admin_config
+from src.config import (
+    DEFAULT_USD_TO_KRW,
+    FLASH_LITE_MODEL,
+    _safe_get_secret,
+    resolve_admin_config,
+)
 from src.models import TierType, UserRecord
 from src.storage import StorageManager
 
@@ -21,14 +26,28 @@ def _storage_lock(storage: StorageManager | None):
 
 KST = timezone(timedelta(hours=9))
 FREE_MAX_BATCH_QUESTIONS = 5
+
+# 월간 토큰 한도 (Gemini 3.5 Flash-Lite 단일 모델 · PRO 대비 ULTRA 정확히 4배)
+FREE_MONTHLY_TOKEN_LIMIT = 500_000
+PRO_MONTHLY_TOKEN_LIMIT = 3_000_000
+ULTRA_MONTHLY_TOKEN_LIMIT = 12_000_000
+MONTHLY_TOKEN_LIMITS: dict[str, int] = {
+    "FREE": FREE_MONTHLY_TOKEN_LIMIT,
+    "PRO": PRO_MONTHLY_TOKEN_LIMIT,
+    "ULTRA": ULTRA_MONTHLY_TOKEN_LIMIT,
+}
+
+# 월 구독료 (관리자 대시보드 예상 매출 대비 API 원가율 계산용)
+PRO_MONTHLY_PRICE_KRW = 9_900
+ULTRA_MONTHLY_PRICE_KRW = 19_900
+
+# 하위 호환용 상수 (고급 모델 폐지 완료)
 PRO_WEEKLY_PREMIUM_LIMIT = 50
 ULTRA_WEEKLY_PREMIUM_LIMIT = 200
-WEEKLY_PREMIUM_LIMITS: dict[str, int] = {
-    "PRO": PRO_WEEKLY_PREMIUM_LIMIT,
-    "ULTRA": ULTRA_WEEKLY_PREMIUM_LIMIT,
-}
+WEEKLY_PREMIUM_LIMITS: dict[str, int] = {}
 FREE_EXAMS_PER_UNLOCK = 3
-PREMIUM_MODEL_IDS: tuple[str, ...] = ("gemini-3.8-flash", "gemini-4-hydrogen")
+PREMIUM_MODEL_IDS: tuple[str, ...] = ()
+
 VALID_TIERS: tuple[TierType, ...] = ("FREE", "CUSTOM", "PRO", "ULTRA", "ADMIN")
 TIER_LABELS: dict[TierType, str] = {
     "FREE": "무료 (0원)",
@@ -50,10 +69,33 @@ def get_kst_week_str() -> str:
     return datetime.now(KST).strftime("%G-W%V")
 
 
+def get_kst_month_str() -> str:
+    """한국 표준시(KST) 기준 현재 월 YYYY-MM을 반환한다 (매월 1일 초기화)."""
+    return datetime.now(KST).strftime("%Y-%m")
+
+
+def format_token_count(tokens: int | float) -> str:
+    """토큰 수를 읽기 쉬운 한국어 축약 표기로 변환한다 (예: 3,000,000 -> 300만, 12,500 -> 12,500)."""
+    n = max(0, int(round(tokens or 0)))
+    if n >= 100_000 and n % 10_000 == 0:
+        return f"{n // 10_000:,}만"
+    return f"{n:,}"
+
+
+def format_krw(cost_usd: float, usd_to_krw: float = DEFAULT_USD_TO_KRW) -> str:
+    """USD 비용을 원화(₩) 문자열로 변환한다."""
+    krw = max(0.0, float(cost_usd or 0.0)) * float(usd_to_krw or DEFAULT_USD_TO_KRW)
+    if 0 < krw < 1.0:
+        return f"₩{krw:.2f}"
+    if krw < 100.0 and krw != int(krw):
+        return f"₩{krw:,.1f}"
+    return f"₩{round(krw):,}"
+
+
 def is_premium_model(model_name: str | None) -> bool:
-    """3.8 이상 또는 Hydrogen 고급 추론 모델인지 여부를 반환한다."""
-    raw = (model_name or "").strip().lower()
-    return raw in PREMIUM_MODEL_IDS or "3.8" in raw or "hydrogen" in raw
+    """전 기능 Gemini 3.5 Flash-Lite 단일 모델 통일로 인해 고급 모델 구분을 사용하지 않는다."""
+    _ = model_name
+    return False
 
 
 PBKDF2_ITERATIONS = 240_000
@@ -203,9 +245,10 @@ def verify_session_token(token: str, storage: StorageManager | None = None) -> s
 
 
 def _sync_user_state(user: UserRecord, today: str, admin_usernames: set[str]) -> bool:
-    """자정(KST) · 주간(KST) 초기화 및 관리자 아이디 자동 ADMIN 승급을 동기화한다."""
+    """자정(KST) · 주간(KST) · 월간(KST) 초기화 및 관리자 아이디 자동 ADMIN 승급을 동기화한다."""
     changed = False
     current_week = get_kst_week_str()
+    current_month = get_kst_month_str()
     if getattr(user, "last_used_date", "") != today:
         user.daily_count = 0
         user.last_used_date = today
@@ -214,6 +257,16 @@ def _sync_user_state(user: UserRecord, today: str, admin_usernames: set[str]) ->
         if hasattr(user, "weekly_premium_count"):
             user.weekly_premium_count = 0
         user.last_used_week = current_week
+        changed = True
+    if hasattr(user, "last_used_month") and getattr(user, "last_used_month", "") != current_month:
+        user.monthly_prompt_tokens = 0
+        user.monthly_cached_tokens = 0
+        user.monthly_output_tokens = 0
+        user.monthly_total_tokens = 0
+        user.monthly_api_calls = 0
+        user.monthly_cost_usd = 0.0
+        user.monthly_server_cost_usd = 0.0
+        user.last_used_month = current_month
         changed = True
     if user.username in admin_usernames and user.tier != "ADMIN":
         user.tier = "ADMIN"
@@ -270,6 +323,7 @@ def register_user(
             return False, "이미 사용 중인 아이디입니다. 다른 아이디를 입력해 주세요.", None
 
         today = get_kst_today_str()
+        current_month = get_kst_month_str()
         admin_cfg = resolve_admin_config()
         initial_tier: TierType = "ADMIN" if norm_id in admin_cfg.admin_usernames else "FREE"
         new_user = UserRecord(
@@ -280,6 +334,7 @@ def register_user(
             custom_api_key="",
             daily_count=0,
             last_used_date=today,
+            last_used_month=current_month,
             created_at=datetime.now(KST).isoformat(timespec="seconds"),
         )
         users.append(new_user)
@@ -377,6 +432,13 @@ def clear_user_custom_api_key(
     return True, "개인 API 키를 삭제하고 무료 회원(FREE)으로 복귀했습니다.", target
 
 
+def is_server_api_key_user(user: UserRecord | None) -> bool:
+    """해당 사용자가 서버 Gemini API 키를 사용하는지(CUSTOM 개인 키가 아닌지) 반환한다."""
+    if user is None:
+        return True
+    return user.tier != "CUSTOM"
+
+
 def resolve_active_gemini_api_key(
     user: UserRecord,
     server_api_key: str,
@@ -384,57 +446,207 @@ def resolve_active_gemini_api_key(
     force_server_key: bool = False,
 ) -> tuple[str, str]:
     """
-    등급 및 작업 유형(업로드·태깅 vs 고급 추론 모델)에 따라 실제 Gemini 호출용 API 키를 라우팅한다.
-    - force_server_key=True (탭 1 업로드/표지인식/크롭/태깅 전체): CUSTOM 포함 모든 등급 서버 키 사용
-    - CUSTOM 등급: 고급 추론 모델(3.8 / Hydrogen, is_premium_model=True)만 개인 API 키 사용,
-      기본 경량 모델(3.5 Flash-Lite 등)과 업로드·태깅 작업은 서버 키 사용
-    - FREE / PRO / ULTRA / ADMIN: 서버 키 사용
+    등급에 따라 실제 Gemini 호출용 API 키를 라우팅한다 (전 기능 Gemini 3.5 Flash-Lite 단일 모델).
+    - CUSTOM 등급: 본인이 등록한 개인 API 키를 모든 작업에 사용 (서버 원가 0원)
+    - FREE / PRO / ULTRA / ADMIN: 서버 공용 Gemini API 키 사용 (월간 토큰 한도 적용)
     """
+    _ = model_name
     server_key = (server_api_key or "").strip()
+    if user.tier == "CUSTOM":
+        custom_key = (user.custom_api_key or "").strip()
+        if custom_key:
+            return custom_key, "개인 키 모드 (CUSTOM · 본인 API 키)"
+        if force_server_key:
+            return server_key, "서버 키 (업로드·태깅 공용)"
+        return "", "개인 키 미등록 (사이드바에서 Gemini API 키를 등록해 주세요)"
     if force_server_key:
         return server_key, "서버 키 (업로드·태깅 공용)"
-    if user.tier == "CUSTOM":
-        if model_name is None or is_premium_model(model_name):
-            return user.custom_api_key.strip(), "개인 키 모드 (CUSTOM · 고급 추론)"
-        return server_key, "서버 키 (기본·업로드 공용)"
     return server_key, f"서버 키 ({TIER_LABELS.get(user.tier, user.tier)})"
 
 
 def get_remaining_free_quota(user: UserRecord) -> int | None:
-    """개편 후 FREE 등급은 기본 추출·업로드가 무제한(3.5 Flash-Lite 고정)이므로 None을 반환한다."""
-    return None
+    """하위 호환용; 월간 토큰 한도는 get_remaining_monthly_tokens()를 사용한다."""
+    return get_remaining_monthly_tokens(user)
 
 
 def get_max_batch_questions(user: UserRecord | None) -> int | None:
-    """등급별 1회 최대 생성·변형 문항 수 제한을 반환한다 (FREE=5문항, 유료·관리자=제한 없음 None)."""
+    """등급별 1회 최대 생성·변형 문항 수 제한을 반환한다 (FREE=5문항, 유료·개인키·관리자=제한 없음 None)."""
     if user is None or user.tier == "FREE":
         return FREE_MAX_BATCH_QUESTIONS
     return None
 
 
-def get_weekly_premium_limit(user: UserRecord | None) -> int | None:
-    """등급별 주간 고급 모델(3.8 / Hydrogen) 생성 문항 한도를 반환한다 (PRO=50, ULTRA=200, 그 외 None)."""
+def get_monthly_token_limit(user: UserRecord | None) -> int | None:
+    """등급별 월간 Gemini 3.5 Flash-Lite 토큰 한도를 반환한다 (FREE=50만, PRO=300만, ULTRA=1,200만, CUSTOM/ADMIN=None)."""
     if user is None:
+        return FREE_MONTHLY_TOKEN_LIMIT
+    return MONTHLY_TOKEN_LIMITS.get(user.tier)
+
+
+def get_used_monthly_tokens(user: UserRecord | None) -> int:
+    """이번 달(KST YYYY-MM) 누적 사용 토큰 수를 반환한다."""
+    if user is None:
+        return 0
+    current_month = get_kst_month_str()
+    if getattr(user, "last_used_month", "") != current_month:
+        return 0
+    return max(0, int(getattr(user, "monthly_total_tokens", 0) or 0))
+
+
+def get_remaining_monthly_tokens(user: UserRecord | None) -> int | None:
+    """이번 달(KST) 잔여 토큰 수를 반환한다. 무제한(CUSTOM/ADMIN)은 None."""
+    limit = get_monthly_token_limit(user)
+    if limit is None:
         return None
-    return WEEKLY_PREMIUM_LIMITS.get(user.tier)
+    used = get_used_monthly_tokens(user)
+    return max(0, limit - used)
+
+
+def check_token_quota(
+    storage: StorageManager,
+    username: str,
+) -> tuple[bool, int | None, int | None, str]:
+    """
+    API 호출 직전 사용자의 이번 달 토큰 한도 초과 여부를 확인한다.
+    반환: (허용 여부, 잔여 토큰 또는 None, 월간 한도 또는 None, 차단/안내 메시지)
+    """
+    user = get_user_by_username(storage, username)
+    if user is None:
+        return False, 0, FREE_MONTHLY_TOKEN_LIMIT, "로그인 계정 정보를 확인할 수 없습니다. 다시 로그인해 주세요."
+
+    limit = get_monthly_token_limit(user)
+    if limit is None:
+        return True, None, None, ""
+
+    used = get_used_monthly_tokens(user)
+    rem = max(0, limit - used)
+    if rem <= 0:
+        tier_lbl = TIER_LABELS.get(user.tier, user.tier)
+        if user.tier == "FREE":
+            upgrade_hint = "사이드바에서 개인 API 키(CUSTOM)를 등록하거나 PRO(월 300만)/ULTRA(월 1,200만) 등급으로 업그레이드해 주세요."
+        elif user.tier == "PRO":
+            upgrade_hint = "매월 1일(KST) 초기화되며, 더 넉넉한 한도가 필요하시면 ULTRA(월 1,200만 토큰 · 4배)로 업그레이드해 주세요."
+        else:
+            upgrade_hint = "매월 1일(KST) 자동 초기화됩니다. 급한 경우 관리자에게 월간 한도 초기화를 요청해 주세요."
+        return (
+            False,
+            0,
+            limit,
+            f"🚫 이번 달 토큰 한도를 모두 사용했습니다 ({tier_lbl} · {used:,} / {limit:,} 토큰). {upgrade_hint}",
+        )
+    return True, rem, limit, ""
+
+
+def record_token_usage(
+    storage: StorageManager,
+    username: str,
+    prompt_tokens: int,
+    cached_tokens: int,
+    output_tokens: int,
+    total_tokens: int,
+    cost_usd: float,
+    api_calls: int = 1,
+    used_server_key: bool = True,
+    sync_drive: bool = True,
+) -> UserRecord | None:
+    """실제 Gemini API 응답에서 수집된 토큰 수와 USD 예상 비용을 사용자 레코드(월간+누적)에 기록한다."""
+    p_tok = max(0, int(prompt_tokens or 0))
+    c_tok = max(0, int(cached_tokens or 0))
+    o_tok = max(0, int(output_tokens or 0))
+    t_tok = max(0, int(total_tokens or 0))
+    if t_tok <= 0:
+        t_tok = p_tok + c_tok + o_tok
+    calls = max(0, int(api_calls or 0))
+    usd = max(0.0, float(cost_usd or 0.0))
+    if t_tok == 0 and calls == 0 and usd == 0.0:
+        return None
+
+    norm_id = normalize_username(username)
+    if not norm_id:
+        return None
+
+    with _storage_lock(storage):
+        users = storage.load_users()
+        today = get_kst_today_str()
+        admin_names = resolve_admin_config().admin_usernames
+        target: UserRecord | None = None
+
+        for u in users:
+            if u.username == norm_id:
+                _sync_user_state(u, today, admin_names)
+                u.monthly_prompt_tokens = int(getattr(u, "monthly_prompt_tokens", 0) or 0) + p_tok
+                u.monthly_cached_tokens = int(getattr(u, "monthly_cached_tokens", 0) or 0) + c_tok
+                u.monthly_output_tokens = int(getattr(u, "monthly_output_tokens", 0) or 0) + o_tok
+                u.monthly_total_tokens = int(getattr(u, "monthly_total_tokens", 0) or 0) + t_tok
+                u.monthly_api_calls = int(getattr(u, "monthly_api_calls", 0) or 0) + calls
+                u.monthly_cost_usd = round(float(getattr(u, "monthly_cost_usd", 0.0) or 0.0) + usd, 8)
+                if used_server_key:
+                    u.monthly_server_cost_usd = round(
+                        float(getattr(u, "monthly_server_cost_usd", 0.0) or 0.0) + usd, 8
+                    )
+
+                u.total_prompt_tokens = int(getattr(u, "total_prompt_tokens", 0) or 0) + p_tok
+                u.total_cached_tokens = int(getattr(u, "total_cached_tokens", 0) or 0) + c_tok
+                u.total_output_tokens = int(getattr(u, "total_output_tokens", 0) or 0) + o_tok
+                u.total_total_tokens = int(getattr(u, "total_total_tokens", 0) or 0) + t_tok
+                u.total_api_calls = int(getattr(u, "total_api_calls", 0) or 0) + calls
+                u.total_cost_usd = round(float(getattr(u, "total_cost_usd", 0.0) or 0.0) + usd, 8)
+                if used_server_key:
+                    u.total_server_cost_usd = round(
+                        float(getattr(u, "total_server_cost_usd", 0.0) or 0.0) + usd, 8
+                    )
+                target = u
+                break
+
+        if target is not None:
+            storage.save_users(users, sync_drive=sync_drive)
+        return target
+
+
+def reset_user_monthly_tokens(
+    storage: StorageManager,
+    target_usernames: list[str],
+) -> tuple[int, str | None]:
+    """관리자가 지정한 회원의 이번 달 토큰 사용량을 0으로 초기화한다 (누적 통계는 보존)."""
+    targets = {normalize_username(u) for u in target_usernames if normalize_username(u)}
+    if not targets:
+        return 0, None
+
+    current_month = get_kst_month_str()
+    with _storage_lock(storage):
+        users = storage.load_users()
+        reset_cnt = 0
+        for u in users:
+            if u.username in targets:
+                u.monthly_prompt_tokens = 0
+                u.monthly_cached_tokens = 0
+                u.monthly_output_tokens = 0
+                u.monthly_total_tokens = 0
+                u.monthly_api_calls = 0
+                u.monthly_cost_usd = 0.0
+                u.monthly_server_cost_usd = 0.0
+                u.last_used_month = current_month
+                reset_cnt += 1
+        if reset_cnt > 0:
+            err = storage.save_users(users)
+            return reset_cnt, err
+        return 0, None
+
+
+def get_weekly_premium_limit(user: UserRecord | None) -> int | None:
+    """하위 호환용 (고급 모델 폐지 완료)."""
+    _ = user
+    return None
 
 
 def get_remaining_pro_weekly_quota(user: UserRecord) -> int | None:
-    """PRO/ULTRA 등급의 이번 주(KST) 남은 고급 모델 생성 문항 수를 반환한다. 타 등급은 None."""
-    limit = get_weekly_premium_limit(user)
-    if limit is None:
-        return None
-    current_week = get_kst_week_str()
-    used_week = (
-        getattr(user, "weekly_premium_count", 0)
-        if getattr(user, "last_used_week", "") == current_week
-        else 0
-    )
-    return max(0, limit - int(used_week or 0))
+    """하위 호환용 (고급 모델 폐지 완료)."""
+    _ = user
+    return None
 
 
 def can_use_premium_features(user: UserRecord) -> bool:
-    """문제 자동 개조 및 맞춤형 시험지 PDF 병합 허용 여부 (개편 후 전 등급 허용, FREE는 3.5 Flash-Lite 기본)."""
+    """문제 자동 개조 및 맞춤형 시험지 PDF 병합 허용 여부 (전 등급 허용, 월간 토큰 한도 적용)."""
     return user.tier in ("FREE", "CUSTOM", "PRO", "ULTRA", "ADMIN")
 
 
@@ -446,59 +658,22 @@ def can_access_shared_concept_db(user: UserRecord | None) -> bool:
 
 
 def resolve_model_for_user(user: UserRecord, requested_model: str) -> tuple[str, str]:
-    """
-    회원 등급과 잔여 해금/주간 한도에 따라 실제 호출할 Gemini 모델 ID와 안내 메시지를 결정한다.
-    - FREE: 기본 추론은 항상 gemini-3.5-flash-lite. 단, 기출 3회 업로드당 1회 해금된 크레딧이 있으면 3.8/Hydrogen 1회 허용.
-    - CUSTOM / ADMIN: 선택한 모든 모델 무제한 허용 (CUSTOM은 개인 키 사용).
-    - PRO(주간 50문항) / ULTRA(주간 200문항): 3.5 계열 무제한, 3.8/Hydrogen은 주간 문항 한도 내 허용(소진 시 gemini-3.5-flash-lite로 우회).
-    """
-    req = (requested_model or "").strip() or "gemini-3.5-flash-lite"
-    if user.tier in ("CUSTOM", "ADMIN"):
-        return req, ""
-
-    if user.tier in ("PRO", "ULTRA"):
-        if is_premium_model(req):
-            rem = get_remaining_pro_weekly_quota(user) or 0
-            if rem <= 0:
-                return (
-                    "gemini-3.5-flash-lite",
-                    f"{user.tier} 주간 고급 모델 한도({get_weekly_premium_limit(user)}문항)를 모두 사용해 Gemini 3.5 Flash-Lite로 실행됩니다.",
-                )
-        return req, ""
-
-    # FREE 등급
-    credits = int(getattr(user, "premium_unlock_credits", 0) or 0)
-    uploaded_cnt = int(getattr(user, "uploaded_exam_count", 0) or 0)
-    if is_premium_model(req):
-        if credits > 0:
-            return req, ""
-        progress = uploaded_cnt % FREE_EXAMS_PER_UNLOCK
-        return (
-            "gemini-3.5-flash-lite",
-            f"FREE 등급은 기출 PDF {FREE_EXAMS_PER_UNLOCK}회 업로드마다 고급 모델(3.8/Hydrogen) 1회 해금됩니다 "
-            f"(현재 {progress}/{FREE_EXAMS_PER_UNLOCK}회). Gemini 3.5 Flash-Lite로 실행됩니다.",
-        )
-
-    if req != "gemini-3.5-flash-lite":
-        return "gemini-3.5-flash-lite", ""
-    return req, ""
+    """전 등급·전 기능을 Gemini 3.5 Flash-Lite 단일 모델로 라우팅한다."""
+    _ = (user, requested_model)
+    return FLASH_LITE_MODEL, ""
 
 
 def record_exam_upload_for_user(
     storage: StorageManager,
     username: str,
 ) -> tuple[UserRecord | None, bool]:
-    """
-    기출 PDF 업로드·태깅 완료 시 회원의 누적 업로드 횟수를 +1 하고,
-    FREE 등급인 경우 3회마다 고급 모델(3.8/Hydrogen) 해금 크레딧 1회를 지급한다.
-    """
+    """기출 PDF 업로드·태깅 완료 시 회원의 누적 업로드 횟수를 +1 한다."""
     norm_id = normalize_username(username)
     with _storage_lock(storage):
         users = storage.load_users()
         today = get_kst_today_str()
         admin_names = resolve_admin_config().admin_usernames
         target: UserRecord | None = None
-        unlocked = False
 
         for u in users:
             if u.username == norm_id:
@@ -506,16 +681,12 @@ def record_exam_upload_for_user(
                 cur_uploads = int(getattr(u, "uploaded_exam_count", 0) or 0) + 1
                 if hasattr(u, "uploaded_exam_count"):
                     u.uploaded_exam_count = cur_uploads
-                if u.tier == "FREE" and cur_uploads % FREE_EXAMS_PER_UNLOCK == 0:
-                    if hasattr(u, "premium_unlock_credits"):
-                        u.premium_unlock_credits = int(getattr(u, "premium_unlock_credits", 0) or 0) + 1
-                    unlocked = True
                 target = u
                 break
 
         if target is not None:
             storage.save_users(users)
-        return target, unlocked
+        return target, False
 
 
 def consume_premium_model_usage(
@@ -524,44 +695,9 @@ def consume_premium_model_usage(
     used_model: str,
     count: int = 1,
 ) -> UserRecord | None:
-    """
-    고급 모델(3.8 / Hydrogen) 작업 실행 시 등급별 크레딧 또는 주간 문항 사용량을 차감/누적한다.
-    - FREE: 실행당 해금 크레딧 1회 차감 (1회 최대 5문항)
-    - PRO / ULTRA: 실제 생성된 문항 수(count)만큼 주간 한도(PRO 50 / ULTRA 200문항)에서 차감
-    - CUSTOM / ADMIN 또는 일반(3.5) 모델 실행 시에는 차감하지 않는다.
-    """
-    if not is_premium_model(used_model):
-        return None
-    step_count = max(1, int(count or 1))
-    norm_id = normalize_username(username)
-    with _storage_lock(storage):
-        users = storage.load_users()
-        today = get_kst_today_str()
-        admin_names = resolve_admin_config().admin_usernames
-        target: UserRecord | None = None
-        changed = False
-
-        for u in users:
-            if u.username == norm_id:
-                if _sync_user_state(u, today, admin_names):
-                    changed = True
-                cur_credits = int(getattr(u, "premium_unlock_credits", 0) or 0)
-                if u.tier == "FREE" and cur_credits > 0:
-                    if hasattr(u, "premium_unlock_credits"):
-                        u.premium_unlock_credits = cur_credits - 1
-                    changed = True
-                elif u.tier in ("PRO", "ULTRA"):
-                    if hasattr(u, "weekly_premium_count"):
-                        u.weekly_premium_count = int(getattr(u, "weekly_premium_count", 0) or 0) + step_count
-                    if hasattr(u, "last_used_week"):
-                        u.last_used_week = get_kst_week_str()
-                    changed = True
-                target = u
-                break
-
-        if changed and target is not None:
-            storage.save_users(users)
-        return target
+    """하위 호환용 no-op (실제 사용량은 record_token_usage에서 토큰 단위로 자동 기록됨)."""
+    _ = (storage, username, used_model, count)
+    return None
 
 
 def consume_extraction_quota(

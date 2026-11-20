@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import concurrent.futures
+import contextlib
 import hashlib
 import html as _html
 import json
 import os
 import random
 import re
+import threading
 import time
 from datetime import datetime
 from typing import Any, Callable
@@ -16,27 +18,42 @@ import streamlit as st
 from src.auth import (
     FREE_EXAMS_PER_UNLOCK,
     FREE_MAX_BATCH_QUESTIONS,
+    FREE_MONTHLY_TOKEN_LIMIT,
+    PRO_MONTHLY_PRICE_KRW,
+    PRO_MONTHLY_TOKEN_LIMIT,
     PRO_WEEKLY_PREMIUM_LIMIT,
-    ULTRA_WEEKLY_PREMIUM_LIMIT,
     TIER_LABELS,
+    ULTRA_MONTHLY_PRICE_KRW,
+    ULTRA_MONTHLY_TOKEN_LIMIT,
+    ULTRA_WEEKLY_PREMIUM_LIMIT,
     VALID_TIERS,
     authenticate_user,
     batch_update_user_tiers,
     can_access_shared_concept_db,
     can_use_premium_features,
+    check_token_quota,
     clear_user_custom_api_key,
     consume_extraction_quota,
     consume_premium_model_usage,
     create_session_token,
     delete_users_by_usernames,
+    format_krw,
+    format_token_count,
+    get_kst_month_str,
     get_max_batch_questions,
+    get_monthly_token_limit,
+    get_remaining_monthly_tokens,
     get_remaining_pro_weekly_quota,
-    get_weekly_premium_limit,
+    get_used_monthly_tokens,
     get_user_by_username,
+    get_weekly_premium_limit,
     is_premium_model,
+    is_server_api_key_user,
     mask_api_key,
     record_exam_upload_for_user,
+    record_token_usage,
     register_user,
+    reset_user_monthly_tokens,
     resolve_active_gemini_api_key,
     resolve_model_for_user,
     save_user_custom_api_key,
@@ -48,8 +65,13 @@ from src.config import (
     DEFAULT_MODEL,
     EXAM_NO_ANSWER_SOLVER_MODEL,
     EXAM_TAGGING_MODEL,
+    FLASH_LITE_CACHED_INPUT_USD_PER_1M,
+    FLASH_LITE_INPUT_USD_PER_1M,
+    FLASH_LITE_MODEL,
+    FLASH_LITE_OUTPUT_USD_PER_1M,
     MODEL_LABELS,
     resolve_credentials,
+    resolve_usd_to_krw_rate,
 )
 from src.curriculum_2022 import (
     build_tagging_grounding_context,
@@ -62,10 +84,12 @@ from src.ebsi_fetcher import attempt_ebsi_pdf_fetch
 from src.exporters import build_exam_ai_jsonl, build_exam_html, build_exam_markdown
 from src.gemini_service import (
     ForbiddenTermRemainingError,
+    TokenUsageRecord,
     analyze_english_exam_pdf_batch_with_gemini,
     analyze_english_question_with_gemini,
     analyze_exam_pdf_batch_with_gemini,
     analyze_question_with_gemini,
+    bind_usage_tracker,
     build_gemini_client,
     chat_followup_with_english,
     chat_followup_with_pdf,
@@ -79,10 +103,12 @@ from src.gemini_service import (
     generate_english_explanation,
     generate_english_transformed_question,
     generate_pdf_grounded_explanation,
+    has_active_usage_tracker,
     match_problem_and_answer_pdfs_with_ai,
     match_questions_to_whitelist,
     prepare_pdf_part,
     rewrite_question_for_pdf,
+    submit_with_usage_context,
 )
 from src.models import (
     ENGLISH_DEFAULT_EXCLUDED_Q_NUMS,
@@ -232,6 +258,90 @@ def _run_startup_drive_sync(_storage: StorageManager, sync_fingerprint: str) -> 
     return _storage.sync_on_startup(sync_media=False)
 
 
+@contextlib.contextmanager
+def _usage_scope(
+    storage_obj: StorageManager | None = None,
+    username: str | None = None,
+    used_server_key: bool | None = None,
+):
+    """현재 로그인 사용자의 실제 Gemini API 토큰·USD 비용을 스레드 안전하게 누적해 종료 시 1회 저장한다."""
+    if has_active_usage_tracker():
+        yield
+        return
+
+    st_mgr = storage_obj or globals().get("storage")
+    uname = (
+        username if username is not None else st.session_state.get("logged_in_username", "")
+    ) or ""
+    if not st_mgr or not uname:
+        yield
+        return
+
+    cur_user = globals().get("current_user")
+    if used_server_key is None:
+        used_server_key = is_server_api_key_user(cur_user)
+
+    acc_lock = threading.Lock()
+    acc = {
+        "prompt": 0,
+        "cached": 0,
+        "output": 0,
+        "total": 0,
+        "calls": 0,
+        "cost_usd": 0.0,
+    }
+
+    def _on_usage(rec: TokenUsageRecord) -> None:
+        with acc_lock:
+            acc["prompt"] += rec.prompt_tokens
+            acc["cached"] += rec.cached_tokens
+            acc["output"] += rec.output_tokens
+            acc["total"] += rec.total_tokens
+            acc["calls"] += 1
+            acc["cost_usd"] += rec.cost_usd
+
+    with bind_usage_tracker(_on_usage):
+        try:
+            yield
+        finally:
+            if acc["total"] > 0 or acc["calls"] > 0 or acc["cost_usd"] > 0.0:
+                try:
+                    record_token_usage(
+                        storage=st_mgr,
+                        username=uname,
+                        prompt_tokens=acc["prompt"],
+                        cached_tokens=acc["cached"],
+                        output_tokens=acc["output"],
+                        total_tokens=acc["total"],
+                        cost_usd=acc["cost_usd"],
+                        api_calls=acc["calls"],
+                        used_server_key=bool(used_server_key),
+                        sync_drive=True,
+                    )
+                except Exception:
+                    pass
+
+
+def _ensure_token_quota(
+    storage_obj: StorageManager | None = None,
+    username: str | None = None,
+    show_error: bool = True,
+) -> bool:
+    """API 호출 직전 월간 토큰 한도를 검사하고 초과 시 안내 메시지를 출력한 뒤 False를 반환한다."""
+    st_mgr = storage_obj or globals().get("storage")
+    uname = (
+        username if username is not None else st.session_state.get("logged_in_username", "")
+    ) or ""
+    if not st_mgr or not uname:
+        return True
+    allowed, _rem, _limit, msg = check_token_quota(st_mgr, uname)
+    if not allowed:
+        if show_error and msg:
+            st.error(msg)
+        return False
+    return True
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def _build_cached_exam_exports(
     _storage: StorageManager,
@@ -289,18 +399,19 @@ def _detect_single_exam_cover(
     except Exception:
         has_p1_text = False
 
-    if api_key:
+    if api_key and _ensure_token_quota(show_error=False):
         try:
             p1_text, p1_png = extract_first_page_for_metadata(prob_bytes, dpi=140)
             if p1_png is None:
                 p1_png = render_pdf_page_png(prob_bytes, 1, dpi=140)
-            ai_meta = extract_exam_header_metadata(
-                api_key=api_key,
-                model_name=EXAM_TAGGING_MODEL,
-                first_page_text=p1_text,
-                first_page_png_bytes=p1_png,
-                filename=prob_name,
-            )
+            with _usage_scope():
+                ai_meta = extract_exam_header_metadata(
+                    api_key=api_key,
+                    model_name=EXAM_TAGGING_MODEL,
+                    first_page_text=p1_text,
+                    first_page_png_bytes=p1_png,
+                    filename=prob_name,
+                )
             raw_ai_year = (ai_meta.year or "").strip().rstrip("년")
             merged_month = (ai_meta.month or parsed_local.get("month") or "").strip()
             if merged_month and not merged_month.endswith("월"):
@@ -378,15 +489,16 @@ def _resolve_mixed_pdf_split_with_ai(
     if raw_sig in cache:
         return cache[raw_sig]
 
-    if api_key:
+    if api_key and _ensure_token_quota(show_error=False):
         try:
             with st.spinner("🤖 Gemini 3.5 Flash-Lite가 업로드된 PDF 중 문제지·해설지를 자동 구분 중..."):
                 preview_items = _build_pairing_preview_items(raw_files)
-                p_idxs, a_idxs = classify_mixed_exam_pdfs_with_ai(
-                    api_key=api_key,
-                    pdf_items=preview_items,
-                    model_name=EXAM_TAGGING_MODEL,
-                )
+                with _usage_scope():
+                    p_idxs, a_idxs = classify_mixed_exam_pdfs_with_ai(
+                        api_key=api_key,
+                        pdf_items=preview_items,
+                        model_name=EXAM_TAGGING_MODEL,
+                    )
             res = (p_idxs, a_idxs, "ai")
             cache[raw_sig] = res
             return res
@@ -406,7 +518,7 @@ def _resolve_auto_answer_matches(
     api_key: str,
 ) -> tuple[list[int | None], dict[int, str], str, str]:
     """
-    업로드된 문제지·해설지 PDF 조합에 대해 Gemini 3.5 Flash-Lite(서버 키) 자동 매칭을 수행하고
+    업로드된 문제지·해설지 PDF 조합에 대해 Gemini 3.5 Flash-Lite 자동 매칭을 수행하고
     결과를 세션에 캐시한다. 실패 또는 API 키 미설정 시 로컬 파일명 매칭으로 폴백한다.
     """
     n_prob = len(prob_files)
@@ -424,17 +536,18 @@ def _resolve_auto_answer_matches(
         return cache[cache_key]
 
     err_msg = ""
-    if api_key:
+    if api_key and _ensure_token_quota(show_error=False):
         try:
             with st.spinner("🤖 Gemini 3.5 Flash-Lite가 문제지·해설지 PDF 1페이지를 비교해 자동 매칭 중..."):
                 prob_items = _build_pairing_preview_items(prob_files)
                 ans_items = _build_pairing_preview_items(ans_files)
-                matches, reasons = match_problem_and_answer_pdfs_with_ai(
-                    api_key=api_key,
-                    problem_items=prob_items,
-                    answer_items=ans_items,
-                    model_name=EXAM_TAGGING_MODEL,
-                )
+                with _usage_scope():
+                    matches, reasons = match_problem_and_answer_pdfs_with_ai(
+                        api_key=api_key,
+                        problem_items=prob_items,
+                        answer_items=ans_items,
+                        model_name=EXAM_TAGGING_MODEL,
+                    )
             res = (matches, reasons, "ai", "")
             cache[cache_key] = res
             return res
@@ -527,7 +640,7 @@ def _crop_single_exam_pdf(
     crops, has_text = parse_exam_pdf(prob_bytes, dpi=220)
     total_p = get_pdf_page_count(prob_bytes)
 
-    if use_vision_fallback and api_key:
+    if use_vision_fallback and api_key and _ensure_token_quota(show_error=False):
         page_text_lens = get_page_text_lengths(prob_bytes)
         target_vision_pages, missing_q_nums = _compute_vision_recovery_pages(
             crops,
@@ -553,32 +666,33 @@ def _crop_single_exam_pdf(
                         f"{model_disp} Vision으로 1페이지씩 순차 탐지합니다..."
                     )
             existing_by_q: dict[int, CroppedQuestion] = {c.q_num: c for c in crops}
-            for step_i, p_num in enumerate(target_vision_pages, start=1):
-                page_png = render_pdf_page_png(prob_bytes, p_num, dpi=180)
-                boxes = detect_scanned_question_boxes(api_key, EXAM_TAGGING_MODEL, page_png)
-                boxes.sort(key=lambda b: (0 if b.xmin < 500 else 1, b.ymin, b.xmin))
-                for b in boxes:
-                    if b.q_num in existing_by_q:
-                        continue
-                    png_b, pw, ph = crop_normalized_box(
-                        prob_bytes,
-                        p_num,
-                        b.ymin,
-                        b.xmin,
-                        b.ymax,
-                        b.xmax,
-                        dpi=250,
-                    )
-                    existing_by_q[b.q_num] = CroppedQuestion(
-                        q_num=b.q_num,
-                        page_num=p_num,
-                        png_bytes=png_b,
-                        width=pw,
-                        height=ph,
-                        extracted_text="",
-                    )
-                if progress_cb:
-                    progress_cb(step_i / max(1, len(target_vision_pages)))
+            with _usage_scope():
+                for step_i, p_num in enumerate(target_vision_pages, start=1):
+                    page_png = render_pdf_page_png(prob_bytes, p_num, dpi=180)
+                    boxes = detect_scanned_question_boxes(api_key, EXAM_TAGGING_MODEL, page_png)
+                    boxes.sort(key=lambda b: (0 if b.xmin < 500 else 1, b.ymin, b.xmin))
+                    for b in boxes:
+                        if b.q_num in existing_by_q:
+                            continue
+                        png_b, pw, ph = crop_normalized_box(
+                            prob_bytes,
+                            p_num,
+                            b.ymin,
+                            b.xmin,
+                            b.ymax,
+                            b.xmax,
+                            dpi=250,
+                        )
+                        existing_by_q[b.q_num] = CroppedQuestion(
+                            q_num=b.q_num,
+                            page_num=p_num,
+                            png_bytes=png_b,
+                            width=pw,
+                            height=ph,
+                            extracted_text="",
+                        )
+                    if progress_cb:
+                        progress_cb(step_i / max(1, len(target_vision_pages)))
             crops = sorted(existing_by_q.values(), key=lambda x: x.q_num)
 
     return crops, total_p, has_text
@@ -597,6 +711,33 @@ def _tag_and_save_single_exam(
     on_warning: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     """단일 시험지 PDF와 해설지를 일괄 태깅·크롭 저장·DB 반영·Drive 동기화한다."""
+    with _usage_scope(storage_obj=storage):
+        return _tag_and_save_single_exam_inner(
+            storage=storage,
+            api_key=api_key,
+            meta=meta,
+            parsed_crops=parsed_crops,
+            target_q_nums=target_q_nums,
+            is_retry=is_retry,
+            push_status=push_status,
+            append_log=append_log,
+            on_progress=on_progress,
+            on_warning=on_warning,
+        )
+
+
+def _tag_and_save_single_exam_inner(
+    storage: StorageManager,
+    api_key: str,
+    meta: dict[str, Any],
+    parsed_crops: list[CroppedQuestion],
+    target_q_nums: list[int],
+    is_retry: bool = False,
+    push_status: Callable[[str], None] | None = None,
+    append_log: Callable[[str], None] | None = None,
+    on_progress: Callable[[float], None] | None = None,
+    on_warning: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
     safe_exam = sanitize_id_part(meta["exam_name"])
     tagging_model = EXAM_TAGGING_MODEL
     tagging_model_label = MODEL_LABELS.get(tagging_model, tagging_model)
@@ -749,7 +890,10 @@ def _tag_and_save_single_exam(
             done_cnt = 0
             total_missing = len(missing_crops)
             with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
-                future_to_cq = {executor.submit(_analyze_eng_worker, cq): cq for cq in missing_crops}
+                future_to_cq = {
+                    submit_with_usage_context(executor, _analyze_eng_worker, cq): cq
+                    for cq in missing_crops
+                }
                 for fut in concurrent.futures.as_completed(future_to_cq):
                     cq = future_to_cq[fut]
                     done_cnt += 1
@@ -872,7 +1016,10 @@ def _tag_and_save_single_exam(
             base_prog = 0.65 if has_answer_sheet else 0.10
             span_prog = 0.85 - base_prog
             with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
-                future_to_cq = {executor.submit(_analyze_worker, cq): cq for cq in missing_crops}
+                future_to_cq = {
+                    submit_with_usage_context(executor, _analyze_worker, cq): cq
+                    for cq in missing_crops
+                }
                 for fut in concurrent.futures.as_completed(future_to_cq):
                     cq = future_to_cq[fut]
                     done_cnt += 1
@@ -1378,17 +1525,16 @@ with st.sidebar:
         upload_gemini_key, upload_key_label = resolve_active_gemini_api_key(
             current_user, creds.gemini_api_key, force_server_key=True
         )
-        pro_weekly_rem = get_remaining_pro_weekly_quota(current_user)
+        monthly_limit = get_monthly_token_limit(current_user)
+        monthly_used = get_used_monthly_tokens(current_user)
+        monthly_rem = get_remaining_monthly_tokens(current_user)
 
         if tier_code == "FREE":
-            free_uploaded_cnt = int(getattr(current_user, "uploaded_exam_count", 0) or 0)
-            upload_prog = free_uploaded_cnt % FREE_EXAMS_PER_UNLOCK
-            credits = int(getattr(current_user, "premium_unlock_credits", 0) or 0)
             status_line = (
                 f"<div style='font-size:0.83rem; color:#334155; margin-top:0.45rem;'>"
-                f"기본(3.5 Flash-Lite): <b>무제한</b> (1회 최대 {FREE_MAX_BATCH_QUESTIONS}문항)<br/>"
-                f"고급 모델(3.8/Hydrogen) 해금: <b>{credits}회</b> "
-                f"<span style='color:#64748B;'>({upload_prog}/{FREE_EXAMS_PER_UNLOCK}회 업로드)</span>"
+                f"모델: <b>Gemini 3.5 Flash-Lite</b> (1회 최대 {FREE_MAX_BATCH_QUESTIONS}문항)<br/>"
+                f"월간 토큰 잔여: <b>{monthly_rem:,} / {format_token_count(monthly_limit or 0)}</b> "
+                f"<span style='color:#64748B;'>(사용 {monthly_used:,})</span>"
                 f"</div>"
             )
         elif tier_code == "CUSTOM":
@@ -1396,26 +1542,29 @@ with st.sidebar:
             status_line = (
                 f"<div style='font-size:0.83rem; color:#166534; margin-top:0.45rem;'>"
                 f"등록된 개인 키: <code>{masked}</code>"
-                f"<br/><b>업로드·태깅: 서버 키 지원</b>"
-                f"<br/><b>고급 추론(3.8/Hydrogen): 개인 키 무제한</b></div>"
+                f"<br/><b>Gemini 3.5 Flash-Lite · 개인 키 무제한</b>"
+                f"<br/><span style='color:#64748B;'>이번 달 사용: {monthly_used:,} 토큰</span></div>"
             )
         elif tier_code == "PRO":
             status_line = (
                 f"<div style='font-size:0.83rem; color:#1D4ED8; margin-top:0.45rem;'>"
-                f"✨ 기본(3.5 Flash-Lite): <b>무제한</b><br/>"
-                f"주간 고급 모델(3.8/Hydrogen): <b>{pro_weekly_rem} / {PRO_WEEKLY_PREMIUM_LIMIT}문항</b>"
+                f"✨ 모델: <b>Gemini 3.5 Flash-Lite</b> · 배치 무제한<br/>"
+                f"월간 토큰 잔여: <b>{monthly_rem:,} / {format_token_count(monthly_limit or 0)}</b> "
+                f"<span style='color:#64748B;'>(사용 {monthly_used:,})</span>"
                 f"</div>"
             )
         elif tier_code == "ULTRA":
             status_line = (
                 "<div style='font-size:0.83rem; color:#C2410C; font-weight:600; margin-top:0.45rem;'>"
-                "🔥 서버 API · 기본 모델 <b>무제한</b><br/>"
-                f"주간 고급 모델(3.8/Hydrogen): <b>{pro_weekly_rem} / {ULTRA_WEEKLY_PREMIUM_LIMIT}문항</b></div>"
+                "🔥 모델: <b>Gemini 3.5 Flash-Lite</b> · PRO 대비 4배<br/>"
+                f"월간 토큰 잔여: <b>{monthly_rem:,} / {format_token_count(monthly_limit or 0)}</b> "
+                f"<span style='color:#9A3412; font-weight:400;'>(사용 {monthly_used:,})</span></div>"
             )
         else:
             status_line = (
                 "<div style='font-size:0.83rem; color:#1D4ED8; font-weight:600; margin-top:0.45rem;'>"
-                "🛡️ 최고 관리자 · 전체 기능 및 회원 관리</div>"
+                "🛡️ 최고 관리자 · 전체 기능 및 토큰·비용 관리<br/>"
+                f"<span style='color:#64748B; font-weight:400;'>이번 달 사용: {monthly_used:,} 토큰</span></div>"
             )
 
         st.markdown(
@@ -1434,10 +1583,9 @@ with st.sidebar:
             unsafe_allow_html=True,
         )
 
-        if tier_code == "FREE":
-            st.progress((int(getattr(current_user, "uploaded_exam_count", 0) or 0) % FREE_EXAMS_PER_UNLOCK) / FREE_EXAMS_PER_UNLOCK)
-        elif tier_code in ("PRO", "ULTRA") and pro_weekly_rem is not None:
-            st.progress(pro_weekly_rem / max(1, get_weekly_premium_limit(current_user) or 1))
+        if monthly_limit is not None and monthly_rem is not None:
+            rem_ratio = max(0.0, min(1.0, monthly_rem / max(1, monthly_limit)))
+            st.progress(rem_ratio)
 
         # CUSTOM 개인 API 키 관리 UI
         if tier_code == "FREE":
@@ -1488,13 +1636,8 @@ with st.sidebar:
             st.rerun()
 
         st.markdown("---")
-        # 등급별 최적 모델 자동 배정 (사이드바 모델 선택 UI 제거)
-        if tier_code == "FREE":
-            selected_model = EXAM_TAGGING_MODEL
-        elif tier_code == "PRO":
-            selected_model, _ = resolve_model_for_user(current_user, CONCEPT_DB_BUILD_MODEL)
-        else:
-            selected_model = CONCEPT_DB_BUILD_MODEL
+        # 전 등급 · 전 기능 Gemini 3.5 Flash-Lite 단일 모델 통일
+        selected_model = FLASH_LITE_MODEL
 
         # 저장소 & DB 요약
         all_records = storage.load_db()
@@ -1883,17 +2026,20 @@ def _render_mode_b_solve_fragment(
                 if st.button("✨ AI 자동 해설", key=f"ai_btn_{q.id}", width="stretch"):
                     if not active_gemini_key:
                         st.error(f"사용 가능한 Gemini API 키({active_key_label})가 설정되지 않았습니다.")
+                    elif not _ensure_token_quota():
+                        pass
                     elif is_eng_item:
                         with st.spinner("영어 구문·논리·오답 분석 해설 생성 중..."):
                             try:
-                                exp_md = generate_english_explanation(
-                                    api_key=active_gemini_key,
-                                    model_name=selected_model,
-                                    question=q,
-                                    rewritten=rw,
-                                    user_answer=st.session_state["user_answers"].get(q.id, ""),
-                                    source_reference=concept_ref_str,
-                                )
+                                with _usage_scope():
+                                    exp_md = generate_english_explanation(
+                                        api_key=active_gemini_key,
+                                        model_name=selected_model,
+                                        question=q,
+                                        rewritten=rw,
+                                        user_answer=st.session_state["user_answers"].get(q.id, ""),
+                                        source_reference=concept_ref_str,
+                                    )
                                 st.session_state["ai_explanations"][q.id] = exp_md
                             except Exception as exc:
                                 st.error(f"영어 AI 해설 생성 실패: {exc}")
@@ -1902,17 +2048,18 @@ def _render_mode_b_solve_fragment(
                     else:
                         with st.spinner("개념서 범위 내 용어만 사용하여 맞춤 해설 작성 중..."):
                             try:
-                                exp_md = generate_pdf_grounded_explanation(
-                                    api_key=active_gemini_key,
-                                    model_name=selected_model,
-                                    question=q,
-                                    crop_png_bytes=crop_b,
-                                    whitelist=whitelist,
-                                    user_answer=st.session_state["user_answers"].get(q.id, ""),
-                                    rewritten=rw,
-                                    sliced_text=st.session_state.get("concept_sliced_text", ""),
-                                    concept_reference=concept_ref_str,
-                                )
+                                with _usage_scope():
+                                    exp_md = generate_pdf_grounded_explanation(
+                                        api_key=active_gemini_key,
+                                        model_name=selected_model,
+                                        question=q,
+                                        crop_png_bytes=crop_b,
+                                        whitelist=whitelist,
+                                        user_answer=st.session_state["user_answers"].get(q.id, ""),
+                                        rewritten=rw,
+                                        sliced_text=st.session_state.get("concept_sliced_text", ""),
+                                        concept_reference=concept_ref_str,
+                                    )
                                 st.session_state["ai_explanations"][q.id] = exp_md
                             except Exception as exc:
                                 st.error(f"AI 해설 생성 실패: {exc}")
@@ -1921,6 +2068,8 @@ def _render_mode_b_solve_fragment(
                 if st.button("🔄 이 문제 다시 변환", key=f"re_rw_btn_{q.id}", width="stretch"):
                     if not active_gemini_key:
                         st.error(f"사용 가능한 Gemini API 키({active_key_label})가 설정되지 않았습니다.")
+                    elif not _ensure_token_quota():
+                        pass
                     elif is_eng_item:
                         eng_meta = item.get("english_meta") or {}
                         src_passage = (
@@ -1938,22 +2087,22 @@ def _render_mode_b_solve_fragment(
                         eff_eng_key = eng_rw_key or active_gemini_key
                         with st.spinner(f"'{eng_target_type}' 유형으로 이 지문을 새롭게 다시 변형 중..."):
                             try:
-                                new_rw = generate_english_transformed_question(
-                                    api_key=eff_eng_key,
-                                    model_name=eng_rw_model,
-                                    source_passage=src_passage,
-                                    target_type=eng_meta.get("target_type") or eng_target_type,
-                                    difficulty=eng_meta.get("difficulty") or "고3 평가원·수능 수준",
-                                    blank_unit=eng_meta.get("blank_unit") or "구 (3~6단어)",
-                                    vocab_style=eng_meta.get("vocab_style") or "밑줄형 (①~⑤)",
-                                    source_label=eng_meta.get("source_label") or eng_source_caption,
-                                    previous_attempt=rw,
-                                    use_precision_mode=eng_precision,
-                                    storage=storage,
-                                    use_cache=False,
-                                    username=current_user.username if current_user is not None else "",
-                                )
-                                _charge_regen_usage(eng_rw_model)
+                                with _usage_scope():
+                                    new_rw = generate_english_transformed_question(
+                                        api_key=eff_eng_key,
+                                        model_name=eng_rw_model,
+                                        source_passage=src_passage,
+                                        target_type=eng_meta.get("target_type") or eng_target_type,
+                                        difficulty=eng_meta.get("difficulty") or "고3 평가원·수능 수준",
+                                        blank_unit=eng_meta.get("blank_unit") or "구 (3~6단어)",
+                                        vocab_style=eng_meta.get("vocab_style") or "밑줄형 (①~⑤)",
+                                        source_label=eng_meta.get("source_label") or eng_source_caption,
+                                        previous_attempt=rw,
+                                        use_precision_mode=eng_precision,
+                                        storage=storage,
+                                        use_cache=False,
+                                        username=current_user.username if current_user is not None else "",
+                                    )
                                 st.session_state["matched_items"][seq_num - 1]["rewritten"] = new_rw
                                 st.session_state["ai_explanations"].pop(q.id, None)
                                 st.session_state["ai_chats"].pop(q.id, None)
@@ -1973,17 +2122,17 @@ def _render_mode_b_solve_fragment(
                                     or []
                                 )
                                 math_rw_model = EXAM_TAGGING_MODEL
-                                new_rw = rewrite_question_for_pdf(
-                                    api_key=active_gemini_key,
-                                    model_name=math_rw_model,
-                                    question=q,
-                                    crop_png_bytes=crop_b,
-                                    whitelist=whitelist,
-                                    out_of_scope_terms=target_oos,
-                                    sliced_text=st.session_state.get("concept_sliced_text", ""),
-                                    previous_attempt=rw,
-                                )
-                                _charge_regen_usage(math_rw_model)
+                                with _usage_scope():
+                                    new_rw = rewrite_question_for_pdf(
+                                        api_key=active_gemini_key,
+                                        model_name=math_rw_model,
+                                        question=q,
+                                        crop_png_bytes=crop_b,
+                                        whitelist=whitelist,
+                                        out_of_scope_terms=target_oos,
+                                        sliced_text=st.session_state.get("concept_sliced_text", ""),
+                                        previous_attempt=rw,
+                                    )
                                 st.session_state["matched_items"][seq_num - 1]["rewritten"] = new_rw
                                 st.session_state["ai_explanations"].pop(q.id, None)
                                 st.session_state["ai_chats"].pop(q.id, None)
@@ -2023,31 +2172,34 @@ def _render_mode_b_solve_fragment(
                 if send_chat and followup_q.strip():
                     if not active_gemini_key or (not is_eng_item and whitelist is None):
                         st.error(f"사용 가능한 Gemini API 키({active_key_label})가 필요합니다.")
+                    elif not _ensure_token_quota():
+                        pass
                     else:
                         q_chat_history.append({"role": "user", "content": followup_q.strip()})
                         with st.spinner("답변 생성 중..."):
                             try:
-                                if is_eng_item:
-                                    reply = chat_followup_with_english(
-                                        api_key=active_gemini_key,
-                                        model_name=selected_model,
-                                        question=q,
-                                        rewritten=rw,
-                                        chat_history=q_chat_history[:-1],
-                                        user_query=followup_q.strip(),
-                                    )
-                                else:
-                                    reply = chat_followup_with_pdf(
-                                        api_key=active_gemini_key,
-                                        model_name=selected_model,
-                                        question=q,
-                                        crop_png_bytes=crop_b,
-                                        whitelist=whitelist,
-                                        chat_history=q_chat_history[:-1],
-                                        user_question=followup_q.strip(),
-                                        rewritten=rw,
-                                        sliced_text=st.session_state.get("concept_sliced_text", ""),
-                                    )
+                                with _usage_scope():
+                                    if is_eng_item:
+                                        reply = chat_followup_with_english(
+                                            api_key=active_gemini_key,
+                                            model_name=selected_model,
+                                            question=q,
+                                            rewritten=rw,
+                                            chat_history=q_chat_history[:-1],
+                                            user_query=followup_q.strip(),
+                                        )
+                                    else:
+                                        reply = chat_followup_with_pdf(
+                                            api_key=active_gemini_key,
+                                            model_name=selected_model,
+                                            question=q,
+                                            crop_png_bytes=crop_b,
+                                            whitelist=whitelist,
+                                            chat_history=q_chat_history[:-1],
+                                            user_question=followup_q.strip(),
+                                            rewritten=rw,
+                                            sliced_text=st.session_state.get("concept_sliced_text", ""),
+                                        )
                                 q_chat_history.append({"role": "assistant", "content": reply})
                                 st.session_state["ai_chats"][q.id] = q_chat_history
                                 st.rerun(scope="fragment")
@@ -2088,9 +2240,9 @@ def _render_mode_b_solve_fragment(
 
 
 def _render_admin_panel() -> None:
-    st.subheader("🛡️ 관리자 회원 관리 (등급 설정 & 사용량 모니터링)")
+    st.subheader("🛡️ 관리자 회원 관리 (등급 설정 · 실제 API 토큰 & 원화 비용 모니터링)")
     st.caption(
-        "가입한 회원 목록은 `./exam_db/users.json`에 영구 저장되며 Google Drive 연동 시 자동 동기화됩니다."
+        "가입한 회원 목록 및 실제 API 토큰·비용 내역은 `./exam_db/users.json`에 영구 저장되며 Google Drive 연동 시 자동 동기화됩니다."
     )
 
     col_top1, col_top2 = st.columns([2, 1])
@@ -2122,6 +2274,87 @@ def _render_admin_panel() -> None:
     m5.metric("ULTRA (19,900원/월)", f"{tier_counts['ULTRA']}명")
     m6.metric("ADMIN", f"{tier_counts['ADMIN']}명")
 
+    # ------------------------------------------------------------------
+    # 💰 실제 API 토큰 사용량 & 원화(₩) 환산 대시보드
+    # ------------------------------------------------------------------
+    current_month = get_kst_month_str()
+    with st.container(border=True):
+        rate_c1, rate_c2 = st.columns([2.4, 1.0])
+        with rate_c1:
+            st.markdown(f"#### 💰 API 토큰 사용량 & 원화(₩) 환산 ({current_month} KST 기준)")
+            st.caption(
+                f"적용 단가 (Gemini 3.5 Flash-Lite): "
+                f"입력 `${FLASH_LITE_INPUT_USD_PER_1M:.2f}` · "
+                f"캐시 `${FLASH_LITE_CACHED_INPUT_USD_PER_1M:.2f}` · "
+                f"출력(+사고) `${FLASH_LITE_OUTPUT_USD_PER_1M:.2f}` / 1M 토큰"
+            )
+        with rate_c2:
+            usd_to_krw = float(
+                st.number_input(
+                    "적용 환율 (1 USD → KRW)",
+                    min_value=500.0,
+                    max_value=5000.0,
+                    value=float(resolve_usd_to_krw_rate()),
+                    step=10.0,
+                    format="%.0f",
+                    key="admin_usd_to_krw_rate",
+                )
+            )
+
+        def _u_month_attr(u_obj: Any, attr: str, default: Any = 0) -> Any:
+            if getattr(u_obj, "last_used_month", "") != current_month:
+                return default
+            return getattr(u_obj, attr, default) or default
+
+        month_prompt_sum = sum(int(_u_month_attr(u, "monthly_prompt_tokens", 0)) for u in users_list)
+        month_cached_sum = sum(int(_u_month_attr(u, "monthly_cached_tokens", 0)) for u in users_list)
+        month_output_sum = sum(int(_u_month_attr(u, "monthly_output_tokens", 0)) for u in users_list)
+        month_total_tok_sum = sum(int(_u_month_attr(u, "monthly_total_tokens", 0)) for u in users_list)
+        month_calls_sum = sum(int(_u_month_attr(u, "monthly_api_calls", 0)) for u in users_list)
+        month_server_usd = sum(float(_u_month_attr(u, "monthly_server_cost_usd", 0.0)) for u in users_list)
+        month_all_usd = sum(float(_u_month_attr(u, "monthly_cost_usd", 0.0)) for u in users_list)
+
+        total_tok_sum = sum(int(getattr(u, "total_total_tokens", 0) or 0) for u in users_list)
+        total_server_usd = sum(float(getattr(u, "total_server_cost_usd", 0.0) or 0.0) for u in users_list)
+        total_all_usd = sum(float(getattr(u, "total_cost_usd", 0.0) or 0.0) for u in users_list)
+
+        est_monthly_rev_krw = (
+            tier_counts["PRO"] * PRO_MONTHLY_PRICE_KRW
+            + tier_counts["ULTRA"] * ULTRA_MONTHLY_PRICE_KRW
+        )
+        month_server_krw = month_server_usd * usd_to_krw
+        cost_ratio_str = (
+            f"{(month_server_krw / est_monthly_rev_krw) * 100:.1f}%"
+            if est_monthly_rev_krw > 0
+            else "-"
+        )
+
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric(
+            "이번 달 서버 API 비용",
+            format_krw(month_server_usd, usd_to_krw),
+            help=f"서버 키 부담분 기준 (${month_server_usd:.4f} / 개인키 포함 전체 ${month_all_usd:.4f})",
+        )
+        k1.caption(f"USD `${month_server_usd:.4f}` (개인키 제외)")
+        k2.metric(
+            "이번 달 전체 사용 토큰",
+            f"{month_total_tok_sum:,}",
+        )
+        k2.caption(
+            f"입력 {month_prompt_sum + month_cached_sum:,} · 출력 {month_output_sum:,} · {month_calls_sum:,}회"
+        )
+        k3.metric(
+            "누적 서버 API 비용",
+            format_krw(total_server_usd, usd_to_krw),
+            help=f"전체 누적 서버 키 부담분 (${total_server_usd:.4f} / 개인키 포함 전체 ${total_all_usd:.4f})",
+        )
+        k3.caption(f"USD `${total_server_usd:.4f}` · 누적 {total_tok_sum:,} 토큰")
+        k4.metric(
+            "예상 월 매출 대비 API 원가율",
+            cost_ratio_str,
+        )
+        k4.caption(f"예상 월 매출 ₩{est_monthly_rev_krw:,}")
+
     filtered_users = [
         u
         for u in users_list
@@ -2129,19 +2362,33 @@ def _render_admin_panel() -> None:
     ]
     filtered_users.sort(key=lambda u: u.created_at or u.username, reverse=True)
 
-    table_rows = [
-        {
-            "아이디": u.username,
-            "이름": u.nickname,
-            "현재 등급": u.tier,
-            "등급 설명": TIER_LABELS.get(u.tier, u.tier),
-            "개인 키": mask_api_key(u.custom_api_key) or "-",
-            "기출 업로드": int(getattr(u, "uploaded_exam_count", 0) or 0),
-            "해금 크레딧": int(getattr(u, "premium_unlock_credits", 0) or 0),
-            "주간 고급사용": int(getattr(u, "weekly_premium_count", 0) or 0),
-        }
-        for u in filtered_users
-    ]
+    table_rows = []
+    for u in filtered_users:
+        u_m_tok = int(_u_month_attr(u, "monthly_total_tokens", 0))
+        u_m_calls = int(_u_month_attr(u, "monthly_api_calls", 0))
+        u_m_usd = float(_u_month_attr(u, "monthly_cost_usd", 0.0))
+        u_t_tok = int(getattr(u, "total_total_tokens", 0) or 0)
+        u_t_usd = float(getattr(u, "total_cost_usd", 0.0) or 0.0)
+        u_lim = get_monthly_token_limit(u)
+        if u_lim is not None and u_lim > 0:
+            usage_pct = f"{min(999.9, (u_m_tok / u_lim) * 100):.1f}% ({format_token_count(u_lim)})"
+        else:
+            usage_pct = "무제한"
+        table_rows.append(
+            {
+                "아이디": u.username,
+                "이름": u.nickname,
+                "현재 등급": u.tier,
+                "이번 달 토큰": u_m_tok,
+                "한도 사용률": usage_pct,
+                "이번 달 비용(₩)": format_krw(u_m_usd, usd_to_krw),
+                "누적 토큰": u_t_tok,
+                "누적 비용(₩)": format_krw(u_t_usd, usd_to_krw),
+                "월 호출수": u_m_calls,
+                "기출 업로드": int(getattr(u, "uploaded_exam_count", 0) or 0),
+                "개인 키": mask_api_key(u.custom_api_key) or "-",
+            }
+        )
 
     edited_rows = st.data_editor(
         table_rows,
@@ -2153,11 +2400,14 @@ def _render_admin_panel() -> None:
                 options=list(VALID_TIERS),
                 required=True,
             ),
-            "등급 설명": st.column_config.TextColumn("등급명", disabled=True),
-            "개인 키": st.column_config.TextColumn("개인 키", disabled=True),
+            "이번 달 토큰": st.column_config.NumberColumn("이번 달 토큰", format="%d", disabled=True),
+            "한도 사용률": st.column_config.TextColumn("한도 사용률", disabled=True),
+            "이번 달 비용(₩)": st.column_config.TextColumn("이번 달 비용(₩)", disabled=True),
+            "누적 토큰": st.column_config.NumberColumn("누적 토큰", format="%d", disabled=True),
+            "누적 비용(₩)": st.column_config.TextColumn("누적 비용(₩)", disabled=True),
+            "월 호출수": st.column_config.NumberColumn("월 호출수", format="%d", disabled=True),
             "기출 업로드": st.column_config.NumberColumn("기출 업로드", disabled=True),
-            "해금 크레딧": st.column_config.NumberColumn("해금 크레딧", disabled=True),
-            "주간 고급사용": st.column_config.NumberColumn("주간 고급사용", disabled=True),
+            "개인 키": st.column_config.TextColumn("개인 키", disabled=True),
         },
         hide_index=True,
         width="stretch",
@@ -2178,6 +2428,30 @@ def _render_admin_panel() -> None:
             st.rerun()
         else:
             st.info("변경된 등급이 없습니다.")
+
+    with st.expander("🔄 관리자: 회원 이번 달 토큰 사용량 초기화", expanded=False):
+        reset_options = [u.username for u in filtered_users]
+        reset_label_map = {
+            u.username: f"@{u.username} ({u.nickname} · {u.tier} · 이번 달 {int(_u_month_attr(u, 'monthly_total_tokens', 0)):,} 토큰)"
+            for u in filtered_users
+        }
+        reset_targets = st.multiselect(
+            "이번 달 토큰 사용량을 0으로 초기화할 회원 선택 (누적 토큰·비용 기록은 유지됨)",
+            options=reset_options,
+            format_func=lambda un: reset_label_map.get(un, un),
+            key="admin_reset_token_select",
+        )
+        if st.button(
+            "🔄 선택한 회원 월간 토큰 초기화",
+            disabled=not reset_targets,
+            key="admin_exec_reset_tokens",
+        ):
+            r_cnt, r_err = reset_user_monthly_tokens(storage, reset_targets)
+            if r_err:
+                st.warning(f"{r_cnt}명 초기화됨 / Drive 저장 경고: {r_err}")
+            elif r_cnt > 0:
+                st.success(f"✅ {r_cnt}명의 이번 달 토큰 사용량을 0으로 초기화했습니다.")
+                st.rerun()
 
     with st.expander("🗑️ 관리자: 회원 계정 삭제", expanded=False):
         actor_id = current_user.username if current_user is not None else ""
@@ -2715,37 +2989,37 @@ if current_user is None:
         with st.container(border=True):
             st.markdown("<span class='tier-badge tier-FREE'>FREE · 0원</span>", unsafe_allow_html=True)
             st.markdown("#### 무료 회원")
-            st.write("- 기출 PDF 업로드 & **3.5 Flash-Lite 무제한**")
-            st.write(f"- 영어·수학 1회 생성 **최대 {FREE_MAX_BATCH_QUESTIONS}문항** 제한")
-            st.write(f"- 기출 **{FREE_EXAMS_PER_UNLOCK}회 업로드마다** 3.8/Hydrogen **1회 해금**")
+            st.write(f"- Gemini 3.5 Flash-Lite **월 {format_token_count(FREE_MONTHLY_TOKEN_LIMIT)} 토큰**")
+            st.write(f"- 1회 생성 **최대 {FREE_MAX_BATCH_QUESTIONS}문항** 제한")
+            st.write("- 매월 1일(KST) 한도 자동 초기화")
     with t_col2:
         with st.container(border=True):
             st.markdown("<span class='tier-badge tier-CUSTOM'>CUSTOM · 0원</span>", unsafe_allow_html=True)
             st.markdown("#### 개인 API 키")
-            st.write("- FREE와 동일 + **본인 API 키 등록**")
-            st.write("- 모든 모델 · 모든 추론 **무제한**")
-            st.write("- 승인 없이 즉시 전환")
+            st.write("- **본인 Gemini API 키** 등록")
+            st.write("- Gemini 3.5 Flash-Lite **토큰 무제한**")
+            st.write("- 1회 배치 제한 없음 · 즉시 전환")
     with t_col3:
         with st.container(border=True):
             st.markdown("<span class='tier-badge tier-PRO'>PRO · 9,900원/월</span>", unsafe_allow_html=True)
             st.markdown("#### 스탠다드 유료")
-            st.write("- **3.5 Flash-Lite 무제한** · 1회 제한 없음")
-            st.write(f"- 고급 모델(3.8/Hydrogen) **주간 {PRO_WEEKLY_PREMIUM_LIMIT}문항**")
-            st.write("- **공용 개념서 DB** 이용 가능")
+            st.write(f"- Gemini 3.5 Flash-Lite **월 {format_token_count(PRO_MONTHLY_TOKEN_LIMIT)} 토큰**")
+            st.write("- 1회 생성 문항 수 **제한 없음**")
+            st.write("- **공용 개념서 DB** 구축·이용 & 재태깅")
     with t_col4:
         with st.container(border=True):
             st.markdown("<span class='tier-badge tier-ULTRA'>ULTRA · 19,900원/월</span>", unsafe_allow_html=True)
-            st.markdown("#### 무제한 유료")
+            st.markdown("#### 대용량 유료 (4배)")
             st.write("- PRO 모든 혜택 포함")
-            st.write(f"- 고급 모델(3.8/Hydrogen) **주간 {ULTRA_WEEKLY_PREMIUM_LIMIT}문항**")
-            st.write("- **공용 개념서 DB** 무제한 이용")
+            st.write(f"- Gemini 3.5 Flash-Lite **월 {format_token_count(ULTRA_MONTHLY_TOKEN_LIMIT)} 토큰** (PRO 4배)")
+            st.write("- **공용 개념서 DB** 구축·이용 & 재태깅")
     with t_col5:
         with st.container(border=True):
             st.markdown("<span class='tier-badge tier-ADMIN'>ADMIN</span>", unsafe_allow_html=True)
             st.markdown("#### 최고 관리자")
-            st.write("- 모든 기능·모델 **무제한** (관리자 전용)")
+            st.write("- 모든 기능·토큰 **무제한** (관리자 전용)")
             st.write("- **공용 개념서 DB** 구축 & 관리")
-            st.write("- **회원 등급 관리** 패널 접근")
+            st.write("- **회원 등급 · API 원화 비용** 관리")
     st.stop()
 
 
@@ -2782,19 +3056,20 @@ def _render_concept_book_builder_section(key_prefix: str = "tab3") -> None:
         elif cb_sig != st.session_state.get(f"{key_prefix}_last_cb_sig"):
             auto_title = cb_pdf_file.name.rsplit(".", 1)[0].replace("_", " ").strip()
             auto_subj_grade = ""
-            if cb_pdf_bytes and active_gemini_key:
+            if cb_pdf_bytes and active_gemini_key and _ensure_token_quota(show_error=False):
                 try:
                     with st.spinner("🔍 개념서 표지(교재명 · 과목 및 학년) 자동 인식 중..."):
                         p1_txt, p1_png = extract_first_page_for_metadata(cb_pdf_bytes, dpi=140)
                         if p1_png is None:
                             p1_png = render_pdf_page_png(cb_pdf_bytes, 1, dpi=140)
-                        cover_meta = extract_concept_book_cover_metadata(
-                            api_key=active_gemini_key,
-                            model_name=EXAM_TAGGING_MODEL,
-                            first_page_text=p1_txt,
-                            first_page_png_bytes=p1_png,
-                            filename=cb_pdf_file.name,
-                        )
+                        with _usage_scope():
+                            cover_meta = extract_concept_book_cover_metadata(
+                                api_key=active_gemini_key,
+                                model_name=EXAM_TAGGING_MODEL,
+                                first_page_text=p1_txt,
+                                first_page_png_bytes=p1_png,
+                                filename=cb_pdf_file.name,
+                            )
                         if cover_meta.book_title:
                             auto_title = cover_meta.book_title
                         if cover_meta.subject_and_grade:
@@ -2853,7 +3128,7 @@ def _render_concept_book_builder_section(key_prefix: str = "tab3") -> None:
         else:
             st.info(
                 "🤖 **AI 자동 추출 모드**: 페이지 범위를 직접 입력하지 않아도 "
-                "Gemini 3.8 Flash가 먼저 목차를 분석한 뒤 본문과 대조해 **표지·목차·문제 풀이·정답지를 제외하고 "
+                "Gemini 3.5 Flash-Lite가 먼저 목차를 분석한 뒤 본문과 대조해 **표지·목차·문제 풀이·정답지를 제외하고 "
                 "순수 개념 설명 구간만 빠짐없이 판별**하여 단원별로 구조화합니다."
             )
 
@@ -2916,19 +3191,19 @@ def _render_concept_book_builder_section(key_prefix: str = "tab3") -> None:
                 f"3단계: {model_disp} 모델로 단원별 핵심 개념·허용 용어·페이지 범위를 구조화하고 공용 DB에 동기화 중..."
                 + (f" ({db_model_notice})" if db_model_notice else "")
             )
-            extracted_book = extract_concept_book_units(
-                api_key=active_gemini_key,
-                model_name=db_build_model,
-                book_title=book_title_in.strip(),
-                subject_and_grade=subject_grade_in.strip(),
-                page_ranges_display=stats["ranges_display"],
-                sliced_pdf_bytes=sliced_bytes,
-                mapped_concept_text=mapped_text,
-                original_pdf_bytes=cb_pdf_bytes,
-                kept_pages=stats.get("kept_pages"),
-                status_callback=lambda m: status_box.info(m),
-            )
-            consume_premium_model_usage(storage, current_user.username, db_build_model)
+            with _usage_scope():
+                extracted_book = extract_concept_book_units(
+                    api_key=active_gemini_key,
+                    model_name=db_build_model,
+                    book_title=book_title_in.strip(),
+                    subject_and_grade=subject_grade_in.strip(),
+                    page_ranges_display=stats["ranges_display"],
+                    sliced_pdf_bytes=sliced_bytes,
+                    mapped_concept_text=mapped_text,
+                    original_pdf_bytes=cb_pdf_bytes,
+                    kept_pages=stats.get("kept_pages"),
+                    status_callback=lambda m: status_box.info(m),
+                )
             grade_match = re.search(r"(고\s*[123])", subject_grade_in)
             grade_str = (
                 grade_match.group(1).replace(" ", "")
@@ -2988,6 +3263,8 @@ def _render_concept_book_builder_section(key_prefix: str = "tab3") -> None:
                     st.error("교재/개념서 PDF 파일을 먼저 업로드해 주세요.")
                 elif not active_gemini_key:
                     st.error(f"사용 가능한 Gemini API 키({active_key_label})가 설정되지 않았습니다.")
+                elif not _ensure_token_quota():
+                    pass
                 elif auto_build_btn and not book_title_in.strip():
                     st.error("교재명을 입력해 주세요. (예: 완자 통합과학)")
                 elif auto_build_btn and not subject_grade_in.strip():
@@ -2995,66 +3272,67 @@ def _render_concept_book_builder_section(key_prefix: str = "tab3") -> None:
                 else:
                     status_box = st.empty()
                     try:
-                        cur_auto_sig = hashlib.sha256(cb_pdf_bytes).hexdigest()[:12]
-                        cached_prev = st.session_state.get(preview_state_key)
-                        if (
-                            auto_build_btn
-                            and cached_prev
-                            and cached_prev.get("pdf_sig") == cur_auto_sig
-                            and cached_prev.get("intervals")
-                        ):
-                            detected_out = cached_prev["detected_out"]
-                            detected_intervals = cached_prev["intervals"]
-                        else:
-                            status_box.info("1단계: PyMuPDF로 PDF 전체 페이지 구조 스캔 중...")
-                            catalog, has_text_layer = extract_pdf_page_catalog(cb_pdf_bytes)
-                            detect_model, _ = resolve_model_for_user(
-                                current_user, CONCEPT_DB_BUILD_MODEL
-                            )
-                            detected_out, detected_intervals = detect_concept_pages_with_ai(
-                                api_key=active_gemini_key,
-                                model_name=detect_model,
-                                pdf_bytes=cb_pdf_bytes,
-                                page_catalog=catalog,
-                                has_text_layer=has_text_layer,
-                                book_title=book_title_in.strip(),
-                                subject_and_grade=subject_grade_in.strip(),
-                                status_callback=lambda m: status_box.info(m),
-                            )
-                            st.session_state[preview_state_key] = {
-                                "pdf_sig": cur_auto_sig,
-                                "detected_out": detected_out,
-                                "intervals": detected_intervals,
-                            }
+                        with _usage_scope():
+                            cur_auto_sig = hashlib.sha256(cb_pdf_bytes).hexdigest()[:12]
+                            cached_prev = st.session_state.get(preview_state_key)
+                            if (
+                                auto_build_btn
+                                and cached_prev
+                                and cached_prev.get("pdf_sig") == cur_auto_sig
+                                and cached_prev.get("intervals")
+                            ):
+                                detected_out = cached_prev["detected_out"]
+                                detected_intervals = cached_prev["intervals"]
+                            else:
+                                status_box.info("1단계: PyMuPDF로 PDF 전체 페이지 구조 스캔 중...")
+                                catalog, has_text_layer = extract_pdf_page_catalog(cb_pdf_bytes)
+                                detect_model, _ = resolve_model_for_user(
+                                    current_user, CONCEPT_DB_BUILD_MODEL
+                                )
+                                detected_out, detected_intervals = detect_concept_pages_with_ai(
+                                    api_key=active_gemini_key,
+                                    model_name=detect_model,
+                                    pdf_bytes=cb_pdf_bytes,
+                                    page_catalog=catalog,
+                                    has_text_layer=has_text_layer,
+                                    book_title=book_title_in.strip(),
+                                    subject_and_grade=subject_grade_in.strip(),
+                                    status_callback=lambda m: status_box.info(m),
+                                )
+                                st.session_state[preview_state_key] = {
+                                    "pdf_sig": cur_auto_sig,
+                                    "detected_out": detected_out,
+                                    "intervals": detected_intervals,
+                                }
 
-                        failed_chunks_list = list(getattr(detected_out, "failed_chunks", []) or [])
-                        if failed_chunks_list:
-                            st.warning(
-                                "⚠️ **일부 PDF 페이지 구간 판별에 실패했습니다** (자동 재시도 후 누락 방지를 위해 표시):\n- "
-                                + "\n- ".join(failed_chunks_list)
-                                + "\n\n해당 구간이 필요하다면 **[✍️ 수동 추출]**에서 직접 범위를 추가해 보완해 주세요."
-                            )
+                            failed_chunks_list = list(getattr(detected_out, "failed_chunks", []) or [])
+                            if failed_chunks_list:
+                                st.warning(
+                                    "⚠️ **일부 PDF 페이지 구간 판별에 실패했습니다** (자동 재시도 후 누락 방지를 위해 표시):\n- "
+                                    + "\n- ".join(failed_chunks_list)
+                                    + "\n\n해당 구간이 필요하다면 **[✍️ 수동 추출]**에서 직접 범위를 추가해 보완해 주세요."
+                                )
 
-                        if not detected_intervals:
-                            status_box.empty()
-                            st.warning(
-                                "AI가 순수 개념 설명 구간을 찾지 못했습니다. [✍️ 수동 추출]로 전환해 페이지 범위를 직접 지정해 주세요."
-                            )
-                        elif auto_preview_btn:
-                            status_box.empty()
-                            st.success(
-                                f"🔍 AI 개념 구간 판별 완료! (총 {len(detected_intervals)}개 구간 · "
-                                f"{sum(e - s + 1 for s, e in detected_intervals)}쪽 감지)"
-                            )
-                        else:
-                            spec_auto = ", ".join(
-                                f"{s}-{e}" if s != e else f"{s}" for s, e in detected_intervals
-                            )
-                            _finalize_and_save_concept_book(
-                                intervals_to_extract=detected_intervals,
-                                spec_label=f"{spec_auto} (AI 자동 추출)",
-                                status_box=status_box,
-                            )
+                            if not detected_intervals:
+                                status_box.empty()
+                                st.warning(
+                                    "AI가 순수 개념 설명 구간을 찾지 못했습니다. [✍️ 수동 추출]로 전환해 페이지 범위를 직접 지정해 주세요."
+                                )
+                            elif auto_preview_btn:
+                                status_box.empty()
+                                st.success(
+                                    f"🔍 AI 개념 구간 판별 완료! (총 {len(detected_intervals)}개 구간 · "
+                                    f"{sum(e - s + 1 for s, e in detected_intervals)}쪽 감지)"
+                                )
+                            else:
+                                spec_auto = ", ".join(
+                                    f"{s}-{e}" if s != e else f"{s}" for s, e in detected_intervals
+                                )
+                                _finalize_and_save_concept_book(
+                                    intervals_to_extract=detected_intervals,
+                                    spec_label=f"{spec_auto} (AI 자동 추출)",
+                                    status_box=status_box,
+                                )
                     except Exception as exc:
                         status_box.empty()
                         st.error(f"AI 자동 추출 실패: {exc}")
@@ -3109,6 +3387,8 @@ def _render_concept_book_builder_section(key_prefix: str = "tab3") -> None:
                     st.error("추출할 개념 페이지 범위를 입력해 주세요. (예: 12-25, 34-48, 60-75)")
                 elif not active_gemini_key:
                     st.error(f"사용 가능한 Gemini API 키({active_key_label})가 설정되지 않았습니다.")
+                elif not _ensure_token_quota():
+                    pass
                 else:
                     try:
                         total_cb_pages = get_pdf_page_count(cb_pdf_bytes)
@@ -3427,6 +3707,8 @@ with tab1:
                         f"서버 업로드·태깅용 API 키가 설정되지 않았습니다 ({verified_key_label}). "
                         "`.streamlit/secrets.toml`의 `GEMINI_API_KEY`를 확인해 주세요."
                     )
+                elif not _ensure_token_quota():
+                    pass
                 else:
                     db_batch_snapshot = storage.load_db()
                     existing_exam_names = {
@@ -3453,6 +3735,9 @@ with tab1:
                         item_log.code("\n".join(live_logs[-18:]), language="text")
 
                     for idx, prob_f in enumerate(prob_files, start=1):
+                        if not _ensure_token_quota():
+                            _append_batch_log("🚫 월간 토큰 한도 도달로 남은 대기열을 중단했습니다.")
+                            break
                         prob_base = _pdf_display_basename(prob_f.name)
                         matched_ans_i = selected_ans_indices[idx - 1]
                         ans_f = ans_files[matched_ans_i] if matched_ans_i is not None else None
@@ -3906,9 +4191,11 @@ with tab1:
             )
             if not verified_key:
                 st.error(
-                    f"서버 업로드·태깅용 API 키가 설정되지 않았습니다 ({verified_key_label}). "
+                    f"업로드·태깅용 API 키가 설정되지 않았습니다 ({verified_key_label}). "
                     "`.streamlit/secrets.toml`의 `GEMINI_API_KEY`를 확인해 주세요."
                 )
+                return
+            if not _ensure_token_quota():
                 return
             if not target_q_nums:
                 st.warning("태깅할 문항을 최소 1개 이상 선택해 주세요.")
@@ -3961,13 +4248,7 @@ with tab1:
             status_placeholder.empty()
 
             if not is_retry and newly_saved:
-                upd_u, unlocked = record_exam_upload_for_user(storage, current_user.username)
-                if unlocked and upd_u is not None:
-                    st.success(
-                        f"🎉 기출 PDF {FREE_EXAMS_PER_UNLOCK}회분 업로드 달성! "
-                        f"고급 추론 모델(3.8 / Hydrogen) **1회 사용권**이 해금되었습니다. "
-                        f"(보유 해금 크레딧: {upd_u.premium_unlock_credits}회)"
-                    )
+                record_exam_upload_for_user(storage, current_user.username)
 
             prev_saved = (
                 st.session_state.get("stage2_saved_q_nums", [])
@@ -4326,6 +4607,8 @@ with tab1:
                                         f"🚫 **'{exam_name}'** 회차에 저장된 해설지 PDF가 없어 다시 태깅할 수 없습니다. "
                                         "기존 회차를 삭제한 뒤 문제지·해설지 PDF를 함께 다시 업로드해 주세요."
                                     )
+                                elif not _ensure_token_quota():
+                                    pass
                                 else:
                                     saved_crops_by_q = {
                                         r.q_num: CroppedQuestion(
@@ -4567,9 +4850,12 @@ def _execute_english_transform_jobs(
     source_summary_label: str,
     use_precision_mode: bool = False,
 ) -> None:
-    """(영어 지문, 목표 수능 유형) 작업 목록을 등급별 제한(FREE=5문항, 유료=제한 없음, PRO/ULTRA 정밀 모드 주간 한도) 하에 실행한다."""
+    """(영어 지문, 목표 수능 유형) 작업 목록을 Gemini 3.5 Flash-Lite 단일 모델 및 등급별 월간 토큰 한도 하에 실행한다."""
     if not jobs:
         st.warning("변형할 영어 지문과 목표 수능 유형을 최소 1개 이상 선택해 주세요.")
+        return
+
+    if not _ensure_token_quota():
         return
 
     user_max_jobs = get_max_batch_questions(current_user)
@@ -4580,23 +4866,8 @@ def _execute_english_transform_jobs(
         )
         jobs = jobs[:user_max_jobs]
 
-    if current_user.tier in ("PRO", "ULTRA") and is_premium_model(rewrite_model):
-        fresh_user = get_user_by_username(storage, current_user.username) or current_user
-        weekly_cap = get_weekly_premium_limit(fresh_user)
-        pro_rem = get_remaining_pro_weekly_quota(fresh_user) or 0
-        if pro_rem <= 0:
-            st.warning(
-                f"⚠️ {fresh_user.tier} 주간 고급 모델 한도({weekly_cap}문항)를 모두 사용하여 "
-                "**Gemini 3.5 Flash-Lite** 기본 모드로 자동 전환해 실행합니다."
-            )
-            rewrite_model = EXAM_TAGGING_MODEL
-            use_precision_mode = False
-        elif len(jobs) > pro_rem:
-            st.warning(
-                f"⚠️ {fresh_user.tier} 주간 고급 모델 잔여 한도(**{pro_rem}문항**)에 맞춰 앞의 {pro_rem}문항만 정밀 생성합니다. "
-                "(나머지 문항은 기본 모드 3.5 Flash-Lite로 무제한 생성 가능합니다.)"
-            )
-            jobs = jobs[:pro_rem]
+    rewrite_model = FLASH_LITE_MODEL
+    use_precision_mode = False
 
     rewrite_api_key, rewrite_key_label = resolve_active_gemini_api_key(
         current_user, creds.gemini_api_key, model_name=rewrite_model
@@ -4608,41 +4879,43 @@ def _execute_english_transform_jobs(
     total_jobs = len(jobs)
     prog = st.progress(0.0)
     stat = st.empty()
-    n_workers = max(1, min(total_jobs, 5 if use_precision_mode else 8))
+    n_workers = max(1, min(total_jobs, 8))
     stat.info(f"🔤 영어 지문 수능형 변형 {total_jobs}문항 병렬 출제 중 (최대 {n_workers}스레드)...")
 
     results_by_idx: dict[int, RewrittenQuestion] = {}
     errors_by_idx: dict[int, str] = {}
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=n_workers) as executor:
-        future_map = {
-            executor.submit(
-                generate_english_transformed_question,
-                api_key=rewrite_api_key,
-                model_name=rewrite_model,
-                source_passage=job["passage_text"],
-                target_type=job["target_type"],
-                difficulty=job["difficulty"],
-                blank_unit=job["blank_unit"],
-                vocab_style=job["vocab_style"],
-                source_label=job["source_label"],
-                use_precision_mode=use_precision_mode,
-                storage=storage,
-                use_cache=True,
-                username=current_user.username if current_user is not None else "",
-            ): idx
-            for idx, job in enumerate(jobs)
-        }
-        done_cnt = 0
-        for fut in concurrent.futures.as_completed(future_map):
-            idx = future_map[fut]
-            done_cnt += 1
-            try:
-                results_by_idx[idx] = fut.result()
-            except Exception as exc:
-                errors_by_idx[idx] = str(exc)
-            prog.progress(done_cnt / total_jobs)
-            stat.info(f"🔤 영어 지문 수능형 변형 출제 중 ({done_cnt}/{total_jobs})...")
+    with _usage_scope():
+        with concurrent.futures.ThreadPoolExecutor(max_workers=n_workers) as executor:
+            future_map = {
+                submit_with_usage_context(
+                    executor,
+                    generate_english_transformed_question,
+                    api_key=rewrite_api_key,
+                    model_name=rewrite_model,
+                    source_passage=job["passage_text"],
+                    target_type=job["target_type"],
+                    difficulty=job["difficulty"],
+                    blank_unit=job["blank_unit"],
+                    vocab_style=job["vocab_style"],
+                    source_label=job["source_label"],
+                    use_precision_mode=use_precision_mode,
+                    storage=storage,
+                    use_cache=True,
+                    username=current_user.username if current_user is not None else "",
+                ): idx
+                for idx, job in enumerate(jobs)
+            }
+            done_cnt = 0
+            for fut in concurrent.futures.as_completed(future_map):
+                idx = future_map[fut]
+                done_cnt += 1
+                try:
+                    results_by_idx[idx] = fut.result()
+                except Exception as exc:
+                    errors_by_idx[idx] = str(exc)
+                prog.progress(done_cnt / total_jobs)
+                stat.info(f"🔤 영어 지문 수능형 변형 출제 중 ({done_cnt}/{total_jobs})...")
 
     prog.progress(1.0)
     stat.empty()
@@ -4690,11 +4963,6 @@ def _execute_english_transform_jobs(
         return
 
     consume_extraction_quota(storage, current_user.username, len(assembled))
-    updated_u = None
-    if is_premium_model(rewrite_model):
-        updated_u = consume_premium_model_usage(
-            storage, current_user.username, rewrite_model, count=len(assembled)
-        )
 
     st.session_state["matched_items"] = assembled
     st.session_state["match_diagnostics"] = []
@@ -4706,12 +4974,12 @@ def _execute_english_transform_jobs(
     st.session_state["ai_chats"] = {}
 
     rem_msg = ""
-    if updated_u is not None and is_premium_model(rewrite_model):
-        if updated_u.tier == "FREE":
-            rem_msg = f" | 남은 고급 모델 해금 크레딧: {int(getattr(updated_u, 'premium_unlock_credits', 0) or 0)}회"
-        elif updated_u.tier in ("PRO", "ULTRA"):
-            pro_rem = get_remaining_pro_weekly_quota(updated_u)
-            rem_msg = f" | {updated_u.tier} 주간 고급 모델 잔여: {pro_rem}/{get_weekly_premium_limit(updated_u)}문항"
+    fresh_u = get_user_by_username(storage, current_user.username)
+    if fresh_u is not None:
+        m_lim = get_monthly_token_limit(fresh_u)
+        m_rem = get_remaining_monthly_tokens(fresh_u)
+        if m_lim is not None and m_rem is not None:
+            rem_msg = f" | 이번 달 잔여 토큰: {m_rem:,} / {format_token_count(m_lim)}"
 
     st.success(f"🎯 총 **{len(assembled)}문항**의 수능형 영어 변형 문제 출제가 완료되었습니다! 아래 모드 A(시험지 PDF) 또는 모드 B(웹 바로 풀기)에서 확인하세요.{rem_msg}")
 
@@ -5298,22 +5566,25 @@ def _render_tab2_concept_source_tabs() -> None:
                     )
                     if not scope_api_key:
                         st.error(f"사용 가능한 Gemini API 키({scope_key_label})가 설정되지 않았습니다.")
+                    elif not _ensure_token_quota():
+                        pass
                     else:
                         with st.spinner(f"PDF ({range_disp})의 순수 개념 본문·도표·용어를 정독해 화이트리스트를 구축 중..."):
                             sliced_bytes, sliced_text, slice_stats = extract_concept_pages_by_ranges(
                                 concept_pdf_bytes, parsed_direct_ranges
                             )
                             try:
-                                wl = extract_concept_whitelist(
-                                    api_key=scope_api_key,
-                                    model_name=CONCEPT_SCOPE_MODEL,
-                                    sliced_pdf_bytes=sliced_bytes,
-                                    sliced_text=sliced_text,
-                                    start_page=first_page_num,
-                                    end_page=last_page_num,
-                                    book_title=direct_book_title.strip() or default_book_name,
-                                    range_display=slice_stats["ranges_display"],
-                                )
+                                with _usage_scope():
+                                    wl = extract_concept_whitelist(
+                                        api_key=scope_api_key,
+                                        model_name=CONCEPT_SCOPE_MODEL,
+                                        sliced_pdf_bytes=sliced_bytes,
+                                        sliced_text=sliced_text,
+                                        start_page=first_page_num,
+                                        end_page=last_page_num,
+                                        book_title=direct_book_title.strip() or default_book_name,
+                                        range_display=slice_stats["ranges_display"],
+                                    )
                                 st.session_state["concept_whitelist"] = wl
                                 st.session_state["concept_sliced_text"] = sliced_text
                                 st.session_state["concept_source_label"] = (
@@ -5439,6 +5710,8 @@ with tab2:
                 )
                 if not match_api_key:
                     st.error(f"사용 가능한 Gemini API 키({match_key_label})가 설정되지 않았습니다.")
+                elif not _ensure_token_quota():
+                    pass
                 elif not db_list:
                     st.warning("저장된 기출 DB가 비어 있습니다. 먼저 [탭 1]에서 모의고사를 수집·태깅해 주세요.")
                 else:
@@ -5458,170 +5731,170 @@ with tab2:
                     if not candidates:
                         st.warning("선택한 과목/학년/단일개념 조건에 맞는 후보 문항이 DB에 없습니다.")
                     else:
-                        with st.spinner(f"후보 {len(candidates)}개 문항의 핵심 원리를 개념서 범위와 대조 중..."):
-                            try:
-                                judgments = match_questions_to_whitelist(
-                                    api_key=match_api_key,
-                                    model_name=match_model,
-                                    candidates=candidates,
-                                    whitelist=whitelist,
-                                )
-                            except Exception as exc:
-                                st.error(f"원리 매칭 중 오류가 발생했습니다: {exc}")
-                                judgments = []
-
-                        j_map = {j.question_id: j for j in judgments}
-                        diagnostics = []
-                        selected_pairs: list[tuple[QuestionRecord, Any]] = []
-                        skipped_needs_rewrite = 0
-
-                        for q in candidates:
-                            j = j_map.get(q.id)
-                            if not j:
-                                continue
-                            diagnostics.append((q, j))
-                            if not j.is_solvable_by_pdf_only:
-                                continue
-                            if j.needs_rewriting and not auto_rewrite_mode:
-                                skipped_needs_rewrite += 1
-                                continue
-                            selected_pairs.append((q, j))
-
-                        if count_mode == "N문제 지정":
-                            selected_pairs = selected_pairs[:target_n]
-                        if tab2_max_batch is not None and len(selected_pairs) > tab2_max_batch:
-                            st.warning(
-                                f"⚠️ 현재 등급은 1회 실행당 최대 {tab2_max_batch}문항까지만 추출·개조됩니다. "
-                                f"(매칭 {len(selected_pairs)}문항 중 앞의 {tab2_max_batch}문항만 실행)"
-                            )
-                            selected_pairs = selected_pairs[:tab2_max_batch]
-
-                        st.session_state["match_diagnostics"] = diagnostics
-
-                        if not selected_pairs:
-                            st.warning(
-                                "선택한 개념서 범위의 개념만으로 풀 수 있는 문항이 없습니다."
-                                + (
-                                    f" (단, CUSTOM/PRO 등급에서 '상위 과목 문제 자동 개조 모드'를 켜면 원리가 일치하는 {skipped_needs_rewrite}문항을 개조해 출제할 수 있습니다.)"
-                                    if skipped_needs_rewrite > 0
-                                    else ""
-                                )
-                            )
-                            st.session_state["matched_items"] = []
-                        else:
-                            assembled: list[dict[str, Any]] = []
-                            prog = st.progress(0.0)
-                            stat = st.empty()
-                            sliced_text_ctx = st.session_state.get("concept_sliced_text", "")
-                            fallback_source_ctx = st.session_state.get("concept_source_label", "")
-
-                            prepared_items: list[tuple[QuestionRecord, Any, bytes | None, str]] = []
-                            rewrite_indices: list[int] = []
-                            for idx, (q, j) in enumerate(selected_pairs):
-                                crop_bytes = storage.get_crop_bytes(
-                                    q.image_filename,
-                                    subject_category=q.subject_category,
-                                    exam_name=q.exam_name,
-                                )
-                                concept_ref = resolve_question_concept_reference(
-                                    question=q,
-                                    judgment=j,
-                                    whitelist=whitelist,
-                                    fallback_source_label=fallback_source_ctx,
-                                )
-                                prepared_items.append((q, j, crop_bytes, concept_ref))
-                                if j.needs_rewriting and auto_rewrite_mode:
-                                    rewrite_indices.append(idx)
-
-                            rewritten_results: dict[int, RewrittenQuestion] = {}
-                            failed_indices: set[int] = set()
-                            if rewrite_indices:
-                                if not rewrite_api_key:
-                                    st.error(
-                                        f"상위 문제 개조용 API 키가 설정되지 않았습니다 ({rewrite_key_label})."
+                        with _usage_scope():
+                            with st.spinner(f"후보 {len(candidates)}개 문항의 핵심 원리를 개념서 범위와 대조 중..."):
+                                try:
+                                    judgments = match_questions_to_whitelist(
+                                        api_key=match_api_key,
+                                        model_name=match_model,
+                                        candidates=candidates,
+                                        whitelist=whitelist,
                                     )
-                                    failed_indices.update(rewrite_indices)
-                                else:
-                                    total_rw = len(rewrite_indices)
-                                    stat.info(f"상위 문제 {total_rw}문항 병렬 자동 개조 중 (최대 4스레드)...")
-                                    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
-                                        future_map = {}
-                                        for idx in rewrite_indices:
-                                            q, j, crop_bytes, _ = prepared_items[idx]
-                                            fut = executor.submit(
-                                                rewrite_question_for_pdf,
-                                                api_key=rewrite_api_key,
-                                                model_name=rewrite_model,
-                                                question=q,
-                                                crop_png_bytes=crop_bytes,
-                                                whitelist=whitelist,
-                                                out_of_scope_terms=j.out_of_scope_terms,
-                                                sliced_text=sliced_text_ctx,
-                                            )
-                                            future_map[fut] = idx
+                                except Exception as exc:
+                                    st.error(f"원리 매칭 중 오류가 발생했습니다: {exc}")
+                                    judgments = []
 
-                                        done_cnt = 0
-                                        for fut in concurrent.futures.as_completed(future_map):
-                                            idx = future_map[fut]
-                                            q_done = prepared_items[idx][0]
-                                            done_cnt += 1
-                                            try:
-                                                rewritten_results[idx] = fut.result()
-                                            except ForbiddenTermRemainingError as fexc:
-                                                failed_indices.add(idx)
-                                                st.warning(f"⛔ {q_done.id} 금지 용어 잔존으로 제외: {fexc}")
-                                            except Exception as exc:
-                                                failed_indices.add(idx)
-                                                st.error(f"{q_done.id} 개조 실패 (원본 제외): {exc}")
-                                            prog.progress(done_cnt / total_rw)
-                                            stat.info(f"상위 문제 병렬 자동 개조 중 ({done_cnt}/{total_rw})...")
+                            j_map = {j.question_id: j for j in judgments}
+                            diagnostics = []
+                            selected_pairs: list[tuple[QuestionRecord, Any]] = []
+                            skipped_needs_rewrite = 0
 
-                            for idx, (q, j, crop_bytes, concept_ref) in enumerate(prepared_items):
-                                if idx in failed_indices:
+                            for q in candidates:
+                                j = j_map.get(q.id)
+                                if not j:
                                     continue
-                                assembled.append(
-                                    {
-                                        "question": q,
-                                        "judgment": j,
-                                        "crop_png_bytes": crop_bytes,
-                                        "rewritten": rewritten_results.get(idx),
-                                        "concept_reference": concept_ref,
-                                    }
+                                diagnostics.append((q, j))
+                                if not j.is_solvable_by_pdf_only:
+                                    continue
+                                if j.needs_rewriting and not auto_rewrite_mode:
+                                    skipped_needs_rewrite += 1
+                                    continue
+                                selected_pairs.append((q, j))
+
+                            if count_mode == "N문제 지정":
+                                selected_pairs = selected_pairs[:target_n]
+                            if tab2_max_batch is not None and len(selected_pairs) > tab2_max_batch:
+                                st.warning(
+                                    f"⚠️ 현재 등급은 1회 실행당 최대 {tab2_max_batch}문항까지만 추출·개조됩니다. "
+                                    f"(매칭 {len(selected_pairs)}문항 중 앞의 {tab2_max_batch}문항만 실행)"
+                                )
+                                selected_pairs = selected_pairs[:tab2_max_batch]
+
+                            st.session_state["match_diagnostics"] = diagnostics
+
+                            if not selected_pairs:
+                                st.warning(
+                                    "선택한 개념서 범위의 개념만으로 풀 수 있는 문항이 없습니다."
+                                    + (
+                                        f" (단, '상위 과목 문제 자동 개조 모드'를 켜면 원리가 일치하는 {skipped_needs_rewrite}문항을 개조해 출제할 수 있습니다.)"
+                                        if skipped_needs_rewrite > 0
+                                        else ""
+                                    )
+                                )
+                                st.session_state["matched_items"] = []
+                            else:
+                                assembled: list[dict[str, Any]] = []
+                                prog = st.progress(0.0)
+                                stat = st.empty()
+                                sliced_text_ctx = st.session_state.get("concept_sliced_text", "")
+                                fallback_source_ctx = st.session_state.get("concept_source_label", "")
+
+                                prepared_items: list[tuple[QuestionRecord, Any, bytes | None, str]] = []
+                                rewrite_indices: list[int] = []
+                                for idx, (q, j) in enumerate(selected_pairs):
+                                    crop_bytes = storage.get_crop_bytes(
+                                        q.image_filename,
+                                        subject_category=q.subject_category,
+                                        exam_name=q.exam_name,
+                                    )
+                                    concept_ref = resolve_question_concept_reference(
+                                        question=q,
+                                        judgment=j,
+                                        whitelist=whitelist,
+                                        fallback_source_label=fallback_source_ctx,
+                                    )
+                                    prepared_items.append((q, j, crop_bytes, concept_ref))
+                                    if j.needs_rewriting and auto_rewrite_mode:
+                                        rewrite_indices.append(idx)
+
+                                rewritten_results: dict[int, RewrittenQuestion] = {}
+                                failed_indices: set[int] = set()
+                                if rewrite_indices:
+                                    if not rewrite_api_key:
+                                        st.error(
+                                            f"상위 문제 개조용 API 키가 설정되지 않았습니다 ({rewrite_key_label})."
+                                        )
+                                        failed_indices.update(rewrite_indices)
+                                    else:
+                                        total_rw = len(rewrite_indices)
+                                        stat.info(f"상위 문제 {total_rw}문항 병렬 자동 개조 중 (최대 4스레드)...")
+                                        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+                                            future_map = {}
+                                            for idx in rewrite_indices:
+                                                q, j, crop_bytes, _ = prepared_items[idx]
+                                                fut = submit_with_usage_context(
+                                                    executor,
+                                                    rewrite_question_for_pdf,
+                                                    api_key=rewrite_api_key,
+                                                    model_name=rewrite_model,
+                                                    question=q,
+                                                    crop_png_bytes=crop_bytes,
+                                                    whitelist=whitelist,
+                                                    out_of_scope_terms=j.out_of_scope_terms,
+                                                    sliced_text=sliced_text_ctx,
+                                                )
+                                                future_map[fut] = idx
+
+                                            done_cnt = 0
+                                            for fut in concurrent.futures.as_completed(future_map):
+                                                idx = future_map[fut]
+                                                q_done = prepared_items[idx][0]
+                                                done_cnt += 1
+                                                try:
+                                                    rewritten_results[idx] = fut.result()
+                                                except ForbiddenTermRemainingError as fexc:
+                                                    failed_indices.add(idx)
+                                                    st.warning(f"⛔ {q_done.id} 금지 용어 잔존으로 제외: {fexc}")
+                                                except Exception as exc:
+                                                    failed_indices.add(idx)
+                                                    st.error(f"{q_done.id} 개조 실패 (원본 제외): {exc}")
+                                                prog.progress(done_cnt / total_rw)
+                                                stat.info(f"상위 문제 병렬 자동 개조 중 ({done_cnt}/{total_rw})...")
+
+                                for idx, (q, j, crop_bytes, concept_ref) in enumerate(prepared_items):
+                                    if idx in failed_indices:
+                                        continue
+                                    assembled.append(
+                                        {
+                                            "question": q,
+                                            "judgment": j,
+                                            "crop_png_bytes": crop_bytes,
+                                            "rewritten": rewritten_results.get(idx),
+                                            "concept_reference": concept_ref,
+                                        }
+                                    )
+
+                                prog.progress(1.0)
+                                stat.empty()
+                                consume_extraction_quota(
+                                    storage, current_user.username, len(assembled)
+                                )
+                                rewritten_cnt = sum(1 for it in assembled if it["rewritten"] is not None)
+                                st.session_state["matched_items"] = assembled
+                                st.session_state["generated_exam_pdf"] = None
+                                st.session_state["user_answers"] = {}
+                                st.session_state["graded"] = False
+                                st.session_state["ai_explanations"] = {}
+                                st.session_state["ai_chats"] = {}
+                                st.session_state["_tab2_last_extract_summary"] = (
+                                    len(assembled),
+                                    sum(1 for it in assembled if it["rewritten"] is None),
+                                    rewritten_cnt,
                                 )
 
-                            prog.progress(1.0)
-                            stat.empty()
-                            consume_extraction_quota(
-                                storage, current_user.username, len(assembled)
-                            )
-                            rewritten_cnt = sum(1 for it in assembled if it["rewritten"] is not None)
-                            updated_u = None
-                            if is_premium_model(rewrite_model) and (
-                                rewritten_cnt > 0 or current_user.tier == "FREE"
-                            ):
-                                updated_u = consume_premium_model_usage(
-                                    storage,
-                                    current_user.username,
-                                    rewrite_model,
-                                    count=max(1, rewritten_cnt),
-                                )
-                            st.session_state["matched_items"] = assembled
-                            st.session_state["generated_exam_pdf"] = None
-                            st.session_state["user_answers"] = {}
-                            st.session_state["graded"] = False
-                            st.session_state["ai_explanations"] = {}
-                            st.session_state["ai_chats"] = {}
+                        last_sum = st.session_state.pop("_tab2_last_extract_summary", None)
+                        if last_sum is not None:
+                            tot_c, orig_c, rw_c = last_sum
                             rem_msg = ""
-                            if updated_u is not None and is_premium_model(rewrite_model):
-                                if updated_u.tier == "FREE":
-                                    rem_msg = f" | 남은 고급 모델 해금 크레딧: {int(getattr(updated_u, 'premium_unlock_credits', 0) or 0)}회"
-                                elif updated_u.tier in ("PRO", "ULTRA"):
-                                    pro_rem = get_remaining_pro_weekly_quota(updated_u)
-                                    rem_msg = f" | {updated_u.tier} 주간 고급 모델 잔여: {pro_rem}/{get_weekly_premium_limit(updated_u)}문항"
+                            fresh_u = get_user_by_username(storage, current_user.username)
+                            if fresh_u is not None:
+                                m_lim = get_monthly_token_limit(fresh_u)
+                                m_rem = get_remaining_monthly_tokens(fresh_u)
+                                if m_lim is not None and m_rem is not None:
+                                    rem_msg = f" | 이번 달 잔여 토큰: {m_rem:,} / {format_token_count(m_lim)}"
                             st.success(
-                                f"🎯 총 {len(assembled)}문항 추출 완료! "
-                                f"(원문 그대로 {sum(1 for it in assembled if it['rewritten'] is None)}문항 · "
-                                f"개념서 기준 개조 {rewritten_cnt}문항){rem_msg}"
+                                f"🎯 총 {tot_c}문항 추출 완료! "
+                                f"(원문 그대로 {orig_c}문항 · 개념서 기준 개조 {rw_c}문항){rem_msg}"
                             )
 
     # -----------------------------------------------------------------------
