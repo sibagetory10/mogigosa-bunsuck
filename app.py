@@ -1002,21 +1002,13 @@ def _tag_and_save_single_exam_inner(
                         _log(f"❌ {err_msg}")
                     _prog(0.65 + 0.20 * (done_cnt / max(1, total_missing)))
 
-        # 화법과 작문 / 언어와 매체 제외 및 독서·문학 공통 지문 세트 동기화
+        # 전 영역(독서 · 문학 · 화법과 작문 · 언어와 매체) 공통 지문 세트 동기화
         kor_group_passages: dict[str, str] = {}
-        excluded_kor_qs: list[int] = []
         for q_n, ext in list(extracted_by_q.items()):
-            sec = getattr(ext, "korean_section", "")
-            if sec in ("화법과 작문", "언어와 매체"):
-                excluded_kor_qs.append(q_n)
-                extracted_by_q.pop(q_n, None)
-                continue
             gid = normalize_korean_group_id(getattr(ext, "passage_group_id", ""), q_n)
             p_txt = (getattr(ext, "passage_text", "") or "").strip()
             if gid and len(p_txt) > len(kor_group_passages.get(gid, "")):
                 kor_group_passages[gid] = p_txt
-        if excluded_kor_qs:
-            _log(f"ℹ️ 화법과 작문 · 언어와 매체 {len(excluded_kor_qs)}문항은 설정에 따라 제외되었습니다 ({sorted(excluded_kor_qs)[:6]}...).")
     else:
         eng_group_passages = {}
         kor_group_passages = {}
@@ -1231,7 +1223,7 @@ def _tag_and_save_single_exam_inner(
             if p_group and len(raw_p_text) < len(kor_group_passages.get(p_group, "")) * 0.7:
                 raw_p_text = kor_group_passages[p_group]
             if not raw_p_text:
-                raw_p_text = (getattr(cq, "shared_passage_text", "") or "").strip()
+                raw_p_text = (getattr(cq, "shared_passage_text", "") or getattr(cq, "extracted_text", "") or "").strip()
             p_topic = (getattr(extracted, "passage_topic", "") or "").strip()
             k_vocab = [v.strip() for v in (getattr(extracted, "key_vocabulary", []) or []) if v and v.strip()]
 
@@ -5914,8 +5906,8 @@ def _render_tab2_korean_transform_section() -> None:
     user_max_jobs = None if max_batch_q is None else max_batch_q
     max_limit_badge = "제한 없음" if user_max_jobs is None else f"1회 최대 **{user_max_jobs}문항**까지"
     st.caption(
-        f"💡 **[탭 1]**에서 수집한 국어 공통 영역(**독서 · 문학**) 지문 세트를 선택하면, "
-        f"해당 지문에 딸린 문항 수(3~6문항)만큼 AI가 지문 전체의 핵심 출제 포인트를 바탕으로 **자유 유형 세트 문항을 일괄 재창작**합니다. ({max_limit_badge})"
+        f"💡 **[탭 1]**에서 수집한 국어 전 영역(**독서 · 문학 · 화법과 작문 · 언어와 매체**) 지문/문항 세트를 선택하면, "
+        f"해당 세트의 문항 수만큼 AI가 핵심 출제 포인트를 바탕으로 **자유 유형 세트 문항을 일괄 재창작**합니다. ({max_limit_badge})"
     )
 
     all_db = storage.load_db()
@@ -5973,7 +5965,7 @@ def _render_tab2_korean_transform_section() -> None:
     with fc2:
         sel_kor_sec = st.selectbox(
             "영역 필터",
-            options=["전체", "독서", "문학"],
+            options=["전체", "독서", "문학", "화법과 작문", "언어와 매체"],
             key="tab2_kor_filter_sec",
         )
     with fc3:
@@ -5983,12 +5975,21 @@ def _render_tab2_korean_transform_section() -> None:
             key="tab2_kor_filter_kw",
         )
 
+    def _classify_kor_sec(cs: str) -> str:
+        if "문학" in cs:
+            return "문학"
+        if "화법" in cs or "작문" in cs:
+            return "화법과 작문"
+        if "언어" in cs or "매체" in cs or "문법" in cs:
+            return "언어와 매체"
+        return "독서"
+
     kw_low = (kor_kw or "").strip().lower()
     filtered_sets: list[dict[str, Any]] = []
     for e in set_entries:
         if sel_kor_exam != "전체" and e["exam_name"] != sel_kor_exam:
             continue
-        sec_label = "문학" if "문학" in e["curr_subj"] else "독서"
+        sec_label = _classify_kor_sec(e["curr_subj"])
         if sel_kor_sec != "전체" and sec_label != sel_kor_sec:
             continue
         if kw_low:
@@ -6064,7 +6065,7 @@ def _render_tab2_korean_transform_section() -> None:
             with st.spinner(f"🤖 {MODEL_LABELS.get(EXAM_TAGGING_MODEL, EXAM_TAGGING_MODEL)}로 국어 지문 세트({len(chosen_sets)}개 세트) 재구성 중..."):
                 for s_entry in chosen_sets:
                     curr_subj = s_entry["curr_subj"]
-                    kor_sec = "문학" if "문학" in curr_subj else "독서"
+                    kor_sec = _classify_kor_sec(curr_subj)
                     m_sub = re.search(r"\(([^)]+)\)", curr_subj)
                     kor_sub = m_sub.group(1) if m_sub else ""
                     try:

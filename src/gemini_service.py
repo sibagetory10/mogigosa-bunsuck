@@ -4124,22 +4124,20 @@ def analyze_korean_exam_pdf_batch_with_gemini(
 
     system_inst = (
         "당신은 대한민국 수능·평가원·교육청 국어 영역(제1교시) 기출 분석 전문가입니다.\n"
-        "이번 수집의 핵심 목표는 **공통 영역인 '독서'와 '문학' 지문 세트만 집중 추출**하는 것입니다.\n"
-        "'화법과 작문', '언어와 매체' 문항은 `korean_section`을 `'화법과 작문'` 또는 `'언어와 매체'`로 분류하고 `passage_text`·`official_explanation`을 간결히 비우세요.\n\n"
+        "요청된 전체 국어 문항(**독서 · 문학 · 화법과 작문 · 언어와 매체**, 1~45번 전체)을 빠짐없이 분석해 JSON(questions)으로 추출하세요.\n\n"
         "[추출 규칙]\n"
         "1. `korean_section`: 반드시 `'독서'`, `'문학'`, `'화법과 작문'`, `'언어와 매체'` 중 하나로 정확히 분류하세요.\n"
-        "   - 고3·평가원·수능 시험지에서 35~45번은 선택과목(화법과 작문 / 언어와 매체)이므로 독서/문학으로 분류하지 마세요.\n"
-        "2. `korean_subgenre`: 독서는 `'독서론'`, `'인문·예술'`, `'사회·경제'`, `'과학·기술'`, `'주제 통합'` 중 하나로, 문학은 `'현대시'`, `'고전시가'`, `'현대소설'`, `'고전소설'`, `'극·수필'`, `'갈래 복합'` 중 하나로 적으세요.\n"
-        "3. `passage_group_id`: 시험지에 표시된 공통 지문 세트 범위(예: `'1~3'`, `'4~9'`, `'18~21'`)를 적으세요.\n"
+        "2. `korean_subgenre`: 독서는 `'독서론'`/`'인문·예술'`/`'사회·경제'`/`'과학·기술'`/`'주제 통합'`, 문학은 `'현대시'`/`'고전시가'`/`'현대소설'`/`'고전소설'`/`'극·수필'`/`'갈래 복합'`, 화작은 `'화법'`/`'작문'`/`'화법·작문 통합'`, 언매는 `'언어(문법)'`/`'매체'` 등으로 적으세요.\n"
+        "3. `passage_group_id`: 시험지에 표시된 공통 지문 세트 범위(예: `'1~3'`, `'4~9'`, `'35~37'`, `'38~42'`)를 적으세요. 단독 문항이면 해당 문항 번호를 적으세요.\n"
         + passage_rule
-        + "5. `passage_topic`: 지문의 핵심 주제 또는 문학 작품명·작가(예: `'한용운, 「님의 침묵」'`, `'법적 의제와 간주의 차이'`)를 1줄로 요약하세요.\n"
-        "6. `key_vocabulary`: 지문의 핵심 개념어·어휘·문학 개념 3~5개를 나열하세요.\n"
-        "7. `question_type`: 원래 문항 유형(예: `'세부 내용 일치'`, `'핵심 논지 추론'`, `'<보기> 사례 적용'`, `'표현상 특징'`, `'서술상 특징'`, `'문맥적 어휘 의미'`).\n"
+        + "5. `passage_topic`: 지문의 핵심 주제, 문학 작품명·작가, 또는 문법·화작 핵심 소재를 1줄로 요약하세요.\n"
+        "6. `key_vocabulary`: 지문·문항의 핵심 개념어·어휘·문법/문학 개념 3~5개를 나열하세요.\n"
+        "7. `question_type`: 원래 문항 유형(예: `'세부 내용 일치'`, `'핵심 논지 추론'`, `'<보기> 사례 적용'`, `'표현상 특징'`, `'고쳐쓰기·자료 활용'`, `'음운·문장 구조 분석'`).\n"
         "8. `official_explanation`과 `answer`: 해설지 기준 핵심 풀이 근거 요약(1~2문장)과 공식 정답(`'1'`~`'5'`)을 정확히 추출하세요."
     )
 
     if status_callback is not None:
-        status_callback(f"⚡ {model_name} 모델로 국어({len(ordered_q)}문항 · 독서/문학) 일괄 분석 중...")
+        status_callback(f"⚡ {model_name} 모델로 국어 전 문항({len(ordered_q)}문항 · 독서/문학/화작/언매) 일괄 분석 중...")
 
     resp = _generate_content_with_fallback(
         client=client,
@@ -4165,13 +4163,11 @@ def analyze_korean_exam_pdf_batch_with_gemini(
             cq_ref = crop_by_q.get(item.q_num)
             fallback_gid = getattr(cq_ref, "passage_group_id", "") if cq_ref is not None else ""
             item.passage_group_id = normalize_korean_group_id(item.passage_group_id or fallback_gid, item.q_num)
-            if item.korean_section in ("화법과 작문", "언어와 매체"):
-                item.passage_text = ""
-            elif not (item.passage_text or "").strip():
-                # AI 출력 토큰 절약을 위해 비워둔 경우 로컬 추출 지문 자동 복원
+            if not (item.passage_text or "").strip():
+                # AI 출력 토큰 절약을 위해 비워둔 경우 로컬 추출 지문(또는 단독 문항 본문) 자동 복원
                 local_sp = local_group_passages.get(item.passage_group_id, "")
                 if not local_sp and cq_ref is not None:
-                    local_sp = (getattr(cq_ref, "shared_passage_text", "") or "").strip()
+                    local_sp = (getattr(cq_ref, "shared_passage_text", "") or getattr(cq_ref, "extracted_text", "") or "").strip()
                 if local_sp:
                     item.passage_text = local_sp
             seen_q.add(item.q_num)
@@ -4192,13 +4188,12 @@ def analyze_korean_question_with_gemini(
     question_text_hint: str = "",
     shared_passage_hint: str = "",
 ) -> KoreanSingleExtractionOutput:
-    """국어 단일 누락 문항 보완 추출 (독서·문학 판별 및 지문·정답 추출)."""
+    """국어 단일 누락 문항 보완 추출 (독서·문학·화작·언매 전 영역 판별 및 지문·정답 추출)."""
     client = _build_client(api_key, timeout_seconds=45)
     system_inst = (
         "당신은 대한민국 수능·모의고사 국어 영역 기출 분석 전문가입니다.\n"
         "제공된 문항 이미지/텍스트와 해설을 보고 영역(`독서`, `문학`, `화법과 작문`, `언어와 매체`), "
-        "세부 갈래, 세트 범위(`passage_group_id`), 순수 지문 원문(`passage_text`), 주제/작품명, 핵심 어휘, 해설, 정답(`'1'`~`'5'`)을 추출하세요.\n"
-        "화법과 작문, 언어와 매체 문항이면 `passage_text`는 빈 문자열로 두세요."
+        "세부 갈래, 세트 범위(`passage_group_id`), 지문/자료 원문(`passage_text`), 주제/작품명, 핵심 어휘, 해설, 정답(`'1'`~`'5'`)을 추출하세요."
     )
     hint_parts: list[str] = [f"시험 회차: {exam_name}", f"문항 번호: {q_num}번"]
     if shared_passage_hint.strip():
@@ -4231,8 +4226,8 @@ def analyze_korean_question_with_gemini(
     out = _parse_structured(resp, KoreanSingleExtractionOutput)
     out.answer = _normalize_extracted_answer(out.answer)
     out.passage_group_id = normalize_korean_group_id(out.passage_group_id, q_num)
-    if out.korean_section in ("화법과 작문", "언어와 매체"):
-        out.passage_text = ""
+    if not (out.passage_text or "").strip():
+        out.passage_text = (shared_passage_hint or question_text_hint or "").strip()
     return out
 
 
@@ -4272,6 +4267,18 @@ def generate_korean_set_reconstruction(
             "문학 영역 추천 유형을 지문 특성에 맞게 자유롭게 배분하세요: "
             "표현상·서술상 특징, 시적 화자/서술자 및 인물의 정서·태도, 구절·소재(㉠~㉤/ⓐ~ⓔ 등)의 함축적 의미, "
             "<보기> 외적 준거(비평문·창작 배경) 기반 작품 감상 적절성, (가)/(나) 작품 간 비교·공통점과 차이점."
+        )
+    elif korean_section == "화법과 작문":
+        type_guide = (
+            "화법과 작문 영역 추천 유형을 지문/대화 특성에 맞게 자유롭게 배분하세요: "
+            "화자/발표자의 말하기 방식 및 전략, 청자/참여자의 반응 분석, 초고 고쳐쓰기 방안의 적절성, "
+            "<보기> 자료(도표·조사 결과·메모) 활용 및 반영 여부."
+        )
+    elif korean_section == "언어와 매체":
+        type_guide = (
+            "언어와 매체 영역 추천 유형을 지문/자료 특성에 맞게 자유롭게 배분하세요: "
+            "국어 문법(음운 변동, 단어 형성, 문장 성분·안은문장, 중세 국어) 원리 적용, "
+            "<보기> 탐구 사례 분석, 매체 자료의 정보 전달 방식·수용자 반응·매체 언어 특성 이해."
         )
     else:
         type_guide = (
