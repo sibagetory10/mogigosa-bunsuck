@@ -6714,7 +6714,7 @@ def _render_tab2_korean_transform_section() -> None:
             with st.expander(f"📄 지문 미리보기: {s_entry['exam_name']} [{s_entry['group_id']}번]", expanded=False):
                 st.text(s_entry["passage_text"][:1500] + ("..." if len(s_entry["passage_text"]) > 1500 else ""))
 
-        opt_c1, opt_c2, opt_c3 = st.columns(3)
+        opt_c1, opt_c2 = st.columns(2)
         with opt_c1:
             include_kor_diagrams = st.checkbox(
                 "🎨 비문학·문학 이해용 도식 그림 포함",
@@ -6727,7 +6727,14 @@ def _render_tab2_korean_transform_section() -> None:
                 value=False,
                 key="tab2_kor_include_passage",
             )
+        opt_c3, opt_c4 = st.columns(2)
         with opt_c3:
+            enable_kor_web_search = st.checkbox(
+                "🌐 문학 웹검색 정밀 분석 (EBS·백과 우선)",
+                value=True,
+                key="tab2_kor_enable_web_search",
+            )
+        with opt_c4:
             enable_kor_proofread = st.checkbox(
                 "🔍 2차 원문 대조 교정 (느림)",
                 value=False,
@@ -6899,6 +6906,7 @@ def _render_tab2_korean_transform_section() -> None:
                                 korean_subgenre=slot["kor_sub"],
                                 passage_topic=s_entry["passage_topic"],
                                 enable_proofread=enable_kor_proofread,
+                                enable_web_search=enable_kor_web_search,
                             )
                             return slot_i, an_out
 

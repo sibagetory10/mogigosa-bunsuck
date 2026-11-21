@@ -4599,6 +4599,61 @@ def _is_korean_poetry_genre(
     return False
 
 
+def fetch_korean_literature_web_brief(
+    api_key: str,
+    model_name: str,
+    passage_text: str,
+    korean_subgenre: str = "",
+    passage_topic: str = "",
+) -> str:
+    """
+    Google Search Grounding을 이용해 문학 작품(작가·작품명)의 EBS·기출 해설·백과사전 기반
+    핵심 특징(시대 배경, 주제, 표현상·서술상 특징, 상징적 시어/소재, 출제 포인트)을 조회한다.
+    개인 블로그/커뮤니티성 출처는 배제하며, 실패 시 빈 문자열을 반환한다.
+    """
+    clean = _strip_korean_exam_noise_lines(passage_text or "")
+    if not clean:
+        return ""
+
+    try:
+        client = _build_client(api_key, timeout_seconds=45)
+        snippet = clean[:1800]
+        search_prompt = (
+            "당신은 대한민국 수능 국어 문학 자료 조사 전문가입니다.\n"
+            "아래 문학 지문에 등장하는 작품(작품명·작가)을 웹검색으로 확인하되, **반드시 EBSi, 수능·모의고사 기출 해설, "
+            "한국민족문화대백과사전(encykorea), 두산백과, 문학사전 등 공신력 있는 교육·백과 출처만 우선 활용**하세요. "
+            "(개인 블로그의 근거 없는 추측이나 비공식 해석은 배제하세요.)\n\n"
+            f"- 갈래/참고 정보: {korean_subgenre or '문학'} / {passage_topic or '-'}\n"
+            f"- 지문 발췌:\n{snippet}\n\n"
+            "검색된 공신력 있는 자료를 바탕으로 아래 5가지를 작품별((가), (나) 등)로 간결하고 정확하게 정리하세요:\n"
+            "1. 작품명 · 작가 · 시대적/창작 배경\n"
+            "2. 핵심 주제 및 작품 성격\n"
+            "3. 대표 표현상·서술상 특징 (시상 전개, 수미상관, 시점, 어조, 비유/역설 등)\n"
+            "4. 핵심 시어·소재의 상징적 의미\n"
+            "5. 수능·모의고사 빈출 출제 포인트\n"
+            "(참고한 대표 출처명도 마지막 줄에 간단히 적으세요.)"
+        )
+        resp = _generate_content_with_fallback(
+            client=client,
+            model_name=model_name,
+            contents=search_prompt,
+            config=types.GenerateContentConfig(
+                tools=[types.Tool(google_search=types.GoogleSearch())],
+                temperature=0.1,
+                max_output_tokens=1500,
+                thinking_config=types.ThinkingConfig(
+                    thinking_level=types.ThinkingLevel.MINIMAL,
+                    include_thoughts=False,
+                ),
+            ),
+            fast_mode=True,
+        )
+        txt = (getattr(resp, "text", None) or "").strip()
+        return txt[:3500]
+    except Exception:
+        return ""
+
+
 def generate_korean_passage_analysis(
     api_key: str,
     model_name: str,
@@ -4609,6 +4664,7 @@ def generate_korean_passage_analysis(
     korean_subgenre: str = "",
     passage_topic: str = "",
     enable_proofread: bool = False,
+    enable_web_search: bool = True,
 ) -> KoreanPassageAnalysisOutput:
     """
     국어 지문 1개 세트를 수능·학원형 정밀 지문 분석지(핵심 주제, 구조 흐름, 문단/연별 요약,
@@ -4619,6 +4675,16 @@ def generate_korean_passage_analysis(
         raise ValueError("분석할 국어 지문 원문(passage_text)이 비어 있습니다.")
 
     is_poetry = _is_korean_poetry_genre(korean_section, korean_subgenre, clean_passage)
+    web_brief = ""
+    if enable_web_search and (korean_section == "문학" or is_poetry):
+        web_brief = fetch_korean_literature_web_brief(
+            api_key=api_key,
+            model_name=model_name,
+            passage_text=clean_passage,
+            korean_subgenre=korean_subgenre,
+            passage_topic=passage_topic,
+        )
+
     poetry_rule = (
         "9. `poetry_works` 및 `poetry_underline_notes`: **시(시가) 갈래이므로 필수 작성** —\n"
         "   - `poetry_works`: 지문 속 각 시 작품((가), (나) 등 시 갈래만 작품별로 분리)에 대해 아래를 작성하세요:\n"
@@ -4655,9 +4721,17 @@ def generate_korean_passage_analysis(
             "문단별 논지 전개 흐름과 구체적 사례 적용 원리를 정밀 정리하세요."
         )
 
+    grounding_inst = (
+        "아래에 제공된 `[신뢰할 수 있는 웹검색 문학 해설]`을 **핵심 분석 기준(메인 기준)**으로 삼아 "
+        "작품의 시대 배경, 핵심 주제, 표현상 특징, 상징적 시어·소재, 출제 포인트를 깊이 있게 반영하되, "
+        "지문 원문 인용(`poetry_works.lines`, `marks.quote`)은 반드시 `[지문 원문]`에 실제로 발췌된 구절만 그대로 사용하세요.\n\n"
+        if web_brief
+        else f"주어진 [{korean_section} · {korean_subgenre or '공통'}] 지문 원문만을 100% 근거로 하여, "
+    )
+
     system_inst = (
         "당신은 대한민국 대치동/수능 국어 영역 일타 강사 수준의 정밀 지문 분석가입니다.\n"
-        f"주어진 [{korean_section} · {korean_subgenre or '공통'}] 지문 원문만을 100% 근거로 하여, "
+        f"{grounding_inst}"
         "학생과 강사가 바로 수업·복습에 활용할 수 있는 **수능·학원형 정밀 지문 분석지**를 JSON으로 작성하세요.\n\n"
         "[작성 규칙]\n"
         "1. `title`: 지문의 핵심 제목이나 작품명·작가를 간결하게 적으세요.\n"
@@ -4686,13 +4760,19 @@ def generate_korean_passage_analysis(
         + f"\n{poetry_rule}"
     )
 
+    web_block = (
+        f"[신뢰할 수 있는 웹검색 문학 해설 (메인 분석 기준)]\n{web_brief}\n\n"
+        if web_brief
+        else ""
+    )
     prompt = (
         f"[지문 정보]\n"
         f"- 출처: {exam_name} [{group_id}번]\n"
         f"- 영역/갈래: {korean_section} ({korean_subgenre or '공통'})\n"
         f"- 참고 주제/작품: {passage_topic or '-'}\n\n"
+        f"{web_block}"
         f"[지문 원문]\n{clean_passage}\n\n"
-        "위 지문을 바탕으로 정밀 지문 분석지 JSON을 작성하세요."
+        "위 자료를 바탕으로 정밀 지문 분석지 JSON을 작성하세요."
     )
 
     resp = _generate_content_with_fallback(
