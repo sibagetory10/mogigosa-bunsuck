@@ -1034,6 +1034,32 @@ def _clean_and_reflow_korean_passage(passage_text: str, is_poetry_or_literature:
     return [p for p in paragraphs if p.strip()]
 
 
+def _format_structure_flow_html(flow_text: str) -> str:
+    """전개 흐름 문자열을 단계별 줄바꿈('도입 : ~~~' 형태) HTML로 변환한다."""
+    raw = (flow_text or "").strip()
+    if not raw:
+        return ""
+    parts = [p.strip() for p in re.split(r"\s*(?:→|->|\r?\n)+\s*", raw) if p.strip()]
+    stage_paren_re = re.compile(
+        r"^(도입|전개|심화(?:/전환)?|전환|결론|발단|위기|절정|결말|서론|본론)\s*\((.+)\)$"
+    )
+    stage_colon_re = re.compile(
+        r"^(도입|전개|심화(?:/전환)?|전환|결론|발단|위기|절정|결말|서론|본론)\s*[:：]\s*(.+)$"
+    )
+    formatted: list[str] = []
+    for part in parts:
+        m_paren = stage_paren_re.match(part)
+        if m_paren:
+            formatted.append(f"<b>{html.escape(m_paren.group(1))}</b> : {html.escape(m_paren.group(2).strip())}")
+            continue
+        m_colon = stage_colon_re.match(part)
+        if m_colon:
+            formatted.append(f"<b>{html.escape(m_colon.group(1))}</b> : {html.escape(m_colon.group(2).strip())}")
+            continue
+        formatted.append(html.escape(part))
+    return "<br/>".join(formatted)
+
+
 def generate_korean_passage_analysis_pdf(
     analyses: list[dict[str, Any]],
     doc_title: str = "수능·모의고사 국어 정밀 지문 분석지",
@@ -1088,9 +1114,24 @@ def generate_korean_passage_analysis_pdf(
         break-after: avoid;
         page-break-after: avoid;
     }
-    .sec-keep {
+    .sec-keep-tbl {
+        width: 100%;
+        border-collapse: collapse;
+        border: none;
+        margin: 0;
+        padding: 0;
         break-inside: avoid;
         page-break-inside: avoid;
+    }
+    .sec-keep-tr {
+        break-inside: avoid;
+        page-break-inside: avoid;
+    }
+    .sec-keep-td {
+        padding: 0;
+        margin: 0;
+        border: none;
+        vertical-align: top;
     }
     .theme-box {
         background-color: #EFF6FF;
@@ -1109,6 +1150,10 @@ def generate_korean_passage_analysis_pdf(
         margin-bottom: 8pt;
         break-inside: avoid;
         page-break-inside: avoid;
+    }
+    .flow-lines {
+        margin-top: 2pt;
+        line-height: 1.58;
     }
     .para-card {
         border-bottom: 0.6pt solid #E2E8F0;
@@ -1206,13 +1251,25 @@ def generate_korean_passage_analysis_pdf(
           </div>
         """
 
-        theme_html = f"""
-          <div class="sec-keep">
-            <div class="sec-title">1. 핵심 주제 및 논리 · 시상 전개</div>
-            <div class="theme-box"><b>핵심 주제:</b> {html.escape(an.core_theme)}</div>
+        def _keep_block(inner_html: str) -> str:
+            return (
+                "<table class='sec-keep-tbl'><tr class='sec-keep-tr'>"
+                f"<td class='sec-keep-td'>{inner_html}</td>"
+                "</tr></table>"
+            )
+
+        flow_html_inner = _format_structure_flow_html(an.structure_flow)
+        theme_html = _keep_block(f"""
+          <div class="sec-title">1. 핵심 주제 및 논리 · 시상 전개</div>
+          <div class="theme-box">
+            <div><b>핵심 주제</b></div>
+            <div>{html.escape(an.core_theme)}</div>
           </div>
-          <div class="flow-box"><b>전개 흐름:</b> {html.escape(an.structure_flow)}</div>
-        """
+          <div class="flow-box">
+            <div><b>전개 흐름:</b></div>
+            <div class="flow-lines">{flow_html_inner}</div>
+          </div>
+        """)
 
         para_rows = []
         for ps in (an.paragraph_summaries or []):
@@ -1222,8 +1279,7 @@ def generate_korean_passage_analysis_pdf(
                 f"{html.escape(ps.summary)}{kp_html}</div>"
             )
         para_html = (
-            f"<div class='sec-keep'><div class='sec-title'>2. 문단 · 연별 정밀 요약</div>{para_rows[0]}</div>"
-            + "".join(para_rows[1:])
+            _keep_block(f"<div class='sec-title'>2. 문단 · 연별 정밀 요약</div>{''.join(para_rows)}")
             if para_rows
             else ""
         )
@@ -1237,10 +1293,10 @@ def generate_korean_passage_analysis_pdf(
                 f"{html.escape(mv.meaning)}</div>"
             )
         vocab_html = (
-            "<div class='sec-keep'>"
-            "<div class='sec-title'>3. 핵심 표지(㉠~㉤ · ⓐ~ⓔ) 및 어휘 · 개념 풀이</div>"
-            f"<div class='vocab-list'>{''.join(vocab_rows)}</div>"
-            "</div>"
+            _keep_block(
+                "<div class='sec-title'>3. 핵심 표지(㉠~㉤ · ⓐ~ⓔ) 및 어휘 · 개념 풀이</div>"
+                f"<div class='vocab-list'>{''.join(vocab_rows)}</div>"
+            )
             if vocab_rows
             else ""
         )
@@ -1251,7 +1307,7 @@ def generate_korean_passage_analysis_pdf(
             if n.strip()
         )
         area_html = (
-            f"<div class='sec-keep'><div class='sec-title'>4. 영역별 핵심 정리 ({html.escape(section_label)})</div>{area_items}</div>"
+            _keep_block(f"<div class='sec-title'>4. 영역별 핵심 정리 ({html.escape(section_label)})</div>{area_items}")
             if area_items
             else ""
         )
@@ -1262,7 +1318,9 @@ def generate_korean_passage_analysis_pdf(
             if c.strip()
         )
         cp_html = (
-            f"<div class='sec-keep'><div class='sec-title'>5. 출제 예상 포인트 및 오답 주의사항</div><div class='checkpoint-box'>{cp_items}</div></div>"
+            _keep_block(
+                f"<div class='sec-title'>5. 출제 예상 포인트 및 오답 주의사항</div><div class='checkpoint-box'>{cp_items}</div>"
+            )
             if cp_items
             else ""
         )
