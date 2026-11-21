@@ -607,6 +607,13 @@ class KoreanMarkerVocabItem(BaseModel):
     meaning: str = Field(..., description="문맥적 의미, 지시 대상 또는 개념 설명")
 
 
+class KoreanPoetryLineNote(BaseModel):
+    """시(현대시·고전시가 등) 원문에서 밑줄을 그어 해설할 핵심 시구·시어 항목."""
+
+    quote: str = Field(..., description="원문에 실제로 등장하는 시구·시어 그대로 발췌 (1개 행 또는 구절)")
+    explanation: str = Field(..., description="해당 밑줄 시구의 표현상 특징, 시적 의미 및 화자의 정서·태도 해설")
+
+
 class KoreanDiagramNode(BaseModel):
     """비문학 지문 이해를 돕는 도식 그림의 개별 개념/단계 노드."""
 
@@ -785,6 +792,10 @@ class KoreanPassageAnalysisOutput(BaseModel):
     exam_checkpoints: list[str] = Field(
         default_factory=list,
         description="수능·내신 출제 예상 포인트 및 오답 함정 주의사항 3~5개",
+    )
+    poetry_underline_notes: list[KoreanPoetryLineNote] = Field(
+        default_factory=list,
+        description="시(현대시·고전시가 등) 갈래일 때 원문에서 밑줄을 그어 해설할 핵심 시구·시어 목록 (4~7개). 산문/비문학은 빈 리스트.",
     )
     visual_diagram: KoreanVisualDiagram | None = Field(
         default=None,

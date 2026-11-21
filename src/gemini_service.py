@@ -4578,6 +4578,27 @@ def proofread_korean_passage_analysis(
         return _sanitize_korean_analysis_output(draft)
 
 
+def _is_korean_poetry_genre(
+    korean_section: str,
+    korean_subgenre: str = "",
+    passage_text: str = "",
+) -> bool:
+    """현대시·고전시가 등 시가 문학 갈래인지 판별한다."""
+    sub = (korean_subgenre or "").strip()
+    sec = (korean_section or "").strip()
+    if any(k in sub for k in ("소설", "극", "시나리오", "희곡", "수필")):
+        return False
+    if any(k in sub for k in ("현대시", "고전시가", "시가", "시조", "가사", "향가", "한시")) or sub == "시":
+        return True
+    if "문학" in sec and not sub and passage_text:
+        lines = [ln.strip() for ln in passage_text.splitlines() if ln.strip()]
+        if len(lines) >= 6:
+            lens = sorted(len(ln) for ln in lines)
+            if lens[len(lens) // 2] <= 22:
+                return True
+    return False
+
+
 def generate_korean_passage_analysis(
     api_key: str,
     model_name: str,
@@ -4591,11 +4612,22 @@ def generate_korean_passage_analysis(
 ) -> KoreanPassageAnalysisOutput:
     """
     국어 지문 1개 세트를 수능·학원형 정밀 지문 분석지(핵심 주제, 구조 흐름, 문단/연별 요약,
-    ㉠~㉤·ⓐ~ⓔ 표지 및 어휘 해설, 영역별 정리, 출제 포인트)로 구조화 분석한다.
+    개념 정의 정리, 영역별 정리, 출제 포인트, 시 갈래 밑줄 해설)로 구조화 분석한다.
     """
     clean_passage = _strip_korean_exam_noise_lines(passage_text or "")
     if not clean_passage:
         raise ValueError("분석할 국어 지문 원문(passage_text)이 비어 있습니다.")
+
+    is_poetry = _is_korean_poetry_genre(korean_section, korean_subgenre, clean_passage)
+    poetry_rule = (
+        "9. `poetry_underline_notes`: **시(시가) 갈래이므로 필수 작성** — "
+        "원문에서 표현상 특징(비유, 감각적 심상, 역설, 반어, 대비, 설의, 객관적 상관물 등)이나 "
+        "화자의 정서·태도가 핵심적으로 드러나는 시구·시어 **4~7개**를 골라, "
+        "`quote`에는 반드시 `[지문 원문]`에 실제로 등장하는 어구 그대로(오타·변형 없이) 넣고, "
+        "`explanation`에는 표현법과 시적·함축적 의미를 구체적으로 해설하세요."
+        if is_poetry
+        else "9. `poetry_underline_notes`: 시(시가) 갈래가 아니므로 빈 리스트 `[]`로 두세요."
+    )
 
     client = _build_client(api_key, timeout_seconds=90)
     if korean_section == "문학":
@@ -4645,6 +4677,7 @@ def generate_korean_passage_analysis(
                 + _KOREAN_DIAGRAM_GUIDE
             )
         )
+        + f"\n{poetry_rule}"
     )
 
     prompt = (

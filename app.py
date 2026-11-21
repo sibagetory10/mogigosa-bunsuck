@@ -153,6 +153,7 @@ from src.models import (
     resolve_question_concept_reference,
 )
 from src.pdf_generator import (
+    _is_korean_poetry_item,
     generate_custom_exam_pdf,
     generate_korean_passage_analysis_pdf,
     generate_korean_passage_only_pdf,
@@ -6942,9 +6943,13 @@ def _render_tab2_korean_transform_section() -> None:
                 "exam_name": s_entry["exam_name"],
                 "group_id": s_entry["group_id"],
                 "section_label": slot["curr_subj"],
+                "subgenre": slot["kor_sub"],
                 "passage_text": s_entry["passage_text"],
                 "analysis": slot["analysis"],
             }
+            is_poetry_slot = _is_korean_poetry_item(
+                slot["curr_subj"], slot["kor_sub"], s_entry["passage_text"], slot["analysis"]
+            )
             if slot["pdf_bytes"] is None:
                 try:
                     single_pdf = generate_korean_passage_analysis_pdf(
@@ -6961,14 +6966,15 @@ def _render_tab2_korean_transform_section() -> None:
                     st.error(f"[{s_entry['exam_name']} {s_entry['group_id']}번] 지문 분석 PDF 생성 실패: {exc}")
                     continue
 
-            # 지문 원문 전용 PDF도 DB에 분리 저장해 두고 원문 ON/OFF 시 즉시 이어붙이기
-            passage_pdf_bytes = storage.get_korean_passage_pdf_bytes(slot["cache_key"])
-            if passage_pdf_bytes is None and (s_entry.get("passage_text") or "").strip():
-                try:
-                    passage_pdf_bytes = generate_korean_passage_only_pdf(single_item)
-                    storage.save_korean_passage_pdf_bytes(slot["cache_key"], passage_pdf_bytes)
-                except Exception as exc_p:
-                    if include_kor_passage:
+            # 시 갈래는 분석 PDF 자체에 밑줄 원문이 항상 포함되므로 원문 전용 PDF 중복 병합 제외
+            passage_pdf_bytes = None
+            if include_kor_passage and not is_poetry_slot:
+                passage_pdf_bytes = storage.get_korean_passage_pdf_bytes(slot["cache_key"])
+                if passage_pdf_bytes is None and (s_entry.get("passage_text") or "").strip():
+                    try:
+                        passage_pdf_bytes = generate_korean_passage_only_pdf(single_item)
+                        storage.save_korean_passage_pdf_bytes(slot["cache_key"], passage_pdf_bytes)
+                    except Exception as exc_p:
                         st.warning(f"[{s_entry['exam_name']} {s_entry['group_id']}번] 원문 PDF 생성 건너뜀: {exc_p}")
 
             pdf_parts.append(slot["pdf_bytes"])
@@ -7052,6 +7058,10 @@ def _render_tab2_korean_transform_section() -> None:
                         st.markdown("**⚠️ 출제 예상 포인트 및 오답 주의사항**")
                         for cp in an.exam_checkpoints:
                             st.write(f"- {cp}")
+                    if getattr(an, "poetry_underline_notes", None):
+                        st.markdown("**✍️ 원문 시구 밑줄 해설**")
+                        for idx_p, pn in enumerate(an.poetry_underline_notes, start=1):
+                            st.write(f"- **({idx_p}) <u>{pn.quote}</u>**: {pn.explanation}", unsafe_allow_html=True)
 
 
 with tab2:

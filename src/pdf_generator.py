@@ -1254,12 +1254,125 @@ _KOREAN_ANALYSIS_CSS = """
         max-width: 100%;
         height: auto;
     }
+    .poem-ul {
+        font-weight: bold;
+        color: #1E3A8A;
+        text-decoration: underline;
+    }
+    .poem-badge {
+        font-size: 7.5pt;
+        font-weight: bold;
+        color: #1D4ED8;
+    }
+    .poem-notes-box {
+        background-color: #EFF6FF;
+        border: 0.8pt solid #BFDBFE;
+        border-radius: 4pt;
+        padding: 7pt 10pt;
+        margin-top: 6pt;
+        margin-bottom: 8pt;
+    }
+    .poem-notes-hdr {
+        font-weight: bold;
+        color: #1E3A8A;
+        margin-bottom: 4pt;
+        font-size: 9.2pt;
+    }
+    .poem-note-row {
+        margin-bottom: 3.5pt;
+        font-size: 8.9pt;
+        line-height: 1.5;
+        break-inside: avoid;
+        page-break-inside: avoid;
+    }
     """
 
 
-def _build_korean_passage_html_block(passage_text: str, is_lit: bool, sec_title: str = "6. 원문 지문 전체") -> str:
-    """기호 제거 및 문단 재조립된 국어 원문 지문 HTML 블록을 생성한다."""
+_CIRCLED_NUMS = ("①", "②", "③", "④", "⑤", "⑥", "⑦", "⑧", "⑨", "⑩")
+
+
+def _is_korean_poetry_item(
+    section_label: str,
+    subgenre: str = "",
+    passage_text: str = "",
+    an: Any = None,
+) -> bool:
+    """현대시·고전시가 등 시가 문학 갈래인지 판별한다."""
+    if an is not None and getattr(an, "poetry_underline_notes", None):
+        return True
+    sub = (subgenre or "").strip()
+    sec = (section_label or "").strip()
+    if any(k in sub for k in ("소설", "극", "시나리오", "희곡", "수필")):
+        return False
+    if any(k in sub for k in ("현대시", "고전시가", "시가", "시조", "가사", "향가", "한시")) or sub == "시":
+        return True
+    if "문학" in sec and not sub and passage_text:
+        lines = [ln.strip() for ln in passage_text.splitlines() if ln.strip()]
+        if len(lines) >= 6:
+            lens = sorted(len(ln) for ln in lines)
+            if lens[len(lens) // 2] <= 22:
+                return True
+    return False
+
+
+def _highlight_poem_line_html(
+    line_text: str,
+    notes_with_idx: list[tuple[int, str]],
+    matched_indices: set[int],
+) -> str:
+    """원문 시 행에서 아직 매칭되지 않은 시구(quote)를 찾아 밑줄 + 원문자 번호 HTML로 변환한다."""
+    segments: list[tuple[bool, str, int]] = [(False, line_text, -1)]
+    for note_idx, quote in notes_with_idx:
+        if note_idx in matched_indices or not quote:
+            continue
+        new_segments: list[tuple[bool, str, int]] = []
+        found_here = False
+        for is_match, seg_txt, seg_idx in segments:
+            if is_match or found_here:
+                new_segments.append((is_match, seg_txt, seg_idx))
+                continue
+            pos = seg_txt.find(quote)
+            if pos != -1:
+                if pos > 0:
+                    new_segments.append((False, seg_txt[:pos], -1))
+                new_segments.append((True, seg_txt[pos : pos + len(quote)], note_idx))
+                if pos + len(quote) < len(seg_txt):
+                    new_segments.append((False, seg_txt[pos + len(quote) :], -1))
+                matched_indices.add(note_idx)
+                found_here = True
+            else:
+                new_segments.append((False, seg_txt, -1))
+        segments = new_segments
+
+    out_parts: list[str] = []
+    for is_match, seg_txt, seg_idx in segments:
+        if is_match:
+            badge = _CIRCLED_NUMS[seg_idx] if seg_idx < len(_CIRCLED_NUMS) else f"({seg_idx + 1})"
+            out_parts.append(
+                f"<span class='poem-ul'><u>{html.escape(seg_txt)}</u></span>"
+                f"<span class='poem-badge'> {badge}</span>"
+            )
+        else:
+            out_parts.append(html.escape(seg_txt))
+    return "".join(out_parts)
+
+
+def _build_korean_passage_html_block(
+    passage_text: str,
+    is_lit: bool,
+    sec_title: str = "6. 원문 지문 전체",
+    underline_notes: list[Any] | None = None,
+) -> str:
+    """기호 제거 및 문단 재조립된 국어 원문 지문 HTML 블록(+ 시 밑줄 해설)을 생성한다."""
     reflowed_paragraphs = _clean_and_reflow_korean_passage(passage_text, is_poetry_or_literature=is_lit)
+    clean_notes = [
+        (i, (getattr(n, "quote", "") or "").strip(), (getattr(n, "explanation", "") or "").strip())
+        for i, n in enumerate(underline_notes or [])
+        if (getattr(n, "quote", "") or "").strip()
+    ]
+    notes_with_idx = [(i, q) for i, q, _ in clean_notes]
+    matched_indices: set[int] = set()
+
     p_blocks: list[str] = []
     p_cls = "passage-lit-line" if is_lit else "passage-p"
     for rp in reflowed_paragraphs:
@@ -1268,11 +1381,33 @@ def _build_korean_passage_html_block(passage_text: str, is_lit: bool, sec_title:
         elif re.match(r"^(?:\[\d{1,2}\s*[~\-～]\s*\d{1,2}\]|\([가나다라]\)|<[가-힣\s]+>)", rp):
             p_blocks.append(f"<div class='passage-hdr'>{html.escape(rp)}</div>")
         else:
-            p_blocks.append(f"<p class='{p_cls}'>{html.escape(rp)}</p>")
+            inner_html = (
+                _highlight_poem_line_html(rp, notes_with_idx, matched_indices)
+                if notes_with_idx
+                else html.escape(rp)
+            )
+            p_blocks.append(f"<p class='{p_cls}'>{inner_html}</p>")
     if not p_blocks:
         return ""
     title_html = f"<div class='sec-title'>{html.escape(sec_title)}</div>" if sec_title else ""
-    return f"{title_html}<div class='passage-box'>{''.join(p_blocks)}</div>"
+
+    notes_html = ""
+    if clean_notes:
+        note_rows: list[str] = []
+        for i, q, exp in clean_notes:
+            badge = _CIRCLED_NUMS[i] if i < len(_CIRCLED_NUMS) else f"({i + 1})"
+            note_rows.append(
+                f"<div class='poem-note-row'><span class='poem-badge'>{badge}</span> "
+                f"<span class='poem-ul'><u>{html.escape(q)}</u></span> : {html.escape(exp)}</div>"
+            )
+        notes_html = (
+            "<div class='poem-notes-box'>"
+            "<div class='poem-notes-hdr'>[밑줄 시구 정밀 해설]</div>"
+            f"{''.join(note_rows)}"
+            "</div>"
+        )
+
+    return f"{title_html}<div class='passage-box'>{''.join(p_blocks)}</div>{notes_html}"
 
 
 def _render_story_pdf(full_html: str, css_text: str) -> bytes:
@@ -1315,8 +1450,10 @@ def generate_korean_passage_analysis_pdf(
         exam_name = item.get("exam_name", "")
         group_id = item.get("group_id", "")
         section_label = item.get("section_label", "독서")
+        subgenre = item.get("subgenre", "")
         passage_text = (item.get("passage_text", "") or "").strip()
         is_lit = "문학" in section_label
+        is_poetry = _is_korean_poetry_item(section_label, subgenre, passage_text, an)
 
         pb_cls = " class='page-break'" if idx > 0 else ""
         banner_html = f"""
@@ -1407,9 +1544,17 @@ def generate_korean_passage_analysis_pdf(
             else ""
         )
 
+        poetry_notes = getattr(an, "poetry_underline_notes", None) or []
+        should_include_passage = include_passage or is_poetry
+        passage_sec_title = "6. 원문 시 전문 및 밑줄 정밀 해설" if is_poetry else "6. 원문 지문 전체"
         passage_html = (
-            _build_korean_passage_html_block(passage_text, is_lit, sec_title="6. 원문 지문 전체")
-            if include_passage
+            _build_korean_passage_html_block(
+                passage_text,
+                is_lit,
+                sec_title=passage_sec_title,
+                underline_notes=poetry_notes if is_poetry else None,
+            )
+            if should_include_passage
             else ""
         )
 
