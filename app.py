@@ -7019,7 +7019,7 @@ def _render_tab2_korean_transform_section() -> None:
                     st.info(f"**핵심 주제:** {an.core_theme}")
                     st.success(f"**전개 흐름:** {an.structure_flow}")
                     _v_diag = getattr(an, "visual_diagram", None)
-                    if _v_diag is not None and getattr(_v_diag, "nodes", None):
+                    if _v_diag is not None and (getattr(_v_diag, "nodes", None) or getattr(_v_diag, "graph_spec", None)):
                         try:
                             st.image(
                                 render_korean_diagram_png(_v_diag),

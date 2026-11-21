@@ -4451,6 +4451,24 @@ def _strip_korean_exam_noise_lines(text: str) -> str:
     return "\n".join(cleaned_lines).strip()
 
 
+_KOREAN_DIAGRAM_GUIDE = (
+    "지문의 핵심 내용을 그림으로 한눈에 이해할 수 있도록 아래 8종 중 가장 적합한 `diagram_type`을 고르세요 "
+    "(단순 박스 나열 `flow`만 반복하지 말고 지문 성격에 맞게 적극적으로 다양화하세요):\n"
+    "  ① `matrix` (항목별 비교 매트릭스표): 두 사상가·이론·법제·개념의 차이점을 비교할 때 사용. "
+    "`nodes`에 비교 대상 2~3개 제목을 넣고, `matrix_rows`에 기준(`criterion`)과 대상별 값(`values`) 3~5행을 반드시 채우세요.\n"
+    "  ② `graph` (X-Y 비례/함수 그래프): 경제(수요·공급·탄력성·비용·가격)나 과학(온도·압력·농도)에서 변수 간 비례·반비례·임계점 관계를 설명할 때 사용. "
+    "`graph_spec`(`x_label`, `y_label`, `curves`[trend: up/down/u_shape/inv_u/flat], `highlight_point`)를 반드시 채우고 `nodes`에 1~2개 핵심 해석을 넣으세요.\n"
+    "  ③ `anatomy` (구조·장치 모식도): 과학·기술·기계(튜링 기계, 세포, 엔진, 컴퓨터 구조 등)의 구성 요소와 역할을 설명할 때 사용. "
+    "`center_label`에 중앙 장치/원리명을, `nodes`에 3~4개 부위·기능 카드를 넣으세요.\n"
+    "  ④ `cycle` (원형 순환·피드백 루프): 상호작용, 피드백, 순환 과정(예: 네트워크 외부성, 생태계·경제 순환)에 사용. `center_label`과 `nodes` 3~4개, 짧은 `relation_labels`(6자 이내)를 넣으세요.\n"
+    "  ⑤ `timeline` (시대·단계 변천 연표): 철학·과학사·역사적 이론 발전 순서에 사용. `nodes`에 시간순 3~4개 단계를 넣으세요.\n"
+    "  ⑥ `venn` (포함·교집합 벤다이어그램): 두 개념의 공통점(`center_label`)과 고유 영역을 구분할 때 사용.\n"
+    "  ⑦ `scale` (대립·균형 저울도): 두 상충 가치·법익·트레이드오프를 비교할 때 사용 (`nodes` 2개, `scale_tilt`: balanced/left/right).\n"
+    "  ⑧ `flow` (원리·과정 흐름도): 인과·절차 단계가 명확한 경우 사용 (`nodes` 2~4개, 짧은 `relation_labels` 6자 이내).\n"
+    "공통 규칙: 각 카드 `details`는 1~3개의 짧은 핵심 구절(26자 이내), `takeaway`는 1줄 핵심 정리."
+)
+
+
 def generate_korean_passage_analysis(
     api_key: str,
     model_name: str,
@@ -4506,15 +4524,11 @@ def generate_korean_passage_analysis(
         "7. `exam_checkpoints`: 실제 모의고사·내신에서 자주 출제되는 포인트와 선지 함정 주의사항 3~5개를 작성하세요.\n"
         "8. `visual_diagram`: "
         + (
-            "비문학(독서) 지문이므로 학생이 핵심 원리·인과·개념 비교를 그림으로 한눈에 이해할 수 있도록 "
-            "`visual_diagram`을 **반드시** 작성하세요. 지문의 성격에 가장 잘 맞는 `diagram_type`을 선택하세요: "
-            "`flow`(원리·과정·인과 단계), `comparison`(두 대상/이론/입장 비교 대조), "
-            "`cycle`(순환·상호작용·피드백), `hierarchy`(중심 개념과 하위 분류). "
-            "`nodes`는 2~4개 핵심 카드로 구성하고, 각 카드 `details`는 1~3개 짧은 핵심 구절(각 26자 이내)로 간결하게 적으세요. "
-            "`relation_labels`에는 노드 사이 화살표/비교 표지에 들어갈 짧은 관계어(예: '촉진', '대립', 'VS', '분화')를 적고, "
-            "`takeaway`에는 시험에 바로 나오는 1줄 핵심 정리를 적으세요."
+            "비문학(독서) 지문이므로 **반드시** `visual_diagram`을 작성하세요.\n"
+            + _KOREAN_DIAGRAM_GUIDE
             if korean_section == "독서"
-            else "개념 비교나 흐름 도식이 이해에 큰 도움이 되는 지문이면 `visual_diagram`을 작성하고, 순수 문학 감상 위주라 도식이 불필요하면 `null`로 두세요."
+            else "개념 비교나 흐름 도식이 이해에 큰 도움이 되는 지문이면 `visual_diagram`을 작성하고, 순수 문학 감상 위주라 도식이 불필요하면 `null`로 두세요.\n"
+            + _KOREAN_DIAGRAM_GUIDE
         )
     )
 
@@ -4565,10 +4579,7 @@ def generate_korean_visual_diagram(
     system_inst = (
         "당신은 수능 국어 비문학 일타 강사입니다. 지문 원문만을 100% 근거로, "
         "학생이 핵심 원리·인과·개념 비교를 그림으로 한눈에 이해할 수 있는 도식 명세(`KoreanVisualDiagram`) JSON을 작성하세요.\n"
-        "- `diagram_type`: `flow`(과정/인과), `comparison`(비교/대조), `cycle`(순환/피드백), `hierarchy`(개념 분류) 중 최적 1개 선택\n"
-        "- `nodes`: 2~4개 카드, 각 `details`는 1~3개의 짧은 핵심 구절(26자 이내)\n"
-        "- `relation_labels`: 노드 사이 화살표/비교 표지에 들어갈 짧은 관계어\n"
-        "- `takeaway`: 1줄 핵심 정리"
+        + _KOREAN_DIAGRAM_GUIDE
     )
     prompt = (
         f"[지문 영역] {korean_section}\n"

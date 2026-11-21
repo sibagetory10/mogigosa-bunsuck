@@ -622,21 +622,89 @@ class KoreanDiagramNode(BaseModel):
     )
 
 
-class KoreanVisualDiagram(BaseModel):
-    """비문학(독서) 지문의 핵심 원리·관계·비교를 시각화하는 도식 그림 명세."""
+class KoreanMatrixRow(BaseModel):
+    """비교 매트릭스표(`matrix`)의 1개 비교 기준 행."""
 
-    diagram_type: Literal["flow", "comparison", "cycle", "hierarchy"] = Field(
-        default="flow",
-        description="도식 유형 (flow=과정/인과 흐름도, comparison=개념/이론 비교, cycle=순환/피드백, hierarchy=상하 개념 구조)",
+    criterion: str = Field(..., description="비교 기준 항목명 (예: '통치 목적', '법의 적용', '핵심 수단')")
+    values: list[str] = Field(
+        default_factory=list,
+        description="상단 비교 대상(nodes 순서)별 대응 내용 목록 (각 항목 28자 이내 권장)",
     )
-    title: str = Field(..., description="도식 상단 제목 (예: '법적 의제와 간주의 비교')")
+
+
+class KoreanGraphCurve(BaseModel):
+    """X-Y 함수/비례 그래프(`graph`)의 개별 곡선·직선 정보."""
+
+    label: str = Field(..., description="곡선/변수 이름 (예: '수요의 가격탄력성', '평균비용')")
+    trend: Literal["up", "down", "u_shape", "inv_u", "flat"] = Field(
+        default="up",
+        description="그래프 추세 (up=우상향 비례, down=우하향 반비례, u_shape=U자형, inv_u=역U자형, flat=일정)",
+    )
+    accent_color: Literal["blue", "green", "amber", "purple", "slate"] = Field(default="blue")
+    annotation: str = Field(default="", description="곡선 특징 설명 (예: 'X 증가 시 Y 감소')")
+
+
+class KoreanGraphSpec(BaseModel):
+    """X-Y 좌표 그래프(`graph`) 명세."""
+
+    x_label: str = Field(..., description="가로축(X축) 변수명 (예: '수요의 가격탄력성')")
+    y_label: str = Field(..., description="세로축(Y축) 변수명 (예: '이용료 수준')")
+    curves: list[KoreanGraphCurve] = Field(
+        default_factory=list,
+        description="좌표평면에 그릴 1~2개 추세선",
+    )
+    highlight_point: str = Field(
+        default="",
+        description="균형점·임계점·교차점 설명 (예: '임계점: 간접 네트워크 외부성 극대화')",
+    )
+
+
+class KoreanVisualDiagram(BaseModel):
+    """비문학(독서) 지문의 핵심 원리·관계·비교를 시각화하는 8종 특화 도식 그림 명세."""
+
+    diagram_type: Literal[
+        "flow",
+        "matrix",
+        "graph",
+        "anatomy",
+        "cycle",
+        "timeline",
+        "venn",
+        "scale",
+        "comparison",
+        "hierarchy",
+    ] = Field(
+        default="flow",
+        description=(
+            "도식 유형: flow(과정/인과 흐름도), matrix(항목별 비교 매트릭스표), "
+            "graph(X-Y 비례/함수 그래프), anatomy(구조/장치 모식도), cycle(원형 순환 루프), "
+            "timeline(시대/단계 연표), venn(포함/교집합 벤다이어그램), scale(대립/균형 저울도)"
+        ),
+    )
+    title: str = Field(..., description="도식 상단 제목 (예: '양면시장 가격탄력성과 이용료 반비례 관계')")
+    center_label: str = Field(
+        default="",
+        description="anatomy(중앙 장치/원리명), cycle(중앙 순환 주제), venn(교집합 핵심)에 표시할 중심 라벨",
+    )
     nodes: list[KoreanDiagramNode] = Field(
         default_factory=list,
-        description="도식을 구성하는 핵심 카드 2~4개",
+        description="도식을 구성하는 핵심 항목/대상/부위/단계 카드 2~4개",
     )
     relation_labels: list[str] = Field(
         default_factory=list,
-        description="노드 사이 화살표/연결선에 표시할 짧은 관계 라벨 목록 (예: ['촉진', '대립', '결과'])",
+        description="노드 사이 화살표/연결선에 표시할 짧은 관계 라벨 목록 (각 8자 이내)",
+    )
+    matrix_rows: list[KoreanMatrixRow] = Field(
+        default_factory=list,
+        description="diagram_type='matrix'일 때 사용하는 기준별 비교 행 리스트 (3~5행)",
+    )
+    graph_spec: KoreanGraphSpec | None = Field(
+        default=None,
+        description="diagram_type='graph'일 때 사용하는 X-Y 좌표 그래프 명세",
+    )
+    scale_tilt: Literal["balanced", "left", "right"] = Field(
+        default="balanced",
+        description="diagram_type='scale'일 때 저울 기울기 (balanced=균형/절충, left=좌측 우위, right=우측 우위)",
     )
     takeaway: str = Field(
         default="",
