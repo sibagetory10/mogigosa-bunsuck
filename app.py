@@ -150,7 +150,11 @@ from src.models import (
     normalize_korean_group_id,
     resolve_question_concept_reference,
 )
-from src.pdf_generator import generate_custom_exam_pdf, generate_korean_passage_analysis_pdf
+from src.pdf_generator import (
+    generate_custom_exam_pdf,
+    generate_korean_passage_analysis_pdf,
+    merge_korean_analysis_pdfs,
+)
 from src.pdf_parser import (
     CroppedQuestion,
     crop_normalized_box,
@@ -231,8 +235,6 @@ def _init_session_defaults() -> None:
         "graded": False,
         "ai_explanations": {},
         "ai_chats": {},
-        "drive_sync_key": "",
-        "drive_sync_result": None,
         "logged_in_username": "",
         "pending_google_signup": None,
         "auth_flash_msg": None,
@@ -264,24 +266,8 @@ _init_session_defaults()
 # 백그라운드 인증 및 저장소 초기화 (서버 캐시 적용으로 새로고침/리런 속도 최적화)
 # ---------------------------------------------------------------------------
 @st.cache_resource(ttl=1800, show_spinner=False)
-def _get_cached_storage(
-    local_root: str,
-    drive_folder_id: str,
-    auth_sig: str,
-    _service_account_info: dict[str, Any] | None,
-    _oauth_info: dict[str, Any] | None,
-) -> StorageManager:
-    return StorageManager(
-        local_root=local_root,
-        service_account_info=_service_account_info,
-        drive_folder_id=drive_folder_id,
-        oauth_info=_oauth_info,
-    )
-
-
-@st.cache_data(ttl=300, show_spinner=False)
-def _run_startup_drive_sync(_storage: StorageManager, sync_fingerprint: str) -> dict[str, Any]:
-    return _storage.sync_on_startup(sync_media=False)
+def _get_cached_storage(local_root: str) -> StorageManager:
+    return StorageManager(local_root=local_root)
 
 
 @contextlib.contextmanager
@@ -829,7 +815,6 @@ def _tag_and_save_single_exam_inner(
                 meta["prob_bytes"],
                 subject_category=meta["subject_category"],
                 exam_name=meta["exam_name"],
-                sync_drive=False,
             )
             pending_pdf_files.append(prob_fn)
         if meta.get("ans_bytes"):
@@ -839,7 +824,6 @@ def _tag_and_save_single_exam_inner(
                 meta["ans_bytes"],
                 subject_category=meta["subject_category"],
                 exam_name=meta["exam_name"],
-                sync_drive=False,
             )
             pending_pdf_files.append(ans_fn)
 
@@ -1197,7 +1181,6 @@ def _tag_and_save_single_exam_inner(
                 cq.png_bytes,
                 subject_category=meta["subject_category"],
                 exam_name=meta["exam_name"],
-                sync_drive=False,
             )
             pending_crop_files.append(img_filename)
 
@@ -1285,7 +1268,6 @@ def _tag_and_save_single_exam_inner(
                         cq_passage_png,
                         subject_category=meta["subject_category"],
                         exam_name=meta["exam_name"],
-                        sync_drive=False,
                     )
                     pending_crop_files.append(p_img_filename)
 
@@ -1356,30 +1338,17 @@ def _tag_and_save_single_exam_inner(
     sorted_all_records = sorted(rec_map.values(), key=lambda r: (r.exam_name, r.q_num))
     pending_crop_files.sort()
 
-    storage.save_db(
+    _status("💾 전체 문항 및 과목·회차별 정리 파일 로컬 영구 저장 중...")
+    sync_err = storage.save_db(
         sorted_all_records,
-        sync_organized_drive=False,
-        sync_db_drive=False,
-        sync_local_organized=False,
-    )
-
-    _status(
-        "☁️ 전체 문항 로컬 저장 및 Google Drive 일괄 동기화 중... "
-        "('Google Drive 동기화 완료'가 뜰 때까지 창을 유지해 주세요)"
-    )
-    sync_err = storage.sync_exam_batch(
-        subject_category=meta["subject_category"],
-        exam_name=meta["exam_name"],
-        records=sorted_all_records,
-        crop_filenames=pending_crop_files,
-        pdf_filenames=pending_pdf_files,
-        include_organized_exports=True,
+        target_exams={meta["exam_name"]},
+        sync_local_organized=True,
     )
     if newly_saved:
         _build_cached_exam_exports.clear()
     _prog(1.0)
     total_batch_s = time.perf_counter() - batch_t0
-    _log(f"🏁 전체 PDF 태깅 및 일괄 저장·동기화 완료 ({len(newly_saved)}문항 · 총 {total_batch_s:.1f}초)")
+    _log(f"🏁 전체 PDF 태깅 및 로컬 DB 일괄 저장 완료 ({len(newly_saved)}문항 · 총 {total_batch_s:.1f}초)")
     return {
         "newly_saved": newly_saved,
         "failed_q_nums": sorted(set(failed_q_nums)),
@@ -1770,27 +1739,9 @@ def _render_ncic_curriculum_manager(key_prefix: str = "ncic") -> None:
 
 
 creds = resolve_credentials()
-auth_payload = creds.oauth_credentials_info or creds.service_account_info
-sa_fingerprint = (
-    hashlib.sha256(json.dumps(auth_payload, sort_keys=True).encode()).hexdigest()[:12]
-    if auth_payload
-    else "none"
-)
-storage = _get_cached_storage(
-    local_root="./exam_db",
-    drive_folder_id=creds.drive_folder_id,
-    auth_sig=sa_fingerprint,
-    _service_account_info=creds.service_account_info,
-    _oauth_info=creds.oauth_credentials_info,
-)
+storage = _get_cached_storage(local_root="./exam_db")
 _fx_api_keys = [k for k in (resolve_billing_api_key(), creds.gemini_api_key) if k]
 start_daily_midnight_fx_scheduler(cache_dir=storage.local_root, api_keys=_fx_api_keys)
-sync_fingerprint = f"{creds.drive_folder_id}:{storage.drive_auth_mode}:{sa_fingerprint}"
-if storage.drive_connected and st.session_state["drive_sync_key"] != sync_fingerprint:
-    sync_out = _run_startup_drive_sync(storage, sync_fingerprint)
-    st.session_state["drive_sync_result"] = sync_out
-    if not sync_out.get("error"):
-        st.session_state["drive_sync_key"] = sync_fingerprint
 
 google_login_cfg = resolve_google_login_config()
 
@@ -2280,20 +2231,7 @@ with st.sidebar:
         unique_exams = sorted({r.exam_name for r in all_records})
         c2.metric("등록 회차", f"{len(unique_exams)}회")
         c3.metric("공용 개념서", f"{len(all_concept_books)}권")
-        if storage.drive_connected:
-            mode_tag = "OAuth" if storage.drive_auth_mode == "oauth" else "서비스 계정"
-            st.caption(f"☁️ Google Drive 연동됨 ({storage.drive_folder_name} · {mode_tag})")
-            sync_res = st.session_state.get("drive_sync_result") or {}
-            if sync_res.get("error"):
-                st.warning(f"Drive 동기화 오류: {sync_res['error'][:160]}")
-            if st.button("🔄 Drive 최신화", key="sidebar_force_sync_btn", width="stretch"):
-                _run_startup_drive_sync.clear()
-                st.session_state["drive_sync_key"] = ""
-                st.rerun()
-        else:
-            st.caption("💾 로컬 영구 저장소 (`./exam_db`, `./concept_db`)")
-            if storage.drive_error:
-                st.caption(f"⚠️ Drive 연결 오류: {storage.drive_error[:140]}")
+        st.caption("💾 서버 영구 저장소 (`./exam_db`, `./concept_db`)")
 
 # ---------------------------------------------------------------------------
 # 메인 헤더 & 2개 탭
@@ -2887,9 +2825,6 @@ def _render_admin_panel() -> None:
     with col_top2:
         st.markdown("<div style='height: 1.65rem;'></div>", unsafe_allow_html=True)
         if st.button("🔄 회원 목록 새로고침", width="stretch", key="admin_refresh_btn"):
-            if storage.drive_connected:
-                _run_startup_drive_sync.clear()
-                storage.sync_on_startup(sync_media=False)
             st.rerun()
 
     users_list = storage.load_users()
@@ -3458,14 +3393,16 @@ def _render_english_pool_admin_section() -> None:
 
 def _render_korean_analysis_pool_admin_section() -> None:
     st.divider()
-    st.subheader("📖 국어 지문 분석지 캐시 관리")
+    st.subheader("📖 국어 지문 분석지 캐시 · PDF DB 관리")
     st.caption(
-        "최초 생성된 국어 지문 분석지는 서버의 `./exam_db/korean_analysis_pool.json`에 "
-        "영구 저장되어 동일 파트 요청 시 AI 호출 없이 즉시 재사용됩니다."
+        "최초 생성된 국어 지문 분석지는 `./exam_db/korean_analysis_pool.json`과 "
+        "지문별 PDF(`./exam_db/korean_analysis_pdfs/*.pdf`)로 영구 저장되어 "
+        "동일 지문 선택 시 재렌더링 없이 즉시 이어 붙여 제공합니다."
     )
 
     pool = storage.load_korean_analysis_pool()
     total_cnt = len(pool)
+    pdf_saved_cnt = sum(1 for ck in pool if storage.has_korean_analysis_pdf(ck))
     exam_names: set[str] = set()
     sec_counts: dict[str, int] = {}
     entries_list: list[tuple[str, dict[str, Any]]] = []
@@ -3478,10 +3415,11 @@ def _render_korean_analysis_pool_admin_section() -> None:
         sec_counts[sec_name] = sec_counts.get(sec_name, 0) + 1
         entries_list.append((ck, entry))
 
-    k_m1, k_m2, k_m3 = st.columns(3)
+    k_m1, k_m2, k_m3, k_m4 = st.columns(4)
     k_m1.metric("저장된 분석지 세트 수", f"{total_cnt}세트")
-    k_m2.metric("포함된 회차 수", f"{len(exam_names)}회차")
-    k_m3.metric("영역 수", f"{len(sec_counts)}개 영역")
+    k_m2.metric("저장된 지문 PDF", f"{pdf_saved_cnt}개")
+    k_m3.metric("포함된 회차 수", f"{len(exam_names)}회차")
+    k_m4.metric("영역 수", f"{len(sec_counts)}개 영역")
 
     if sec_counts:
         summary_parts = [f"{k}({v})" for k, v in sorted(sec_counts.items(), key=lambda kv: (-kv[1], kv[0]))]
@@ -3568,7 +3506,8 @@ def _render_korean_analysis_pool_admin_section() -> None:
 
             r_col1, r_col2 = st.columns([5, 1])
             with r_col1:
-                st.markdown(f"**[{ex_n} · {gid_n}번]** {an_title} (`{sec_disp}`) · 키 `{ck}`")
+                pdf_badge = "📑 PDF 저장됨" if storage.has_korean_analysis_pdf(ck) else "📝 JSON만"
+                st.markdown(f"**[{ex_n} · {gid_n}번]** {an_title} (`{sec_disp}` · {pdf_badge}) · 키 `{ck}`")
                 cap_parts = [p for p in (f"저장: {saved_at}" if saved_at else "", theme_prev) if p]
                 if cap_parts:
                     st.caption(" · ".join(cap_parts))
@@ -4232,12 +4171,7 @@ def _render_concept_book_builder_section(key_prefix: str = "tab3") -> None:
                 st.warning(save_err)
             else:
                 st.success(
-                    f"🎉 공용 개념서 DB 저장 완료! (`{record.book_title}` · 총 {len(record.units)}개 단원 구조화 · "
-                    + (
-                        "로컬 ./concept_db 및 Google Drive 동기화 완료)"
-                        if storage.drive_connected
-                        else "로컬 ./concept_db 저장 완료)"
-                    )
+                    f"🎉 공용 개념서 DB 저장 완료! (`{record.book_title}` · 총 {len(record.units)}개 단원 구조화 · 로컬 ./concept_db 저장 완료)"
                 )
 
         if is_auto_mode:
@@ -5221,15 +5155,8 @@ with tab1:
                 return
 
             tagging_model_label = MODEL_LABELS.get(EXAM_TAGGING_MODEL, EXAM_TAGGING_MODEL)
-            sync_notice = (
-                st.warning(
-                    "☁️ **\"Google Drive 동기화 완료\"** 문구가 뜰 때까지 브라우저 창을 닫지 말고 유지해 주세요. "
-                    "(전체 PDF를 한 번에 태깅한 뒤 로컬 DB와 Google Drive에 일괄 저장합니다.)"
-                )
-                if storage.drive_connected
-                else st.info(
-                    "💾 전체 PDF를 한 번에 태깅한 뒤 서버 영구 디스크(`./exam_db`)에 일괄 저장합니다."
-                )
+            sync_notice = st.info(
+                "💾 전체 PDF를 한 번에 태깅한 뒤 서버 영구 디스크(`./exam_db`)에 일괄 저장합니다."
             )
             status_placeholder = st.empty()
             log_placeholder = st.empty()
@@ -5298,8 +5225,7 @@ with tab1:
 
             if saved_q_nums:
                 st.success(
-                    f"🎉 `{meta['exam_name']}` 총 {len(saved_q_nums)}개 문항 태깅 및 영구 저장 완료!"
-                    + (" (Google Drive 동기화 완료)" if storage.drive_connected else " (로컬 ./exam_db 저장)")
+                    f"🎉 `{meta['exam_name']}` 총 {len(saved_q_nums)}개 문항 태깅 및 영구 저장 완료! (로컬 ./exam_db 저장)"
                 )
             if sync_err_state:
                 st.warning(sync_err_state)
@@ -5358,31 +5284,20 @@ with tab1:
     # 저장된 DB 조회 및 과목·회차별 관리
     st.markdown("---")
     st.subheader("3️⃣ 과목별 · 모의고사 회차별 기출 DB 탐색 & 파일 내보내기")
-    if storage.drive_connected:
-        st.caption(
-            f"☁️ Google Drive `{storage.drive_folder_name}/<과목>/<회차명>/` 폴더에 "
-            "`기출정리.html`, `기출정리.md`, `문제목록.json`, 크롭 PNG, 원본 PDF가 자동 정리됩니다."
-        )
-    else:
-        st.caption(
-            "💾 로컬 `./exam_db/과목별_기출DB/<과목>/<회차명>/` 폴더에 "
-            "`기출정리.html`, `기출정리.md`, `문제목록.json`, 크롭 PNG, 원본 PDF가 자동 정리됩니다."
-        )
+    st.caption(
+        "💾 로컬 `./exam_db/과목별_기출DB/<과목>/<회차명>/` 폴더에 "
+        "`기출정리.html`, `기출정리.md`, `문제목록.json`, 크롭 PNG, 원본 PDF가 자동 정리됩니다."
+    )
 
     db_records = storage.load_db()
 
     if is_admin:
         with st.expander("🧹 관리자: 누적 기출 DB 전체 초기화 (회원 계정은 유지)", expanded=False):
-            st.warning("로컬(`./exam_db`) 및 Google Drive에 누적된 기출 문항·크롭 이미지·PDF 파일을 모두 삭제합니다. (`users.json` 회원 정보는 유지됩니다.)")
+            st.warning("서버(`./exam_db`)에 누적된 기출 문항·크롭 이미지·PDF 파일을 모두 삭제합니다. (`users.json` 회원 정보는 유지됩니다.)")
             confirm_wipe = st.checkbox("정말 모든 기출 DB 파일을 초기화합니다.", key="confirm_db_wipe")
             if st.button("🗑️ 기출 DB 전체 초기화 실행", disabled=not confirm_wipe, key="exec_db_wipe"):
                 wipe_res = storage.reset_exam_database(delete_users=False)
-                if wipe_res.get("drive_error"):
-                    st.error(f"Drive 초기화 중 오류: {wipe_res['drive_error']}")
-                else:
-                    st.success(
-                        f"초기화 완료! (로컬 항목 {wipe_res['removed_local']}개, Drive 항목 {wipe_res['trashed_drive']}개 정리)"
-                    )
+                st.success(f"초기화 완료! (로컬 항목 {wipe_res['removed_local']}개 정리)")
                 st.rerun()
 
     def _extract_exam_search_attrs(exam_name: str, subj_cat: str) -> dict[str, str]:
@@ -6771,7 +6686,14 @@ def _render_tab2_korean_transform_section() -> None:
             q_nums = [r.q_num for r in s_entry["records"]]
             sec_tag = s_entry["curr_subj"]
             topic_tag = s_entry["passage_topic"] or "주제 미상"
-            set_label = f"[{s_entry['exam_name']}] [{s_entry['group_id']}번] ({sec_tag} · {len(q_nums)}문항) — {topic_tag}"
+            kor_sec_chk = _classify_kor_sec(sec_tag)
+            c_key_chk = storage.build_korean_analysis_key(
+                s_entry["passage_text"],
+                s_entry["group_id"],
+                kor_sec_chk,
+            )
+            pdf_status_tag = " · 📑 분석지PDF DB" if storage.has_korean_analysis_pdf(c_key_chk) else ""
+            set_label = f"[{s_entry['exam_name']}] [{s_entry['group_id']}번] ({sec_tag} · {len(q_nums)}문항{pdf_status_tag}) — {topic_tag}"
             is_chk = st.checkbox(
                 set_label,
                 value=False,
@@ -6877,7 +6799,7 @@ def _render_tab2_korean_transform_section() -> None:
 
         chosen_sets = [filtered_sets[i] for i in selected_set_indices]
         prepared_slots: list[dict[str, Any]] = []
-        missing_slot_indices: list[int] = []
+        missing_ai_indices: list[int] = []
         for idx_s, s_entry in enumerate(chosen_sets):
             curr_subj = s_entry["curr_subj"]
             kor_sec = _classify_kor_sec(curr_subj)
@@ -6889,6 +6811,7 @@ def _render_tab2_korean_transform_section() -> None:
                 kor_sec,
             )
             cached_an = storage.get_cached_korean_analysis(c_key)
+            cached_pdf = storage.get_korean_analysis_pdf_bytes(c_key)
             prepared_slots.append(
                 {
                     "entry": s_entry,
@@ -6897,15 +6820,17 @@ def _render_tab2_korean_transform_section() -> None:
                     "kor_sub": kor_sub,
                     "cache_key": c_key,
                     "analysis": cached_an,
+                    "pdf_bytes": cached_pdf,
                 }
             )
             if cached_an is None:
-                missing_slot_indices.append(idx_s)
+                missing_ai_indices.append(idx_s)
 
-        cache_hit_cnt = len(chosen_sets) - len(missing_slot_indices)
+        pdf_hit_cnt = sum(1 for sl in prepared_slots if sl["pdf_bytes"] is not None)
+        json_to_pdf_cnt = 0
         ai_gen_cnt = 0
 
-        if missing_slot_indices:
+        if missing_ai_indices:
             kor_api_key, kor_key_label = resolve_active_gemini_api_key(
                 current_user, creds.gemini_api_key, model_name=EXAM_TAGGING_MODEL
             )
@@ -6918,10 +6843,10 @@ def _render_tab2_korean_transform_section() -> None:
             with _usage_scope():
                 with st.spinner(
                     f"📑 {MODEL_LABELS.get(EXAM_TAGGING_MODEL, EXAM_TAGGING_MODEL)}로 "
-                    f"미등록 국어 지문 분석지 {len(missing_slot_indices)}세트 생성 중 "
-                    f"(DB 로드 {cache_hit_cnt}세트)..."
+                    f"미등록 국어 지문 분석지 {len(missing_ai_indices)}세트 생성 중 "
+                    f"(DB 로드 {len(chosen_sets) - len(missing_ai_indices)}세트)..."
                 ):
-                    for slot_i in missing_slot_indices:
+                    for slot_i in missing_ai_indices:
                         slot = prepared_slots[slot_i]
                         s_entry = slot["entry"]
                         try:
@@ -6949,31 +6874,45 @@ def _render_tab2_korean_transform_section() -> None:
                             st.error(f"[{s_entry['exam_name']} {s_entry['group_id']}번] 지문 분석 실패: {exc}")
 
         analyses_list: list[dict[str, Any]] = []
+        pdf_parts: list[bytes] = []
         for slot in prepared_slots:
-            if slot["analysis"] is None:
+            if slot["analysis"] is None and slot["pdf_bytes"] is None:
                 continue
             s_entry = slot["entry"]
-            analyses_list.append(
-                {
-                    "exam_name": s_entry["exam_name"],
-                    "group_id": s_entry["group_id"],
-                    "section_label": slot["curr_subj"],
-                    "passage_text": s_entry["passage_text"],
-                    "analysis": slot["analysis"],
-                }
-            )
+            single_item = {
+                "exam_name": s_entry["exam_name"],
+                "group_id": s_entry["group_id"],
+                "section_label": slot["curr_subj"],
+                "passage_text": s_entry["passage_text"],
+                "analysis": slot["analysis"],
+            }
+            if slot["pdf_bytes"] is None:
+                try:
+                    single_pdf = generate_korean_passage_analysis_pdf([single_item])
+                    storage.save_korean_analysis_pdf_bytes(slot["cache_key"], single_pdf)
+                    slot["pdf_bytes"] = single_pdf
+                    if slot_index_was_json_only := (slot not in [prepared_slots[i] for i in missing_ai_indices]):
+                        _ = slot_index_was_json_only
+                        json_to_pdf_cnt += 1
+                except Exception as exc:
+                    st.error(f"[{s_entry['exam_name']} {s_entry['group_id']}번] 지문 PDF 생성 실패: {exc}")
+                    continue
 
-        if analyses_list:
+            pdf_parts.append(slot["pdf_bytes"])
+            if slot["analysis"] is not None:
+                analyses_list.append(single_item)
+
+        if pdf_parts:
             try:
-                pdf_bytes = generate_korean_passage_analysis_pdf(analyses_list)
+                pdf_bytes = merge_korean_analysis_pdfs(pdf_parts)
                 st.session_state["kor_analysis_results"] = analyses_list
                 st.session_state["kor_analysis_pdf"] = pdf_bytes
                 if current_user is not None:
                     exam_names_uniq = list(dict.fromkeys(it["exam_name"] for it in analyses_list))
                     an_title = (
-                        f"{exam_names_uniq[0]} 국어 지문 분석지 ({len(analyses_list)}세트)"
+                        f"{exam_names_uniq[0]} 국어 지문 분석지 ({len(pdf_parts)}세트)"
                         if len(exam_names_uniq) == 1
-                        else f"국어 정밀 지문 분석지 ({len(analyses_list)}세트)"
+                        else f"국어 정밀 지문 분석지 ({len(pdf_parts)}세트)"
                     )
                     an_sig = "kor_an_" + hashlib.sha256(
                         "|".join(f"{it['exam_name']}::{it['group_id']}" for it in analyses_list).encode("utf-8")
@@ -6985,17 +6924,22 @@ def _render_tab2_korean_transform_section() -> None:
                             "title": an_title,
                             "subject": "국어",
                             "exam_kind": "korean_analysis",
-                            "question_count": len(analyses_list),
+                            "question_count": len(pdf_parts),
                             "items": [],
                         },
                         pdf_bytes=pdf_bytes,
                     )
+                detail_notes: list[str] = [f"저장 PDF 즉시 이어붙이기 {pdf_hit_cnt}세트"]
+                if json_to_pdf_cnt > 0:
+                    detail_notes.append(f"기존 분석 JSON→PDF 저장 {json_to_pdf_cnt}세트")
+                if ai_gen_cnt > 0:
+                    detail_notes.append(f"신규 AI 분석+PDF 저장 {ai_gen_cnt}세트")
                 st.success(
-                    f"📑 총 {len(analyses_list)}개 국어 지문 정밀 분석지 PDF가 생성되었습니다! "
-                    f"(DB 즉시 로드 {cache_hit_cnt}세트 · 신규 AI 분석 {ai_gen_cnt}세트)"
+                    f"📑 총 {len(pdf_parts)}개 국어 지문 분석지 합본 PDF가 생성되었습니다! "
+                    f"({' · '.join(detail_notes)})"
                 )
             except Exception as exc:
-                st.error(f"분석지 PDF 렌더링 실패: {exc}")
+                st.error(f"분석지 PDF 병합 실패: {exc}")
 
     saved_analyses: list[dict[str, Any]] = st.session_state.get("kor_analysis_results") or []
     saved_analysis_pdf: bytes | None = st.session_state.get("kor_analysis_pdf")

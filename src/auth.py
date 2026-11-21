@@ -154,7 +154,7 @@ _PROCESS_FALLBACK_SIGNING_KEY: bytes | None = None
 def _get_session_signing_key(storage: StorageManager | None = None) -> bytes:
     """새로고침 이후에도 유지되는 서명용 비밀키를 결정론적으로 로드한다."""
     parts: list[str] = []
-    for key_name in ("SESSION_SECRET", "ADMIN_PASSWORD", "GEMINI_API_KEY", "GOOGLE_DRIVE_FOLDER_ID"):
+    for key_name in ("SESSION_SECRET", "ADMIN_PASSWORD", "GEMINI_API_KEY"):
         sec_val = _safe_get_secret([key_name, key_name.lower()])
         if isinstance(sec_val, str) and sec_val.strip():
             parts.append(f"{key_name}:{sec_val.strip()}")
@@ -850,7 +850,8 @@ def record_token_usage(
                 break
 
         if target is not None:
-            storage.save_users(users, sync_drive=sync_drive)
+            _ = sync_drive
+            storage.save_users(users)
         return target
 
 

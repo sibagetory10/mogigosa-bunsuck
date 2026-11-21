@@ -1375,3 +1375,36 @@ def generate_korean_passage_analysis_pdf(
     writer.close()
     return writer_buf.getvalue()
 
+
+def merge_korean_analysis_pdfs(pdf_bytes_list: list[bytes]) -> bytes:
+    """지문별로 저장된 국어 분석지 PDF 바이트들을 순서대로 이어 붙이고 전체 통합 쪽번호를 덧입힌다."""
+    valid_pdfs = [b for b in pdf_bytes_list if b]
+    if not valid_pdfs:
+        raise ValueError("이어 붙일 국어 분석지 PDF 데이터가 없습니다.")
+
+    merged = pymupdf.open()
+    try:
+        for raw_pdf in valid_pdfs:
+            with pymupdf.open("pdf", raw_pdf) as src_doc:
+                merged.insert_pdf(src_doc)
+
+        total_pages = merged.page_count
+        if total_pages == 0:
+            raise ValueError("병합된 국어 분석지 PDF에 페이지가 없습니다.")
+
+        for page_idx in range(total_pages):
+            page = merged[page_idx]
+            rect = pymupdf.Rect(0, page.rect.height - 28, page.rect.width, page.rect.height - 10)
+            page.insert_textbox(
+                rect,
+                f"- {page_idx + 1} / {total_pages} -",
+                fontsize=8.5,
+                fontname="helv",
+                color=(0.39, 0.45, 0.55),
+                align=pymupdf.TEXT_ALIGN_CENTER,
+            )
+
+        return merged.tobytes(garbage=3, deflate=True)
+    finally:
+        merged.close()
+
