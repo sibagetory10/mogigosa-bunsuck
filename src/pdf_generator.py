@@ -961,9 +961,22 @@ def _join_korean_wrapped_line(prev_line: str, next_line: str) -> str:
     return f"{prev_line} {next_line}"
 
 
+_KOR_PASSAGE_MARKER_RE = re.compile(
+    r"[\u3260-\u327B\u24B6-\u24E9]"
+    r"|[\[\(]\s*[A-Za-zㄱ-ㅎ]\s*[\]\)]"
+    r"|(?:^|(?<=\s))[ㄱ-ㅎA-Za-z]\.(?=\s)"
+)
+
+
+def _strip_korean_passage_markers(line: str) -> str:
+    """국어 지문 원문에서 문제용 기호(㉠~㉭, ⓐ~ⓩ, [A]/[B], (a)/(b), ㄱ./a. 등)를 제거한다."""
+    cleaned = _KOR_PASSAGE_MARKER_RE.sub("", line)
+    return re.sub(r"[ \t]{2,}", " ", cleaned).strip()
+
+
 def _clean_and_reflow_korean_passage(passage_text: str, is_poetry_or_literature: bool = False) -> list[str]:
     """
-    국어 지문 원문에서 시험지 쪽수('4', '12')·푸터('국어 영역') 노이즈를 제거하고,
+    국어 지문 원문에서 시험지 쪽수('4', '12')·푸터('국어 영역')·문제용 기호(㉠~㉭, ⓐ~ⓩ, [A]/[B] 등)를 제거하고,
     2단 폭 때문에 문장 중간에서 끊긴 줄바꿈을 자연스러운 문단 단위로 재조립해 반환한다.
     """
     raw_lines = (passage_text or "").splitlines()
@@ -979,6 +992,9 @@ def _clean_and_reflow_korean_passage(passage_text: str, is_poetry_or_literature:
         if re.match(r"^(?:국어|수학|영어|한국사)\s*영역(?:\s*\d{1,2})?$", s):
             continue
         if re.match(r"^(?:\d{1,2}\s+국어|국어\s+\d{1,2})$", s):
+            continue
+        s = _strip_korean_passage_markers(s)
+        if not s:
             continue
         cleaned.append((s, is_indented))
 

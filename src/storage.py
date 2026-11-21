@@ -1154,9 +1154,9 @@ class StorageManager:
             self._save_korean_analysis_pool_unlocked(pool)
 
     def get_korean_analysis_pdf_path(self, cache_key: str) -> Path:
-        """지문별 국어 분석지 PDF 파일 경로를 반환한다."""
+        """지문별 국어 분석지 PDF 파일 경로를 반환한다 (원문 기호 제거 v2 포맷)."""
         safe_key = re.sub(r"[^a-zA-Z0-9_-]+", "_", (cache_key or "").strip()) or "empty"
-        return self.korean_analysis_pdfs_root / f"{safe_key}.pdf"
+        return self.korean_analysis_pdfs_root / f"{safe_key}_v2.pdf"
 
     def has_korean_analysis_pdf(self, cache_key: str) -> bool:
         """지문별 국어 분석지 PDF가 서버 DB에 저장되어 있는지 반환한다."""
@@ -1190,6 +1190,10 @@ class StorageManager:
             self.korean_analysis_pdfs_root.mkdir(parents=True, exist_ok=True)
             p = self.get_korean_analysis_pdf_path(cache_key)
             _atomic_write_bytes(p, pdf_bytes)
+            safe_key = re.sub(r"[^a-zA-Z0-9_-]+", "_", (cache_key or "").strip()) or "empty"
+            legacy_p = self.korean_analysis_pdfs_root / f"{safe_key}.pdf"
+            if legacy_p.exists():
+                legacy_p.unlink(missing_ok=True)
             with _GLOBAL_CACHE_LOCK:
                 _GLOBAL_STORAGE_STATS_CACHE.clear()
 
@@ -1204,10 +1208,14 @@ class StorageManager:
                 pool.pop(cache_key, None)
                 self._save_korean_analysis_pool_unlocked(pool)
                 removed = 1
-            pdf_p = self.get_korean_analysis_pdf_path(cache_key)
-            if pdf_p.exists():
-                pdf_p.unlink(missing_ok=True)
-                removed = 1
+            safe_key = re.sub(r"[^a-zA-Z0-9_-]+", "_", (cache_key or "").strip()) or "empty"
+            for pdf_p in (
+                self.get_korean_analysis_pdf_path(cache_key),
+                self.korean_analysis_pdfs_root / f"{safe_key}.pdf",
+            ):
+                if pdf_p.exists():
+                    pdf_p.unlink(missing_ok=True)
+                    removed = 1
             return removed
 
     def clear_korean_analysis_pool(self) -> int:
