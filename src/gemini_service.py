@@ -4150,6 +4150,10 @@ def analyze_korean_exam_pdf_batch_with_gemini(
             response_schema=BatchKoreanExamExtractionOutput,
             temperature=0.1,
             max_output_tokens=32768,
+            thinking_config=types.ThinkingConfig(
+                thinking_level=types.ThinkingLevel.MINIMAL,
+                include_thoughts=False,
+            ),
         ),
         fast_mode=True,
         status_callback=status_callback,
@@ -4221,6 +4225,10 @@ def analyze_korean_question_with_gemini(
             response_mime_type="application/json",
             response_schema=KoreanSingleExtractionOutput,
             temperature=0.1,
+            thinking_config=types.ThinkingConfig(
+                thinking_level=types.ThinkingLevel.MINIMAL,
+                include_thoughts=False,
+            ),
         ),
         fast_mode=True,
     )
@@ -4323,6 +4331,10 @@ def generate_korean_set_reconstruction(
             response_schema=KoreanSetReconstructionOutput,
             temperature=0.35,
             max_output_tokens=16384,
+            thinking_config=types.ThinkingConfig(
+                thinking_level=types.ThinkingLevel.MINIMAL,
+                include_thoughts=False,
+            ),
         ),
         fast_mode=True,
     )
@@ -4453,6 +4465,10 @@ def generate_korean_passage_analysis(
             response_schema=KoreanPassageAnalysisOutput,
             temperature=0.2,
             max_output_tokens=8192,
+            thinking_config=types.ThinkingConfig(
+                thinking_level=types.ThinkingLevel.MINIMAL,
+                include_thoughts=False,
+            ),
         ),
         fast_mode=True,
     )
