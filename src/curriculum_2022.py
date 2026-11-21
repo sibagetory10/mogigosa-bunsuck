@@ -10,6 +10,7 @@ import pymupdf
 from src.models import ConceptBookRecord, QuestionExtractionOutput
 
 _DATA_PATH = Path(__file__).resolve().parent.parent / "data" / "curriculum_2022.json"
+_RUNTIME_STANDARDS_PATH = Path(__file__).resolve().parent.parent / "exam_db" / "ncic_standards.json"
 
 _EVERYDAY_TERM_STOPWORDS = frozenset(
     {
@@ -72,15 +73,71 @@ def _canon_subject_key(text: str) -> str:
     return s
 
 
+def _load_runtime_standards(runtime_path: Path | None = None) -> dict[str, list[dict[str, Any]]]:
+    """Git 비추적 런타임 저장소(exam_db/ncic_standards.json)에서 업로드된 성취기준을 로드한다."""
+    target = runtime_path or _RUNTIME_STANDARDS_PATH
+    if not target.exists():
+        return {}
+    try:
+        raw = json.loads(target.read_text(encoding="utf-8"))
+        cats = raw.get("categories") if isinstance(raw, dict) and "categories" in raw else raw
+        if not isinstance(cats, dict):
+            return {}
+        return {
+            str(k): list(v)
+            for k, v in cats.items()
+            if isinstance(v, list)
+        }
+    except Exception:
+        return {}
+
+
+def _save_runtime_standards(
+    standards_by_cat: dict[str, list[dict[str, Any]]],
+    runtime_path: Path | None = None,
+) -> None:
+    """업로드된 NCIC 성취기준을 Git 비추적 런타임 저장소(exam_db/ncic_standards.json)에 저장한다."""
+    target = runtime_path or _RUNTIME_STANDARDS_PATH
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(
+        json.dumps({"version": "2022-33", "categories": standards_by_cat}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
 def load_curriculum_2022_catalog(path: Path | None = None) -> dict[str, Any]:
     """2022 개정 교육과정 공식 편제 및 NCIC 누적 성취기준 JSON을 로드한다."""
     target = path or _DATA_PATH
     if not target.exists():
-        return {"version": "2022-33", "categories": {}}
-    try:
-        return json.loads(target.read_text(encoding="utf-8"))
-    except Exception:
-        return {"version": "2022-33", "categories": {}}
+        catalog: dict[str, Any] = {"version": "2022-33", "categories": {}}
+    else:
+        try:
+            catalog = json.loads(target.read_text(encoding="utf-8"))
+        except Exception:
+            catalog = {"version": "2022-33", "categories": {}}
+
+    if path is None:
+        runtime_stds = _load_runtime_standards()
+        cat_map = catalog.setdefault("categories", {})
+        for cat_name, std_list in runtime_stds.items():
+            if not std_list:
+                continue
+            cat_entry = cat_map.setdefault(
+                cat_name,
+                {"subjects": [], "shift_notes": [], "core_units": {}, "standards": []},
+            )
+            merged_by_code: dict[str, dict[str, Any]] = {
+                (s.get("code") or "").strip(): s
+                for s in (cat_entry.get("standards") or [])
+                if (s.get("code") or "").strip()
+            }
+            for item in std_list:
+                code = (item.get("code") or "").strip()
+                if code:
+                    merged_by_code[code] = item
+            cat_entry["standards"] = list(merged_by_code.values())
+
+    return catalog
 
 
 def save_curriculum_2022_catalog(catalog: dict[str, Any], path: Path | None = None) -> None:
@@ -266,11 +323,37 @@ def merge_ncic_standards_to_catalog(
     extracted_standards: list[dict[str, Any]],
     path: Path | None = None,
 ) -> dict[str, int]:
-    """추출된 NCIC 성취기준 리스트를 curriculum_2022.json에 병합 저장한다."""
-    catalog = load_curriculum_2022_catalog(path)
-    cat_map = catalog.setdefault("categories", {})
+    """추출된 NCIC 성취기준 리스트를 병합 저장한다. (기본 경로는 Git 비추적 exam_db/ncic_standards.json)"""
     added = 0
     updated = 0
+
+    if path is None:
+        runtime_stds = _load_runtime_standards()
+        for item in extracted_standards:
+            code = (item.get("code") or "").strip()
+            cat = (item.get("category") or "").strip()
+            if not code or cat not in CURRICULUM_CATEGORIES:
+                continue
+            stds = runtime_stds.setdefault(cat, [])
+            existing_idx = next((i for i, s in enumerate(stds) if s.get("code") == code), None)
+            clean_entry = {
+                "code": code,
+                "subject": (item.get("subject") or "").strip(),
+                "unit": (item.get("unit") or "").strip(),
+                "min_grade": int(item.get("min_grade") or (1 if code.startswith("10") else 2)),
+                "statement": (item.get("statement") or "").strip(),
+            }
+            if existing_idx is None:
+                stds.append(clean_entry)
+                added += 1
+            else:
+                stds[existing_idx] = clean_entry
+                updated += 1
+        _save_runtime_standards(runtime_stds)
+        return {"added": added, "updated": updated}
+
+    catalog = load_curriculum_2022_catalog(path)
+    cat_map = catalog.setdefault("categories", {})
 
     for item in extracted_standards:
         code = (item.get("code") or "").strip()
@@ -305,6 +388,14 @@ def clear_ncic_standards_for_category(
     """특정 교과 대분류에 누적 저장된 NCIC 성취기준(standards)만 초기화하고 삭제된 개수를 반환한다."""
     if category not in CURRICULUM_CATEGORIES:
         return 0
+    if path is None:
+        runtime_stds = _load_runtime_standards()
+        existing = runtime_stds.get(category) or []
+        removed_count = len(existing)
+        if removed_count > 0:
+            runtime_stds[category] = []
+            _save_runtime_standards(runtime_stds)
+        return removed_count
     catalog = load_curriculum_2022_catalog(path)
     cat_map = catalog.setdefault("categories", {})
     cat_entry = cat_map.get(category)
