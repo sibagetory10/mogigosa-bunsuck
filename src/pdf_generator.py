@@ -1747,6 +1747,110 @@ def _render_poetry_work_png(work: Any) -> bytes:
         doc.close()
 
 
+def _render_poetry_work_png_pages(work: Any, max_height_pt: float = 560.0) -> list[bytes]:
+    """시 원문 이미지가 너무 길어 페이지에 축소되지 않도록 연 단위로 분할해 렌더링한다."""
+    from types import SimpleNamespace
+
+    png0 = _render_poetry_work_png(work)
+    with Image.open(io.BytesIO(png0)) as im:
+        w_px, h_px = im.size
+    h_pt = h_px * (520.0 / max(1, w_px))
+    if h_pt <= max_height_pt:
+        return [png0]
+
+    raw_lines = [str(ln or "") for ln in (getattr(work, "lines", None) or [])]
+    n_lines = len(raw_lines)
+    if n_lines < 8:
+        return [png0]
+
+    n_chunks = max(2, math.ceil(h_pt / max_height_pt))
+    blank_indices = [i for i, ln in enumerate(raw_lines) if not ln.strip()]
+
+    split_points: list[int] = [0]
+    for k in range(1, n_chunks):
+        ideal = int(round(n_lines * k / n_chunks))
+        # 가장 가까운 연 구분(빈 줄) 찾기
+        best_bp = None
+        best_dist = 9999
+        for bi in blank_indices:
+            if bi > split_points[-1] + 3 and bi < n_lines - 3:
+                d = abs(bi - ideal)
+                if d < best_dist:
+                    best_dist = d
+                    best_bp = bi
+        if best_bp is not None and best_dist <= max(6, n_lines // (n_chunks * 2) + 2):
+            split_points.append(best_bp + 1)
+        elif ideal > split_points[-1] + 3 and ideal < n_lines - 2:
+            split_points.append(ideal)
+    split_points.append(n_lines)
+
+    marks = list(getattr(work, "marks", None) or [])
+    brackets = list(getattr(work, "brackets", None) or [])
+    work_label = (getattr(work, "work_label", "") or "").strip()
+    title_author = (getattr(work, "title_author", "") or "").strip()
+
+    out_pngs: list[bytes] = []
+    total_parts = len(split_points) - 1
+    for part_idx in range(total_parts):
+        s0 = split_points[part_idx]
+        e0 = split_points[part_idx + 1]
+        sub_lines = raw_lines[s0:e0]
+        while sub_lines and not sub_lines[0].strip():
+            sub_lines = sub_lines[1:]
+            s0 += 1
+        while sub_lines and not sub_lines[-1].strip():
+            sub_lines = sub_lines[:-1]
+            e0 -= 1
+        if not sub_lines:
+            continue
+
+        # 1-based range [s0+1, e0]
+        sub_marks = []
+        for mk in marks:
+            li = int(getattr(mk, "line_index", 0) or 0)
+            if s0 + 1 <= li <= e0:
+                sub_marks.append(
+                    SimpleNamespace(
+                        line_index=li - s0,
+                        quote=getattr(mk, "quote", ""),
+                        mark_type=getattr(mk, "mark_type", "underline"),
+                        color=getattr(mk, "color", "red"),
+                        position=getattr(mk, "position", "below"),
+                        note=getattr(mk, "note", ""),
+                    )
+                )
+
+        sub_brackets = []
+        for br in brackets:
+            bs = int(getattr(br, "start_line", 1) or 1)
+            be = int(getattr(br, "end_line", bs) or bs)
+            ov_s = max(bs, s0 + 1)
+            ov_e = min(be, e0)
+            if ov_s <= ov_e:
+                sub_brackets.append(
+                    SimpleNamespace(
+                        start_line=ov_s - s0,
+                        end_line=ov_e - s0,
+                        side=getattr(br, "side", "right"),
+                        style=getattr(br, "style", "brace"),
+                        color=getattr(br, "color", "blue"),
+                        note=getattr(br, "note", ""),
+                    )
+                )
+
+        sub_title = f"{title_author} ({part_idx + 1}/{total_parts})" if total_parts > 1 else title_author
+        sub_work = SimpleNamespace(
+            work_label=work_label if part_idx == 0 else "",
+            title_author=sub_title,
+            lines=sub_lines,
+            marks=sub_marks,
+            brackets=sub_brackets,
+        )
+        out_pngs.append(_render_poetry_work_png(sub_work))
+
+    return out_pngs or [png0]
+
+
 def _highlight_poem_line_html(
     line_text: str,
     notes_with_idx: list[tuple[int, str]],
@@ -1981,15 +2085,15 @@ def generate_korean_passage_analysis_pdf(
             work_imgs_html: list[str] = []
             for pw in poetry_works:
                 try:
-                    pw_png = _render_poetry_work_png(pw)
-                    pw_b64 = base64.b64encode(pw_png).decode("ascii")
-                    work_imgs_html.append(
-                        _keep_block(
-                            f"<div class='diagram-wrap' style='margin-top:6pt; margin-bottom:8pt;'>"
-                            f"<img class='diagram-img' width='515' src='data:image/png;base64,{pw_b64}'/>"
-                            "</div>"
+                    for pw_png in _render_poetry_work_png_pages(pw, max_height_pt=560.0):
+                        pw_b64 = base64.b64encode(pw_png).decode("ascii")
+                        work_imgs_html.append(
+                            _keep_block(
+                                f"<div class='diagram-wrap' style='margin-top:6pt; margin-bottom:8pt;'>"
+                                f"<img class='diagram-img' width='515' src='data:image/png;base64,{pw_b64}'/>"
+                                "</div>"
+                            )
                         )
-                    )
                 except Exception:
                     continue
 
