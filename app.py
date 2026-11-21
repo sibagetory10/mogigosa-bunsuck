@@ -2753,6 +2753,7 @@ def _render_admin_panel() -> None:
 
     _render_server_storage_admin_section()
     _render_english_pool_admin_section()
+    _render_korean_analysis_pool_admin_section()
 
 
 def _format_bytes_human(num_bytes: int | float) -> str:
@@ -2921,6 +2922,130 @@ def _render_english_pool_admin_section() -> None:
                     removed = storage.delete_english_pool_entry(ck, idx)
                     if removed > 0:
                         st.success(f"캐시 항목(`{ck}` #{idx + 1})을 삭제했습니다.")
+                    st.rerun()
+
+
+def _render_korean_analysis_pool_admin_section() -> None:
+    st.divider()
+    st.subheader("📖 국어 지문 분석지 캐시 관리")
+    st.caption(
+        "최초 생성된 국어 지문 분석지는 서버의 `./exam_db/korean_analysis_pool.json`에 "
+        "영구 저장되어 동일 파트 요청 시 AI 호출 없이 즉시 재사용됩니다."
+    )
+
+    pool = storage.load_korean_analysis_pool()
+    total_cnt = len(pool)
+    exam_names: set[str] = set()
+    sec_counts: dict[str, int] = {}
+    entries_list: list[tuple[str, dict[str, Any]]] = []
+    for ck, entry in pool.items():
+        if not isinstance(entry, dict):
+            continue
+        ex_name = str(entry.get("exam_name") or "미분류 회차").strip() or "미분류 회차"
+        sec_name = str(entry.get("section") or "기타").strip() or "기타"
+        exam_names.add(ex_name)
+        sec_counts[sec_name] = sec_counts.get(sec_name, 0) + 1
+        entries_list.append((ck, entry))
+
+    k_m1, k_m2, k_m3 = st.columns(3)
+    k_m1.metric("저장된 분석지 세트 수", f"{total_cnt}세트")
+    k_m2.metric("포함된 회차 수", f"{len(exam_names)}회차")
+    k_m3.metric("영역 수", f"{len(sec_counts)}개 영역")
+
+    if sec_counts:
+        summary_parts = [f"{k}({v})" for k, v in sorted(sec_counts.items(), key=lambda kv: (-kv[1], kv[0]))]
+        st.caption("영역별 분포: " + " · ".join(summary_parts))
+
+    if total_cnt == 0:
+        st.info("현재 저장된 국어 지문 분석지 캐시가 없습니다.")
+        return
+
+    col_clr1, col_clr2 = st.columns([2, 1])
+    with col_clr1:
+        confirm_clear = st.checkbox(
+            "국어 분석지 캐시 전체 비우기 확인 (기출 DB·회원 DB는 유지됨)",
+            key="admin_confirm_clear_kor_an_pool",
+        )
+    with col_clr2:
+        if st.button(
+            "🧹 국어 분석지 캐시 전체 비우기",
+            disabled=not confirm_clear,
+            width="stretch",
+            key="admin_clear_kor_an_pool_btn",
+        ):
+            removed_cnt = storage.clear_korean_analysis_pool()
+            st.success(f"🧹 국어 지문 분석지 캐시 {removed_cnt}세트를 모두 비웠습니다.")
+            st.rerun()
+
+    with st.expander(f"📋 저장된 국어 지문 분석지 상세 조회 / 개별 삭제 ({total_cnt}세트)", expanded=False):
+        f_col1, f_col2, f_col3 = st.columns([1.2, 1.0, 1.5])
+        with f_col1:
+            sel_exam = st.selectbox(
+                "회차 필터",
+                options=["전체"] + sorted(exam_names, reverse=True),
+                key="admin_kor_an_pool_exam_filter",
+            )
+        with f_col2:
+            sel_sec = st.selectbox(
+                "영역 필터",
+                options=["전체"] + sorted(sec_counts.keys()),
+                key="admin_kor_an_pool_sec_filter",
+            )
+        with f_col3:
+            kor_q = st.text_input(
+                "제목/주제/회차/키 검색",
+                placeholder="키워드 또는 캐시 키 입력...",
+                key="admin_kor_an_pool_search",
+            ).strip().lower()
+
+        sorted_entries = sorted(
+            entries_list,
+            key=lambda kv: (str(kv[1].get("saved_at") or ""), str(kv[1].get("exam_name") or "")),
+            reverse=True,
+        )
+        filtered_entries = []
+        for ck, ent in sorted_entries:
+            ex_n = str(ent.get("exam_name") or "미분류 회차").strip() or "미분류 회차"
+            sec_n = str(ent.get("section") or "기타").strip() or "기타"
+            if sel_exam != "전체" and ex_n != sel_exam:
+                continue
+            if sel_sec != "전체" and sec_n != sel_sec:
+                continue
+            an_dict = ent.get("analysis") if isinstance(ent.get("analysis"), dict) else {}
+            an_title = str(an_dict.get("title") or "")
+            an_theme = str(an_dict.get("core_theme") or "")
+            if kor_q and not (
+                kor_q in ck.lower()
+                or kor_q in ex_n.lower()
+                or kor_q in an_title.lower()
+                or kor_q in an_theme.lower()
+                or kor_q in str(ent.get("group_id") or "").lower()
+            ):
+                continue
+            filtered_entries.append((ck, ent, an_dict))
+
+        st.caption(f"검색 결과: {len(filtered_entries)}세트 (최대 50건 표시)")
+        for ck, ent, an_dict in filtered_entries[:50]:
+            ex_n = str(ent.get("exam_name") or "미분류 회차")
+            gid_n = str(ent.get("group_id") or "-")
+            sec_n = str(ent.get("section") or "기타")
+            sub_n = str(ent.get("subgenre") or "")
+            sec_disp = f"{sec_n}({sub_n})" if sub_n else sec_n
+            an_title = str(an_dict.get("title") or "제목 없음")
+            theme_prev = " ".join(str(an_dict.get("core_theme") or "").split())[:120]
+            saved_at = str(ent.get("saved_at") or "")
+
+            r_col1, r_col2 = st.columns([5, 1])
+            with r_col1:
+                st.markdown(f"**[{ex_n} · {gid_n}번]** {an_title} (`{sec_disp}`) · 키 `{ck}`")
+                cap_parts = [p for p in (f"저장: {saved_at}" if saved_at else "", theme_prev) if p]
+                if cap_parts:
+                    st.caption(" · ".join(cap_parts))
+            with r_col2:
+                if st.button("🗑️ 삭제", key=f"del_kor_an_pool_{ck}", width="stretch"):
+                    removed = storage.delete_korean_analysis_entry(ck)
+                    if removed > 0:
+                        st.success(f"국어 분석지 캐시(`{ck}`)를 삭제했습니다.")
                     st.rerun()
 
 
@@ -3096,12 +3221,14 @@ def _render_my_exams_tab() -> None:
         ex_q_cnt = int(ex.get("question_count") or len(ex.get("items") or []))
         ex_updated = str(ex.get("updated_at") or ex.get("created_at") or "")
         last_score = ex.get("last_score")
+        is_kor_analysis = ex.get("exam_kind") == "korean_analysis"
 
         with st.container(border=True):
             top_c1, top_c2 = st.columns([4, 1.5])
             with top_c1:
                 st.markdown(f"**[{ex_subj}] {ex_title}**")
-                meta_parts = [f"총 {ex_q_cnt}문항", f"저장일시: {ex_updated}"]
+                count_label = f"총 {ex_q_cnt}세트 (지문 분석지)" if is_kor_analysis else f"총 {ex_q_cnt}문항"
+                meta_parts = [count_label, f"저장일시: {ex_updated}"]
                 if isinstance(last_score, dict):
                     meta_parts.append(
                         f"최근 점수: {last_score.get('percent', 0)}점 ({last_score.get('correct', 0)}/{last_score.get('total', ex_q_cnt)})"
@@ -3123,7 +3250,9 @@ def _render_my_exams_tab() -> None:
 
             b_c1, b_c2, b_c3 = st.columns([1.4, 1.2, 3.4])
             with b_c1:
-                if st.button("✏️ 이 시험지 다시 풀기", key=f"my_exam_load_{ex_id}", width="stretch"):
+                if is_kor_analysis:
+                    st.caption("📑 지문 분석지 PDF 전용")
+                elif st.button("✏️ 이 시험지 다시 풀기", key=f"my_exam_load_{ex_id}", width="stretch"):
                     restored = _deserialize_matched_items(ex.get("items") or [])
                     if restored:
                         st.session_state["matched_items"] = restored
@@ -6197,52 +6326,124 @@ def _render_tab2_korean_transform_section() -> None:
             return
 
         chosen_sets = [filtered_sets[i] for i in selected_set_indices]
-        kor_api_key, kor_key_label = resolve_active_gemini_api_key(
-            current_user, creds.gemini_api_key, model_name=EXAM_TAGGING_MODEL
-        )
-        if not kor_api_key:
-            st.error(f"사용 가능한 Gemini API 키({kor_key_label})가 설정되지 않았습니다.")
-            return
-        if not _ensure_token_quota():
-            return
+        prepared_slots: list[dict[str, Any]] = []
+        missing_slot_indices: list[int] = []
+        for idx_s, s_entry in enumerate(chosen_sets):
+            curr_subj = s_entry["curr_subj"]
+            kor_sec = _classify_kor_sec(curr_subj)
+            m_sub = re.search(r"\(([^)]+)\)", curr_subj)
+            kor_sub = m_sub.group(1) if m_sub else ""
+            c_key = storage.build_korean_analysis_key(
+                s_entry["passage_text"],
+                s_entry["group_id"],
+                kor_sec,
+            )
+            cached_an = storage.get_cached_korean_analysis(c_key)
+            prepared_slots.append(
+                {
+                    "entry": s_entry,
+                    "curr_subj": curr_subj,
+                    "kor_sec": kor_sec,
+                    "kor_sub": kor_sub,
+                    "cache_key": c_key,
+                    "analysis": cached_an,
+                }
+            )
+            if cached_an is None:
+                missing_slot_indices.append(idx_s)
+
+        cache_hit_cnt = len(chosen_sets) - len(missing_slot_indices)
+        ai_gen_cnt = 0
+
+        if missing_slot_indices:
+            kor_api_key, kor_key_label = resolve_active_gemini_api_key(
+                current_user, creds.gemini_api_key, model_name=EXAM_TAGGING_MODEL
+            )
+            if not kor_api_key:
+                st.error(f"사용 가능한 Gemini API 키({kor_key_label})가 설정되지 않았습니다.")
+                return
+            if not _ensure_token_quota():
+                return
+
+            with _usage_scope():
+                with st.spinner(
+                    f"📑 {MODEL_LABELS.get(EXAM_TAGGING_MODEL, EXAM_TAGGING_MODEL)}로 "
+                    f"미등록 국어 지문 분석지 {len(missing_slot_indices)}세트 생성 중 "
+                    f"(DB 로드 {cache_hit_cnt}세트)..."
+                ):
+                    for slot_i in missing_slot_indices:
+                        slot = prepared_slots[slot_i]
+                        s_entry = slot["entry"]
+                        try:
+                            an_out = generate_korean_passage_analysis(
+                                api_key=kor_api_key,
+                                model_name=EXAM_TAGGING_MODEL,
+                                exam_name=s_entry["exam_name"],
+                                group_id=s_entry["group_id"],
+                                passage_text=s_entry["passage_text"],
+                                korean_section=slot["kor_sec"],
+                                korean_subgenre=slot["kor_sub"],
+                                passage_topic=s_entry["passage_topic"],
+                            )
+                            slot["analysis"] = an_out
+                            ai_gen_cnt += 1
+                            storage.save_cached_korean_analysis(
+                                slot["cache_key"],
+                                an_out,
+                                exam_name=s_entry["exam_name"],
+                                group_id=s_entry["group_id"],
+                                korean_section=slot["kor_sec"],
+                                korean_subgenre=slot["kor_sub"],
+                            )
+                        except Exception as exc:
+                            st.error(f"[{s_entry['exam_name']} {s_entry['group_id']}번] 지문 분석 실패: {exc}")
 
         analyses_list: list[dict[str, Any]] = []
-        with _usage_scope():
-            with st.spinner(f"📑 {MODEL_LABELS.get(EXAM_TAGGING_MODEL, EXAM_TAGGING_MODEL)}로 국어 지문 분석지({len(chosen_sets)}개 세트) 생성 중..."):
-                for s_entry in chosen_sets:
-                    curr_subj = s_entry["curr_subj"]
-                    kor_sec = _classify_kor_sec(curr_subj)
-                    m_sub = re.search(r"\(([^)]+)\)", curr_subj)
-                    kor_sub = m_sub.group(1) if m_sub else ""
-                    try:
-                        an_out = generate_korean_passage_analysis(
-                            api_key=kor_api_key,
-                            model_name=EXAM_TAGGING_MODEL,
-                            exam_name=s_entry["exam_name"],
-                            group_id=s_entry["group_id"],
-                            passage_text=s_entry["passage_text"],
-                            korean_section=kor_sec,
-                            korean_subgenre=kor_sub,
-                            passage_topic=s_entry["passage_topic"],
-                        )
-                        analyses_list.append(
-                            {
-                                "exam_name": s_entry["exam_name"],
-                                "group_id": s_entry["group_id"],
-                                "section_label": curr_subj,
-                                "passage_text": s_entry["passage_text"],
-                                "analysis": an_out,
-                            }
-                        )
-                    except Exception as exc:
-                        st.error(f"[{s_entry['exam_name']} {s_entry['group_id']}번] 지문 분석 실패: {exc}")
+        for slot in prepared_slots:
+            if slot["analysis"] is None:
+                continue
+            s_entry = slot["entry"]
+            analyses_list.append(
+                {
+                    "exam_name": s_entry["exam_name"],
+                    "group_id": s_entry["group_id"],
+                    "section_label": slot["curr_subj"],
+                    "passage_text": s_entry["passage_text"],
+                    "analysis": slot["analysis"],
+                }
+            )
 
         if analyses_list:
             try:
                 pdf_bytes = generate_korean_passage_analysis_pdf(analyses_list)
                 st.session_state["kor_analysis_results"] = analyses_list
                 st.session_state["kor_analysis_pdf"] = pdf_bytes
-                st.success(f"📑 총 {len(analyses_list)}개 국어 지문 정밀 분석지 PDF가 생성되었습니다!")
+                if current_user is not None:
+                    exam_names_uniq = list(dict.fromkeys(it["exam_name"] for it in analyses_list))
+                    an_title = (
+                        f"{exam_names_uniq[0]} 국어 지문 분석지 ({len(analyses_list)}세트)"
+                        if len(exam_names_uniq) == 1
+                        else f"국어 정밀 지문 분석지 ({len(analyses_list)}세트)"
+                    )
+                    an_sig = "kor_an_" + hashlib.sha256(
+                        "|".join(f"{it['exam_name']}::{it['group_id']}" for it in analyses_list).encode("utf-8")
+                    ).hexdigest()[:12]
+                    storage.save_user_exam(
+                        current_user.username,
+                        {
+                            "exam_id": an_sig,
+                            "title": an_title,
+                            "subject": "국어",
+                            "exam_kind": "korean_analysis",
+                            "question_count": len(analyses_list),
+                            "items": [],
+                        },
+                        pdf_bytes=pdf_bytes,
+                    )
+                st.success(
+                    f"📑 총 {len(analyses_list)}개 국어 지문 정밀 분석지 PDF가 생성되었습니다! "
+                    f"(DB 즉시 로드 {cache_hit_cnt}세트 · 신규 AI 분석 {ai_gen_cnt}세트)"
+                )
             except Exception as exc:
                 st.error(f"분석지 PDF 렌더링 실패: {exc}")
 

@@ -19,7 +19,14 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
 from src.exporters import build_exam_ai_jsonl, build_exam_html, build_exam_markdown
-from src.models import ConceptBookRecord, LEGACY_TIER_MAP, QuestionRecord, RewrittenQuestion, UserRecord
+from src.models import (
+    ConceptBookRecord,
+    KoreanPassageAnalysisOutput,
+    LEGACY_TIER_MAP,
+    QuestionRecord,
+    RewrittenQuestion,
+    UserRecord,
+)
 
 DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive"]
 FOLDER_MIME = "application/vnd.google-apps.folder"
@@ -81,6 +88,7 @@ class StorageManager:
         self.db_path = self.local_root / "db.json"
         self.users_path = self.local_root / "users.json"
         self.english_pool_path = self.local_root / "english_question_pool.json"
+        self.korean_analysis_pool_path = self.local_root / "korean_analysis_pool.json"
         self.user_english_history_path = self.local_root / "user_english_history.json"
         self.saved_exams_root = self.local_root / "saved_exams"
         self.saved_exams_pdfs_root = self.saved_exams_root / "pdfs"
@@ -1102,6 +1110,7 @@ class StorageManager:
                         pass
 
             self.save_db(remaining, sync_organized_drive=False)
+            self.delete_korean_analyses_by_exam(exam_name)
             return len(to_delete)
 
     def rename_exam(self, old_exam_name: str, new_exam_name: str) -> int:
@@ -1131,6 +1140,7 @@ class StorageManager:
                     except Exception:
                         pass
             self.save_db(records, sync_organized_drive=False)
+            self.rename_korean_analyses_exam(old_n, new_n)
             return changed
 
     def reset_exam_database(self, delete_users: bool = False) -> dict[str, Any]:
@@ -1155,6 +1165,8 @@ class StorageManager:
             _atomic_write_text(self.db_path, "[]", encoding="utf-8")
             if self.english_pool_path.exists():
                 _atomic_write_text(self.english_pool_path, "{}", encoding="utf-8")
+            if self.korean_analysis_pool_path.exists():
+                _atomic_write_text(self.korean_analysis_pool_path, "{}", encoding="utf-8")
             if delete_users and self.users_path.exists():
                 self.users_path.unlink(missing_ok=True)
 
@@ -1586,3 +1598,134 @@ class StorageManager:
             "app_total_files": app_total_files,
             "breakdown": breakdown,
         }
+
+    # -----------------------------------------------------------------------
+    # 국어 정밀 지문 분석지 캐시 풀(Pool) 영구 저장 / 조회 / 관리
+    # -----------------------------------------------------------------------
+    @staticmethod
+    def build_korean_analysis_key(
+        passage_text: str,
+        group_id: str = "",
+        korean_section: str = "",
+    ) -> str:
+        """국어 지문 원문·세트 번호·영역 조합으로 분석지 캐시 키를 생성한다."""
+        norm_p = re.sub(r"\s+", " ", (passage_text or "").strip())
+        raw_key = f"{norm_p}||{(group_id or '').strip()}||{(korean_section or '').strip()}"
+        return hashlib.sha256(raw_key.encode("utf-8")).hexdigest()[:24]
+
+    def _load_korean_analysis_pool_unlocked(self) -> dict[str, dict[str, Any]]:
+        if not self.korean_analysis_pool_path.exists():
+            return {}
+        try:
+            data = json.loads(self.korean_analysis_pool_path.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _save_korean_analysis_pool_unlocked(self, pool: dict[str, dict[str, Any]]) -> None:
+        raw = json.dumps(pool, ensure_ascii=False, indent=2)
+        _atomic_write_text(self.korean_analysis_pool_path, raw, encoding="utf-8")
+
+    def load_korean_analysis_pool(self) -> dict[str, dict[str, Any]]:
+        """저장된 국어 지문 분석지 풀(Pool) 전체를 안전하게 조회한다."""
+        with self._lock:
+            pool = self._load_korean_analysis_pool_unlocked()
+            return {k: dict(v) for k, v in pool.items() if isinstance(v, dict)}
+
+    def get_cached_korean_analysis(self, cache_key: str) -> KoreanPassageAnalysisOutput | None:
+        """국어 분석지 풀에서 캐시 히트 시 KoreanPassageAnalysisOutput을 즉시 반환한다."""
+        if not cache_key:
+            return None
+        with self._lock:
+            pool = self._load_korean_analysis_pool_unlocked()
+            entry = pool.get(cache_key)
+            if not isinstance(entry, dict):
+                return None
+            raw_analysis = entry.get("analysis")
+            if not isinstance(raw_analysis, dict):
+                return None
+            try:
+                return KoreanPassageAnalysisOutput.model_validate(raw_analysis)
+            except Exception:
+                return None
+
+    def save_cached_korean_analysis(
+        self,
+        cache_key: str,
+        analysis: KoreanPassageAnalysisOutput,
+        *,
+        exam_name: str = "",
+        group_id: str = "",
+        korean_section: str = "",
+        korean_subgenre: str = "",
+    ) -> None:
+        """AI로 신규 생성한 국어 지문 분석지를 서버 풀에 영구 저장한다."""
+        if not cache_key or analysis is None:
+            return
+        with self._lock:
+            pool = self._load_korean_analysis_pool_unlocked()
+            pool[cache_key] = {
+                "exam_name": (exam_name or "").strip(),
+                "group_id": (group_id or "").strip(),
+                "section": (korean_section or "").strip(),
+                "subgenre": (korean_subgenre or "").strip(),
+                "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "analysis": analysis.model_dump(),
+            }
+            self._save_korean_analysis_pool_unlocked(pool)
+
+    def delete_korean_analysis_entry(self, cache_key: str) -> int:
+        """국어 지문 분석지 캐시에서 특정 키 항목 1건을 삭제한다."""
+        if not cache_key:
+            return 0
+        with self._lock:
+            pool = self._load_korean_analysis_pool_unlocked()
+            if cache_key not in pool:
+                return 0
+            pool.pop(cache_key, None)
+            self._save_korean_analysis_pool_unlocked(pool)
+            return 1
+
+    def clear_korean_analysis_pool(self) -> int:
+        """국어 지문 분석지 캐시 전체를 비운다."""
+        with self._lock:
+            pool = self._load_korean_analysis_pool_unlocked()
+            removed = len(pool)
+            self._save_korean_analysis_pool_unlocked({})
+            return removed
+
+    def delete_korean_analyses_by_exam(self, exam_name: str) -> int:
+        """특정 회차가 삭제될 때 해당 회차의 국어 분석지 캐시도 함께 삭제한다."""
+        target_exam = (exam_name or "").strip()
+        if not target_exam:
+            return 0
+        with self._lock:
+            pool = self._load_korean_analysis_pool_unlocked()
+            to_del = [
+                k
+                for k, v in pool.items()
+                if isinstance(v, dict) and str(v.get("exam_name") or "").strip() == target_exam
+            ]
+            if not to_del:
+                return 0
+            for k in to_del:
+                pool.pop(k, None)
+            self._save_korean_analysis_pool_unlocked(pool)
+            return len(to_del)
+
+    def rename_korean_analyses_exam(self, old_exam_name: str, new_exam_name: str) -> int:
+        """회차명 변경 시 국어 분석지 캐시의 exam_name 메타데이터를 동기화한다."""
+        old_n = (old_exam_name or "").strip()
+        new_n = re.sub(r"\s+", " ", (new_exam_name or "").strip())
+        if not old_n or not new_n or old_n == new_n:
+            return 0
+        with self._lock:
+            pool = self._load_korean_analysis_pool_unlocked()
+            changed = 0
+            for k, v in pool.items():
+                if isinstance(v, dict) and str(v.get("exam_name") or "").strip() == old_n:
+                    v["exam_name"] = new_n
+                    changed += 1
+            if changed > 0:
+                self._save_korean_analysis_pool_unlocked(pool)
+            return changed
