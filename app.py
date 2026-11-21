@@ -1682,11 +1682,16 @@ def _render_ncic_curriculum_manager(key_prefix: str = "ncic") -> None:
                 disabled=not auto_cats,
                 use_container_width=True,
             ):
-                with st.spinner("교육부(moe.go.kr) 고시 제2022-33호 원문을 내려받아 성취기준 파싱 중..."):
+                with st.spinner("교육부(moe.go.kr) 고시 제2022-33호 원문 불러오는 중 (지연 시 내장 공식 원문 자동 적용)..."):
                     try:
                         auto_res = fetch_and_sync_moe_2022_curriculum(target_categories=auto_cats)
+                        src_note = (
+                            " (웹 지연/차단으로 내장 교육부 공식 원문 시드 적용)"
+                            if auto_res.get("source") == "seed_fallback"
+                            else ""
+                        )
                         st.success(
-                            f"✅ 웹 자동 불러오기 완료! 총 {auto_res['extracted_total']}개 추출 "
+                            f"✅ 웹 자동 불러오기 완료!{src_note} 총 {auto_res['extracted_total']}개 추출 "
                             f"(신규 {auto_res['added']}개 추가 · 기존 {auto_res['updated']}개 갱신)"
                         )
                         st.rerun()

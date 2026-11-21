@@ -16,6 +16,7 @@ exam_db/
 concept_db/
 *.json
 !data/curriculum_2022.json
+!data/curriculum_2022_moe_seed.json
 
 # OS & editor artifacts
 .DS_Store

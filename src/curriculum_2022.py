@@ -5,6 +5,7 @@ import io
 import json
 import re
 import struct
+import time
 import urllib.request
 import zipfile
 import zlib
@@ -16,6 +17,7 @@ import pymupdf
 from src.models import ConceptBookRecord, QuestionExtractionOutput
 
 _DATA_PATH = Path(__file__).resolve().parent.parent / "data" / "curriculum_2022.json"
+_MOE_SEED_PATH = Path(__file__).resolve().parent.parent / "data" / "curriculum_2022_moe_seed.json"
 _RUNTIME_STANDARDS_PATH = Path(__file__).resolve().parent.parent / "exam_db" / "ncic_standards.json"
 _CATALOG_CACHE: dict[str, tuple[tuple[Any, ...], dict[str, Any]]] = {}
 
@@ -495,23 +497,31 @@ def _extract_hwp_text(hwp_bytes: bytes) -> str:
     return "\n".join(lines)
 
 
-def fetch_and_sync_moe_2022_curriculum(
-    target_categories: Sequence[str] | None = None,
-    path: Path | None = None,
-    timeout: int = 60,
-) -> dict[str, Any]:
-    """
-    교육부(moe.go.kr) 고시 제2022-33호 공식 원문 ZIP(별책 5·7·8·9·14)을 웹에서 직접 내려받아
-    국어·영어·수학·사회·과학·한국사 성취기준을 자동 파싱·병합한다.
-    """
+def _download_moe_zip(timeout: int = 8, total_timeout: int = 15) -> bytes:
+    """교육부 원문 ZIP을 전체 시간 상한(total_timeout) 내에 내려받는다."""
     req = urllib.request.Request(
         _MOE_2022_33_ZIP_URL,
         headers={"User-Agent": "Mozilla/5.0", "Referer": _MOE_2022_33_REFERER},
     )
-    zip_bytes = urllib.request.urlopen(req, timeout=timeout).read()
-    cat_obj = load_curriculum_2022_catalog()
-    target_set = set(target_categories) if target_categories else set(CURRICULUM_CATEGORIES)
+    deadline = time.monotonic() + max(2, int(total_timeout))
+    chunks: list[bytes] = []
+    with urllib.request.urlopen(req, timeout=max(2, int(timeout))) as resp:
+        while True:
+            if time.monotonic() > deadline:
+                raise TimeoutError(f"교육부(moe.go.kr) 다운로드 제한시간({total_timeout}초) 초과")
+            chunk = resp.read(65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+    return b"".join(chunks)
 
+
+def _extract_moe_zip_items(
+    zip_bytes: bytes,
+    target_set: set[str],
+    catalog: dict[str, Any],
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """교육부 고시 제2022-33호 ZIP 바이너리에서 별책 HWP 성취기준을 추출한다."""
     hint_rules: list[tuple[str, str]] = [
         ("국어과", "국어"),
         ("영어과", "영어"),
@@ -519,7 +529,6 @@ def fetch_and_sync_moe_2022_curriculum(
         ("사회과", "사회"),
         ("과학과", "과학"),
     ]
-
     all_extracted: list[dict[str, Any]] = []
     per_file_counts: dict[str, int] = {}
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
@@ -539,11 +548,48 @@ def fetch_and_sync_moe_2022_curriculum(
             items = _parse_curriculum_text_lines(
                 txt.splitlines(),
                 subject_category_hint=matched_hint,
-                catalog=cat_obj,
+                catalog=catalog,
             )
             filtered_items = [it for it in items if it.get("category") in target_set]
             per_file_counts[fname] = len(filtered_items)
             all_extracted.extend(filtered_items)
+    return all_extracted, per_file_counts
+
+
+def fetch_and_sync_moe_2022_curriculum(
+    target_categories: Sequence[str] | None = None,
+    path: Path | None = None,
+    timeout: int = 8,
+    total_timeout: int = 15,
+    allow_seed_fallback: bool = True,
+) -> dict[str, Any]:
+    """
+    교육부(moe.go.kr) 고시 제2022-33호 공식 원문 ZIP(별책 5·7·8·9·14)을 웹에서 직접 내려받아
+    국어·영어·수학·사회·과학·한국사 성취기준을 자동 파싱·병합한다.
+    해외 서버 IP 차단/지연 등으로 웹 접속이 제한시간 내에 실패하면 내장 공식 원문 시드로 즉시 폴백한다.
+    """
+    cat_obj = load_curriculum_2022_catalog()
+    target_set = set(target_categories) if target_categories else set(CURRICULUM_CATEGORIES)
+
+    source_mode = "web"
+    fallback_reason = ""
+    all_extracted: list[dict[str, Any]] = []
+    per_file_counts: dict[str, int] = {}
+
+    try:
+        zip_bytes = _download_moe_zip(timeout=timeout, total_timeout=total_timeout)
+        all_extracted, per_file_counts = _extract_moe_zip_items(zip_bytes, target_set, cat_obj)
+        if not all_extracted:
+            raise ValueError("교육부 원문 ZIP에서 추출된 성취기준이 0건입니다.")
+    except Exception as exc:
+        if not (allow_seed_fallback and _MOE_SEED_PATH.exists()):
+            raise
+        seed_raw = json.loads(_MOE_SEED_PATH.read_text(encoding="utf-8"))
+        seed_items = seed_raw.get("items") or []
+        all_extracted = [it for it in seed_items if it.get("category") in target_set]
+        per_file_counts = dict(seed_raw.get("files") or {})
+        source_mode = "seed_fallback"
+        fallback_reason = str(exc)
 
     res = merge_ncic_standards_to_catalog(all_extracted, path=path)
     return {
@@ -551,6 +597,8 @@ def fetch_and_sync_moe_2022_curriculum(
         "added": res["added"],
         "updated": res["updated"],
         "files": per_file_counts,
+        "source": source_mode,
+        "fallback_reason": fallback_reason,
     }
 
 
