@@ -4473,6 +4473,94 @@ _KOREAN_DIAGRAM_GUIDE = (
 )
 
 
+def _sanitize_korean_analysis_output(out: KoreanPassageAnalysisOutput) -> KoreanPassageAnalysisOutput:
+    """국어 분석지 출력에서 잔여 문제 표지(㉠~㉤, ⓐ~ⓔ, [A]~[E]) 및 여분 공백을 결정론적으로 정제한다."""
+    marker_only_re = re.compile(r"^[㉠㉡㉢㉣㉤ⓐⓑⓒⓓⓔㄱ-ㅎa-eA-E]\b|^[㉠㉡㉢㉣㉤ⓐⓑⓒⓓⓔ]|^\[[A-E]\]")
+    inline_marker_re = re.compile(r"[\u3260-\u327B\u24B6-\u24E9]|\[[A-E]\]")
+
+    def _clean_str(s: str) -> str:
+        return re.sub(r"[ \t]{2,}", " ", inline_marker_re.sub("", s or "")).strip()
+
+    clean_vocab = [
+        mv.model_copy(update={"term": _clean_str(mv.term), "meaning": _clean_str(mv.meaning)})
+        for mv in (out.marker_and_vocab_notes or [])
+        if (mv.term or "").strip() and not marker_only_re.match((mv.term or "").strip())
+    ]
+    clean_paras = [
+        ps.model_copy(
+            update={
+                "label": _clean_str(ps.label),
+                "summary": _clean_str(ps.summary),
+                "key_point": _clean_str(ps.key_point),
+            }
+        )
+        for ps in (out.paragraph_summaries or [])
+    ]
+    return out.model_copy(
+        update={
+            "title": _clean_str(out.title),
+            "core_theme": _clean_str(out.core_theme),
+            "paragraph_summaries": clean_paras,
+            "marker_and_vocab_notes": clean_vocab,
+            "area_specific_notes": [_clean_str(n) for n in (out.area_specific_notes or []) if _clean_str(n)],
+            "exam_checkpoints": [_clean_str(c) for c in (out.exam_checkpoints or []) if _clean_str(c)],
+        }
+    )
+
+
+def proofread_korean_passage_analysis(
+    *,
+    api_key: str,
+    model_name: str,
+    passage_text: str,
+    draft: KoreanPassageAnalysisOutput,
+    korean_section: str = "독서",
+) -> KoreanPassageAnalysisOutput:
+    """신규 생성된 국어 지문 분석지 초안을 원문과 대조하여 오탈자·맞춤법·비문·사실 불일치를 1회 마무리 교정한다."""
+    clean_passage = _strip_korean_exam_noise_lines(passage_text or "")
+    if not clean_passage:
+        return _sanitize_korean_analysis_output(draft)
+
+    client = _build_client(api_key, timeout_seconds=60)
+    system_inst = (
+        "당신은 대한민국 수능 국어 교재 출판사 수석 교열·감수 편집자입니다.\n"
+        "주어진 [지문 원문]과 [분석지 초안 JSON]을 대조하여 아래 4가지만 정밀 교정하고 최종 JSON을 반환하세요:\n"
+        "1. **맞춤법 · 오탈자 · 띄어쓰기 · 어색한 조사/비문** 교정 (예: 학술 용어 오타, 문장 호응 오류).\n"
+        "2. **원문 사실 일치 검증**: 지문에 없는 수치·개념·인물/작품명이나 반대로 서술된 인과관계가 있으면 지문 원문에 맞게 수정.\n"
+        "3. **문제용 표지 기호 제거**: `㉠~㉤`, `ⓐ~ⓔ`, `[A]~[E]` 같은 기호가 설명에 남아있으면 자연스러운 개념어로 치환.\n"
+        "4. **도식(`visual_diagram`) 최종 점검**: `diagram_type`에 필수 필드가 비어 있지 않은지, 각 `details` 항목이 간결(26자 이내)한지 다듬기.\n"
+        "이미 완벽한 부분은 불필요하게 축약하거나 훼손하지 말고 원안을 충실히 유지하세요."
+    )
+    prompt = (
+        f"[영역] {korean_section}\n\n"
+        f"[지문 원문]\n{clean_passage[:5000]}\n\n"
+        f"[분석지 초안 JSON]\n{draft.model_dump_json(indent=2)}\n\n"
+        "위 초안을 검토·교정한 최종 `KoreanPassageAnalysisOutput` JSON을 출력하세요."
+    )
+    try:
+        resp = _generate_content_with_fallback(
+            client=client,
+            model_name=model_name,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                system_instruction=system_inst,
+                response_mime_type="application/json",
+                response_schema=KoreanPassageAnalysisOutput,
+                temperature=0.1,
+                max_output_tokens=8192,
+                thinking_config=types.ThinkingConfig(
+                    thinking_level=types.ThinkingLevel.MINIMAL,
+                    include_thoughts=False,
+                ),
+            ),
+            fast_mode=True,
+        )
+        reviewed = _parse_structured(resp, KoreanPassageAnalysisOutput)
+        return _sanitize_korean_analysis_output(reviewed)
+    except Exception:
+        return _sanitize_korean_analysis_output(draft)
+
+
 def generate_korean_passage_analysis(
     api_key: str,
     model_name: str,
@@ -4482,6 +4570,7 @@ def generate_korean_passage_analysis(
     korean_section: str = "독서",
     korean_subgenre: str = "",
     passage_topic: str = "",
+    enable_proofread: bool = True,
 ) -> KoreanPassageAnalysisOutput:
     """
     국어 지문 1개 세트를 수능·학원형 정밀 지문 분석지(핵심 주제, 구조 흐름, 문단/연별 요약,
@@ -4562,7 +4651,16 @@ def generate_korean_passage_analysis(
         ),
         fast_mode=True,
     )
-    return _parse_structured(resp, KoreanPassageAnalysisOutput)
+    draft_out = _parse_structured(resp, KoreanPassageAnalysisOutput)
+    if enable_proofread:
+        return proofread_korean_passage_analysis(
+            api_key=api_key,
+            model_name=model_name,
+            passage_text=clean_passage,
+            draft=draft_out,
+            korean_section=korean_section,
+        )
+    return _sanitize_korean_analysis_output(draft_out)
 
 
 def generate_korean_visual_diagram(

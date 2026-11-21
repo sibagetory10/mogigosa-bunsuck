@@ -6873,7 +6873,7 @@ def _render_tab2_korean_transform_section() -> None:
                 need_total = len(missing_ai_indices) + len(missing_diag_indices)
                 with st.spinner(
                     f"📑 {MODEL_LABELS.get(EXAM_TAGGING_MODEL, EXAM_TAGGING_MODEL)}로 "
-                    f"국어 지문 분석지·이해 도식 {need_total}건 생성 중 "
+                    f"국어 지문 분석지·도식 생성 및 오탈자·원문 대조 마무리 검토 {need_total}건 진행 중 "
                     f"(DB 로드 {len(chosen_sets) - len(missing_ai_indices)}세트)..."
                 ):
                     for slot_i in missing_ai_indices:
