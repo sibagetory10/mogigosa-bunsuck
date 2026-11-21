@@ -80,6 +80,7 @@ from src.config import (
 from src.curriculum_2022 import (
     build_tagging_grounding_context,
     clear_ncic_standards_for_category,
+    fetch_and_sync_moe_2022_curriculum,
     get_catalog_summary_stats,
     get_official_subjects_for_category,
     merge_ncic_standards_to_catalog,
@@ -1663,6 +1664,34 @@ def _render_ncic_curriculum_manager(key_prefix: str = "ncic") -> None:
         r2[0].metric("사회 기준표", f"{stats['사회']['subjects']}과목", f"성취기준 {stats['사회']['standards']}개")
         r2[1].metric("과학 기준표", f"{stats['과학']['subjects']}과목", f"성취기준 {stats['과학']['standards']}개")
         r2[2].metric("한국사 기준표", f"{stats['한국사']['subjects']}과목", f"성취기준 {stats['한국사']['standards']}개")
+
+        auto_c1, auto_c2 = st.columns([2.2, 1.4])
+        with auto_c1:
+            auto_cats = st.multiselect(
+                "웹에서 자동 불러올 교과 (교육부 고시 제2022-33호 공식 원문)",
+                options=["국어", "영어", "수학", "사회", "과학", "한국사"],
+                default=["국어", "영어", "수학", "사회", "과학", "한국사"],
+                key=f"{key_prefix}_moe_auto_cats",
+            )
+        with auto_c2:
+            st.markdown("<div style='height: 1.65rem;'></div>", unsafe_allow_html=True)
+            if st.button(
+                "🌐 교육부 공식 원문 웹에서 자동 불러오기",
+                key=f"{key_prefix}_moe_auto_fetch_btn",
+                type="primary",
+                disabled=not auto_cats,
+                use_container_width=True,
+            ):
+                with st.spinner("교육부(moe.go.kr) 고시 제2022-33호 원문을 내려받아 성취기준 파싱 중..."):
+                    try:
+                        auto_res = fetch_and_sync_moe_2022_curriculum(target_categories=auto_cats)
+                        st.success(
+                            f"✅ 웹 자동 불러오기 완료! 총 {auto_res['extracted_total']}개 추출 "
+                            f"(신규 {auto_res['added']}개 추가 · 기존 {auto_res['updated']}개 갱신)"
+                        )
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"❌ 교육부 공식 원문 불러오기 실패: {exc}")
 
         nc1, nc2 = st.columns([2, 1])
         with nc1:
