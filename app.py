@@ -6714,7 +6714,7 @@ def _render_tab2_korean_transform_section() -> None:
             with st.expander(f"📄 지문 미리보기: {s_entry['exam_name']} [{s_entry['group_id']}번]", expanded=False):
                 st.text(s_entry["passage_text"][:1500] + ("..." if len(s_entry["passage_text"]) > 1500 else ""))
 
-        opt_c1, opt_c2 = st.columns(2)
+        opt_c1, opt_c2, opt_c3 = st.columns(3)
         with opt_c1:
             include_kor_diagrams = st.checkbox(
                 "🎨 비문학·문학 이해용 도식 그림 포함",
@@ -6726,6 +6726,12 @@ def _render_tab2_korean_transform_section() -> None:
                 "📄 원문 지문 전체 포함 (ON/OFF)",
                 value=False,
                 key="tab2_kor_include_passage",
+            )
+        with opt_c3:
+            enable_kor_proofread = st.checkbox(
+                "🔍 2차 원문 대조 교정 (느림)",
+                value=False,
+                key="tab2_kor_enable_proofread",
             )
         kb_c1, kb_c2 = st.columns(2)
         with kb_c1:
@@ -6873,15 +6879,16 @@ def _render_tab2_korean_transform_section() -> None:
 
             with _usage_scope():
                 need_total = len(missing_ai_indices) + len(missing_diag_indices)
+                mode_lbl = "2차 교정 포함" if enable_kor_proofread else "고속 병렬"
                 with st.spinner(
                     f"📑 {MODEL_LABELS.get(EXAM_TAGGING_MODEL, EXAM_TAGGING_MODEL)}로 "
-                    f"국어 지문 분석지·도식 생성 및 오탈자·원문 대조 마무리 검토 {need_total}건 진행 중 "
+                    f"국어 지문 분석지·도식 생성 ({mode_lbl}) {need_total}건 병렬 진행 중 "
                     f"(DB 로드 {len(chosen_sets) - len(missing_ai_indices)}세트)..."
                 ):
-                    for slot_i in missing_ai_indices:
-                        slot = prepared_slots[slot_i]
-                        s_entry = slot["entry"]
-                        try:
+                    if missing_ai_indices:
+                        def _run_ai_slot(slot_i: int):
+                            slot = prepared_slots[slot_i]
+                            s_entry = slot["entry"]
                             an_out = generate_korean_passage_analysis(
                                 api_key=kor_api_key,
                                 model_name=EXAM_TAGGING_MODEL,
@@ -6891,27 +6898,41 @@ def _render_tab2_korean_transform_section() -> None:
                                 korean_section=slot["kor_sec"],
                                 korean_subgenre=slot["kor_sub"],
                                 passage_topic=s_entry["passage_topic"],
+                                enable_proofread=enable_kor_proofread,
                             )
-                            slot["analysis"] = an_out
-                            ai_gen_cnt += 1
-                            storage.save_cached_korean_analysis(
-                                slot["cache_key"],
-                                an_out,
-                                exam_name=s_entry["exam_name"],
-                                group_id=s_entry["group_id"],
-                                korean_section=slot["kor_sec"],
-                                korean_subgenre=slot["kor_sub"],
-                            )
-                        except Exception as exc:
-                            st.error(f"[{s_entry['exam_name']} {s_entry['group_id']}번] 지문 분석 실패: {exc}")
+                            return slot_i, an_out
 
-                    for slot_i in missing_diag_indices:
-                        slot = prepared_slots[slot_i]
-                        s_entry = slot["entry"]
-                        cur_an = slot["analysis"]
-                        if cur_an is None:
-                            continue
-                        try:
+                        with concurrent.futures.ThreadPoolExecutor(
+                            max_workers=min(4, len(missing_ai_indices))
+                        ) as executor:
+                            fut_map = {executor.submit(_run_ai_slot, si): si for si in missing_ai_indices}
+                            for fut in concurrent.futures.as_completed(fut_map):
+                                si = fut_map[fut]
+                                slot = prepared_slots[si]
+                                s_entry = slot["entry"]
+                                try:
+                                    _, an_out = fut.result()
+                                    slot["analysis"] = an_out
+                                    ai_gen_cnt += 1
+                                    storage.save_cached_korean_analysis(
+                                        slot["cache_key"],
+                                        an_out,
+                                        exam_name=s_entry["exam_name"],
+                                        group_id=s_entry["group_id"],
+                                        korean_section=slot["kor_sec"],
+                                        korean_subgenre=slot["kor_sub"],
+                                    )
+                                except Exception as exc:
+                                    st.error(f"[{s_entry['exam_name']} {s_entry['group_id']}번] 지문 분석 실패: {exc}")
+
+                    valid_diag_indices = [
+                        si for si in missing_diag_indices if prepared_slots[si]["analysis"] is not None
+                    ]
+                    if valid_diag_indices:
+                        def _run_diag_slot(slot_i: int):
+                            slot = prepared_slots[slot_i]
+                            s_entry = slot["entry"]
+                            cur_an = slot["analysis"]
                             diag_out = generate_korean_visual_diagram(
                                 api_key=kor_api_key,
                                 model_name=EXAM_TAGGING_MODEL,
@@ -6920,18 +6941,31 @@ def _render_tab2_korean_transform_section() -> None:
                                 core_theme=cur_an.core_theme,
                                 korean_section=slot["kor_sec"],
                             )
-                            updated_an = cur_an.model_copy(update={"visual_diagram": diag_out})
-                            slot["analysis"] = updated_an
-                            storage.save_cached_korean_analysis(
-                                slot["cache_key"],
-                                updated_an,
-                                exam_name=s_entry["exam_name"],
-                                group_id=s_entry["group_id"],
-                                korean_section=slot["kor_sec"],
-                                korean_subgenre=slot["kor_sub"],
-                            )
-                        except Exception as exc:
-                            st.warning(f"[{s_entry['exam_name']} {s_entry['group_id']}번] 이해 도식 생성 건너뜀: {exc}")
+                            return slot_i, diag_out
+
+                        with concurrent.futures.ThreadPoolExecutor(
+                            max_workers=min(4, len(valid_diag_indices))
+                        ) as executor:
+                            fut_map = {executor.submit(_run_diag_slot, si): si for si in valid_diag_indices}
+                            for fut in concurrent.futures.as_completed(fut_map):
+                                si = fut_map[fut]
+                                slot = prepared_slots[si]
+                                s_entry = slot["entry"]
+                                cur_an = slot["analysis"]
+                                try:
+                                    _, diag_out = fut.result()
+                                    updated_an = cur_an.model_copy(update={"visual_diagram": diag_out})
+                                    slot["analysis"] = updated_an
+                                    storage.save_cached_korean_analysis(
+                                        slot["cache_key"],
+                                        updated_an,
+                                        exam_name=s_entry["exam_name"],
+                                        group_id=s_entry["group_id"],
+                                        korean_section=slot["kor_sec"],
+                                        korean_subgenre=slot["kor_sub"],
+                                    )
+                                except Exception as exc:
+                                    st.warning(f"[{s_entry['exam_name']} {s_entry['group_id']}번] 이해 도식 생성 건너뜀: {exc}")
 
         analyses_list: list[dict[str, Any]] = []
         pdf_parts: list[bytes] = []

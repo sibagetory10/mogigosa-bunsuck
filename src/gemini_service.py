@@ -4608,7 +4608,7 @@ def generate_korean_passage_analysis(
     korean_section: str = "독서",
     korean_subgenre: str = "",
     passage_topic: str = "",
-    enable_proofread: bool = True,
+    enable_proofread: bool = False,
 ) -> KoreanPassageAnalysisOutput:
     """
     국어 지문 1개 세트를 수능·학원형 정밀 지문 분석지(핵심 주제, 구조 흐름, 문단/연별 요약,
