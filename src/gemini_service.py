@@ -4404,7 +4404,7 @@ def generate_korean_passage_analysis(
             detected_markers.append(m_tok)
     marker_hint = (
         f"지문에서 감지된 필수 표지 기호({len(detected_markers)}개): {', '.join(detected_markers)} — "
-        "위 기호는 `marker_and_vocab_notes`에 1개도 빠짐없이 반드시 모두 포함하세요."
+        "위 기호는 `marker_and_vocab_notes`에 1개도 빠짐없이 모두 포함하고, 여기에 더해 지문의 핵심 개념어·전문 용어도 3~4개 함께 선정해 총 4~6개 항목을 작성하세요."
         if detected_markers
         else "지문에 기호가 없다면 핵심 개념어·어휘 4~6개를 선정해 해설하세요."
     )

@@ -928,6 +928,39 @@ def generate_custom_exam_pdf(
     return out_bytes
 
 
+def _join_korean_wrapped_line(prev_line: str, next_line: str) -> str:
+    """2단 PDF 줄바꿈으로 끊긴 두 줄을 이어 붙일 때 단어·조사 중간에 불필요한 공백이 들어가지 않도록 보정한다."""
+    if not prev_line:
+        return next_line
+    if not next_line:
+        return prev_line
+
+    # 앞 줄 끝이 하이픈/공백이면 그대로 연결
+    if prev_line.endswith((" ", "\t")):
+        return prev_line + next_line
+
+    # 다음 줄이 한국어 문장부호나 대표 조사·어미로 시작하면 붙여쓰기
+    if re.match(
+        r"^(?:[.,?!:;·\)\]\”\’]|(?:이다|입니다|있다|없다|한다|된다|하며|하여|하고|하면|해서|하는|되는|된|할|될|은|는|이|가|을|를|의|에|에서|에게|로|으로|와|과|도|만|까지|부터|처럼|보다|라고|이라고|라는|이라는|라|이라|며|으며|고|서|니|면|지만|으나|나|거나)\b)",
+        next_line,
+    ):
+        return prev_line + next_line
+
+    # 앞 줄 끝 어절(마지막 공백 이후)이 1~2글자이고 다음 줄 첫 어절도 1~2글자 한글이면 한 단어가 줄 끝에서 쪼개졌을 가능성이 높음
+    last_tok = prev_line.split()[-1] if prev_line.split() else ""
+    first_tok = next_line.split()[0] if next_line.split() else ""
+    if (
+        1 <= len(last_tok) <= 2
+        and 1 <= len(first_tok) <= 2
+        and re.fullmatch(r"[가-힣]+", last_tok)
+        and re.fullmatch(r"[가-힣]+", first_tok)
+        and len(prev_line) >= 18
+    ):
+        return prev_line + next_line
+
+    return f"{prev_line} {next_line}"
+
+
 def _clean_and_reflow_korean_passage(passage_text: str, is_poetry_or_literature: bool = False) -> list[str]:
     """
     국어 지문 원문에서 시험지 쪽수('4', '12')·푸터('국어 영역') 노이즈를 제거하고,
@@ -966,36 +999,38 @@ def _clean_and_reflow_korean_passage(passage_text: str, is_poetry_or_literature:
 
     # 독서(산문) 지문: 문장 종결 부호(. ? ! ” ’ ) 등) 또는 헤더([11~14], (가), (나), <보기>) 뒤에서만 문단을 나눔
     paragraphs: list[str] = []
-    buf: list[str] = []
+    cur_para = ""
+    prev_raw_ln = ""
     header_re = re.compile(r"^(?:\[\d{1,2}\s*[~\-～]\s*\d{1,2}\]|\([가나다라]\)|<[가-힣\s]+>|-\s*.*-\s*$)")
     sentence_end_re = re.compile(r"[.?!…\"”’\)\]]\s*$")
 
     for ln in cleaned:
         if not ln:
-            if buf:
-                paragraphs.append(" ".join(buf))
-                buf = []
+            if cur_para:
+                paragraphs.append(cur_para)
+                cur_para = ""
+                prev_raw_ln = ""
             continue
         if header_re.match(ln):
-            if buf:
-                paragraphs.append(" ".join(buf))
-                buf = []
+            if cur_para:
+                paragraphs.append(cur_para)
+                cur_para = ""
+                prev_raw_ln = ""
             paragraphs.append(ln)
             continue
-        if buf:
-            prev_line = buf[-1]
-            # 이전 줄이 문장 끝이고 현재 줄이 비교적 짧지 않거나 새 문단 시작처럼 보이면(이전 줄 길이가 2단 폭보다 짧은 경우) 문단 분리
-            if sentence_end_re.search(prev_line) and len(prev_line) <= 22:
-                paragraphs.append(" ".join(buf))
-                buf = [ln]
+        if cur_para:
+            if sentence_end_re.search(prev_raw_ln) and len(prev_raw_ln) <= 22:
+                paragraphs.append(cur_para)
+                cur_para = ln
             else:
-                # 한글 단어 중간이 아닌 경우 공백으로 연결, 음절 중간 끊김이 아닌 일반 공백 연결
-                buf.append(ln)
+                cur_para = _join_korean_wrapped_line(cur_para, ln)
+            prev_raw_ln = ln
         else:
-            buf.append(ln)
+            cur_para = ln
+            prev_raw_ln = ln
 
-    if buf:
-        paragraphs.append(" ".join(buf))
+    if cur_para:
+        paragraphs.append(cur_para)
     return [p for p in paragraphs if p.strip()]
 
 
@@ -1052,6 +1087,10 @@ def generate_korean_passage_analysis_pdf(
         margin-bottom: 5pt;
         break-after: avoid;
         page-break-after: avoid;
+    }
+    .sec-keep {
+        break-inside: avoid;
+        page-break-inside: avoid;
     }
     .theme-box {
         background-color: #EFF6FF;
@@ -1168,8 +1207,10 @@ def generate_korean_passage_analysis_pdf(
         """
 
         theme_html = f"""
-          <div class="sec-title">1. 핵심 주제 및 논리 · 시상 전개</div>
-          <div class="theme-box"><b>핵심 주제:</b> {html.escape(an.core_theme)}</div>
+          <div class="sec-keep">
+            <div class="sec-title">1. 핵심 주제 및 논리 · 시상 전개</div>
+            <div class="theme-box"><b>핵심 주제:</b> {html.escape(an.core_theme)}</div>
+          </div>
           <div class="flow-box"><b>전개 흐름:</b> {html.escape(an.structure_flow)}</div>
         """
 
@@ -1181,7 +1222,8 @@ def generate_korean_passage_analysis_pdf(
                 f"{html.escape(ps.summary)}{kp_html}</div>"
             )
         para_html = (
-            "<div class='sec-title'>2. 문단 · 연별 정밀 요약</div>" + "".join(para_rows)
+            f"<div class='sec-keep'><div class='sec-title'>2. 문단 · 연별 정밀 요약</div>{para_rows[0]}</div>"
+            + "".join(para_rows[1:])
             if para_rows
             else ""
         )
@@ -1195,8 +1237,10 @@ def generate_korean_passage_analysis_pdf(
                 f"{html.escape(mv.meaning)}</div>"
             )
         vocab_html = (
+            "<div class='sec-keep'>"
             "<div class='sec-title'>3. 핵심 표지(㉠~㉤ · ⓐ~ⓔ) 및 어휘 · 개념 풀이</div>"
             f"<div class='vocab-list'>{''.join(vocab_rows)}</div>"
+            "</div>"
             if vocab_rows
             else ""
         )
@@ -1207,7 +1251,7 @@ def generate_korean_passage_analysis_pdf(
             if n.strip()
         )
         area_html = (
-            f"<div class='sec-title'>4. 영역별 핵심 정리 ({html.escape(section_label)})</div>{area_items}"
+            f"<div class='sec-keep'><div class='sec-title'>4. 영역별 핵심 정리 ({html.escape(section_label)})</div>{area_items}</div>"
             if area_items
             else ""
         )
@@ -1218,7 +1262,7 @@ def generate_korean_passage_analysis_pdf(
             if c.strip()
         )
         cp_html = (
-            f"<div class='sec-title'>5. 출제 예상 포인트 및 오답 주의사항</div><div class='checkpoint-box'>{cp_items}</div>"
+            f"<div class='sec-keep'><div class='sec-title'>5. 출제 예상 포인트 및 오답 주의사항</div><div class='checkpoint-box'>{cp_items}</div></div>"
             if cp_items
             else ""
         )
