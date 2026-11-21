@@ -967,11 +967,12 @@ def _clean_and_reflow_korean_passage(passage_text: str, is_poetry_or_literature:
     2단 폭 때문에 문장 중간에서 끊긴 줄바꿈을 자연스러운 문단 단위로 재조립해 반환한다.
     """
     raw_lines = (passage_text or "").splitlines()
-    cleaned: list[str] = []
+    cleaned: list[tuple[str, bool]] = []
     for raw_ln in raw_lines:
+        is_indented = bool(re.match(r"^(?:[ \t\u3000]{2,}|\t|\u3000)", raw_ln))
         s = raw_ln.strip()
         if not s:
-            cleaned.append("")
+            cleaned.append(("", False))
             continue
         if re.match(r"^\[?\s*\d{1,2}\s*\]?$", s):
             continue
@@ -979,13 +980,13 @@ def _clean_and_reflow_korean_passage(passage_text: str, is_poetry_or_literature:
             continue
         if re.match(r"^(?:\d{1,2}\s+국어|국어\s+\d{1,2})$", s):
             continue
-        cleaned.append(s)
+        cleaned.append((s, is_indented))
 
     if is_poetry_or_literature:
         # 시·문학은 연/행 구분을 보존하되 연속 빈 줄만 정리
         out_lit: list[str] = []
         prev_blank = False
-        for ln in cleaned:
+        for ln, _ in cleaned:
             if not ln:
                 if not prev_blank and out_lit:
                     out_lit.append("")
@@ -997,14 +998,18 @@ def _clean_and_reflow_korean_passage(passage_text: str, is_poetry_or_literature:
             out_lit.pop()
         return out_lit
 
-    # 독서(산문) 지문: 문장 종결 부호(. ? ! ” ’ ) 등) 또는 헤더([11~14], (가), (나), <보기>) 뒤에서만 문단을 나눔
+    # 독서(산문) 지문: 빈 줄, 들여쓰기 시작, 헤더, 문장 종결 후 짧은 줄 기준으로 문단 나눔
+    prose_lens = sorted(len(ln) for ln, _ in cleaned if len(ln) >= 15)
+    full_len = prose_lens[int(len(prose_lens) * 0.8)] if prose_lens else 30
+    short_end_thresh = max(24, int(full_len * 0.84))
+
     paragraphs: list[str] = []
     cur_para = ""
     prev_raw_ln = ""
     header_re = re.compile(r"^(?:\[\d{1,2}\s*[~\-～]\s*\d{1,2}\]|\([가나다라]\)|<[가-힣\s]+>|-\s*.*-\s*$)")
     sentence_end_re = re.compile(r"[.?!…\"”’\)\]]\s*$")
 
-    for ln in cleaned:
+    for ln, is_indented in cleaned:
         if not ln:
             if cur_para:
                 paragraphs.append(cur_para)
@@ -1019,7 +1024,7 @@ def _clean_and_reflow_korean_passage(passage_text: str, is_poetry_or_literature:
             paragraphs.append(ln)
             continue
         if cur_para:
-            if sentence_end_re.search(prev_raw_ln) and len(prev_raw_ln) <= 22:
+            if sentence_end_re.search(prev_raw_ln) and (is_indented or len(prev_raw_ln) <= short_end_thresh):
                 paragraphs.append(cur_para)
                 cur_para = ln
             else:
@@ -1217,8 +1222,12 @@ def generate_korean_passage_analysis_pdf(
         line-height: 1.62;
     }
     .passage-p {
-        margin: 0 0 5pt 0;
+        margin: 0 0 7.5pt 0;
+        text-indent: 9pt;
         text-align: justify;
+    }
+    .passage-lit-line {
+        margin: 0 0 2.5pt 0;
     }
     .passage-hdr {
         margin: 4pt 0 3pt 0;
@@ -1332,13 +1341,14 @@ def generate_korean_passage_analysis_pdf(
 
         reflowed_paragraphs = _clean_and_reflow_korean_passage(passage_text, is_poetry_or_literature=is_lit)
         p_blocks: list[str] = []
+        p_cls = "passage-lit-line" if is_lit else "passage-p"
         for rp in reflowed_paragraphs:
             if not rp:
-                p_blocks.append("<div style='height:4pt;'></div>")
+                p_blocks.append("<div style='height:5pt;'></div>")
             elif re.match(r"^(?:\[\d{1,2}\s*[~\-～]\s*\d{1,2}\]|\([가나다라]\)|<[가-힣\s]+>)", rp):
                 p_blocks.append(f"<div class='passage-hdr'>{html.escape(rp)}</div>")
             else:
-                p_blocks.append(f"<p class='passage-p'>{html.escape(rp)}</p>")
+                p_blocks.append(f"<p class='{p_cls}'>{html.escape(rp)}</p>")
         passage_html = (
             f"<div class='sec-title'>6. 원문 지문 전체</div><div class='passage-box'>{''.join(p_blocks)}</div>"
             if p_blocks
