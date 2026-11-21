@@ -1262,7 +1262,9 @@ def generate_korean_passage_analysis_pdf(
         text-align: center;
     }
     .diagram-img {
-        width: 100%;
+        width: 505pt;
+        max-width: 100%;
+        height: auto;
     }
     """
 
@@ -1390,7 +1392,7 @@ def generate_korean_passage_analysis_pdf(
                 diag_b64 = base64.b64encode(diag_png).decode("ascii")
                 diagram_html = _keep_block(
                     "<div class='sec-title'>한눈에 보는 개념 · 원리 도식</div>"
-                    f"<div class='diagram-wrap'><img class='diagram-img' src='data:image/png;base64,{diag_b64}'/></div>"
+                    f"<div class='diagram-wrap'><img class='diagram-img' width='505' src='data:image/png;base64,{diag_b64}'/></div>"
                 )
             except Exception:
                 diagram_html = ""

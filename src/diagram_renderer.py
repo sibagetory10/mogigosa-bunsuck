@@ -209,20 +209,23 @@ def _draw_arrow(
     p2 = (x2 + head_len * math.cos(a2), y2 + head_len * math.sin(a2))
     draw.polygon([(x2, y2), p1, p2], fill=color)
 
-    clean_lbl = (label or "").strip()
+    clean_lbl = " ".join((label or "").split()).strip()
     if clean_lbl and f_lbl is not None:
+        max_pill_w = 82
+        while len(clean_lbl) > 2 and draw.textlength(clean_lbl, font=f_lbl) > max_pill_w:
+            clean_lbl = clean_lbl[:-1].rstrip()
         mx = (x1 + x2) // 2
         my = (y1 + y2) // 2
-        tw = int(draw.textlength(clean_lbl, font=f_lbl)) + 16
-        th = 24
+        tw = int(draw.textlength(clean_lbl, font=f_lbl)) + 14
+        th = 22
         draw.rounded_rectangle(
-            [mx - tw // 2, my - th // 2 - 14, mx + tw // 2, my + th // 2 - 14],
+            [mx - tw // 2, my - th // 2 - 18, mx + tw // 2, my + th // 2 - 18],
             radius=8,
             fill=(255, 255, 255),
             outline=(148, 163, 184),
             width=2,
         )
-        draw.text((mx - tw // 2 + 8, my - th // 2 - 11), clean_lbl, font=f_lbl, fill=(30, 58, 138))
+        draw.text((mx - tw // 2 + 7, my - th // 2 - 15), clean_lbl, font=f_lbl, fill=(30, 58, 138))
 
 
 def render_korean_diagram_png(diagram: KoreanVisualDiagram) -> bytes:
@@ -233,15 +236,15 @@ def render_korean_diagram_png(diagram: KoreanVisualDiagram) -> bytes:
 
     W = 1400
     PAD_X = 36
-    GAP_X = 46
-    GAP_Y = 44
+    GAP_X = 88
+    GAP_Y = 48
 
     f_hdr_tag = _load_font(17, bold=True)
     f_hdr_title = _load_font(26, bold=True)
     f_sub = _load_font(16, bold=True)
     f_title = _load_font(22, bold=True)
     f_body = _load_font(19, bold=False)
-    f_lbl = _load_font(16, bold=True)
+    f_lbl = _load_font(14, bold=True)
     f_take = _load_font(19, bold=True)
 
     probe = Image.new("RGB", (W, 200), (255, 255, 255))
@@ -304,7 +307,7 @@ def render_korean_diagram_png(diagram: KoreanVisualDiagram) -> bytes:
     else:
         # flow 또는 comparison (4개 이하 1줄, 5개면 상단 3개 + 하단 2개)
         if n <= 4:
-            gap = 36 if dtype == "comparison" else GAP_X
+            gap = 74 if dtype == "comparison" else GAP_X
             card_w = (W - PAD_X * 2 - gap * (n - 1)) // n
             card_h = max(_measure_card_height(pdraw, nd, card_w, f_sub, f_title, f_body) for nd in nodes)
             for i, nd in enumerate(nodes):
@@ -397,16 +400,18 @@ def render_korean_diagram_png(diagram: KoreanVisualDiagram) -> bytes:
             _, x2, y2, _, _ = boxes[i + 1]
             mx = (x1 + w1 + x2) // 2
             my = y1 + h1 // 2
-            vs_lbl = rel_labels[i] if i < len(rel_labels) else "VS"
-            tw = max(38, int(draw.textlength(vs_lbl, font=f_lbl)) + 18)
+            vs_lbl = " ".join((rel_labels[i] if i < len(rel_labels) else "VS").split()).strip() or "VS"
+            while len(vs_lbl) > 2 and draw.textlength(vs_lbl, font=f_lbl) > 58:
+                vs_lbl = vs_lbl[:-1].rstrip()
+            tw = max(36, int(draw.textlength(vs_lbl, font=f_lbl)) + 16)
             draw.rounded_rectangle(
-                [mx - tw // 2, my - 16, mx + tw // 2, my + 16],
-                radius=12,
+                [mx - tw // 2, my - 15, mx + tw // 2, my + 15],
+                radius=11,
                 fill=(239, 246, 255),
                 outline=(59, 130, 246),
                 width=2,
             )
-            draw.text((mx - tw // 2 + 9, my - 10), vs_lbl, font=f_lbl, fill=(29, 78, 216))
+            draw.text((mx - tw // 2 + 8, my - 8), vs_lbl, font=f_lbl, fill=(29, 78, 216))
 
     else:
         # flow 화살표

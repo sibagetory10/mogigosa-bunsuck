@@ -1154,9 +1154,9 @@ class StorageManager:
             self._save_korean_analysis_pool_unlocked(pool)
 
     def get_korean_analysis_pdf_path(self, cache_key: str) -> Path:
-        """지문별 국어 분석지 PDF 파일 경로를 반환한다 (도식 그림·기호 제거 v3 포맷)."""
+        """지문별 국어 분석지 PDF 파일 경로를 반환한다 (도식 폭 보정 v4 포맷)."""
         safe_key = re.sub(r"[^a-zA-Z0-9_-]+", "_", (cache_key or "").strip()) or "empty"
-        return self.korean_analysis_pdfs_root / f"{safe_key}_v3.pdf"
+        return self.korean_analysis_pdfs_root / f"{safe_key}_v4.pdf"
 
     def has_korean_analysis_pdf(self, cache_key: str) -> bool:
         """지문별 국어 분석지 PDF가 서버 DB에 저장되어 있는지 반환한다."""
@@ -1191,7 +1191,7 @@ class StorageManager:
             p = self.get_korean_analysis_pdf_path(cache_key)
             _atomic_write_bytes(p, pdf_bytes)
             safe_key = re.sub(r"[^a-zA-Z0-9_-]+", "_", (cache_key or "").strip()) or "empty"
-            for old_name in (f"{safe_key}.pdf", f"{safe_key}_v2.pdf"):
+            for old_name in (f"{safe_key}.pdf", f"{safe_key}_v2.pdf", f"{safe_key}_v3.pdf"):
                 legacy_p = self.korean_analysis_pdfs_root / old_name
                 if legacy_p.exists():
                     legacy_p.unlink(missing_ok=True)
@@ -1212,6 +1212,7 @@ class StorageManager:
             safe_key = re.sub(r"[^a-zA-Z0-9_-]+", "_", (cache_key or "").strip()) or "empty"
             for pdf_p in (
                 self.get_korean_analysis_pdf_path(cache_key),
+                self.korean_analysis_pdfs_root / f"{safe_key}_v3.pdf",
                 self.korean_analysis_pdfs_root / f"{safe_key}_v2.pdf",
                 self.korean_analysis_pdfs_root / f"{safe_key}.pdf",
             ):
