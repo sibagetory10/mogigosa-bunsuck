@@ -4620,13 +4620,19 @@ def generate_korean_passage_analysis(
 
     is_poetry = _is_korean_poetry_genre(korean_section, korean_subgenre, clean_passage)
     poetry_rule = (
-        "9. `poetry_underline_notes`: **시(시가) 갈래이므로 필수 작성** — "
-        "원문에서 표현상 특징(비유, 감각적 심상, 역설, 반어, 대비, 설의, 객관적 상관물 등)이나 "
-        "화자의 정서·태도가 핵심적으로 드러나는 시구·시어 **4~7개**를 골라, "
-        "`quote`에는 반드시 `[지문 원문]`에 실제로 등장하는 어구 그대로(오타·변형 없이) 넣고, "
-        "`explanation`에는 표현법과 시적·함축적 의미를 구체적으로 해설하세요."
+        "9. `poetry_works` 및 `poetry_underline_notes`: **시(시가) 갈래이므로 필수 작성** —\n"
+        "   - `poetry_works`: 지문 속 각 시 작품((가), (나) 등 시 갈래만 작품별로 분리)에 대해 아래를 작성하세요:\n"
+        "     * `work_label`: `'(가)'`, `'(나)'` (단일 작품이면 `''`), `title_author`: `'작가, 「작품명」'`\n"
+        "     * `lines`: 원문 시의 각 행을 순서대로 담은 리스트 (연과 연 사이는 빈 문자열 `''` 삽입, 원문 표기 100% 그대로 유지)\n"
+        "     * `marks`: 핵심 시어·시구 8~16개에 대해 `line_index`(1부터 시작, 빈 줄 포함), `quote`(해당 행 원문 그대로), "
+        "`mark_type`(`underline` 직선밑줄 / `wavy` 물결선 / `box` 네모 / `circle` 동그라미 / `triangle` 세모-시련·부정), "
+        "`color`(`red` 정서·감각·시련 / `blue` 구조·희망·극복의지 / `dark` 대상·어구풀이), "
+        "`position`(`above` 또는 `below` — 한 행에 여러 주석이면 위/아래 분산), `note`(25자 이내 짧은 핵심 주석)를 지정하세요.\n"
+        "     * `brackets`: 연/행 묶음·구조 주석 2~5개 (`start_line`, `end_line`, `side`=`'right'`/`'left'`, "
+        "`style`=`'brace'` 중괄호 / `'arc'` 수미상관 연결호 / `'divider'` 시상전환 점선, `color`, `note` 예: `'대구법 & 연쇄법'`, `'수미상관 구조'`, `'시상 전환'`).\n"
+        "   - `poetry_underline_notes`: 핵심 시구 4~7개 요약 리스트도 함께 채우세요."
         if is_poetry
-        else "9. `poetry_underline_notes`: 시(시가) 갈래가 아니므로 빈 리스트 `[]`로 두세요."
+        else "9. `poetry_works` 및 `poetry_underline_notes`: 시(시가) 갈래가 아니므로 둘 다 빈 리스트 `[]`로 두세요."
     )
 
     client = _build_client(api_key, timeout_seconds=90)

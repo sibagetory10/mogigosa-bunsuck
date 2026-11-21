@@ -614,6 +614,65 @@ class KoreanPoetryLineNote(BaseModel):
     explanation: str = Field(..., description="해당 밑줄 시구의 표현상 특징, 시적 의미 및 화자의 정서·태도 해설")
 
 
+class KoreanPoetryMark(BaseModel):
+    """시 원문 특정 행·시어에 직접 그리는 밑줄·물결선·네모·동그라미·세모 및 행간 주석."""
+
+    line_index: int = Field(..., description="해당 시 작품 `lines` 리스트 내 1부터 시작하는 행 번호 (빈 줄 포함)")
+    quote: str = Field(..., description="해당 행 원문에 실제로 존재하는 시어·시구 그대로 발췌")
+    mark_type: Literal["underline", "wavy", "box", "circle", "triangle"] = Field(
+        default="underline",
+        description="표기 도형: underline(직선 밑줄), wavy(물결선), box(네모 박스), circle(동그라미), triangle(세모/시련·부정)",
+    )
+    color: Literal["red", "blue", "dark"] = Field(
+        default="red",
+        description="주석 색상: red(화자 정서·감각 이미지·부정/시련), blue(구조적 특징·긍정/희망/극복 의지), dark(기본 대상/지시어)",
+    )
+    position: Literal["above", "below"] = Field(
+        default="below",
+        description="행간 주석 배치 위치 (below=행 아래, above=행 위)",
+    )
+    note: str = Field(..., description="시어 위/아래 행간에 화살표로 연결할 짧은 핵심 해설 (25자 이내 권장)")
+
+
+class KoreanPoetryMarginBracket(BaseModel):
+    """시 좌·우 여백에 여러 행/연을 묶어 표시하는 구조 브라켓·수미상관·시상전환 주석."""
+
+    start_line: int = Field(..., description="묶음 시작 행 번호 (1부터 시작)")
+    end_line: int = Field(..., description="묶음 끝 행 번호 (1부터 시작)")
+    side: Literal["left", "right"] = Field(
+        default="right",
+        description="여백 위치 (right=연/행 묶음·대구·시상전환 등, left=수미상관 큰 연결선 등)",
+    )
+    style: Literal["brace", "arc", "divider"] = Field(
+        default="brace",
+        description="선 스타일: brace(중괄호 } / { 묶음), arc(두 연을 잇는 큰 호 - 수미상관 등), divider(시상 전환 점선 구분선)",
+    )
+    color: Literal["red", "blue", "dark"] = Field(
+        default="blue",
+        description="여백 주석 색상 (blue/red/dark)",
+    )
+    note: str = Field(..., description="여백에 표시할 구조·시상 전개 핵심 주석 (예: '대구법 & 연쇄법', '수미상관 구조', '시상 전환')")
+
+
+class KoreanPoetryWorkAnnotation(BaseModel):
+    """(가)/(나) 등 개별 시 작품 1편의 행간·여백 주석형 원문 분석 데이터."""
+
+    work_label: str = Field(default="", description="작품 구분 기호 (예: '(가)', '(나)', 단일 작품이면 '')")
+    title_author: str = Field(..., description="작품명 및 작가 (예: '신동엽, 「산에 언덕에」')")
+    lines: list[str] = Field(
+        default_factory=list,
+        description="원문 시의 각 행 리스트 (연과 연 사이는 빈 문자열 '' 포함). 반드시 원문 표기 그대로 수록.",
+    )
+    marks: list[KoreanPoetryMark] = Field(
+        default_factory=list,
+        description="시어·시구별 밑줄/물결/네모/동그라미/세모 및 행간 주석 목록 (8~16개 권장)",
+    )
+    brackets: list[KoreanPoetryMarginBracket] = Field(
+        default_factory=list,
+        description="좌·우 여백 묶음 괄호, 수미상관 연결선, 시상 전환 구분선 목록 (2~5개 권장)",
+    )
+
+
 class KoreanDiagramNode(BaseModel):
     """비문학 지문 이해를 돕는 도식 그림의 개별 개념/단계 노드."""
 
@@ -796,6 +855,10 @@ class KoreanPassageAnalysisOutput(BaseModel):
     poetry_underline_notes: list[KoreanPoetryLineNote] = Field(
         default_factory=list,
         description="시(현대시·고전시가 등) 갈래일 때 원문에서 밑줄을 그어 해설할 핵심 시구·시어 목록 (4~7개). 산문/비문학은 빈 리스트.",
+    )
+    poetry_works: list[KoreanPoetryWorkAnnotation] = Field(
+        default_factory=list,
+        description="시(현대시·고전시가 등) 갈래일 때 (가)/(나) 작품별로 분리한 행간·여백 주석형 원문 분석 데이터 리스트. 산문/비문학은 빈 리스트.",
     )
     visual_diagram: KoreanVisualDiagram | None = Field(
         default=None,
