@@ -6628,19 +6628,23 @@ def _render_tab2_korean_transform_section() -> None:
         key=lambda e: (e["exam_name"], min(x.q_num for x in e["records"])),
     )
 
-    fc1, fc2, fc3 = st.columns([1.2, 1.0, 1.4])
+    fc1, fc2, fc3 = st.columns([1.3, 1.1, 1.3])
     avail_kor_exams = sorted({e["exam_name"] for e in set_entries}, reverse=True)
     with fc1:
-        sel_kor_exam = st.selectbox(
-            "모의고사 회차 필터",
-            options=["전체"] + avail_kor_exams,
-            key="tab2_kor_filter_exam",
+        sel_kor_exams = st.multiselect(
+            "모의고사 회차 필터 (복수 선택)",
+            options=avail_kor_exams,
+            default=[],
+            placeholder="전체 회차",
+            key="tab2_kor_filter_exams",
         )
     with fc2:
-        sel_kor_sec = st.selectbox(
-            "영역 필터",
-            options=["전체", "독서", "문학", "화법과 작문", "언어와 매체"],
-            key="tab2_kor_filter_sec",
+        sel_kor_secs = st.multiselect(
+            "영역 필터 (복수 선택)",
+            options=["독서", "문학", "화법과 작문", "언어와 매체"],
+            default=[],
+            placeholder="전체 영역",
+            key="tab2_kor_filter_secs",
         )
     with fc3:
         kor_kw = st.text_input(
@@ -6661,10 +6665,10 @@ def _render_tab2_korean_transform_section() -> None:
     kw_low = (kor_kw or "").strip().lower()
     filtered_sets: list[dict[str, Any]] = []
     for e in set_entries:
-        if sel_kor_exam != "전체" and e["exam_name"] != sel_kor_exam:
+        if sel_kor_exams and e["exam_name"] not in sel_kor_exams:
             continue
         sec_label = _classify_kor_sec(e["curr_subj"])
-        if sel_kor_sec != "전체" and sec_label != sel_kor_sec:
+        if sel_kor_secs and sec_label not in sel_kor_secs:
             continue
         if kw_low:
             blob = " ".join(
