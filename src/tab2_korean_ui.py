@@ -7,7 +7,6 @@ from typing import Any, Callable
 import streamlit as st
 
 from src.auth import (
-    consume_user_token_quota,
     get_max_batch_questions,
 )
 from src.config import (

@@ -15,12 +15,22 @@ from src.models import (
     KoreanVisualDiagram,
     normalize_korean_group_id,
 )
-from src.gemini_service import (
-    _build_client,
-    _encode_image_part,
-    _generate_content_with_fallback,
-    _parse_structured,
-)
+def _build_client(api_key: str, *, timeout_seconds: int = 120) -> Any:
+    from src.gemini_service import _build_client as _impl
+
+    return _impl(api_key, timeout_seconds=timeout_seconds)
+
+
+def _generate_content_with_fallback(*args: Any, **kwargs: Any) -> Any:
+    from src.gemini_service import _generate_content_with_fallback as _impl
+
+    return _impl(*args, **kwargs)
+
+
+def _parse_structured(*args: Any, **kwargs: Any) -> Any:
+    from src.gemini_service import _parse_structured as _impl
+
+    return _impl(*args, **kwargs)
 
 def _sync_korean_group_passages(items: list[KoreanQuestionExtractionItem]) -> None:
     """동일한 passage_group_id를 공유하는 국어 세트 문항들의 지문·주제·세부 갈래를 동기화한다."""
