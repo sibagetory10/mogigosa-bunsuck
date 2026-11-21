@@ -645,6 +645,269 @@ def _render_scale(
     return total_h, [_draw_fn]
 
 
+def _render_fishbone(
+    diagram: KoreanVisualDiagram,
+    W: int,
+    PAD_X: int,
+    body_top: int,
+    fonts: dict[str, Any],
+) -> tuple[int, list[Any]]:
+    """피쉬본(어골도): 다발적 원인·요인 -> 핵심 결과/현상 수렴 도식."""
+    nodes = list(diagram.nodes or [])[:4]
+    while len(nodes) < 2:
+        nodes.append(KoreanDiagramNode(title=f"핵심 요인 {len(nodes) + 1}"))
+    head_txt = (diagram.center_label or diagram.title or "핵심 결과").strip()
+    probe = ImageDraw.Draw(Image.new("RGB", (W, 100)))
+
+    card_w = 410
+    head_w = 270
+    head_h = 136
+    top_nodes = nodes[::2]
+    bot_nodes = nodes[1::2]
+    top_h = max((_measure_card_height(probe, nd, card_w, fonts["sub"], fonts["title"], fonts["body"]) for nd in top_nodes), default=120)
+    bot_h = max((_measure_card_height(probe, nd, card_w, fonts["sub"], fonts["title"], fonts["body"]) for nd in bot_nodes), default=120)
+    spine_gap = 76
+    total_h = top_h + spine_gap + bot_h
+
+    def _draw_fn(draw: ImageDraw.ImageDraw) -> None:
+        spine_y = body_top + top_h + spine_gap // 2
+        head_x = W - PAD_X - head_w
+        head_y = spine_y - head_h // 2
+
+        # 중앙 척추선
+        _draw_arrow(draw, PAD_X + 20, spine_y, head_x - 8, spine_y, color=(30, 41, 59))
+
+        # 상단 원인 카드 + 대각선 가시
+        for i, nd in enumerate(top_nodes):
+            cx = PAD_X + 30 + i * (card_w + 56)
+            cy = body_top + (top_h - _measure_card_height(probe, nd, card_w, fonts["sub"], fonts["title"], fonts["body"]))
+            ch = _measure_card_height(probe, nd, card_w, fonts["sub"], fonts["title"], fonts["body"])
+            _draw_node_card(draw, nd, cx, cy, card_w, ch, fonts["sub"], fonts["title"], fonts["body"])
+            sx = cx + card_w // 2
+            tx = min(head_x - 34, sx + 70)
+            draw.line([(sx, cy + ch), (tx, spine_y)], fill=(59, 130, 246), width=3)
+            draw.ellipse([tx - 5, spine_y - 5, tx + 5, spine_y + 5], fill=(29, 78, 216))
+
+        # 하단 원인 카드 + 대각선 가시
+        for i, nd in enumerate(bot_nodes):
+            cx = PAD_X + 30 + i * (card_w + 56)
+            cy = body_top + top_h + spine_gap
+            ch = _measure_card_height(probe, nd, card_w, fonts["sub"], fonts["title"], fonts["body"])
+            _draw_node_card(draw, nd, cx, cy, card_w, ch, fonts["sub"], fonts["title"], fonts["body"])
+            sx = cx + card_w // 2
+            tx = min(head_x - 34, sx + 70)
+            draw.line([(sx, cy), (tx, spine_y)], fill=(22, 163, 74), width=3)
+            draw.ellipse([tx - 5, spine_y - 5, tx + 5, spine_y + 5], fill=(21, 128, 61))
+
+        # 우측 핵심 결과(머리) 박스
+        draw.rounded_rectangle(
+            [head_x, head_y, head_x + head_w, head_y + head_h],
+            radius=20,
+            fill=(255, 251, 235),
+            outline=(217, 119, 6),
+            width=4,
+        )
+        draw.text((head_x + 18, head_y + 14), "핵심 결과 · 현상", font=fonts["sub"], fill=(180, 83, 9))
+        h_lines = _wrap_text(draw, head_txt, fonts["title"], head_w - 36)
+        hy = head_y + 48
+        for hl in h_lines[:3]:
+            draw.text((head_x + 18, hy), hl, font=fonts["title"], fill=(15, 23, 42))
+            hy += 28
+
+    return total_h, [_draw_fn]
+
+
+def _render_quadrant(
+    diagram: KoreanVisualDiagram,
+    W: int,
+    PAD_X: int,
+    body_top: int,
+    fonts: dict[str, Any],
+) -> tuple[int, list[Any]]:
+    """2x2 사분면 분류 도식: 두 개의 직교 분류 축을 기준으로 4개 구역에 개념 배치."""
+    nodes = list(diagram.nodes or [])[:4]
+    while len(nodes) < 4:
+        nodes.append(KoreanDiagramNode(title=f"유형 {len(nodes) + 1}", accent_color=_COLOR_CYCLE[len(nodes) % len(_COLOR_CYCLE)]))
+
+    y_lbl = (diagram.quadrant_y_label or "세로 분류 기준 (Y)").strip()
+    x_lbl = (diagram.quadrant_x_label or "가로 분류 기준 (X)").strip()
+    probe = ImageDraw.Draw(Image.new("RGB", (W, 100)))
+
+    card_w = 570
+    top_h = max(_measure_card_height(probe, nd, card_w, fonts["sub"], fonts["title"], fonts["body"]) for nd in nodes[:2])
+    bot_h = max(_measure_card_height(probe, nd, card_w, fonts["sub"], fonts["title"], fonts["body"]) for nd in nodes[2:4])
+    top_pad = 44
+    mid_gap = 64
+    bot_pad = 40
+    total_h = top_pad + top_h + mid_gap + bot_h + bot_pad
+
+    def _draw_fn(draw: ImageDraw.ImageDraw) -> None:
+        cx = W // 2
+        cy = body_top + top_pad + top_h + mid_gap // 2
+
+        # 십자 축 화살표
+        _draw_arrow(draw, cx, body_top + total_h - bot_pad + 6, cx, body_top + 28, color=(30, 41, 59))
+        _draw_arrow(draw, PAD_X + 10, cy, W - PAD_X - 10, cy, color=(30, 41, 59))
+
+        # Y축 기준 배지 (상단 중앙)
+        ytw = draw.textlength(y_lbl, font=fonts["sub"])
+        draw.rounded_rectangle(
+            [cx - ytw / 2 - 14, body_top, cx + ytw / 2 + 14, body_top + 26],
+            radius=8,
+            fill=(239, 246, 255),
+            outline=(59, 130, 246),
+            width=2,
+        )
+        draw.text((cx - ytw / 2, body_top + 4), y_lbl, font=fonts["sub"], fill=(29, 78, 216))
+
+        # X축 기준 배지 (하단 중앙)
+        xtw = draw.textlength(x_lbl, font=fonts["sub"])
+        xy_box = body_top + total_h - 30
+        draw.rounded_rectangle(
+            [cx - xtw / 2 - 14, xy_box, cx + xtw / 2 + 14, xy_box + 26],
+            radius=8,
+            fill=(240, 253, 244),
+            outline=(34, 197, 94),
+            width=2,
+        )
+        draw.text((cx - xtw / 2, xy_box + 4), x_lbl, font=fonts["sub"], fill=(22, 101, 52))
+
+        # 4개 사분면 카드 (좌상, 우상, 좌하, 우하)
+        lx = PAD_X + 24
+        rx = W - PAD_X - 24 - card_w
+        ty = body_top + top_pad
+        by = body_top + top_pad + top_h + mid_gap
+        _draw_node_card(draw, nodes[0], lx, ty, card_w, top_h, fonts["sub"], fonts["title"], fonts["body"])
+        _draw_node_card(draw, nodes[1], rx, ty, card_w, top_h, fonts["sub"], fonts["title"], fonts["body"])
+        _draw_node_card(draw, nodes[2], lx, by, card_w, bot_h, fonts["sub"], fonts["title"], fonts["body"])
+        _draw_node_card(draw, nodes[3], rx, by, card_w, bot_h, fonts["sub"], fonts["title"], fonts["body"])
+
+    return total_h, [_draw_fn]
+
+
+def _render_decision_tree(
+    diagram: KoreanVisualDiagram,
+    W: int,
+    PAD_X: int,
+    body_top: int,
+    fonts: dict[str, Any],
+) -> tuple[int, list[Any]]:
+    """조건 분기(If-Else) 결정 트리: 상단 조건 판단 마름모 -> 예/아니오 분기 결과."""
+    nodes = list(diagram.nodes or [])[:3]
+    while len(nodes) < 2:
+        nodes.append(KoreanDiagramNode(title=f"결과 {len(nodes) + 1}"))
+    cond_txt = (diagram.center_label or diagram.title or "핵심 조건 판단").strip()
+    rel_labels = list(diagram.relation_labels or [])
+    probe = ImageDraw.Draw(Image.new("RGB", (W, 100)))
+
+    diamond_h = 128
+    diamond_w = 420
+    branch_gap = 64
+    n = len(nodes)
+    card_gap = 46
+    card_w = (W - PAD_X * 2 - card_gap * (n - 1)) // n
+    card_h = max(_measure_card_height(probe, nd, card_w, fonts["sub"], fonts["title"], fonts["body"]) for nd in nodes)
+    total_h = diamond_h + branch_gap + card_h
+
+    def _draw_fn(draw: ImageDraw.ImageDraw) -> None:
+        cx = W // 2
+        dy_top = body_top
+        dy_mid = dy_top + diamond_h // 2
+        dy_bot = dy_top + diamond_h
+
+        # 조건 마름모(◇)
+        pts = [(cx, dy_top), (cx + diamond_w // 2, dy_mid), (cx, dy_bot), (cx - diamond_w // 2, dy_mid)]
+        draw.polygon(pts, fill=(239, 246, 255), outline=(29, 78, 216), width=4)
+        c_lines = _wrap_text(draw, cond_txt, fonts["title"], diamond_w - 130)
+        cy_t = dy_mid - (len(c_lines[:2]) * 26) // 2
+        for cl in c_lines[:2]:
+            tw = draw.textlength(cl, font=fonts["title"])
+            draw.text((cx - tw / 2, cy_t), cl, font=fonts["title"], fill=(15, 23, 42))
+            cy_t += 26
+
+        # 분기선 + 결과 카드
+        mid_y = dy_bot + branch_gap // 2
+        draw.line([(cx, dy_bot), (cx, mid_y)], fill=(71, 85, 105), width=3)
+        card_y = dy_bot + branch_gap
+        centers = [PAD_X + i * (card_w + card_gap) + card_w // 2 for i in range(n)]
+        draw.line([(centers[0], mid_y), (centers[-1], mid_y)], fill=(71, 85, 105), width=3)
+
+        default_branches = ["예 (O)", "아니오 (X)", "조건 분기"] if n == 2 else ["조건 1", "조건 2", "조건 3"]
+        for i, nd in enumerate(nodes):
+            ccx = centers[i]
+            lbl = rel_labels[i] if i < len(rel_labels) and rel_labels[i].strip() else default_branches[i]
+            _draw_arrow(draw, ccx, mid_y, ccx, card_y - 4, label=lbl, f_lbl=fonts["lbl"])
+            _draw_node_card(draw, nd, PAD_X + i * (card_w + card_gap), card_y, card_w, card_h, fonts["sub"], fonts["title"], fonts["body"])
+
+    return total_h, [_draw_fn]
+
+
+def _render_pyramid(
+    diagram: KoreanVisualDiagram,
+    W: int,
+    PAD_X: int,
+    body_top: int,
+    fonts: dict[str, Any],
+) -> tuple[int, list[Any]]:
+    """위계·계층 피라미드: 최상위(좁음) -> 최하위(넓음) 다층 레이어 도식."""
+    nodes = list(diagram.nodes or [])[:4]
+    while len(nodes) < 2:
+        nodes.append(KoreanDiagramNode(title=f"계층 {len(nodes) + 1}"))
+    n = len(nodes)
+    probe = ImageDraw.Draw(Image.new("RGB", (W, 100)))
+
+    layer_heights: list[int] = []
+    min_w = 540
+    max_w = W - PAD_X * 2
+    for i, nd in enumerate(nodes):
+        top_w = int(min_w + (max_w - min_w) * (i / max(1, n)))
+        avail_w = max(240, top_w - 80)
+        d_txt = " · ".join(nd.details or [])
+        t_lines = _wrap_text(probe, nd.title, fonts["title"], avail_w)
+        d_lines = _wrap_text(probe, d_txt, fonts["body"], avail_w) if d_txt else []
+        lh = max(76, 22 + len(t_lines) * 28 + len(d_lines) * 24 + 14)
+        layer_heights.append(lh)
+
+    gap_y = 8
+    total_h = sum(layer_heights) + gap_y * (n - 1)
+
+    def _draw_fn(draw: ImageDraw.ImageDraw) -> None:
+        cur_y = body_top
+        cx = W // 2
+        for i, nd in enumerate(nodes):
+            lh = layer_heights[i]
+            w_top = int(min_w + (max_w - min_w) * (i / n))
+            w_bot = int(min_w + (max_w - min_w) * ((i + 1) / n))
+            pal = _PALETTES.get(nd.accent_color or _COLOR_CYCLE[i % len(_COLOR_CYCLE)], _PALETTES["blue"])
+            poly = [
+                (cx - w_top // 2, cur_y),
+                (cx + w_top // 2, cur_y),
+                (cx + w_bot // 2, cur_y + lh),
+                (cx - w_bot // 2, cur_y + lh),
+            ]
+            draw.polygon(poly, fill=pal["bg"], outline=pal["border"], width=3)
+
+            avail_w = max(220, w_top - 70)
+            t_lines = _wrap_text(draw, nd.title, fonts["title"], avail_w)
+            d_txt = " · ".join(nd.details or [])
+            d_lines = _wrap_text(draw, d_txt, fonts["body"], avail_w) if d_txt else []
+            txt_block_h = len(t_lines) * 28 + (len(d_lines) * 24 + 4 if d_lines else 0)
+            ty = cur_y + max(12, (lh - txt_block_h) // 2)
+            for tl in t_lines:
+                tw = draw.textlength(tl, font=fonts["title"])
+                draw.text((cx - tw / 2, ty), tl, font=fonts["title"], fill=pal["hdr"])
+                ty += 28
+            if d_lines:
+                ty += 4
+                for dl in d_lines:
+                    dw = draw.textlength(dl, font=fonts["body"])
+                    draw.text((cx - dw / 2, ty), dl, font=fonts["body"], fill=(30, 41, 59))
+                    ty += 24
+            cur_y += lh + gap_y
+
+    return total_h, [_draw_fn]
+
+
 def _render_card_layout(
     diagram: KoreanVisualDiagram,
     dtype: str,
@@ -836,6 +1099,14 @@ def render_korean_diagram_png(diagram: KoreanVisualDiagram) -> bytes:
         body_h, draw_fns = _render_venn(diagram, W, PAD_X, body_top, fonts)
     elif dtype == "scale":
         body_h, draw_fns = _render_scale(diagram, W, PAD_X, body_top, fonts)
+    elif dtype == "fishbone":
+        body_h, draw_fns = _render_fishbone(diagram, W, PAD_X, body_top, fonts)
+    elif dtype == "quadrant":
+        body_h, draw_fns = _render_quadrant(diagram, W, PAD_X, body_top, fonts)
+    elif dtype == "decision_tree":
+        body_h, draw_fns = _render_decision_tree(diagram, W, PAD_X, body_top, fonts)
+    elif dtype == "pyramid":
+        body_h, draw_fns = _render_pyramid(diagram, W, PAD_X, body_top, fonts)
     else:
         body_h, draw_fns = _render_card_layout(diagram, dtype, W, PAD_X, body_top, fonts)
 
@@ -859,6 +1130,10 @@ def render_korean_diagram_png(diagram: KoreanVisualDiagram) -> bytes:
         "timeline": "시대 · 사상 변천 연표",
         "venn": "개념 포함 · 교집합 벤다이어그램",
         "scale": "가치 대립 · 균형 저울도",
+        "fishbone": "다발적 원인 → 결과 어골도",
+        "quadrant": "2×2 사분면 분류 도식",
+        "decision_tree": "조건 분기 · 판정 순서도",
+        "pyramid": "위계 · 계층 피라미드",
         "comparison": "개념 · 이론 비교 도식",
         "hierarchy": "개념 체계 · 분류 구조도",
     }

@@ -660,7 +660,7 @@ class KoreanGraphSpec(BaseModel):
 
 
 class KoreanVisualDiagram(BaseModel):
-    """비문학(독서) 지문의 핵심 원리·관계·비교를 시각화하는 8종 특화 도식 그림 명세."""
+    """비문학(독서) 지문의 핵심 원리·관계·비교를 시각화하는 12종 특화 도식 그림 명세."""
 
     diagram_type: Literal[
         "flow",
@@ -671,20 +671,33 @@ class KoreanVisualDiagram(BaseModel):
         "timeline",
         "venn",
         "scale",
+        "fishbone",
+        "quadrant",
+        "decision_tree",
+        "pyramid",
         "comparison",
         "hierarchy",
     ] = Field(
         default="flow",
         description=(
-            "도식 유형: flow(과정/인과 흐름도), matrix(항목별 비교 매트릭스표), "
-            "graph(X-Y 비례/함수 그래프), anatomy(구조/장치 모식도), cycle(원형 순환 루프), "
-            "timeline(시대/단계 연표), venn(포함/교집합 벤다이어그램), scale(대립/균형 저울도)"
+            "도식 유형: flow(흐름도), matrix(비교 매트릭스표), graph(X-Y 비례/함수 그래프), "
+            "anatomy(구조/장치 모식도), cycle(원형 순환 루프), timeline(연표), venn(벤다이어그램), "
+            "scale(대립 저울도), fishbone(피쉬본 어골도: 다발적 원인->결과), "
+            "quadrant(2x2 사분면 분류), decision_tree(조건분기 결정 트리), pyramid(위계 피라미드)"
         ),
     )
     title: str = Field(..., description="도식 상단 제목 (예: '양면시장 가격탄력성과 이용료 반비례 관계')")
     center_label: str = Field(
         default="",
-        description="anatomy(중앙 장치/원리명), cycle(중앙 순환 주제), venn(교집합 핵심)에 표시할 중심 라벨",
+        description="anatomy(중앙 장치명), cycle(순환 주제), venn(교집합), fishbone(최종 결과/현상), decision_tree(핵심 조건 질문) 라벨",
+    )
+    quadrant_x_label: str = Field(
+        default="",
+        description="diagram_type='quadrant'일 때 가로축(X축) 분류 기준 (예: '배제성 (좌: 불가 ↔ 우: 가능)')",
+    )
+    quadrant_y_label: str = Field(
+        default="",
+        description="diagram_type='quadrant'일 때 세로축(Y축) 분류 기준 (예: '경합성 (하: 낮음 ↔ 상: 높음)')",
     )
     nodes: list[KoreanDiagramNode] = Field(
         default_factory=list,

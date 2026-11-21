@@ -4452,9 +4452,9 @@ def _strip_korean_exam_noise_lines(text: str) -> str:
 
 
 _KOREAN_DIAGRAM_GUIDE = (
-    "지문의 핵심 내용을 그림으로 한눈에 이해할 수 있도록 아래 8종 중 가장 적합한 `diagram_type`을 고르세요 "
-    "(단순 박스 나열 `flow`만 반복하지 말고 지문 성격에 맞게 적극적으로 다양화하세요):\n"
-    "  ① `matrix` (항목별 비교 매트릭스표): 두 사상가·이론·법제·개념의 차이점을 비교할 때 사용. "
+    "지문의 핵심 내용을 그림으로 한눈에 이해할 수 있도록 아래 12종 중 가장 적합한 `diagram_type`을 고르세요 "
+    "(단순 박스 나열 `flow`만 반복하지 말고 지문 성격에 맞게 가장 직관적인 형식을 선택하세요):\n"
+    "  ① `matrix` (항목별 비교 매트릭스표): 두 사상가·이론·법제·개념의 기준별 차이점을 비교할 때 사용. "
     "`nodes`에 비교 대상 2~3개 제목을 넣고, `matrix_rows`에 기준(`criterion`)과 대상별 값(`values`) 3~5행을 반드시 채우세요.\n"
     "  ② `graph` (X-Y 비례/함수 그래프): 경제(수요·공급·탄력성·비용·가격)나 과학(온도·압력·농도)에서 변수 간 비례·반비례·임계점 관계를 설명할 때 사용. "
     "`graph_spec`(`x_label`, `y_label`, `curves`[trend: up/down/u_shape/inv_u/flat], `highlight_point`)를 반드시 채우고 `nodes`에 1~2개 핵심 해석을 넣으세요.\n"
@@ -4464,7 +4464,11 @@ _KOREAN_DIAGRAM_GUIDE = (
     "  ⑤ `timeline` (시대·단계 변천 연표): 철학·과학사·역사적 이론 발전 순서에 사용. `nodes`에 시간순 3~4개 단계를 넣으세요.\n"
     "  ⑥ `venn` (포함·교집합 벤다이어그램): 두 개념의 공통점(`center_label`)과 고유 영역을 구분할 때 사용.\n"
     "  ⑦ `scale` (대립·균형 저울도): 두 상충 가치·법익·트레이드오프를 비교할 때 사용 (`nodes` 2개, `scale_tilt`: balanced/left/right).\n"
-    "  ⑧ `flow` (원리·과정 흐름도): 인과·절차 단계가 명확한 경우 사용 (`nodes` 2~4개, 짧은 `relation_labels` 6자 이내).\n"
+    "  ⑧ `fishbone` (피쉬본 어골도): 여러 복합 원인/요인(`nodes` 2~4개)이 하나의 핵심 결과/현상(`center_label`)으로 수렴하는 다발적 인과 분석에 사용.\n"
+    "  ⑨ `quadrant` (2×2 사분면 분류): 두 개의 직교 기준(`quadrant_x_label`, `quadrant_y_label`)으로 4가지 유형(`nodes` 4개: 좌상, 우상, 좌하, 우하 순서)을 분류할 때 사용.\n"
+    "  ⑩ `decision_tree` (조건분기 결정 트리): 법적 요건 충족 판정이나 알고리즘처럼 핵심 조건(`center_label`)에 따라 `예 (O)` / `아니오 (X)`(`relation_labels`, `nodes` 2~3개)로 갈라지는 판정 구조에 사용.\n"
+    "  ⑪ `pyramid` (위계·계층 피라미드): 법규범 효력(헌법>법률>명령), 사회/생태/시스템 계층처럼 상하 위계가 쌓이는 구조(`nodes` 최상위→최하위 3~4개)에 사용.\n"
+    "  ⑫ `flow` (원리·과정 흐름도): 인과·절차 단계가 순차적으로 이어지는 경우 사용 (`nodes` 2~4개, 짧은 `relation_labels` 6자 이내).\n"
     "공통 규칙: 각 카드 `details`는 1~3개의 짧은 핵심 구절(26자 이내), `takeaway`는 1줄 핵심 정리."
 )
 
