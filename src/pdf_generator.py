@@ -1320,23 +1320,74 @@ def _is_korean_poetry_item(
 
 
 def _pick_korean_font_paths() -> tuple[str | None, str | None, str | None]:
-    """시스템에서 명조(시 본문) · 고딕(주석) · 고딕 볼드 폰트 경로를 찾는다."""
+    """시스템(Linux/Windows/macOS)에서 명조(시 본문) · 고딕(주석) · 고딕 볼드 폰트 경로를 찾는다."""
     serif_candidates = [
         "/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc",
         "/usr/share/fonts/truetype/noto/NotoSerifCJK-Regular.ttc",
+        "C:/Windows/Fonts/batang.ttc",
+        "C:/Windows/Fonts/H2MJRE.TTF",
+        "/System/Library/Fonts/Supplemental/AppleMyungjo.ttf",
     ]
     sans_candidates = [
         "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
         "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
+        "C:/Windows/Fonts/malgun.ttf",
+        "C:/Windows/Fonts/NanumGothic.ttf",
+        "/System/Library/Fonts/AppleSDGothicNeo.ttc",
     ]
     bold_candidates = [
         "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
         "/usr/share/fonts/truetype/nanum/NanumGothicBold.ttf",
+        "C:/Windows/Fonts/malgunbd.ttf",
+        "C:/Windows/Fonts/NanumGothicBold.ttf",
+        "/System/Library/Fonts/AppleSDGothicNeo.ttc",
     ]
     serif_p = next((p for p in serif_candidates if os.path.exists(p)), None)
     sans_p = next((p for p in sans_candidates if os.path.exists(p)), None)
     bold_p = next((p for p in bold_candidates if os.path.exists(p)), None) or sans_p
     return serif_p, sans_p, bold_p
+
+
+def _measure_rendered_line_chars(
+    text: str,
+    fontfile: str | None,
+    fontsize: float,
+) -> tuple[list[tuple[float, float]], float]:
+    """PyMuPDF 실제 렌더링 좌표(rawdict)로 각 글자의 (x0, x1) 오프셋과 전체 폭을 정확히 측정한다."""
+    if not text:
+        return [], 0.0
+    tmp_doc = pymupdf.open()
+    try:
+        p = tmp_doc.new_page(width=2000, height=120)
+        if fontfile:
+            p.insert_font(fontname="mfont", fontfile=fontfile)
+            fn = "mfont"
+        else:
+            fn = "korea"
+        p.insert_text((0.0, 60.0), text, fontname=fn, fontsize=fontsize, color=(0, 0, 0))
+        rd = p.get_text("rawdict")
+        chars_bbox: list[tuple[float, float]] = []
+        for blk in rd.get("blocks", []):
+            for ln in blk.get("lines", []):
+                for sp in ln.get("spans", []):
+                    for ch in sp.get("chars", []):
+                        bb = ch.get("bbox")
+                        if bb:
+                            chars_bbox.append((float(bb[0]), float(bb[2])))
+        if len(chars_bbox) == len(text):
+            return chars_bbox, chars_bbox[-1][1]
+        # fallback: 공백 등 rawdict에서 누락된 문자가 있을 때 선형 보간
+        f_obj = pymupdf.Font(fontfile=fontfile) if fontfile else pymupdf.Font("korea")
+        space_w = fontsize if not fontfile else f_obj.text_length(" ", fontsize=fontsize)
+        out: list[tuple[float, float]] = []
+        cx = 0.0
+        for ch in text:
+            cw = space_w if ch == " " else f_obj.text_length(ch, fontsize=fontsize)
+            out.append((cx, cx + cw))
+            cx += cw
+        return out, cx
+    finally:
+        tmp_doc.close()
 
 
 def _wrap_text_by_width(text: str, font_obj: pymupdf.Font, fontsize: float, max_width: float) -> list[str]:
@@ -1381,22 +1432,35 @@ def _render_poetry_work_png(work: Any) -> bytes:
     poem_color = (0.08, 0.10, 0.15)
     muted_color = (0.38, 0.44, 0.54)
 
-    W = 520.0
-    X_LEFT_LABEL = 6.0
-    X_LEFT_ARC = 64.0
-    X_POEM = 74.0
-    X_RIGHT_MARGIN = 374.0
-    RIGHT_TEXT_MAX_W = W - X_RIGHT_MARGIN - 8.0
-    POEM_FS = 10.6
-    NOTE_FS = 7.4
-    MARGIN_FS = 7.6
-
     raw_lines = [str(ln or "") for ln in (getattr(work, "lines", None) or [])]
     if not raw_lines:
         raise ValueError("시 원문 행 데이터가 비어 있습니다.")
 
     marks = list(getattr(work, "marks", None) or [])
     brackets = list(getattr(work, "brackets", None) or [])
+
+    W = 520.0
+    has_left_bracket = any((getattr(b, "side", "") or "") == "left" for b in brackets)
+    X_LEFT_LABEL = 6.0
+    X_LEFT_ARC = 64.0
+    X_POEM = 72.0 if has_left_bracket else 22.0
+    POEM_FS = 10.6
+    NOTE_FS = 7.4
+    MARGIN_FS = 7.5
+
+    # 실제 렌더링 좌표로 전체 시 행 폭을 측정하고, 우측 여백(>=105pt)을 침범하면 폰트 크기 자동 축소
+    measured_lines = [_measure_rendered_line_chars(ltxt, serif_path, POEM_FS) for ltxt in raw_lines]
+    max_poem_w = max((lw for _, lw in measured_lines), default=120.0)
+    max_allowed_poem_w = W - X_POEM - 115.0
+    if max_poem_w > max_allowed_poem_w and max_poem_w > 0:
+        POEM_FS = max(8.4, round(POEM_FS * (max_allowed_poem_w / max_poem_w), 2))
+        measured_lines = [_measure_rendered_line_chars(ltxt, serif_path, POEM_FS) for ltxt in raw_lines]
+        max_poem_w = max((lw for _, lw in measured_lines), default=120.0)
+
+    X_RIGHT_MARGIN = max(350.0, X_POEM + max_poem_w + 18.0)
+    if X_RIGHT_MARGIN > W - 88.0:
+        X_RIGHT_MARGIN = W - 88.0
+    RIGHT_TEXT_MAX_W = max(72.0, W - X_RIGHT_MARGIN - 8.0)
 
     # 각 mark를 실제 행 번호(1-based)에 정확히 매칭
     line_marks: dict[int, list[tuple[Any, int, int]]] = {}
@@ -1446,20 +1510,23 @@ def _render_poetry_work_png(work: Any) -> bytes:
             cur_y += 12.0
             continue
 
+        chars_bbox, line_w = measured_lines[li - 1]
         m_list = sorted(line_marks.get(li, []), key=lambda t: t[1])
         above_items: list[dict[str, Any]] = []
         below_items: list[dict[str, Any]] = []
 
         for mk, p0, p1 in m_list:
-            prefix_w = serif_font.text_length(ltxt[:p0], fontsize=POEM_FS)
-            quote_w = serif_font.text_length(ltxt[p0:p1], fontsize=POEM_FS)
-            x0 = X_POEM + prefix_w
-            x1 = x0 + quote_w
+            if chars_bbox and 0 <= p0 < p1 <= len(chars_bbox):
+                x0 = X_POEM + chars_bbox[p0][0]
+                x1 = X_POEM + chars_bbox[p1 - 1][1]
+            else:
+                x0 = X_POEM + serif_font.text_length(ltxt[:p0], fontsize=POEM_FS)
+                x1 = x0 + serif_font.text_length(ltxt[p0:p1], fontsize=POEM_FS)
             mid_x = (x0 + x1) * 0.5
             note_txt = (getattr(mk, "note", "") or "").strip()
             note_w = sans_font.text_length(note_txt, fontsize=NOTE_FS)
             # 주석 텍스트 X 범위 [nx, nx + note_w]
-            nx = max(X_POEM - 8.0, min(mid_x - note_w * 0.35, X_RIGHT_MARGIN - 12.0 - note_w))
+            nx = max(X_POEM - 8.0, min(mid_x - note_w * 0.35, X_RIGHT_MARGIN - 8.0 - note_w))
             pos_pref = getattr(mk, "position", "below") or "below"
 
             item = {
@@ -1502,7 +1569,6 @@ def _render_poetry_work_png(work: Any) -> bytes:
         below_pad = 7.0 + below_tiers * 15.5
 
         y_base = cur_y + above_pad + POEM_FS
-        line_w = serif_font.text_length(ltxt, fontsize=POEM_FS)
         line_layouts.append(
             {
                 "line_index": li,
@@ -1587,9 +1653,19 @@ def _render_poetry_work_png(work: Any) -> bytes:
                     page.draw_oval(pymupdf.Rect(x0 - 2.2, y_top - 1.5, x1 + 2.2, y_bot + 1.2), color=col, width=1.0)
                     anchor_y = y_bot + 1.2 if pos_kind == "below" else y_top - 1.5
                 elif mtype == "triangle":
-                    tri_pts = [(mid_x, y_top - 2.5), (x0 - 2.0, y_bot + 1.0), (x1 + 2.0, y_bot + 1.0)]
-                    page.draw_polyline(tri_pts + [tri_pts[0]], color=col, width=1.0)
-                    anchor_y = y_bot + 1.0 if pos_kind == "below" else y_top - 2.5
+                    q_len = len((getattr(mk, "quote", "") or "").strip())
+                    if q_len <= 2:
+                        tri_pts = [(mid_x, y_top - 4.0), (x0 - 3.5, y_bot + 1.2), (x1 + 3.5, y_bot + 1.2)]
+                        page.draw_polyline(tri_pts + [tri_pts[0]], color=col, width=1.05)
+                        anchor_y = y_bot + 1.2 if pos_kind == "below" else y_top - 4.0
+                    else:
+                        page.draw_line((x0, y_bot), (x1, y_bot), color=col, width=1.1)
+                        tri_cx = mid_x
+                        tri_top = y_top - 4.2
+                        tri_bot = y_top - 0.5
+                        tri_pts = [(tri_cx, tri_top), (tri_cx - 2.6, tri_bot), (tri_cx + 2.6, tri_bot)]
+                        page.draw_polyline(tri_pts + [tri_pts[0]], color=col, width=0.95)
+                        anchor_y = y_bot if pos_kind == "below" else tri_top - 1.5
                 else:
                     page.draw_line((x0, y_bot), (x1, y_bot), color=col, width=1.0)
                     anchor_y = y_bot
@@ -1601,9 +1677,9 @@ def _render_poetry_work_png(work: Any) -> bytes:
                         line_end_y = note_y - NOTE_FS - 1.5
                         page.draw_line((mid_x, anchor_y + 0.5), (mid_x, max(anchor_y + 2.0, line_end_y)), color=col, width=0.75)
                     else:
-                        note_y = y_top - 4.5 - tier * 14.0
+                        note_y = min(y_top - 4.5, anchor_y - 2.5) - tier * 14.0
                         line_end_y = note_y + 1.5
-                        page.draw_line((mid_x, anchor_y - 0.5), (mid_x, min(anchor_y - 2.0, line_end_y)), color=col, width=0.75)
+                        page.draw_line((mid_x, anchor_y - 0.5), (mid_x, min(anchor_y - 1.5, line_end_y)), color=col, width=0.75)
                     page.insert_text((it["nx"], note_y), it["note"], fontname=sans_fn, fontsize=NOTE_FS, color=col)
 
     # 좌·우 여백 브라켓 / 수미상관 호 / 시상전환 구분선 렌더링
@@ -1650,9 +1726,9 @@ def _render_poetry_work_png(work: Any) -> bytes:
                     for wi, wl in enumerate(wrapped[:4]):
                         page.insert_text((X_RIGHT_MARGIN, start_ty + wi * 10.0), wl, fontname=bold_fn, fontsize=MARGIN_FS, color=col)
         else:
-            # brace (중괄호 } / {)
+            # brace (중괄호 } / {) — 시 본문 끝(max_end_x)보다 항상 우측에 배치
             max_end_x = max((line_layouts[k]["end_x"] for k in range(s_idx - 1, e_idx)), default=X_POEM + 100.0)
-            bx = min(X_RIGHT_MARGIN - 10.0, max_end_x + 8.0) if side == "right" else X_LEFT_ARC
+            bx = min(W - 82.0, max_end_x + 8.0) if side == "right" else X_LEFT_ARC
             tip = bx + 5.0 if side == "right" else bx - 5.0
             pts = [(bx, y_s), (bx + 2.5 if side == "right" else bx - 2.5, y_s + 2.0), (bx + 2.5 if side == "right" else bx - 2.5, y_mid - 2.0), (tip, y_mid), (bx + 2.5 if side == "right" else bx - 2.5, y_mid + 2.0), (bx + 2.5 if side == "right" else bx - 2.5, y_e - 2.0), (bx, y_e)]
             page.draw_polyline(pts, color=col, width=1.0)
