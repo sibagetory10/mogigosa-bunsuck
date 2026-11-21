@@ -155,6 +155,7 @@ from src.models import (
 from src.pdf_generator import (
     generate_custom_exam_pdf,
     generate_korean_passage_analysis_pdf,
+    generate_korean_passage_only_pdf,
     merge_korean_analysis_pdfs,
 )
 from src.pdf_parser import (
@@ -3508,8 +3509,9 @@ def _render_korean_analysis_pool_admin_section() -> None:
 
             r_col1, r_col2 = st.columns([5, 1])
             with r_col1:
-                pdf_badge = "📑 PDF 저장됨" if storage.has_korean_analysis_pdf(ck) else "📝 JSON만"
-                st.markdown(f"**[{ex_n} · {gid_n}번]** {an_title} (`{sec_disp}` · {pdf_badge}) · 키 `{ck}`")
+                pdf_badge = "📑 분석PDF" if storage.has_korean_analysis_pdf(ck) else "📝 JSON만"
+                pas_badge = " · 📄 원문PDF" if storage.has_korean_passage_pdf(ck) else ""
+                st.markdown(f"**[{ex_n} · {gid_n}번]** {an_title} (`{sec_disp}` · {pdf_badge}{pas_badge}) · 키 `{ck}`")
                 cap_parts = [p for p in (f"저장: {saved_at}" if saved_at else "", theme_prev) if p]
                 if cap_parts:
                     st.caption(" · ".join(cap_parts))
@@ -6710,11 +6712,19 @@ def _render_tab2_korean_transform_section() -> None:
             with st.expander(f"📄 지문 미리보기: {s_entry['exam_name']} [{s_entry['group_id']}번]", expanded=False):
                 st.text(s_entry["passage_text"][:1500] + ("..." if len(s_entry["passage_text"]) > 1500 else ""))
 
-        include_kor_diagrams = st.checkbox(
-            "🎨 비문학 이해용 도식 그림 자동 생성 포함 (원리 흐름·개념 비교·순환·계층 도식)",
-            value=True,
-            key="tab2_kor_include_diagrams",
-        )
+        opt_c1, opt_c2 = st.columns(2)
+        with opt_c1:
+            include_kor_diagrams = st.checkbox(
+                "🎨 비문학 이해용 도식 그림 포함",
+                value=True,
+                key="tab2_kor_include_diagrams",
+            )
+        with opt_c2:
+            include_kor_passage = st.checkbox(
+                "📄 원문 지문 전체 포함 (ON/OFF)",
+                value=False,
+                key="tab2_kor_include_passage",
+            )
         kb_c1, kb_c2 = st.columns(2)
         with kb_c1:
             run_kor_btn = st.form_submit_button(
@@ -6939,6 +6949,7 @@ def _render_tab2_korean_transform_section() -> None:
                     single_pdf = generate_korean_passage_analysis_pdf(
                         [single_item],
                         include_diagrams=include_kor_diagrams,
+                        include_passage=False,
                     )
                     if include_kor_diagrams:
                         storage.save_korean_analysis_pdf_bytes(slot["cache_key"], single_pdf)
@@ -6946,10 +6957,22 @@ def _render_tab2_korean_transform_section() -> None:
                     if slot not in [prepared_slots[i] for i in missing_ai_indices]:
                         json_to_pdf_cnt += 1
                 except Exception as exc:
-                    st.error(f"[{s_entry['exam_name']} {s_entry['group_id']}번] 지문 PDF 생성 실패: {exc}")
+                    st.error(f"[{s_entry['exam_name']} {s_entry['group_id']}번] 지문 분석 PDF 생성 실패: {exc}")
                     continue
 
+            # 지문 원문 전용 PDF도 DB에 분리 저장해 두고 원문 ON/OFF 시 즉시 이어붙이기
+            passage_pdf_bytes = storage.get_korean_passage_pdf_bytes(slot["cache_key"])
+            if passage_pdf_bytes is None and (s_entry.get("passage_text") or "").strip():
+                try:
+                    passage_pdf_bytes = generate_korean_passage_only_pdf(single_item)
+                    storage.save_korean_passage_pdf_bytes(slot["cache_key"], passage_pdf_bytes)
+                except Exception as exc_p:
+                    if include_kor_passage:
+                        st.warning(f"[{s_entry['exam_name']} {s_entry['group_id']}번] 원문 PDF 생성 건너뜀: {exc_p}")
+
             pdf_parts.append(slot["pdf_bytes"])
+            if include_kor_passage and passage_pdf_bytes:
+                pdf_parts.append(passage_pdf_bytes)
             if slot["analysis"] is not None:
                 analyses_list.append(single_item)
 
@@ -6960,13 +6983,14 @@ def _render_tab2_korean_transform_section() -> None:
                 st.session_state["kor_analysis_pdf"] = pdf_bytes
                 if current_user is not None:
                     exam_names_uniq = list(dict.fromkeys(it["exam_name"] for it in analyses_list))
+                    p_tag = "원문포함" if include_kor_passage else "분석전용"
                     an_title = (
-                        f"{exam_names_uniq[0]} 국어 지문 분석지 ({len(pdf_parts)}세트)"
+                        f"{exam_names_uniq[0]} 국어 지문 분석지 ({len(analyses_list)}세트 · {p_tag})"
                         if len(exam_names_uniq) == 1
-                        else f"국어 정밀 지문 분석지 ({len(pdf_parts)}세트)"
+                        else f"국어 정밀 지문 분석지 ({len(analyses_list)}세트 · {p_tag})"
                     )
                     an_sig = "kor_an_" + hashlib.sha256(
-                        "|".join(f"{it['exam_name']}::{it['group_id']}" for it in analyses_list).encode("utf-8")
+                        ("|".join(f"{it['exam_name']}::{it['group_id']}" for it in analyses_list) + f"::{p_tag}").encode("utf-8")
                     ).hexdigest()[:12]
                     storage.save_user_exam(
                         current_user.username,
@@ -6975,7 +6999,7 @@ def _render_tab2_korean_transform_section() -> None:
                             "title": an_title,
                             "subject": "국어",
                             "exam_kind": "korean_analysis",
-                            "question_count": len(pdf_parts),
+                            "question_count": len(analyses_list),
                             "items": [],
                         },
                         pdf_bytes=pdf_bytes,
@@ -6985,9 +7009,10 @@ def _render_tab2_korean_transform_section() -> None:
                     detail_notes.append(f"기존 분석 JSON→PDF 저장 {json_to_pdf_cnt}세트")
                 if ai_gen_cnt > 0:
                     detail_notes.append(f"신규 AI 분석+PDF 저장 {ai_gen_cnt}세트")
+                mode_note = "원문 지문 포함 ON" if include_kor_passage else "원문 지문 제외 OFF"
                 st.success(
-                    f"📑 총 {len(pdf_parts)}개 국어 지문 분석지 합본 PDF가 생성되었습니다! "
-                    f"({' · '.join(detail_notes)})"
+                    f"📑 총 {len(analyses_list)}개 국어 지문 분석지 합본 PDF가 생성되었습니다! ({mode_note} · "
+                    f"{' · '.join(detail_notes)})"
                 )
             except Exception as exc:
                 st.error(f"분석지 PDF 병합 실패: {exc}")

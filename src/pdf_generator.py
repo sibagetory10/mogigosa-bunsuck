@@ -1083,19 +1083,7 @@ def _format_structure_flow_html(flow_text: str) -> str:
     return "<br/>".join(formatted)
 
 
-def generate_korean_passage_analysis_pdf(
-    analyses: list[dict[str, Any]],
-    doc_title: str = "수능·모의고사 국어 정밀 지문 분석지",
-    include_diagrams: bool = True,
-) -> bytes:
-    """
-    국어 지문 분석 결과(KoreanPassageAnalysisOutput + 원문 지문 + 출처 메타) 리스트를
-    수능·학원형 정밀 지문 분석지 PDF로 렌더링한다 (PyMuPDF Story 기반 자동 페이지 넘김).
-    """
-    if not analyses:
-        raise ValueError("생성할 국어 지문 분석 데이터가 없습니다.")
-
-    analysis_css = """
+_KOREAN_ANALYSIS_CSS = """
     body {
         font-family: "NanumGothic", "Malgun Gothic", sans-serif;
         font-size: 9.4pt;
@@ -1268,6 +1256,57 @@ def generate_korean_passage_analysis_pdf(
     }
     """
 
+
+def _build_korean_passage_html_block(passage_text: str, is_lit: bool, sec_title: str = "6. 원문 지문 전체") -> str:
+    """기호 제거 및 문단 재조립된 국어 원문 지문 HTML 블록을 생성한다."""
+    reflowed_paragraphs = _clean_and_reflow_korean_passage(passage_text, is_poetry_or_literature=is_lit)
+    p_blocks: list[str] = []
+    p_cls = "passage-lit-line" if is_lit else "passage-p"
+    for rp in reflowed_paragraphs:
+        if not rp:
+            p_blocks.append("<div style='height:5pt;'></div>")
+        elif re.match(r"^(?:\[\d{1,2}\s*[~\-～]\s*\d{1,2}\]|\([가나다라]\)|<[가-힣\s]+>)", rp):
+            p_blocks.append(f"<div class='passage-hdr'>{html.escape(rp)}</div>")
+        else:
+            p_blocks.append(f"<p class='{p_cls}'>{html.escape(rp)}</p>")
+    if not p_blocks:
+        return ""
+    title_html = f"<div class='sec-title'>{html.escape(sec_title)}</div>" if sec_title else ""
+    return f"{title_html}<div class='passage-box'>{''.join(p_blocks)}</div>"
+
+
+def _render_story_pdf(full_html: str, css_text: str) -> bytes:
+    """HTML + CSS를 PyMuPDF Story로 A4 PDF 바이트로 렌더링한다."""
+    story = pymupdf.Story(html=full_html, user_css=css_text)
+    writer_buf = io.BytesIO()
+    mediabox = pymupdf.paper_rect("a4")
+    where = mediabox + (36, 40, -36, -42)
+    writer = pymupdf.DocumentWriter(writer_buf)
+    more = True
+    while more:
+        dev = writer.begin_page(mediabox)
+        more, _ = story.place(where)
+        story.draw(dev, None)
+        writer.end_page()
+    writer.close()
+    return writer_buf.getvalue()
+
+
+def generate_korean_passage_analysis_pdf(
+    analyses: list[dict[str, Any]],
+    doc_title: str = "수능·모의고사 국어 정밀 지문 분석지",
+    include_diagrams: bool = True,
+    include_passage: bool = True,
+) -> bytes:
+    """
+    국어 지문 분석 결과(KoreanPassageAnalysisOutput + 원문 지문 + 출처 메타) 리스트를
+    수능·학원형 정밀 지문 분석지 PDF로 렌더링한다 (PyMuPDF Story 기반 자동 페이지 넘김).
+    """
+    if not analyses:
+        raise ValueError("생성할 국어 지문 분석 데이터가 없습니다.")
+
+    analysis_css = _KOREAN_ANALYSIS_CSS
+
     sections_html: list[str] = []
     today_str = datetime.now().strftime("%Y.%m.%d")
 
@@ -1368,19 +1407,9 @@ def generate_korean_passage_analysis_pdf(
             else ""
         )
 
-        reflowed_paragraphs = _clean_and_reflow_korean_passage(passage_text, is_poetry_or_literature=is_lit)
-        p_blocks: list[str] = []
-        p_cls = "passage-lit-line" if is_lit else "passage-p"
-        for rp in reflowed_paragraphs:
-            if not rp:
-                p_blocks.append("<div style='height:5pt;'></div>")
-            elif re.match(r"^(?:\[\d{1,2}\s*[~\-～]\s*\d{1,2}\]|\([가나다라]\)|<[가-힣\s]+>)", rp):
-                p_blocks.append(f"<div class='passage-hdr'>{html.escape(rp)}</div>")
-            else:
-                p_blocks.append(f"<p class='{p_cls}'>{html.escape(rp)}</p>")
         passage_html = (
-            f"<div class='sec-title'>6. 원문 지문 전체</div><div class='passage-box'>{''.join(p_blocks)}</div>"
-            if p_blocks
+            _build_korean_passage_html_block(passage_text, is_lit, sec_title="6. 원문 지문 전체")
+            if include_passage
             else ""
         )
 
@@ -1402,20 +1431,32 @@ def generate_korean_passage_analysis_pdf(
         )
 
     full_html = f"<html><body>{''.join(sections_html)}</body></html>"
-    story = pymupdf.Story(html=full_html, user_css=analysis_css)
-    writer_buf = io.BytesIO()
-    mediabox = pymupdf.paper_rect("a4")
-    where = mediabox + (36, 40, -36, -42)
+    return _render_story_pdf(full_html, analysis_css)
 
-    writer = pymupdf.DocumentWriter(writer_buf)
-    more = True
-    while more:
-        dev = writer.begin_page(mediabox)
-        more, _ = story.place(where)
-        story.draw(dev, None)
-        writer.end_page()
-    writer.close()
-    return writer_buf.getvalue()
+
+def generate_korean_passage_only_pdf(item: dict[str, Any]) -> bytes:
+    """국어 지문 1개 세트의 '원문 지문 전체'만 독립된 PDF로 렌더링한다 (원문 ON/OFF 병합용)."""
+    exam_name = str(item.get("exam_name") or "")
+    group_id = str(item.get("group_id") or "")
+    section_label = str(item.get("section_label") or "독서")
+    passage_text = (item.get("passage_text") or "").strip()
+    an = item.get("analysis")
+    title = getattr(an, "title", "") if an is not None else ""
+    is_lit = "문학" in section_label
+
+    passage_block = _build_korean_passage_html_block(passage_text, is_lit, sec_title="")
+    if not passage_block:
+        raise ValueError("렌더링할 원문 지문 텍스트가 비어 있습니다.")
+
+    banner = f"""
+    <div class="hdr-banner" style="padding:7pt 11pt; margin-bottom:8pt;">
+      <div class="hdr-sub">원문 지문 전체 · {html.escape(section_label)}</div>
+      <div class="hdr-title" style="font-size:12.5pt;">{html.escape(title or f"{exam_name} [{group_id}번]")}</div>
+      <div class="hdr-meta">출처: {html.escape(exam_name)} [{html.escape(group_id)}번]</div>
+    </div>
+    """
+    full_html = f"<html><body>{banner}{passage_block}</body></html>"
+    return _render_story_pdf(full_html, _KOREAN_ANALYSIS_CSS)
 
 
 def merge_korean_analysis_pdfs(pdf_bytes_list: list[bytes]) -> bytes:
