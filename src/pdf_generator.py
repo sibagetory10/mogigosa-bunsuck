@@ -928,6 +928,77 @@ def generate_custom_exam_pdf(
     return out_bytes
 
 
+def _clean_and_reflow_korean_passage(passage_text: str, is_poetry_or_literature: bool = False) -> list[str]:
+    """
+    국어 지문 원문에서 시험지 쪽수('4', '12')·푸터('국어 영역') 노이즈를 제거하고,
+    2단 폭 때문에 문장 중간에서 끊긴 줄바꿈을 자연스러운 문단 단위로 재조립해 반환한다.
+    """
+    raw_lines = (passage_text or "").splitlines()
+    cleaned: list[str] = []
+    for raw_ln in raw_lines:
+        s = raw_ln.strip()
+        if not s:
+            cleaned.append("")
+            continue
+        if re.match(r"^\[?\s*\d{1,2}\s*\]?$", s):
+            continue
+        if re.match(r"^(?:국어|수학|영어|한국사)\s*영역(?:\s*\d{1,2})?$", s):
+            continue
+        if re.match(r"^(?:\d{1,2}\s+국어|국어\s+\d{1,2})$", s):
+            continue
+        cleaned.append(s)
+
+    if is_poetry_or_literature:
+        # 시·문학은 연/행 구분을 보존하되 연속 빈 줄만 정리
+        out_lit: list[str] = []
+        prev_blank = False
+        for ln in cleaned:
+            if not ln:
+                if not prev_blank and out_lit:
+                    out_lit.append("")
+                prev_blank = True
+            else:
+                out_lit.append(ln)
+                prev_blank = False
+        while out_lit and not out_lit[-1]:
+            out_lit.pop()
+        return out_lit
+
+    # 독서(산문) 지문: 문장 종결 부호(. ? ! ” ’ ) 등) 또는 헤더([11~14], (가), (나), <보기>) 뒤에서만 문단을 나눔
+    paragraphs: list[str] = []
+    buf: list[str] = []
+    header_re = re.compile(r"^(?:\[\d{1,2}\s*[~\-～]\s*\d{1,2}\]|\([가나다라]\)|<[가-힣\s]+>|-\s*.*-\s*$)")
+    sentence_end_re = re.compile(r"[.?!…\"”’\)\]]\s*$")
+
+    for ln in cleaned:
+        if not ln:
+            if buf:
+                paragraphs.append(" ".join(buf))
+                buf = []
+            continue
+        if header_re.match(ln):
+            if buf:
+                paragraphs.append(" ".join(buf))
+                buf = []
+            paragraphs.append(ln)
+            continue
+        if buf:
+            prev_line = buf[-1]
+            # 이전 줄이 문장 끝이고 현재 줄이 비교적 짧지 않거나 새 문단 시작처럼 보이면(이전 줄 길이가 2단 폭보다 짧은 경우) 문단 분리
+            if sentence_end_re.search(prev_line) and len(prev_line) <= 22:
+                paragraphs.append(" ".join(buf))
+                buf = [ln]
+            else:
+                # 한글 단어 중간이 아닌 경우 공백으로 연결, 음절 중간 끊김이 아닌 일반 공백 연결
+                buf.append(ln)
+        else:
+            buf.append(ln)
+
+    if buf:
+        paragraphs.append(" ".join(buf))
+    return [p for p in paragraphs if p.strip()]
+
+
 def generate_korean_passage_analysis_pdf(
     analyses: list[dict[str, Any]],
     doc_title: str = "수능·모의고사 국어 정밀 지문 분석지",
@@ -942,8 +1013,8 @@ def generate_korean_passage_analysis_pdf(
     analysis_css = """
     body {
         font-family: "NanumGothic", "Malgun Gothic", sans-serif;
-        font-size: 9.5pt;
-        line-height: 1.56;
+        font-size: 9.4pt;
+        line-height: 1.54;
         color: #0F172A;
     }
     .hdr-banner {
@@ -951,7 +1022,9 @@ def generate_korean_passage_analysis_pdf(
         border-radius: 5pt;
         background-color: #F8FAFC;
         padding: 9pt 12pt;
-        margin-bottom: 12pt;
+        margin-bottom: 10pt;
+        break-inside: avoid;
+        page-break-inside: avoid;
     }
     .hdr-sub {
         font-size: 8.2pt;
@@ -970,20 +1043,24 @@ def generate_korean_passage_analysis_pdf(
         margin-top: 3pt;
     }
     .sec-title {
-        font-size: 10.5pt;
+        font-size: 10.4pt;
         font-weight: bold;
         color: #1E3A8A;
         border-left: 3.5pt solid #2563EB;
         padding-left: 6pt;
         margin-top: 10pt;
         margin-bottom: 5pt;
+        break-after: avoid;
+        page-break-after: avoid;
     }
     .theme-box {
         background-color: #EFF6FF;
         border: 0.9pt solid #93C5FD;
         border-radius: 4pt;
         padding: 7pt 10pt;
-        margin-bottom: 8pt;
+        margin-bottom: 6pt;
+        break-inside: avoid;
+        page-break-inside: avoid;
     }
     .flow-box {
         background-color: #F0FDF4;
@@ -991,19 +1068,14 @@ def generate_korean_passage_analysis_pdf(
         border-radius: 4pt;
         padding: 7pt 10pt;
         margin-bottom: 8pt;
-    }
-    .passage-box {
-        background-color: #FAFAFA;
-        border: 0.8pt solid #CBD5E1;
-        border-radius: 4pt;
-        padding: 8pt 10pt;
-        font-size: 9.0pt;
-        line-height: 1.60;
-        margin-bottom: 10pt;
+        break-inside: avoid;
+        page-break-inside: avoid;
     }
     .para-card {
         border-bottom: 0.6pt solid #E2E8F0;
         padding: 4pt 0;
+        break-inside: avoid;
+        page-break-inside: avoid;
     }
     .para-lbl {
         font-weight: bold;
@@ -1011,42 +1083,63 @@ def generate_korean_passage_analysis_pdf(
     }
     .para-kp {
         color: #0F766E;
-        font-size: 8.8pt;
+        font-size: 8.7pt;
         margin-top: 1.5pt;
     }
-    .vocab-tbl {
-        width: 100%;
-        border-collapse: collapse;
+    .vocab-list {
+        border: 0.8pt solid #CBD5E1;
+        border-radius: 4pt;
+        background-color: #FFFFFF;
+        padding: 4pt 8pt;
         margin-bottom: 8pt;
-        font-size: 8.9pt;
     }
-    .vocab-tbl th {
-        background-color: #F1F5F9;
-        border: 0.7pt solid #CBD5E1;
-        padding: 4pt 6pt;
-        text-align: left;
+    .vocab-row {
+        border-bottom: 0.5pt solid #E2E8F0;
+        padding: 4pt 0;
+        font-size: 9.0pt;
+        break-inside: avoid;
+        page-break-inside: avoid;
+    }
+    .vocab-row-last {
+        padding: 4pt 0;
+        font-size: 9.0pt;
+        break-inside: avoid;
+        page-break-inside: avoid;
+    }
+    .vocab-badge {
+        display: inline;
+        background-color: #FEF3C7;
+        color: #92400E;
         font-weight: bold;
-        color: #1E293B;
-    }
-    .vocab-tbl td {
-        border: 0.7pt solid #CBD5E1;
-        padding: 4pt 6pt;
-        vertical-align: top;
-    }
-    .term-col {
-        width: 24%;
-        font-weight: bold;
-        color: #B45309;
+        padding: 1pt 5pt;
+        border-radius: 3pt;
     }
     .checkpoint-box {
         background-color: #FFFBEB;
         border: 0.9pt solid #FCD34D;
         border-radius: 4pt;
         padding: 7pt 10pt;
-        margin-bottom: 10pt;
+        margin-bottom: 8pt;
     }
     .note-li {
         margin-bottom: 3pt;
+    }
+    .passage-box {
+        background-color: #FAFAFA;
+        border: 0.8pt solid #CBD5E1;
+        border-radius: 4pt;
+        padding: 8pt 11pt;
+        font-size: 9.0pt;
+        line-height: 1.62;
+    }
+    .passage-p {
+        margin: 0 0 5pt 0;
+        text-align: justify;
+    }
+    .passage-hdr {
+        margin: 4pt 0 3pt 0;
+        font-weight: bold;
+        color: #1E293B;
     }
     .page-break {
         page-break-before: always;
@@ -1062,6 +1155,7 @@ def generate_korean_passage_analysis_pdf(
         group_id = item.get("group_id", "")
         section_label = item.get("section_label", "독서")
         passage_text = (item.get("passage_text", "") or "").strip()
+        is_lit = "문학" in section_label
 
         pb_cls = " class='page-break'" if idx > 0 else ""
         banner_html = f"""
@@ -1092,16 +1186,17 @@ def generate_korean_passage_analysis_pdf(
             else ""
         )
 
+        vocab_items = [mv for mv in (an.marker_and_vocab_notes or []) if (mv.term or "").strip()]
         vocab_rows = []
-        for mv in (an.marker_and_vocab_notes or []):
+        for v_i, mv in enumerate(vocab_items):
+            row_cls = "vocab-row-last" if v_i == len(vocab_items) - 1 else "vocab-row"
             vocab_rows.append(
-                f"<tr><td class='term-col'>{html.escape(mv.term)}</td><td>{html.escape(mv.meaning)}</td></tr>"
+                f"<div class='{row_cls}'><span class='vocab-badge'>{html.escape(mv.term)}</span> &nbsp; "
+                f"{html.escape(mv.meaning)}</div>"
             )
         vocab_html = (
             "<div class='sec-title'>3. 핵심 표지(㉠~㉤ · ⓐ~ⓔ) 및 어휘 · 개념 풀이</div>"
-            "<table class='vocab-tbl'><tr><th>표지 / 어휘</th><th>문맥적 의미 및 설명</th></tr>"
-            + "".join(vocab_rows)
-            + "</table>"
+            f"<div class='vocab-list'>{''.join(vocab_rows)}</div>"
             if vocab_rows
             else ""
         )
@@ -1128,10 +1223,18 @@ def generate_korean_passage_analysis_pdf(
             else ""
         )
 
-        p_escaped = "<br/>".join(html.escape(ln) for ln in passage_text.splitlines())
+        reflowed_paragraphs = _clean_and_reflow_korean_passage(passage_text, is_poetry_or_literature=is_lit)
+        p_blocks: list[str] = []
+        for rp in reflowed_paragraphs:
+            if not rp:
+                p_blocks.append("<div style='height:4pt;'></div>")
+            elif re.match(r"^(?:\[\d{1,2}\s*[~\-～]\s*\d{1,2}\]|\([가나다라]\)|<[가-힣\s]+>)", rp):
+                p_blocks.append(f"<div class='passage-hdr'>{html.escape(rp)}</div>")
+            else:
+                p_blocks.append(f"<p class='passage-p'>{html.escape(rp)}</p>")
         passage_html = (
-            f"<div class='sec-title'>6. 원문 지문 전체</div><div class='passage-box'>{p_escaped}</div>"
-            if p_escaped
+            f"<div class='sec-title'>6. 원문 지문 전체</div><div class='passage-box'>{''.join(p_blocks)}</div>"
+            if p_blocks
             else ""
         )
 

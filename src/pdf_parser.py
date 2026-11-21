@@ -682,6 +682,8 @@ def _is_footer_or_header_noise(text: str, y0: float, page_h: float) -> bool:
     )
     if any(p in t for p in always_noise):
         return True
+    if re.match(r"^(?:국어|수학|영어|한국사|사회탐구|과학탐구|직업탐구|제2외국어)\s*영역$", t):
+        return True
     if not in_margin:
         return False
 
