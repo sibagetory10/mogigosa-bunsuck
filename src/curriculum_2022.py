@@ -93,11 +93,11 @@ def save_curriculum_2022_catalog(catalog: dict[str, Any], path: Path | None = No
     )
 
 
-CURRICULUM_CATEGORIES: tuple[str, ...] = ("수학", "사회", "과학", "한국사")
+CURRICULUM_CATEGORIES: tuple[str, ...] = ("국어", "영어", "수학", "사회", "과학", "한국사")
 
 
 def get_catalog_summary_stats(catalog: dict[str, Any] | None = None) -> dict[str, dict[str, int]]:
-    """대분류(수학·사회·과학·한국사)별 공식 과목 수 및 NCIC 성취기준 수 통계를 반환한다."""
+    """대분류(국어·영어·수학·사회·과학·한국사)별 공식 과목 수 및 NCIC 성취기준 수 통계를 반환한다."""
     cat_data = (catalog or load_curriculum_2022_catalog()).get("categories", {})
     stats: dict[str, dict[str, int]] = {}
     for cat_name in CURRICULUM_CATEGORIES:
@@ -162,6 +162,10 @@ def _infer_category_from_std(code: str, subject_name: str, fallback_cat: str) ->
     txt = f"{code} {subject_name}"
     if any(k in txt for k in ("한사", "한국사")):
         return "한국사"
+    if any(k in txt for k in ("공국", "국어", "화언", "화법", "독작", "독서와 작문", "문학", "주독", "문영", "직의", "독토", "매의", "매체 의사소통", "언탐", "언어생활")):
+        return "국어"
+    if any(k in txt for k in ("공영", "기영", "영어", "영Ⅰ", "영Ⅱ", "영1", "영2", "영독", "영문", "영발", "심영", "심독", "직영", "실영", "미영", "세영")):
+        return "영어"
     if any(k in txt for k in ("공수", "수학", "대수", "미적", "확통", "확률", "기하")):
         return "수학"
     if any(k in txt for k in ("통과", "과학", "물리", "화학", "생명", "지구", "역에", "전자", "물질", "화반", "세포", "유전", "지시", "행우")):

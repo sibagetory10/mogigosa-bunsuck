@@ -1616,31 +1616,34 @@ def _render_question_tag_details(
 
 
 def _render_ncic_curriculum_manager(key_prefix: str = "ncic") -> None:
-    """2022 개정 교육과정(NCIC 고시 별책 7·8·9 PDF) 기준표 현황 조회 및 성취기준 누적 등록 UI."""
+    """2022 개정 교육과정(NCIC 고시 별책 5·7·8·9·14 PDF) 기준표 현황 조회 및 성취기준 누적 등록 UI."""
     with st.expander("🧭 2022 개정 교육과정 공식 기준표(NCIC 고시 PDF) 관리 · 성취기준 보강", expanded=False):
         stats = get_catalog_summary_stats()
         st.caption(
             "기본적으로 2022 교육부 고시(제2022-33호) 공식 과목 편제표가 내장되어 있으며, "
-            "국가교육과정정보센터(ncic.re.kr)의 [별책 7(사회) / 별책 8(수학) / 별책 9(과학)] PDF를 올리면 "
+            "국가교육과정정보센터(ncic.re.kr)의 [별책 5(국어) / 별책 7(사회·한국사) / 별책 8(수학) / 별책 9(과학) / 별책 14(영어)] PDF를 올리면 "
             "공식 성취기준 코드가 기준표에 누적되어 태깅 할루시네이션 검증이 한층 엄격해집니다."
         )
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("수학 기준표", f"{stats['수학']['subjects']}과목", f"성취기준 {stats['수학']['standards']}개")
-        m2.metric("사회 기준표", f"{stats['사회']['subjects']}과목", f"성취기준 {stats['사회']['standards']}개")
-        m3.metric("과학 기준표", f"{stats['과학']['subjects']}과목", f"성취기준 {stats['과학']['standards']}개")
-        m4.metric("한국사 기준표", f"{stats['한국사']['subjects']}과목", f"성취기준 {stats['한국사']['standards']}개")
+        r1 = st.columns(3)
+        r1[0].metric("국어 기준표", f"{stats['국어']['subjects']}과목", f"성취기준 {stats['국어']['standards']}개")
+        r1[1].metric("영어 기준표", f"{stats['영어']['subjects']}과목", f"성취기준 {stats['영어']['standards']}개")
+        r1[2].metric("수학 기준표", f"{stats['수학']['subjects']}과목", f"성취기준 {stats['수학']['standards']}개")
+        r2 = st.columns(3)
+        r2[0].metric("사회 기준표", f"{stats['사회']['subjects']}과목", f"성취기준 {stats['사회']['standards']}개")
+        r2[1].metric("과학 기준표", f"{stats['과학']['subjects']}과목", f"성취기준 {stats['과학']['standards']}개")
+        r2[2].metric("한국사 기준표", f"{stats['한국사']['subjects']}과목", f"성취기준 {stats['한국사']['standards']}개")
 
         nc1, nc2 = st.columns([2, 1])
         with nc1:
             ncic_pdf = st.file_uploader(
-                "NCIC 2022 교육과정 고시 PDF 업로드 (별책 7/8/9 · 한국사 포함)",
+                "NCIC 2022 교육과정 고시 PDF 업로드 (별책 5 국어 / 7 사회·한국사 / 8 수학 / 9 과학 / 14 영어)",
                 type=["pdf"],
                 key=f"{key_prefix}_ncic_pdf",
             )
         with nc2:
             ncic_cat_hint = st.selectbox(
                 "기본 교과 대분류",
-                options=["과학", "수학", "사회", "한국사"],
+                options=["국어", "영어", "수학", "사회", "과학", "한국사"],
                 key=f"{key_prefix}_ncic_cat",
             )
         if ncic_pdf is not None and st.button("📥 NCIC 고시 PDF 성취기준 추출·반영", key=f"{key_prefix}_ncic_apply"):

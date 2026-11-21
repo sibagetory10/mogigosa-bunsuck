@@ -19,6 +19,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="NCIC(국가교육과정정보센터) 2022 개정 교육과정 별책 PDF를 파싱해 data/curriculum_2022.json을 갱신합니다."
     )
+    parser.add_argument("--korean", type=Path, help="별책 5 국어과 교육과정 PDF 경로")
+    parser.add_argument("--english", type=Path, help="별책 14 영어과 교육과정 PDF 경로")
     parser.add_argument("--math", type=Path, help="별책 8 수학과 교육과정 PDF 경로")
     parser.add_argument("--science", type=Path, help="별책 9 과학과 교육과정 PDF 경로")
     parser.add_argument("--social", type=Path, help="별책 7 사회과 교육과정 PDF 경로")
@@ -26,6 +28,8 @@ def main() -> int:
     args = parser.parse_args()
 
     targets: list[tuple[str, Path | None]] = [
+        ("국어", args.korean),
+        ("영어", args.english),
         ("수학", args.math),
         ("과학", args.science),
         ("사회", args.social),
@@ -43,7 +47,7 @@ def main() -> int:
         all_extracted.extend(items)
 
     if not all_extracted:
-        print("추출할 PDF 인자가 지정되지 않았습니다. --math / --science / --social / --history 옵션을 확인하세요.")
+        print("추출할 PDF 인자가 지정되지 않았습니다. --korean / --english / --math / --science / --social / --history 옵션을 확인하세요.")
         return 1
 
     res = merge_ncic_standards_to_catalog(all_extracted)
