@@ -84,6 +84,7 @@ from src.models import (
     EnglishSingleExtractionOutput,
     ExamHeaderMetadata,
     KoreanPassageAnalysisOutput,
+    KoreanVisualDiagram,
     KoreanQuestionExtractionItem,
     KoreanSetReconstructionOutput,
     KoreanSingleExtractionOutput,
@@ -4502,7 +4503,19 @@ def generate_korean_passage_analysis(
         "`term`에는 정의되는 개념어(예: `'대리'`, `'현명주의'`, `'자기장'`)만 간결하게 적고, `meaning`에는 지문에 나온 정의를 `'~~는 ~~~~이다'` 형태로 적으세요. "
         "(지문에 명확한 정의 문장이 없으면 빈 리스트 `[]`로 두세요.)\n"
         f"6. `area_specific_notes`: {area_guide}\n"
-        "7. `exam_checkpoints`: 실제 모의고사·내신에서 자주 출제되는 포인트와 선지 함정 주의사항 3~5개를 작성하세요."
+        "7. `exam_checkpoints`: 실제 모의고사·내신에서 자주 출제되는 포인트와 선지 함정 주의사항 3~5개를 작성하세요.\n"
+        "8. `visual_diagram`: "
+        + (
+            "비문학(독서) 지문이므로 학생이 핵심 원리·인과·개념 비교를 그림으로 한눈에 이해할 수 있도록 "
+            "`visual_diagram`을 **반드시** 작성하세요. 지문의 성격에 가장 잘 맞는 `diagram_type`을 선택하세요: "
+            "`flow`(원리·과정·인과 단계), `comparison`(두 대상/이론/입장 비교 대조), "
+            "`cycle`(순환·상호작용·피드백), `hierarchy`(중심 개념과 하위 분류). "
+            "`nodes`는 2~4개 핵심 카드로 구성하고, 각 카드 `details`는 1~3개 짧은 핵심 구절(각 26자 이내)로 간결하게 적으세요. "
+            "`relation_labels`에는 노드 사이 화살표/비교 표지에 들어갈 짧은 관계어(예: '촉진', '대립', 'VS', '분화')를 적고, "
+            "`takeaway`에는 시험에 바로 나오는 1줄 핵심 정리를 적으세요."
+            if korean_section == "독서"
+            else "개념 비교나 흐름 도식이 이해에 큰 도움이 되는 지문이면 `visual_diagram`을 작성하고, 순수 문학 감상 위주라 도식이 불필요하면 `null`로 두세요."
+        )
     )
 
     prompt = (
@@ -4532,5 +4545,54 @@ def generate_korean_passage_analysis(
         fast_mode=True,
     )
     return _parse_structured(resp, KoreanPassageAnalysisOutput)
+
+
+def generate_korean_visual_diagram(
+    *,
+    api_key: str,
+    model_name: str,
+    passage_text: str,
+    title: str = "",
+    core_theme: str = "",
+    korean_section: str = "독서",
+) -> KoreanVisualDiagram:
+    """기존에 분석된 국어 비문학 지문에 대해 이해를 돕는 도식 그림 스펙만 생성한다."""
+    clean_passage = _strip_korean_exam_noise_lines(passage_text or "")
+    if not clean_passage:
+        raise ValueError("도식을 생성할 국어 지문 원문이 비어 있습니다.")
+
+    client = _build_client(api_key, timeout_seconds=60)
+    system_inst = (
+        "당신은 수능 국어 비문학 일타 강사입니다. 지문 원문만을 100% 근거로, "
+        "학생이 핵심 원리·인과·개념 비교를 그림으로 한눈에 이해할 수 있는 도식 명세(`KoreanVisualDiagram`) JSON을 작성하세요.\n"
+        "- `diagram_type`: `flow`(과정/인과), `comparison`(비교/대조), `cycle`(순환/피드백), `hierarchy`(개념 분류) 중 최적 1개 선택\n"
+        "- `nodes`: 2~4개 카드, 각 `details`는 1~3개의 짧은 핵심 구절(26자 이내)\n"
+        "- `relation_labels`: 노드 사이 화살표/비교 표지에 들어갈 짧은 관계어\n"
+        "- `takeaway`: 1줄 핵심 정리"
+    )
+    prompt = (
+        f"[지문 영역] {korean_section}\n"
+        f"[제목/주제] {title or '-'} / {core_theme or '-'}\n\n"
+        f"[지문 원문]\n{clean_passage[:4500]}\n\n"
+        "위 지문의 핵심을 시각화한 도식 JSON을 작성하세요."
+    )
+    resp = _generate_content_with_fallback(
+        client=client,
+        model_name=model_name,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            system_instruction=system_inst,
+            response_mime_type="application/json",
+            response_schema=KoreanVisualDiagram,
+            temperature=0.2,
+            max_output_tokens=2048,
+            thinking_config=types.ThinkingConfig(
+                thinking_level=types.ThinkingLevel.MINIMAL,
+                include_thoughts=False,
+            ),
+        ),
+        fast_mode=True,
+    )
+    return _parse_structured(resp, KoreanVisualDiagram)
 
 

@@ -607,6 +607,43 @@ class KoreanMarkerVocabItem(BaseModel):
     meaning: str = Field(..., description="문맥적 의미, 지시 대상 또는 개념 설명")
 
 
+class KoreanDiagramNode(BaseModel):
+    """비문학 지문 이해를 돕는 도식 그림의 개별 개념/단계 노드."""
+
+    title: str = Field(..., description="카드 제목 (예: '1단계: 압력 상승', '현명주의')")
+    subtitle: str = Field(default="", description="부제 또는 역할 태그 (예: '원인', '핵심 입장')")
+    details: list[str] = Field(
+        default_factory=list,
+        description="카드 안에 들어갈 1~3줄 핵심 설명 (각 줄 28자 이내 권장)",
+    )
+    accent_color: Literal["blue", "green", "amber", "purple", "slate"] = Field(
+        default="blue",
+        description="카드 강조 색상 (blue / green / amber / purple / slate)",
+    )
+
+
+class KoreanVisualDiagram(BaseModel):
+    """비문학(독서) 지문의 핵심 원리·관계·비교를 시각화하는 도식 그림 명세."""
+
+    diagram_type: Literal["flow", "comparison", "cycle", "hierarchy"] = Field(
+        default="flow",
+        description="도식 유형 (flow=과정/인과 흐름도, comparison=개념/이론 비교, cycle=순환/피드백, hierarchy=상하 개념 구조)",
+    )
+    title: str = Field(..., description="도식 상단 제목 (예: '법적 의제와 간주의 비교')")
+    nodes: list[KoreanDiagramNode] = Field(
+        default_factory=list,
+        description="도식을 구성하는 핵심 카드 2~4개",
+    )
+    relation_labels: list[str] = Field(
+        default_factory=list,
+        description="노드 사이 화살표/연결선에 표시할 짧은 관계 라벨 목록 (예: ['촉진', '대립', '결과'])",
+    )
+    takeaway: str = Field(
+        default="",
+        description="도식 하단에 표시할 1줄 핵심 정리 (시험 출제 포인트)",
+    )
+
+
 class KoreanPassageAnalysisOutput(BaseModel):
     """수능·학원형 국어 지문 정밀 분석지 구조화 출력 스키마."""
 
@@ -631,6 +668,10 @@ class KoreanPassageAnalysisOutput(BaseModel):
     exam_checkpoints: list[str] = Field(
         default_factory=list,
         description="수능·내신 출제 예상 포인트 및 오답 함정 주의사항 3~5개",
+    )
+    visual_diagram: KoreanVisualDiagram | None = Field(
+        default=None,
+        description="비문학(독서) 등 지문 이해를 돕는 개념·원리·비교 도식 그림 데이터 (불필요한 경우 None)",
     )
 
 

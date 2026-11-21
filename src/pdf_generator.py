@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import html
 import io
 import re
@@ -9,6 +10,7 @@ from typing import Any
 import pymupdf
 from PIL import Image
 
+from src.diagram_renderer import render_korean_diagram_png
 from src.models import ConceptWhitelist, QuestionRecord, RewrittenQuestion
 from src.text_formatter import (
     format_chemical_scripts,
@@ -1084,6 +1086,7 @@ def _format_structure_flow_html(flow_text: str) -> str:
 def generate_korean_passage_analysis_pdf(
     analyses: list[dict[str, Any]],
     doc_title: str = "수능·모의고사 국어 정밀 지문 분석지",
+    include_diagrams: bool = True,
 ) -> bytes:
     """
     국어 지문 분석 결과(KoreanPassageAnalysisOutput + 원문 지문 + 출처 메타) 리스트를
@@ -1253,6 +1256,14 @@ def generate_korean_passage_analysis_pdf(
     .page-break {
         page-break-before: always;
     }
+    .diagram-wrap {
+        margin-top: 4pt;
+        margin-bottom: 8pt;
+        text-align: center;
+    }
+    .diagram-img {
+        width: 100%;
+    }
     """
 
     sections_html: list[str] = []
@@ -1371,8 +1382,21 @@ def generate_korean_passage_analysis_pdf(
             else ""
         )
 
+        diagram_html = ""
+        v_diag = getattr(an, "visual_diagram", None)
+        if include_diagrams and v_diag is not None and getattr(v_diag, "nodes", None):
+            try:
+                diag_png = render_korean_diagram_png(v_diag)
+                diag_b64 = base64.b64encode(diag_png).decode("ascii")
+                diagram_html = _keep_block(
+                    "<div class='sec-title'>한눈에 보는 개념 · 원리 도식</div>"
+                    f"<div class='diagram-wrap'><img class='diagram-img' src='data:image/png;base64,{diag_b64}'/></div>"
+                )
+            except Exception:
+                diagram_html = ""
+
         sections_html.append(
-            f"{banner_html}{theme_html}{para_html}{vocab_html}{area_html}{cp_html}{passage_html}</div>"
+            f"{banner_html}{theme_html}{diagram_html}{para_html}{vocab_html}{area_html}{cp_html}{passage_html}</div>"
         )
 
     full_html = f"<html><body>{''.join(sections_html)}</body></html>"

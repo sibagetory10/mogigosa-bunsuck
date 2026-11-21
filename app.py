@@ -98,6 +98,7 @@ from src.curriculum_2022 import (
     merge_ncic_standards_to_catalog,
     parse_ncic_curriculum_pdf,
 )
+from src.diagram_renderer import render_korean_diagram_png
 from src.ebsi_fetcher import attempt_ebsi_pdf_fetch
 from src.exporters import build_exam_ai_jsonl, build_exam_html, build_exam_markdown
 from src.fx_rate import get_daily_gemini_fx_rate, start_daily_midnight_fx_scheduler
@@ -125,6 +126,7 @@ from src.gemini_service import (
     generate_english_transformed_question,
     generate_korean_passage_analysis,
     generate_korean_set_reconstruction,
+    generate_korean_visual_diagram,
     generate_pdf_grounded_explanation,
     has_active_usage_tracker,
     match_problem_and_answer_pdfs_with_ai,
@@ -6708,6 +6710,11 @@ def _render_tab2_korean_transform_section() -> None:
             with st.expander(f"📄 지문 미리보기: {s_entry['exam_name']} [{s_entry['group_id']}번]", expanded=False):
                 st.text(s_entry["passage_text"][:1500] + ("..." if len(s_entry["passage_text"]) > 1500 else ""))
 
+        include_kor_diagrams = st.checkbox(
+            "🎨 비문학 이해용 도식 그림 자동 생성 포함 (원리 흐름·개념 비교·순환·계층 도식)",
+            value=True,
+            key="tab2_kor_include_diagrams",
+        )
         kb_c1, kb_c2 = st.columns(2)
         with kb_c1:
             run_kor_btn = st.form_submit_button(
@@ -6804,6 +6811,7 @@ def _render_tab2_korean_transform_section() -> None:
         chosen_sets = [filtered_sets[i] for i in selected_set_indices]
         prepared_slots: list[dict[str, Any]] = []
         missing_ai_indices: list[int] = []
+        missing_diag_indices: list[int] = []
         for idx_s, s_entry in enumerate(chosen_sets):
             curr_subj = s_entry["curr_subj"]
             kor_sec = _classify_kor_sec(curr_subj)
@@ -6815,7 +6823,7 @@ def _render_tab2_korean_transform_section() -> None:
                 kor_sec,
             )
             cached_an = storage.get_cached_korean_analysis(c_key)
-            cached_pdf = storage.get_korean_analysis_pdf_bytes(c_key)
+            cached_pdf = storage.get_korean_analysis_pdf_bytes(c_key) if include_kor_diagrams else None
             prepared_slots.append(
                 {
                     "entry": s_entry,
@@ -6829,12 +6837,19 @@ def _render_tab2_korean_transform_section() -> None:
             )
             if cached_an is None:
                 missing_ai_indices.append(idx_s)
+            elif (
+                include_kor_diagrams
+                and kor_sec == "독서"
+                and getattr(cached_an, "visual_diagram", None) is None
+            ):
+                missing_diag_indices.append(idx_s)
+                prepared_slots[idx_s]["pdf_bytes"] = None
 
         pdf_hit_cnt = sum(1 for sl in prepared_slots if sl["pdf_bytes"] is not None)
         json_to_pdf_cnt = 0
         ai_gen_cnt = 0
 
-        if missing_ai_indices:
+        if missing_ai_indices or missing_diag_indices:
             kor_api_key, kor_key_label = resolve_active_gemini_api_key(
                 current_user, creds.gemini_api_key, model_name=EXAM_TAGGING_MODEL
             )
@@ -6845,9 +6860,10 @@ def _render_tab2_korean_transform_section() -> None:
                 return
 
             with _usage_scope():
+                need_total = len(missing_ai_indices) + len(missing_diag_indices)
                 with st.spinner(
                     f"📑 {MODEL_LABELS.get(EXAM_TAGGING_MODEL, EXAM_TAGGING_MODEL)}로 "
-                    f"미등록 국어 지문 분석지 {len(missing_ai_indices)}세트 생성 중 "
+                    f"국어 지문 분석지·이해 도식 {need_total}건 생성 중 "
                     f"(DB 로드 {len(chosen_sets) - len(missing_ai_indices)}세트)..."
                 ):
                     for slot_i in missing_ai_indices:
@@ -6877,6 +6893,34 @@ def _render_tab2_korean_transform_section() -> None:
                         except Exception as exc:
                             st.error(f"[{s_entry['exam_name']} {s_entry['group_id']}번] 지문 분석 실패: {exc}")
 
+                    for slot_i in missing_diag_indices:
+                        slot = prepared_slots[slot_i]
+                        s_entry = slot["entry"]
+                        cur_an = slot["analysis"]
+                        if cur_an is None:
+                            continue
+                        try:
+                            diag_out = generate_korean_visual_diagram(
+                                api_key=kor_api_key,
+                                model_name=EXAM_TAGGING_MODEL,
+                                passage_text=s_entry["passage_text"],
+                                title=cur_an.title,
+                                core_theme=cur_an.core_theme,
+                                korean_section=slot["kor_sec"],
+                            )
+                            updated_an = cur_an.model_copy(update={"visual_diagram": diag_out})
+                            slot["analysis"] = updated_an
+                            storage.save_cached_korean_analysis(
+                                slot["cache_key"],
+                                updated_an,
+                                exam_name=s_entry["exam_name"],
+                                group_id=s_entry["group_id"],
+                                korean_section=slot["kor_sec"],
+                                korean_subgenre=slot["kor_sub"],
+                            )
+                        except Exception as exc:
+                            st.warning(f"[{s_entry['exam_name']} {s_entry['group_id']}번] 이해 도식 생성 건너뜀: {exc}")
+
         analyses_list: list[dict[str, Any]] = []
         pdf_parts: list[bytes] = []
         for slot in prepared_slots:
@@ -6892,11 +6936,14 @@ def _render_tab2_korean_transform_section() -> None:
             }
             if slot["pdf_bytes"] is None:
                 try:
-                    single_pdf = generate_korean_passage_analysis_pdf([single_item])
-                    storage.save_korean_analysis_pdf_bytes(slot["cache_key"], single_pdf)
+                    single_pdf = generate_korean_passage_analysis_pdf(
+                        [single_item],
+                        include_diagrams=include_kor_diagrams,
+                    )
+                    if include_kor_diagrams:
+                        storage.save_korean_analysis_pdf_bytes(slot["cache_key"], single_pdf)
                     slot["pdf_bytes"] = single_pdf
-                    if slot_index_was_json_only := (slot not in [prepared_slots[i] for i in missing_ai_indices]):
-                        _ = slot_index_was_json_only
+                    if slot not in [prepared_slots[i] for i in missing_ai_indices]:
                         json_to_pdf_cnt += 1
                 except Exception as exc:
                     st.error(f"[{s_entry['exam_name']} {s_entry['group_id']}번] 지문 PDF 생성 실패: {exc}")
@@ -6971,6 +7018,16 @@ def _render_tab2_korean_transform_section() -> None:
                 ):
                     st.info(f"**핵심 주제:** {an.core_theme}")
                     st.success(f"**전개 흐름:** {an.structure_flow}")
+                    _v_diag = getattr(an, "visual_diagram", None)
+                    if _v_diag is not None and getattr(_v_diag, "nodes", None):
+                        try:
+                            st.image(
+                                render_korean_diagram_png(_v_diag),
+                                caption=f"🖼️ {_v_diag.title}",
+                                width="stretch",
+                            )
+                        except Exception:
+                            pass
                     if an.paragraph_summaries:
                         st.markdown("**📌 문단 · 연별 요약**")
                         for ps in an.paragraph_summaries:
