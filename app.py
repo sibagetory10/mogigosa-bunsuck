@@ -361,7 +361,34 @@ def _build_cached_exam_exports(
     records_sig: str,
     _exam_recs: list[QuestionRecord],
 ) -> tuple[bytes, bytes, bytes, bytes]:
-    """회차별 HTML/MD/JSONL/JSON 내보내기 바이트를 캐싱해 불필요한 크롭 이미지 반복 로드·인코딩을 방지한다."""
+    """회차별 HTML/MD/JSONL/JSON 내보내기 바이트를 캐싱한다. 로컬 정리 파일의 mtime이 db.json 이상이면 즉시 재사용한다."""
+    try:
+        exam_dir = _storage._local_exam_dir(subj_cat, exam_name)
+        html_p = exam_dir / "기출정리.html"
+        md_p = exam_dir / "기출정리.md"
+        jsonl_p = exam_dir / "ai_index.jsonl"
+        json_p = exam_dir / "문제목록.json"
+        if html_p.exists() and md_p.exists() and jsonl_p.exists() and json_p.exists():
+            db_mtime = _storage.db_path.stat().st_mtime_ns if _storage.db_path.exists() else 0
+            min_export_mtime = min(
+                html_p.stat().st_mtime_ns,
+                md_p.stat().st_mtime_ns,
+                jsonl_p.stat().st_mtime_ns,
+                json_p.stat().st_mtime_ns,
+            )
+            if min_export_mtime >= db_mtime:
+                raw_json_bytes = json_p.read_bytes()
+                parsed_list = json.loads(raw_json_bytes.decode("utf-8"))
+                if isinstance(parsed_list, list) and len(parsed_list) == len(_exam_recs):
+                    return (
+                        html_p.read_bytes(),
+                        md_p.read_bytes(),
+                        jsonl_p.read_bytes(),
+                        raw_json_bytes,
+                    )
+    except Exception:
+        pass
+
     html_str = build_exam_html(
         exam_name,
         subj_cat,
@@ -2812,10 +2839,9 @@ def _render_server_storage_admin_section() -> None:
         st.subheader("💾 서버 저장공간 & 앱 DB 용량 모니터링")
     with hdr_c2:
         st.markdown("<div style='height: 0.45rem;'></div>", unsafe_allow_html=True)
-        if st.button("🔄 용량 새로고침", key="admin_refresh_storage_btn", width="stretch"):
-            st.rerun()
+        refresh_storage = st.button("🔄 용량 새로고침", key="admin_refresh_storage_btn", width="stretch")
 
-    stats = storage.get_server_storage_stats()
+    stats = storage.get_server_storage_stats(force_refresh=bool(refresh_storage))
     st.caption(f"기준 디스크 경로: `{stats['mount_path']}`")
 
     disk_total = int(stats["disk_total_bytes"])
@@ -2888,6 +2914,25 @@ def _run_git_cmd(repo_dir: Path, args: list[str], timeout: int = 15) -> tuple[bo
         return False, str(exc)
 
 
+@st.cache_data(ttl=30, show_spinner=False)
+def _get_cached_git_status_snapshot(repo_dir_str: str) -> dict[str, Any]:
+    repo_p = Path(repo_dir_str)
+    ok_head, local_head = _run_git_cmd(repo_p, ["rev-parse", "--short", "HEAD"])
+    ok_msg, local_msg = _run_git_cmd(repo_p, ["log", "-1", "--format=%cd · %s", "--date=short"])
+    ok_st, dirty_raw = _run_git_cmd(repo_p, ["status", "--short"])
+    ok_rem, remote_head = _run_git_cmd(repo_p, ["rev-parse", "--short", "origin/main"])
+    dirty_lines = [ln for ln in dirty_raw.splitlines() if ln.strip()] if ok_st else []
+    return {
+        "ok_head": ok_head,
+        "local_head": local_head,
+        "ok_msg": ok_msg,
+        "local_msg": local_msg,
+        "dirty_lines": dirty_lines,
+        "ok_rem": ok_rem,
+        "remote_head": remote_head,
+    }
+
+
 def _render_server_git_update_admin_section() -> None:
     st.divider()
     repo_dir = Path(__file__).resolve().parent
@@ -2898,15 +2943,18 @@ def _render_server_git_update_admin_section() -> None:
         st.markdown("<div style='height: 0.45rem;'></div>", unsafe_allow_html=True)
         check_remote = st.button("🔍 최신 상태 확인", key="admin_git_check_btn", width="stretch")
 
-    ok_head, local_head = _run_git_cmd(repo_dir, ["rev-parse", "--short", "HEAD"])
-    ok_msg, local_msg = _run_git_cmd(repo_dir, ["log", "-1", "--format=%cd · %s", "--date=short"])
-    ok_st, dirty_raw = _run_git_cmd(repo_dir, ["status", "--short"])
-    dirty_lines = [ln for ln in dirty_raw.splitlines() if ln.strip()] if ok_st else []
-
     if check_remote:
         _run_git_cmd(repo_dir, ["fetch", "origin", "main", "--quiet"], timeout=20)
+        _get_cached_git_status_snapshot.clear()
 
-    ok_rem, remote_head = _run_git_cmd(repo_dir, ["rev-parse", "--short", "origin/main"])
+    git_snap = _get_cached_git_status_snapshot(str(repo_dir))
+    ok_head = bool(git_snap["ok_head"])
+    local_head = str(git_snap["local_head"])
+    ok_msg = bool(git_snap["ok_msg"])
+    local_msg = str(git_snap["local_msg"])
+    dirty_lines = list(git_snap["dirty_lines"])
+    ok_rem = bool(git_snap["ok_rem"])
+    remote_head = str(git_snap["remote_head"])
 
     g1, g2, g3 = st.columns(3)
     g1.metric("현재 서버 커밋", local_head if ok_head else "확인 불가")
@@ -2972,8 +3020,10 @@ def _render_server_git_update_admin_section() -> None:
                         st.code(log_txt, language="text")
                 except Exception as exc:
                     st.error(f"❌ 실행 오류: {exc}")
+                _get_cached_git_status_snapshot.clear()
             else:
                 ok_pull, pull_out = _run_git_cmd(repo_dir, ["pull", "--ff-only", "origin", "main"], timeout=30)
+                _get_cached_git_status_snapshot.clear()
                 if ok_pull:
                     st.success(f"✅ git pull 완료: {pull_out or 'Already up to date.'}")
                 else:
@@ -3453,8 +3503,9 @@ def _normalize_exam_identity(name: str) -> str:
     return re.sub(r"[^가-힣a-zA-Z0-9]+", "", s_norm).lower()
 
 
+@st.cache_data(show_spinner=False)
 def _build_recommended_exam_catalog() -> list[dict[str, str]]:
-    """최근 3개년(2024~2026) 고1·고2·고3 주요 학평/모평/수능 + 과목별 추천 기출 카탈로그를 생성한다."""
+    """최근 3개년(2024~2026) 고1·고2·고3 주요 학평/모평/수능 + 과목별 추천 기출 정적 카탈로그를 생성한다."""
     years = ["2026", "2025", "2024"]
     grade_specs: list[tuple[str, list[str], list[tuple[str, str]]]] = [
         (
@@ -3496,6 +3547,7 @@ def _build_recommended_exam_catalog() -> list[dict[str, str]]:
         for grade, months, subjects in grade_specs:
             for m in months:
                 for subj_cat, subj_name in subjects:
+                    ex_name = f"{y}년 {m} {grade} {subj_name}"
                     catalog.append(
                         {
                             "year": y,
@@ -3503,7 +3555,8 @@ def _build_recommended_exam_catalog() -> list[dict[str, str]]:
                             "grade": grade,
                             "subject_cat": subj_cat,
                             "subject_name": subj_name,
-                            "exam_name": f"{y}년 {m} {grade} {subj_name}",
+                            "exam_name": ex_name,
+                            "norm_id": _normalize_exam_identity(ex_name),
                         }
                     )
     return catalog
@@ -3537,7 +3590,7 @@ def _render_exam_coverage_board() -> None:
     missing_all = [
         item
         for item in catalog
-        if _normalize_exam_identity(item["exam_name"]) not in registered_ids
+        if (item.get("norm_id") or _normalize_exam_identity(item["exam_name"])) not in registered_ids
     ]
 
     with st.expander(
@@ -5350,119 +5403,135 @@ with tab1:
                                         }
                                         st.rerun()
 
-                        # 회차별 정리 파일 & 원본 PDF 다운로드 바 (캐싱 적용)
-                        records_sig = f"{len(exam_recs)}:{','.join(r.id for r in exam_recs)}"
-                        html_bytes, md_bytes, ai_jsonl_bytes, json_bytes = _build_cached_exam_exports(
-                            storage,
-                            exam_name,
-                            subj_cat,
-                            records_sig,
-                            exam_recs,
-                        )
-                        dl_c1, dl_c2, dl_c3, dl_c4, dl_c5, dl_c6 = st.columns(6)
-                        with dl_c1:
-                            st.download_button(
-                                "🌐 웹페이지(HTML)",
-                                data=html_bytes,
-                                file_name=f"{safe_fn_prefix}_기출정리.html",
-                                mime="text/html",
-                                key=f"dl_html_search_{subj_cat}_{exam_uid}",
-                                width="stretch",
+                        # 회차별 내보내기·원본 PDF 및 문항 상세 이미지 지연 로드 토글 (검색 목록 초기 렌더링 속도 극대화)
+                        tgl_c1, tgl_c2 = st.columns(2)
+                        with tgl_c1:
+                            open_exports = st.toggle(
+                                "📥 내보내기 · 원본 PDF 다운로드 열기",
+                                value=False,
+                                key=f"tgl_exports_{subj_cat}_{exam_uid}",
                             )
-                        with dl_c2:
-                            st.download_button(
-                                "📝 정리본(MD)",
-                                data=md_bytes,
-                                file_name=f"{safe_fn_prefix}_기출정리.md",
-                                mime="text/markdown",
-                                key=f"dl_md_search_{subj_cat}_{exam_uid}",
-                                width="stretch",
-                            )
-                        with dl_c3:
-                            st.download_button(
-                                "🤖 AI용(JSONL)",
-                                data=ai_jsonl_bytes,
-                                file_name=f"{safe_fn_prefix}_ai_index.jsonl",
-                                mime="application/x-ndjson",
-                                key=f"dl_jsonl_search_{subj_cat}_{exam_uid}",
-                                width="stretch",
-                            )
-                        with dl_c4:
-                            st.download_button(
-                                "📦 JSON",
-                                data=json_bytes,
-                                file_name=f"{safe_fn_prefix}_문제목록.json",
-                                mime="application/json",
-                                key=f"dl_json_search_{subj_cat}_{exam_uid}",
-                                width="stretch",
+                        with tgl_c2:
+                            open_details = st.toggle(
+                                f"📋 '{exam_name}' 문항 상세 · 이미지 열기 ({len(exam_recs)}문항)",
+                                value=False,
+                                key=f"tgl_details_{subj_cat}_{exam_uid}",
                             )
 
-                        prob_pdf_name = next((r.source_pdf for r in exam_recs if r.source_pdf), "")
-                        ans_pdf_name = next((r.answer_pdf for r in exam_recs if r.answer_pdf), "")
-                        with dl_c5:
-                            prob_bytes = (
-                                storage.get_pdf_bytes(prob_pdf_name, subject_category=subj_cat, exam_name=exam_name)
-                                if prob_pdf_name
-                                else None
+                        if open_exports:
+                            records_sig = f"{len(exam_recs)}:{','.join(r.id for r in exam_recs)}"
+                            html_bytes, md_bytes, ai_jsonl_bytes, json_bytes = _build_cached_exam_exports(
+                                storage,
+                                exam_name,
+                                subj_cat,
+                                records_sig,
+                                exam_recs,
                             )
-                            if prob_bytes:
+                            dl_c1, dl_c2, dl_c3, dl_c4, dl_c5, dl_c6 = st.columns(6)
+                            with dl_c1:
                                 st.download_button(
-                                    "📕 문제지 PDF",
-                                    data=prob_bytes,
-                                    file_name=prob_pdf_name,
-                                    mime="application/pdf",
-                                    key=f"dl_prob_search_{subj_cat}_{exam_uid}",
+                                    "🌐 웹페이지(HTML)",
+                                    data=html_bytes,
+                                    file_name=f"{safe_fn_prefix}_기출정리.html",
+                                    mime="text/html",
+                                    key=f"dl_html_search_{subj_cat}_{exam_uid}",
                                     width="stretch",
                                 )
-                        with dl_c6:
-                            ans_bytes = (
-                                storage.get_pdf_bytes(ans_pdf_name, subject_category=subj_cat, exam_name=exam_name)
-                                if ans_pdf_name
-                                else None
-                            )
-                            if ans_bytes:
+                            with dl_c2:
                                 st.download_button(
-                                    "📗 해설지 PDF",
-                                    data=ans_bytes,
-                                    file_name=ans_pdf_name,
-                                    mime="application/pdf",
-                                    key=f"dl_ans_search_{subj_cat}_{exam_uid}",
+                                    "📝 정리본(MD)",
+                                    data=md_bytes,
+                                    file_name=f"{safe_fn_prefix}_기출정리.md",
+                                    mime="text/markdown",
+                                    key=f"dl_md_search_{subj_cat}_{exam_uid}",
+                                    width="stretch",
+                                )
+                            with dl_c3:
+                                st.download_button(
+                                    "🤖 AI용(JSONL)",
+                                    data=ai_jsonl_bytes,
+                                    file_name=f"{safe_fn_prefix}_ai_index.jsonl",
+                                    mime="application/x-ndjson",
+                                    key=f"dl_jsonl_search_{subj_cat}_{exam_uid}",
+                                    width="stretch",
+                                )
+                            with dl_c4:
+                                st.download_button(
+                                    "📦 JSON",
+                                    data=json_bytes,
+                                    file_name=f"{safe_fn_prefix}_문제목록.json",
+                                    mime="application/json",
+                                    key=f"dl_json_search_{subj_cat}_{exam_uid}",
                                     width="stretch",
                                 )
 
-                        with st.expander(f"📋 '{exam_name}' 문항 상세 보기 ({len(exam_recs)}문항)", expanded=False):
-                            for rec in exam_recs:
-                                warn_prefix = "⚠️ 검토 필요 · " if getattr(rec, "needs_review", False) else ""
-                                if rec.subject_category == "영어":
-                                    sec_lbl = getattr(rec, "english_section", "") or ("듣기" if rec.q_num <= 17 else "독해")
-                                    type_lbl = getattr(rec, "english_question_type", "") or rec.unit_name
-                                    grp_lbl = f" · 세트 `[{rec.passage_group_id}]`" if getattr(rec, "passage_group_id", "") else ""
-                                    st.markdown(
-                                        f"{warn_prefix}**{rec.q_num}번** · `영어 ({sec_lbl})` · {type_lbl}{grp_lbl} "
-                                        f"(정답 `{rec.answer}`)"
+                            prob_pdf_name = next((r.source_pdf for r in exam_recs if r.source_pdf), "")
+                            ans_pdf_name = next((r.answer_pdf for r in exam_recs if r.answer_pdf), "")
+                            with dl_c5:
+                                prob_bytes = (
+                                    storage.get_pdf_bytes(prob_pdf_name, subject_category=subj_cat, exam_name=exam_name)
+                                    if prob_pdf_name
+                                    else None
+                                )
+                                if prob_bytes:
+                                    st.download_button(
+                                        "📕 문제지 PDF",
+                                        data=prob_bytes,
+                                        file_name=prob_pdf_name,
+                                        mime="application/pdf",
+                                        key=f"dl_prob_search_{subj_cat}_{exam_uid}",
+                                        width="stretch",
                                     )
-                                else:
-                                    st.markdown(
-                                        f"{warn_prefix}**{rec.q_num}번** · `{rec.curriculum_subject}` · {rec.unit_name} "
-                                        f"(고{rec.min_grade}, {'단일 원리' if rec.is_single_concept else '복합 원리'}, 정답 `{rec.answer}`)"
+                            with dl_c6:
+                                ans_bytes = (
+                                    storage.get_pdf_bytes(ans_pdf_name, subject_category=subj_cat, exam_name=exam_name)
+                                    if ans_pdf_name
+                                    else None
+                                )
+                                if ans_bytes:
+                                    st.download_button(
+                                        "📗 해설지 PDF",
+                                        data=ans_bytes,
+                                        file_name=ans_pdf_name,
+                                        mime="application/pdf",
+                                        key=f"dl_ans_search_{subj_cat}_{exam_uid}",
+                                        width="stretch",
                                     )
-                                col_a, col_b = st.columns([1, 1.3])
-                                with col_a:
-                                    img_b = storage.get_crop_bytes(
-                                        rec.image_filename,
-                                        subject_category=rec.subject_category,
-                                        exam_name=rec.exam_name,
-                                    )
-                                    if img_b:
-                                        st.image(img_b, width="stretch")
-                                with col_b:
-                                    _render_question_tag_details(
-                                        rec,
-                                        storage=storage,
-                                        key_prefix="db_search",
-                                        allow_delete=True,
-                                    )
-                                st.markdown("---")
+
+                        if open_details:
+                            with st.container(border=True):
+                                for rec in exam_recs:
+                                    warn_prefix = "⚠️ 검토 필요 · " if getattr(rec, "needs_review", False) else ""
+                                    if rec.subject_category == "영어":
+                                        sec_lbl = getattr(rec, "english_section", "") or ("듣기" if rec.q_num <= 17 else "독해")
+                                        type_lbl = getattr(rec, "english_question_type", "") or rec.unit_name
+                                        grp_lbl = f" · 세트 `[{rec.passage_group_id}]`" if getattr(rec, "passage_group_id", "") else ""
+                                        st.markdown(
+                                            f"{warn_prefix}**{rec.q_num}번** · `영어 ({sec_lbl})` · {type_lbl}{grp_lbl} "
+                                            f"(정답 `{rec.answer}`)"
+                                        )
+                                    else:
+                                        st.markdown(
+                                            f"{warn_prefix}**{rec.q_num}번** · `{rec.curriculum_subject}` · {rec.unit_name} "
+                                            f"(고{rec.min_grade}, {'단일 원리' if rec.is_single_concept else '복합 원리'}, 정답 `{rec.answer}`)"
+                                        )
+                                    col_a, col_b = st.columns([1, 1.3])
+                                    with col_a:
+                                        img_b = storage.get_crop_bytes(
+                                            rec.image_filename,
+                                            subject_category=rec.subject_category,
+                                            exam_name=rec.exam_name,
+                                        )
+                                        if img_b:
+                                            st.image(img_b, width="stretch")
+                                    with col_b:
+                                        _render_question_tag_details(
+                                            rec,
+                                            storage=storage,
+                                            key_prefix="db_search",
+                                            allow_delete=True,
+                                        )
+                                    st.markdown("---")
 
 
 # ===========================================================================

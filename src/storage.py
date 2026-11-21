@@ -29,8 +29,34 @@ from src.models import (
 )
 
 DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive"]
-FOLDER_MIME = "application/vnd.google-apps.folder"
+FOLDER_MIME = "https://vnd.google-apps.folder" if False else "application/vnd.google-apps.folder"
 KNOWN_SUBJECT_FOLDERS = ("수학", "사회", "과학", "한국사", "국어", "영어")
+
+_GLOBAL_CACHE_LOCK = threading.RLock()
+_GLOBAL_JSON_CACHE: dict[str, tuple[Any, Any]] = {}
+_GLOBAL_STORAGE_STATS_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+STORAGE_STATS_TTL_SECONDS = 60.0
+
+
+def _file_stat_sig(path: Path) -> tuple[int, int] | None:
+    try:
+        st = path.stat()
+        return (int(st.st_mtime_ns), int(st.st_size))
+    except OSError:
+        return None
+
+
+def _dir_json_stat_sig(dir_path: Path, main_file: Path) -> tuple[Any, ...]:
+    parts: list[Any] = [str(main_file.resolve()) if main_file.exists() else str(main_file), _file_stat_sig(main_file)]
+    if dir_path.exists():
+        try:
+            for child in sorted(dir_path.glob("*.json")):
+                if child.name == main_file.name:
+                    continue
+                parts.append((child.name, _file_stat_sig(child)))
+        except OSError:
+            pass
+    return tuple(parts)
 
 
 def _safe_segment(name: str) -> str:
@@ -479,8 +505,14 @@ class StorageManager:
         with self._lock:
             if not self.db_path.exists():
                 return []
-            if self.db_path.stat().st_size == 0:
+            sig = _file_stat_sig(self.db_path)
+            if sig is None or sig[1] == 0:
                 return []
+            cache_key = f"db::{self.db_path.resolve()}"
+            with _GLOBAL_CACHE_LOCK:
+                cached = _GLOBAL_JSON_CACHE.get(cache_key)
+                if cached is not None and cached[0] == sig:
+                    return [rec.model_copy(deep=True) for rec in cached[1]]
 
             last_err: Exception | None = None
             for attempt in range(3):
@@ -492,7 +524,11 @@ class StorageManager:
                     raw = json.loads(text)
                     if not isinstance(raw, list):
                         raise ValueError(f"db.json 루트가 리스트가 아닙니다 (type: {type(raw)})")
-                    return [QuestionRecord.model_validate(item) for item in raw]
+                    records = [QuestionRecord.model_validate(item) for item in raw]
+                    new_sig = _file_stat_sig(self.db_path) or sig
+                    with _GLOBAL_CACHE_LOCK:
+                        _GLOBAL_JSON_CACHE[cache_key] = (new_sig, records)
+                    return [rec.model_copy(deep=True) for rec in records]
                 except Exception as exc:
                     last_err = exc
                     if attempt < 2:
@@ -571,6 +607,14 @@ class StorageManager:
             payload = [rec.model_dump() for rec in records]
             raw_text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
             _atomic_write_text(self.db_path, raw_text, encoding="utf-8")
+            new_sig = _file_stat_sig(self.db_path)
+            if new_sig is not None:
+                with _GLOBAL_CACHE_LOCK:
+                    _GLOBAL_JSON_CACHE[f"db::{self.db_path.resolve()}"] = (
+                        new_sig,
+                        [rec.model_copy(deep=True) for rec in records],
+                    )
+                    _GLOBAL_STORAGE_STATS_CACHE.clear()
 
             errors: list[str] = []
             if sync_local_organized or sync_organized_drive:
@@ -600,8 +644,14 @@ class StorageManager:
         with self._lock:
             if not self.users_path.exists():
                 return []
-            if self.users_path.stat().st_size == 0:
+            sig = _file_stat_sig(self.users_path)
+            if sig is None or sig[1] == 0:
                 return []
+            cache_key = f"users::{self.users_path.resolve()}"
+            with _GLOBAL_CACHE_LOCK:
+                cached = _GLOBAL_JSON_CACHE.get(cache_key)
+                if cached is not None and cached[0] == sig:
+                    return [u.model_copy(deep=True) for u in cached[1]]
 
             last_err: Exception | None = None
             for attempt in range(3):
@@ -624,7 +674,10 @@ class StorageManager:
                     users = [UserRecord.model_validate(item) for item in raw]
                     if needs_migration:
                         self.save_users(users)
-                    return users
+                    new_sig = _file_stat_sig(self.users_path) or sig
+                    with _GLOBAL_CACHE_LOCK:
+                        _GLOBAL_JSON_CACHE[cache_key] = (new_sig, users)
+                    return [u.model_copy(deep=True) for u in users]
                 except Exception as exc:
                     last_err = exc
                     if attempt < 2:
@@ -644,6 +697,13 @@ class StorageManager:
             payload = [u.model_dump() for u in users]
             raw_text = json.dumps(payload, ensure_ascii=False, indent=2)
             _atomic_write_text(self.users_path, raw_text, encoding="utf-8")
+            new_sig = _file_stat_sig(self.users_path)
+            if new_sig is not None:
+                with _GLOBAL_CACHE_LOCK:
+                    _GLOBAL_JSON_CACHE[f"users::{self.users_path.resolve()}"] = (
+                        new_sig,
+                        [u.model_copy(deep=True) for u in users],
+                    )
 
             if sync_drive and self.drive_connected:
                 try:
@@ -660,6 +720,13 @@ class StorageManager:
     def load_concept_books(self) -> list[ConceptBookRecord]:
         """로컬 ./concept_db 에 저장된 공용 개념서·교과서 DB 목록을 불러온다."""
         with self._lock:
+            dir_sig = _dir_json_stat_sig(self.concept_root, self.concept_books_path)
+            cache_key = f"cbooks::{self.concept_root.resolve()}"
+            with _GLOBAL_CACHE_LOCK:
+                cached = _GLOBAL_JSON_CACHE.get(cache_key)
+                if cached is not None and cached[0] == dir_sig:
+                    return [b.model_copy(deep=True) for b in cached[1]]
+
             books_map: dict[str, ConceptBookRecord] = {}
             if self.concept_books_path.exists():
                 try:
@@ -686,7 +753,11 @@ class StorageManager:
                     except Exception:
                         continue
 
-            return sorted(books_map.values(), key=lambda x: (x.subject, x.book_title))
+            ordered_books = sorted(books_map.values(), key=lambda x: (x.subject, x.book_title))
+            new_sig = _dir_json_stat_sig(self.concept_root, self.concept_books_path)
+            with _GLOBAL_CACHE_LOCK:
+                _GLOBAL_JSON_CACHE[cache_key] = (new_sig, ordered_books)
+            return [b.model_copy(deep=True) for b in ordered_books]
 
     def save_concept_book(self, book: ConceptBookRecord) -> str | None:
         """
@@ -1216,15 +1287,37 @@ class StorageManager:
     def _load_english_pool_unlocked(self) -> dict[str, list[dict[str, Any]]]:
         if not self.english_pool_path.exists():
             return {}
+        sig = _file_stat_sig(self.english_pool_path)
+        if sig is None or sig[1] == 0:
+            return {}
+        cache_key = f"eng_pool::{self.english_pool_path.resolve()}"
+        with _GLOBAL_CACHE_LOCK:
+            cached = _GLOBAL_JSON_CACHE.get(cache_key)
+            if cached is not None and cached[0] == sig:
+                return {k: [dict(it) for it in v] for k, v in cached[1].items()}
         try:
             data = json.loads(self.english_pool_path.read_text(encoding="utf-8"))
-            return data if isinstance(data, dict) else {}
+            clean = {
+                str(k): [dict(it) for it in v if isinstance(it, dict)]
+                for k, v in (data if isinstance(data, dict) else {}).items()
+                if isinstance(v, list)
+            }
+            with _GLOBAL_CACHE_LOCK:
+                _GLOBAL_JSON_CACHE[cache_key] = (sig, clean)
+            return {k: [dict(it) for it in v] for k, v in clean.items()}
         except Exception:
             return {}
 
     def _save_english_pool_unlocked(self, pool: dict[str, list[dict[str, Any]]]) -> None:
         raw = json.dumps(pool, ensure_ascii=False, indent=2)
         _atomic_write_text(self.english_pool_path, raw, encoding="utf-8")
+        new_sig = _file_stat_sig(self.english_pool_path)
+        if new_sig is not None:
+            with _GLOBAL_CACHE_LOCK:
+                _GLOBAL_JSON_CACHE[f"eng_pool::{self.english_pool_path.resolve()}"] = (
+                    new_sig,
+                    {str(k): [dict(it) for it in v if isinstance(it, dict)] for k, v in pool.items() if isinstance(v, list)},
+                )
 
     def load_english_pool(self) -> dict[str, list[dict[str, Any]]]:
         """저장된 영어 변형 풀(Pool) 전체를 안전하게 조회한다."""
@@ -1519,9 +1612,16 @@ class StorageManager:
     # -----------------------------------------------------------------------
     # 서버 디스크 및 앱 저장공간 통계 (관리자 모니터링용)
     # -----------------------------------------------------------------------
-    def get_server_storage_stats(self) -> dict[str, Any]:
-        """서버 디스크 전체/사용/여유 용량과 앱 DB 폴더별 파일 수 및 용량을 반환한다."""
+    def get_server_storage_stats(self, force_refresh: bool = False) -> dict[str, Any]:
+        """서버 디스크 전체/사용/여유 용량과 앱 DB 폴더별 파일 수 및 용량을 반환한다 (60초 TTL 캐시 적용)."""
         mount_path = self.local_root.resolve()
+        cache_key = str(mount_path)
+        now_ts = time.monotonic()
+        if not force_refresh:
+            with _GLOBAL_CACHE_LOCK:
+                cached_stats = _GLOBAL_STORAGE_STATS_CACHE.get(cache_key)
+                if cached_stats is not None and (now_ts - cached_stats[0]) < STORAGE_STATS_TTL_SECONDS:
+                    return dict(cached_stats[1])
         try:
             usage = shutil.disk_usage(mount_path)
             disk_total = int(usage.total)
@@ -1588,7 +1688,7 @@ class StorageManager:
         app_total_bytes = sum(item["bytes"] for item in breakdown)
         app_total_files = sum(item["files"] for item in breakdown)
 
-        return {
+        stats_out = {
             "mount_path": str(mount_path),
             "disk_total_bytes": disk_total,
             "disk_used_bytes": disk_used,
@@ -1598,6 +1698,9 @@ class StorageManager:
             "app_total_files": app_total_files,
             "breakdown": breakdown,
         }
+        with _GLOBAL_CACHE_LOCK:
+            _GLOBAL_STORAGE_STATS_CACHE[cache_key] = (now_ts, stats_out)
+        return dict(stats_out)
 
     # -----------------------------------------------------------------------
     # 국어 정밀 지문 분석지 캐시 풀(Pool) 영구 저장 / 조회 / 관리
@@ -1616,15 +1719,37 @@ class StorageManager:
     def _load_korean_analysis_pool_unlocked(self) -> dict[str, dict[str, Any]]:
         if not self.korean_analysis_pool_path.exists():
             return {}
+        sig = _file_stat_sig(self.korean_analysis_pool_path)
+        if sig is None or sig[1] == 0:
+            return {}
+        cache_key = f"kor_pool::{self.korean_analysis_pool_path.resolve()}"
+        with _GLOBAL_CACHE_LOCK:
+            cached = _GLOBAL_JSON_CACHE.get(cache_key)
+            if cached is not None and cached[0] == sig:
+                return {k: dict(v) for k, v in cached[1].items()}
         try:
             data = json.loads(self.korean_analysis_pool_path.read_text(encoding="utf-8"))
-            return data if isinstance(data, dict) else {}
+            clean = {
+                str(k): dict(v)
+                for k, v in (data if isinstance(data, dict) else {}).items()
+                if isinstance(v, dict)
+            }
+            with _GLOBAL_CACHE_LOCK:
+                _GLOBAL_JSON_CACHE[cache_key] = (sig, clean)
+            return {k: dict(v) for k, v in clean.items()}
         except Exception:
             return {}
 
     def _save_korean_analysis_pool_unlocked(self, pool: dict[str, dict[str, Any]]) -> None:
         raw = json.dumps(pool, ensure_ascii=False, indent=2)
         _atomic_write_text(self.korean_analysis_pool_path, raw, encoding="utf-8")
+        new_sig = _file_stat_sig(self.korean_analysis_pool_path)
+        if new_sig is not None:
+            with _GLOBAL_CACHE_LOCK:
+                _GLOBAL_JSON_CACHE[f"kor_pool::{self.korean_analysis_pool_path.resolve()}"] = (
+                    new_sig,
+                    {str(k): dict(v) for k, v in pool.items() if isinstance(v, dict)},
+                )
 
     def load_korean_analysis_pool(self) -> dict[str, dict[str, Any]]:
         """저장된 국어 지문 분석지 풀(Pool) 전체를 안전하게 조회한다."""

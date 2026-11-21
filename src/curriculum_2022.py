@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import re
 from pathlib import Path
@@ -11,6 +12,15 @@ from src.models import ConceptBookRecord, QuestionExtractionOutput
 
 _DATA_PATH = Path(__file__).resolve().parent.parent / "data" / "curriculum_2022.json"
 _RUNTIME_STANDARDS_PATH = Path(__file__).resolve().parent.parent / "exam_db" / "ncic_standards.json"
+_CATALOG_CACHE: dict[str, tuple[tuple[Any, ...], dict[str, Any]]] = {}
+
+
+def _stat_sig(path: Path) -> tuple[int, int] | None:
+    try:
+        st = path.stat()
+        return (int(st.st_mtime_ns), int(st.st_size))
+    except OSError:
+        return None
 
 _EVERYDAY_TERM_STOPWORDS = frozenset(
     {
@@ -103,11 +113,23 @@ def _save_runtime_standards(
         json.dumps({"version": "2022-33", "categories": standards_by_cat}, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+    _CATALOG_CACHE.clear()
 
 
 def load_curriculum_2022_catalog(path: Path | None = None) -> dict[str, Any]:
-    """2022 개정 교육과정 공식 편제 및 NCIC 누적 성취기준 JSON을 로드한다."""
+    """2022 개정 교육과정 공식 편제 및 NCIC 누적 성취기준 JSON을 로드한다 (mtime 기반 메모리 캐시 적용)."""
     target = path or _DATA_PATH
+    if path is None:
+        cache_key = f"default::{target}::{_RUNTIME_STANDARDS_PATH}"
+        sig = (_stat_sig(target), _stat_sig(_RUNTIME_STANDARDS_PATH))
+    else:
+        cache_key = f"custom::{target}"
+        sig = (_stat_sig(target),)
+
+    cached = _CATALOG_CACHE.get(cache_key)
+    if cached is not None and cached[0] == sig:
+        return copy.deepcopy(cached[1])
+
     if not target.exists():
         catalog: dict[str, Any] = {"version": "2022-33", "categories": {}}
     else:
@@ -137,6 +159,7 @@ def load_curriculum_2022_catalog(path: Path | None = None) -> dict[str, Any]:
                     merged_by_code[code] = item
             cat_entry["standards"] = list(merged_by_code.values())
 
+    _CATALOG_CACHE[cache_key] = (sig, copy.deepcopy(catalog))
     return catalog
 
 
@@ -148,6 +171,7 @@ def save_curriculum_2022_catalog(catalog: dict[str, Any], path: Path | None = No
         json.dumps(catalog, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+    _CATALOG_CACHE.clear()
 
 
 CURRICULUM_CATEGORIES: tuple[str, ...] = ("국어", "영어", "수학", "사회", "과학", "한국사")
