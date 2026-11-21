@@ -3664,7 +3664,11 @@ def _render_my_exams_tab() -> None:
         st.info("로그인 후 이용할 수 있습니다.")
         return
 
-    all_exams = storage.list_user_exams(current_user.username)
+    all_exams = [
+        ex
+        for ex in storage.list_user_exams(current_user.username)
+        if ex.get("exam_kind") != "korean_analysis"
+    ]
     if not all_exams:
         st.info("아직 저장된 시험지가 없습니다. **탭 2**에서 PDF를 만들거나 문제를 풀고 채점하면 이곳에 자동 저장됩니다.")
         return
@@ -3695,13 +3699,12 @@ def _render_my_exams_tab() -> None:
         ex_q_cnt = int(ex.get("question_count") or len(ex.get("items") or []))
         ex_updated = str(ex.get("updated_at") or ex.get("created_at") or "")
         last_score = ex.get("last_score")
-        is_kor_analysis = ex.get("exam_kind") == "korean_analysis"
 
         with st.container(border=True):
             top_c1, top_c2 = st.columns([4, 1.5])
             with top_c1:
                 st.markdown(f"**[{ex_subj}] {ex_title}**")
-                count_label = f"총 {ex_q_cnt}세트 (지문 분석지)" if is_kor_analysis else f"총 {ex_q_cnt}문항"
+                count_label = f"총 {ex_q_cnt}문항"
                 meta_parts = [count_label, f"저장일시: {ex_updated}"]
                 if isinstance(last_score, dict):
                     meta_parts.append(
@@ -3724,9 +3727,7 @@ def _render_my_exams_tab() -> None:
 
             b_c1, b_c2, b_c3 = st.columns([1.4, 1.2, 3.4])
             with b_c1:
-                if is_kor_analysis:
-                    st.caption("📑 지문 분석지 PDF 전용")
-                elif st.button("✏️ 이 시험지 다시 풀기", key=f"my_exam_load_{ex_id}", width="stretch"):
+                if st.button("✏️ 이 시험지 다시 풀기", key=f"my_exam_load_{ex_id}", width="stretch"):
                     restored = _deserialize_matched_items(ex.get("items") or [])
                     if restored:
                         st.session_state["matched_items"] = restored
@@ -6981,29 +6982,6 @@ def _render_tab2_korean_transform_section() -> None:
                 pdf_bytes = merge_korean_analysis_pdfs(pdf_parts)
                 st.session_state["kor_analysis_results"] = analyses_list
                 st.session_state["kor_analysis_pdf"] = pdf_bytes
-                if current_user is not None:
-                    exam_names_uniq = list(dict.fromkeys(it["exam_name"] for it in analyses_list))
-                    p_tag = "원문포함" if include_kor_passage else "분석전용"
-                    an_title = (
-                        f"{exam_names_uniq[0]} 국어 지문 분석지 ({len(analyses_list)}세트 · {p_tag})"
-                        if len(exam_names_uniq) == 1
-                        else f"국어 정밀 지문 분석지 ({len(analyses_list)}세트 · {p_tag})"
-                    )
-                    an_sig = "kor_an_" + hashlib.sha256(
-                        ("|".join(f"{it['exam_name']}::{it['group_id']}" for it in analyses_list) + f"::{p_tag}").encode("utf-8")
-                    ).hexdigest()[:12]
-                    storage.save_user_exam(
-                        current_user.username,
-                        {
-                            "exam_id": an_sig,
-                            "title": an_title,
-                            "subject": "국어",
-                            "exam_kind": "korean_analysis",
-                            "question_count": len(analyses_list),
-                            "items": [],
-                        },
-                        pdf_bytes=pdf_bytes,
-                    )
                 detail_notes: list[str] = [f"저장 PDF 즉시 이어붙이기 {pdf_hit_cnt}세트"]
                 if json_to_pdf_cnt > 0:
                     detail_notes.append(f"기존 분석 JSON→PDF 저장 {json_to_pdf_cnt}세트")
