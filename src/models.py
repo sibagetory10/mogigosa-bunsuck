@@ -590,7 +590,7 @@ class KoreanPassageAnalysisOutput(BaseModel):
     )
     marker_and_vocab_notes: list[KoreanMarkerVocabItem] = Field(
         default_factory=list,
-        description="지문 속 ㉠~㉤, ⓐ~ⓔ 표지 및 핵심 어휘·개념어 해설 리스트",
+        description="지문 속에서 '~~는 ~~~~이다' 형태로 정의가 제시된 핵심 개념어 및 정의 정리 리스트 (기호 표지 제외)",
     )
     area_specific_notes: list[str] = Field(
         default_factory=list,

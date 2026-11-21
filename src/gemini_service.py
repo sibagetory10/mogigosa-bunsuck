@@ -4397,18 +4397,6 @@ def generate_korean_passage_analysis(
     if not clean_passage:
         raise ValueError("분석할 국어 지문 원문(passage_text)이 비어 있습니다.")
 
-    # 지문 속 기호(㉠~㉤, ⓐ~ⓔ, [A]~[E])를 사전 추출해 누락 방지 체크리스트로 전달
-    detected_markers: list[str] = []
-    for m_tok in re.findall(r"[㉠㉡㉢㉣㉤ⓐⓑⓒⓓⓔ]|\[[A-E]\]", clean_passage):
-        if m_tok not in detected_markers:
-            detected_markers.append(m_tok)
-    marker_hint = (
-        f"지문에서 감지된 필수 표지 기호({len(detected_markers)}개): {', '.join(detected_markers)} — "
-        "위 기호는 `marker_and_vocab_notes`에 1개도 빠짐없이 모두 포함하고, 여기에 더해 지문의 핵심 개념어·전문 용어도 3~4개 함께 선정해 총 4~6개 항목을 작성하세요."
-        if detected_markers
-        else "지문에 기호가 없다면 핵심 개념어·어휘 4~6개를 선정해 해설하세요."
-    )
-
     client = _build_client(api_key, timeout_seconds=90)
     if korean_section == "문학":
         area_guide = (
@@ -4438,8 +4426,10 @@ def generate_korean_passage_analysis(
         "2. `core_theme`: 지문 전체의 핵심 주제(또는 작품 주제 의식)를 1~2문장으로 명확히 요약하세요.\n"
         "3. `structure_flow`: 글 전체의 논리 흐름이나 시상/서사 전개를 `도입 : ...\\n전개 : ...\\n심화 : ...\\n결론 : ...`처럼 단계별 줄바꿈 형식으로 한눈에 보이게 정리하세요.\n"
         "4. `paragraph_summaries`: 독서는 문단별(1문단, 2문단...)로, 문학은 작품·연·장면별((가) 1연, (나) 도입...)로 빠짐없이 요약하세요.\n"
-        f"5. `marker_and_vocab_notes`: {marker_hint} "
-        "각 항목의 `term`은 `'㉠ 역기전력의 크기'` 또는 `'ⓐ 따를 수 있다'`처럼 **기호 + 핵심 어구(15자 이내)**로 간결하게 적고, 구체적 설명은 `meaning`에 적으세요.\n"
+        "5. `marker_and_vocab_notes`: **절대 `㉠~㉤`, `ⓐ~ⓔ`, `[A]~[E]` 같은 표지 기호는 넣지 마세요.** "
+        "오직 지문 원문에서 개념·용어의 정의가 명시된 문장(`'~~는 ~~~~이다'`, `'~~(이)란 ~~~~을 말한다'` 등)만 뽑아 정리하세요. "
+        "`term`에는 정의되는 개념어(예: `'대리'`, `'현명주의'`, `'자기장'`)만 간결하게 적고, `meaning`에는 지문에 나온 정의를 `'~~는 ~~~~이다'` 형태로 적으세요. "
+        "(지문에 명확한 정의 문장이 없으면 빈 리스트 `[]`로 두세요.)\n"
         f"6. `area_specific_notes`: {area_guide}\n"
         "7. `exam_checkpoints`: 실제 모의고사·내신에서 자주 출제되는 포인트와 선지 함정 주의사항 3~5개를 작성하세요."
     )

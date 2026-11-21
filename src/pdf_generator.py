@@ -1284,7 +1284,12 @@ def generate_korean_passage_analysis_pdf(
             else ""
         )
 
-        vocab_items = [mv for mv in (an.marker_and_vocab_notes or []) if (mv.term or "").strip()]
+        vocab_items = [
+            mv
+            for mv in (an.marker_and_vocab_notes or [])
+            if (mv.term or "").strip()
+            and not re.match(r"^[㉠㉡㉢㉣㉤ⓐⓑⓒⓓⓔㄱ-ㅎa-eA-E]\b|^[㉠㉡㉢㉣㉤ⓐⓑⓒⓓⓔ]|^\[[A-E]\]", (mv.term or "").strip())
+        ]
         vocab_rows = []
         for v_i, mv in enumerate(vocab_items):
             row_cls = "vocab-row-last" if v_i == len(vocab_items) - 1 else "vocab-row"
@@ -1294,7 +1299,7 @@ def generate_korean_passage_analysis_pdf(
             )
         vocab_html = (
             _keep_block(
-                "<div class='sec-title'>3. 핵심 표지(㉠~㉤ · ⓐ~ⓔ) 및 어휘 · 개념 풀이</div>"
+                "<div class='sec-title'>3. 지문 핵심 개념 정의 정리</div>"
                 f"<div class='vocab-list'>{''.join(vocab_rows)}</div>"
             )
             if vocab_rows

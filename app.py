@@ -6199,7 +6199,7 @@ def _render_tab2_korean_transform_section() -> None:
                             kp = f" *(포인트: {ps.key_point})*" if ps.key_point else ""
                             st.write(f"- **[{ps.label}]** {ps.summary}{kp}")
                     if an.marker_and_vocab_notes:
-                        st.markdown("**🔖 표지(㉠~㉤ · ⓐ~ⓔ) 및 핵심 어휘**")
+                        st.markdown("**🔖 지문 핵심 개념 정의**")
                         for mv in an.marker_and_vocab_notes:
                             st.write(f"- **`{mv.term}`**: {mv.meaning}")
                     if an.area_specific_notes:
