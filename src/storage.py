@@ -1503,3 +1503,86 @@ class StorageManager:
                     pass
             self._save_user_exams_unlocked(uname, exams)
             return True
+
+    # -----------------------------------------------------------------------
+    # 서버 디스크 및 앱 저장공간 통계 (관리자 모니터링용)
+    # -----------------------------------------------------------------------
+    def get_server_storage_stats(self) -> dict[str, Any]:
+        """서버 디스크 전체/사용/여유 용량과 앱 DB 폴더별 파일 수 및 용량을 반환한다."""
+        mount_path = self.local_root.resolve()
+        try:
+            usage = shutil.disk_usage(mount_path)
+            disk_total = int(usage.total)
+            disk_used = int(usage.used)
+            disk_free = int(usage.free)
+        except OSError:
+            disk_total = 0
+            disk_used = 0
+            disk_free = 0
+        disk_used_pct = round((disk_used / disk_total) * 100.0, 1) if disk_total > 0 else 0.0
+
+        def _dir_stats(dir_path: Path) -> tuple[int, int]:
+            if not dir_path.exists():
+                return 0, 0
+            total_b = 0
+            file_cnt = 0
+            try:
+                for p in dir_path.rglob("*"):
+                    try:
+                        if p.is_file() and not p.is_symlink():
+                            total_b += int(p.stat().st_size)
+                            file_cnt += 1
+                    except OSError:
+                        continue
+            except OSError:
+                pass
+            return total_b, file_cnt
+
+        def _root_files_stats(dir_path: Path) -> tuple[int, int]:
+            if not dir_path.exists():
+                return 0, 0
+            total_b = 0
+            file_cnt = 0
+            try:
+                for p in dir_path.iterdir():
+                    try:
+                        if p.is_file() and not p.is_symlink():
+                            total_b += int(p.stat().st_size)
+                            file_cnt += 1
+                    except OSError:
+                        continue
+            except OSError:
+                pass
+            return total_b, file_cnt
+
+        specs: list[tuple[str, str, tuple[int, int]]] = [
+            ("기출 원본 PDF", str(self.pdfs_dir), _dir_stats(self.pdfs_dir)),
+            ("크롭 문항 이미지", str(self.crops_dir), _dir_stats(self.crops_dir)),
+            ("과목별 정리 파일", str(self.organized_dir), _dir_stats(self.organized_dir)),
+            ("나의 시험지 보관함", str(self.saved_exams_root), _dir_stats(self.saved_exams_root)),
+            ("DB JSON · 캐시 파일", str(self.local_root), _root_files_stats(self.local_root)),
+            ("공용 개념서 DB", str(self.concept_root), _dir_stats(self.concept_root)),
+        ]
+
+        breakdown = [
+            {
+                "label": label,
+                "path": path_str,
+                "bytes": int(b_cnt),
+                "files": int(f_cnt),
+            }
+            for label, path_str, (b_cnt, f_cnt) in specs
+        ]
+        app_total_bytes = sum(item["bytes"] for item in breakdown)
+        app_total_files = sum(item["files"] for item in breakdown)
+
+        return {
+            "mount_path": str(mount_path),
+            "disk_total_bytes": disk_total,
+            "disk_used_bytes": disk_used,
+            "disk_free_bytes": disk_free,
+            "disk_used_percent": disk_used_pct,
+            "app_total_bytes": app_total_bytes,
+            "app_total_files": app_total_files,
+            "breakdown": breakdown,
+        }

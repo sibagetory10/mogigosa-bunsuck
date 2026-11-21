@@ -2751,7 +2751,86 @@ def _render_admin_panel() -> None:
                 elif del_note:
                     st.warning(del_note)
 
+    _render_server_storage_admin_section()
     _render_english_pool_admin_section()
+
+
+def _format_bytes_human(num_bytes: int | float) -> str:
+    val = float(max(0, num_bytes or 0))
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if val < 1024.0 or unit == "TB":
+            if unit == "B":
+                return f"{int(val):,} B"
+            if val >= 100:
+                return f"{val:.1f} {unit}"
+            return f"{val:.2f} {unit}"
+        val /= 1024.0
+    return "0 B"
+
+
+def _render_server_storage_admin_section() -> None:
+    st.divider()
+    hdr_c1, hdr_c2 = st.columns([3.5, 1])
+    with hdr_c1:
+        st.subheader("💾 서버 저장공간 & 앱 DB 용량 모니터링")
+    with hdr_c2:
+        st.markdown("<div style='height: 0.45rem;'></div>", unsafe_allow_html=True)
+        if st.button("🔄 용량 새로고침", key="admin_refresh_storage_btn", width="stretch"):
+            st.rerun()
+
+    stats = storage.get_server_storage_stats()
+    st.caption(f"기준 디스크 경로: `{stats['mount_path']}`")
+
+    disk_total = int(stats["disk_total_bytes"])
+    disk_used = int(stats["disk_used_bytes"])
+    disk_free = int(stats["disk_free_bytes"])
+    disk_pct = float(stats["disk_used_percent"])
+    app_bytes = int(stats["app_total_bytes"])
+    app_files = int(stats["app_total_files"])
+
+    s1, s2, s3, s4 = st.columns(4)
+    s1.metric("서버 전체 저장공간", _format_bytes_human(disk_total))
+    s2.metric(
+        "서버 현재 사용 중",
+        _format_bytes_human(disk_used),
+        delta=f"{disk_pct:.1f}% 사용",
+        delta_color="off",
+    )
+    s3.metric("서버 여유 공간", _format_bytes_human(disk_free))
+    s4.metric(
+        "앱 DB 사용량",
+        _format_bytes_human(app_bytes),
+        delta=f"파일 {app_files:,}개",
+        delta_color="off",
+    )
+
+    st.progress(
+        min(1.0, max(0.0, disk_pct / 100.0)),
+        text=(
+            f"서버 디스크 사용률: {disk_pct:.1f}% "
+            f"({_format_bytes_human(disk_used)} / {_format_bytes_human(disk_total)})"
+        ),
+    )
+
+    if disk_pct >= 85.0:
+        st.warning(
+            "⚠️ 서버 디스크 사용률이 85%를 초과했습니다. "
+            "불필요한 캐시나 기출 PDF 정리를 권장합니다."
+        )
+
+    with st.expander("📂 앱 폴더별 저장공간 상세 내역", expanded=False):
+        sorted_bd = sorted(stats["breakdown"], key=lambda it: it["bytes"], reverse=True)
+        rows = [
+            {
+                "항목": it["label"],
+                "경로": it["path"],
+                "파일 수": f"{int(it['files']):,}개",
+                "사용 용량": _format_bytes_human(it["bytes"]),
+                "앱 내 비중(%)": f"{(it['bytes'] / app_bytes * 100.0):.1f}%" if app_bytes > 0 else "0.0%",
+            }
+            for it in sorted_bd
+        ]
+        st.dataframe(rows, hide_index=True, width="stretch")
 
 
 def _render_english_pool_admin_section() -> None:
