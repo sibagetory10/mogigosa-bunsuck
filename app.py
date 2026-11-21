@@ -6715,7 +6715,7 @@ def _render_tab2_korean_transform_section() -> None:
         opt_c1, opt_c2 = st.columns(2)
         with opt_c1:
             include_kor_diagrams = st.checkbox(
-                "🎨 비문학 이해용 도식 그림 포함",
+                "🎨 비문학·문학 이해용 도식 그림 포함",
                 value=True,
                 key="tab2_kor_include_diagrams",
             )
@@ -6849,7 +6849,7 @@ def _render_tab2_korean_transform_section() -> None:
                 missing_ai_indices.append(idx_s)
             elif (
                 include_kor_diagrams
-                and kor_sec == "독서"
+                and kor_sec in ("독서", "문학")
                 and getattr(cached_an, "visual_diagram", None) is None
             ):
                 missing_diag_indices.append(idx_s)
@@ -7044,7 +7044,11 @@ def _render_tab2_korean_transform_section() -> None:
                     st.info(f"**핵심 주제:** {an.core_theme}")
                     st.success(f"**전개 흐름:** {an.structure_flow}")
                     _v_diag = getattr(an, "visual_diagram", None)
-                    if _v_diag is not None and (getattr(_v_diag, "nodes", None) or getattr(_v_diag, "graph_spec", None)):
+                    if _v_diag is not None and (
+                        getattr(_v_diag, "nodes", None)
+                        or getattr(_v_diag, "graph_spec", None)
+                        or getattr(_v_diag, "emotion_points", None)
+                    ):
                         try:
                             st.image(
                                 render_korean_diagram_png(_v_diag),

@@ -1415,7 +1415,11 @@ def generate_korean_passage_analysis_pdf(
 
         diagram_html = ""
         v_diag = getattr(an, "visual_diagram", None)
-        if include_diagrams and v_diag is not None and (getattr(v_diag, "nodes", None) or getattr(v_diag, "graph_spec", None)):
+        if include_diagrams and v_diag is not None and (
+            getattr(v_diag, "nodes", None)
+            or getattr(v_diag, "graph_spec", None)
+            or getattr(v_diag, "emotion_points", None)
+        ):
             try:
                 diag_png = render_korean_diagram_png(v_diag)
                 diag_b64 = base64.b64encode(diag_png).decode("ascii")

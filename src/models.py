@@ -659,8 +659,33 @@ class KoreanGraphSpec(BaseModel):
     )
 
 
+class KoreanCharacterEdge(BaseModel):
+    """소설 인물관계도(`character_map`)의 인물 간 관계선 정보."""
+
+    source_idx: int = Field(default=0, ge=0, description="출발 인물 노드 인덱스 (0-based)")
+    target_idx: int = Field(default=1, ge=0, description="도착 인물 노드 인덱스 (0-based)")
+    relation: str = Field(default="", description="관계 설명 (예: '조력', '모함·대립', '부자 갈등')")
+    polarity: Literal["positive", "negative", "neutral"] = Field(
+        default="neutral",
+        description="positive=조력/지지(+), negative=갈등/대립(-), neutral=일반 관계",
+    )
+
+
+class KoreanEmotionPoint(BaseModel):
+    """시상 전개 정서 변화 그래프(`emotion_arc`)의 구간별 정서 좌표."""
+
+    stage: str = Field(..., description="구간·시점 라벨 (예: '1연', '전반부', '과거')")
+    emotion: str = Field(..., description="해당 구간 핵심 정서·태도 (예: '절망·상실', '극복 의지')")
+    level: int = Field(
+        default=0,
+        ge=-2,
+        le=2,
+        description="정서 극성 수준 (-2=극심한 부정, -1=부정, 0=중립/전환, 1=긍정, 2=강한 긍정/극복)",
+    )
+
+
 class KoreanVisualDiagram(BaseModel):
-    """비문학(독서) 지문의 핵심 원리·관계·비교를 시각화하는 12종 특화 도식 그림 명세."""
+    """비문학·문학 지문의 핵심 원리·관계·정서·구조를 시각화하는 16종 특화 도식 그림 명세."""
 
     diagram_type: Literal[
         "flow",
@@ -675,15 +700,18 @@ class KoreanVisualDiagram(BaseModel):
         "quadrant",
         "decision_tree",
         "pyramid",
+        "character_map",
+        "emotion_arc",
+        "poetic_contrast",
+        "space_journey",
         "comparison",
         "hierarchy",
     ] = Field(
         default="flow",
         description=(
-            "도식 유형: flow(흐름도), matrix(비교 매트릭스표), graph(X-Y 비례/함수 그래프), "
-            "anatomy(구조/장치 모식도), cycle(원형 순환 루프), timeline(연표), venn(벤다이어그램), "
-            "scale(대립 저울도), fishbone(피쉬본 어골도: 다발적 원인->결과), "
-            "quadrant(2x2 사분면 분류), decision_tree(조건분기 결정 트리), pyramid(위계 피라미드)"
+            "도식 유형: 비문학 12종(flow, matrix, graph, anatomy, cycle, timeline, venn, scale, "
+            "fishbone, quadrant, decision_tree, pyramid) + 문학 4종(character_map=인물관계·갈등도, "
+            "emotion_arc=정서변화 그래프, poetic_contrast=(+)/(-) 시어 대립도, space_journey=공간·시선 이동 경로도)"
         ),
     )
     title: str = Field(..., description="도식 상단 제목 (예: '양면시장 가격탄력성과 이용료 반비례 관계')")
@@ -718,6 +746,14 @@ class KoreanVisualDiagram(BaseModel):
     scale_tilt: Literal["balanced", "left", "right"] = Field(
         default="balanced",
         description="diagram_type='scale'일 때 저울 기울기 (balanced=균형/절충, left=좌측 우위, right=우측 우위)",
+    )
+    character_edges: list[KoreanCharacterEdge] = Field(
+        default_factory=list,
+        description="diagram_type='character_map'일 때 인물 간 조력/갈등 관계선 목록",
+    )
+    emotion_points: list[KoreanEmotionPoint] = Field(
+        default_factory=list,
+        description="diagram_type='emotion_arc'일 때 연·시간별 정서 변화 좌표 목록 (3~5개)",
     )
     takeaway: str = Field(
         default="",

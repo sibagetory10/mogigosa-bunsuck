@@ -4472,6 +4472,23 @@ _KOREAN_DIAGRAM_GUIDE = (
     "공통 규칙: 각 카드 `details`는 1~3개의 짧은 핵심 구절(26자 이내), `takeaway`는 1줄 핵심 정리."
 )
 
+_KOREAN_LIT_DIAGRAM_GUIDE = (
+    "문학 작품의 갈래와 핵심 구조에 맞춰 아래 5종 중 가장 최적화된 `diagram_type`을 **반드시** 선택해 작성하세요:\n"
+    "  ① `character_map` (소설 인물관계도 · 갈등 구조도 — 현대소설·고전소설·극 추천): "
+    "`nodes`에 핵심 인물 2~4명을 넣으세요(고전소설처럼 호칭이 여러 개면 `subtitle`에 통합 호칭 예: `이선 = 원수 = 좌승상`을 반드시 병기). "
+    "`character_edges`에 인물 인덱스 간 조력(`positive`)/갈등(`negative`)/일반(`neutral`) 관계(`relation` 8자 이내)를 명시하세요.\n"
+    "  ② `emotion_arc` (시상 전개 · 정서 변화 그래프 — 현대시·고전시가 추천): "
+    "`emotion_points`에 시간·연 흐름순 3~5개 좌표를 넣으세요(`stage`='1연'/'전반부', `emotion`='그리움'/'극복 의지', `level`=-2~+2). "
+    "V자 반전·심화 등 정서 흐름을 정확히 반영하고 `nodes`에도 핵심 연/구간 요약을 2~3개 담으세요.\n"
+    "  ③ `poetic_contrast` (화자 중심 (+) / (-) 시어 대립도 — 자연친화·유배·저항시 추천): "
+    "`center_label`에 시적 화자·중심 상황을 넣고, `nodes[0]`에는 '(+) 지향 · 긍정 시어' 목록을, `nodes[1]`에는 '(-) 대립 · 부정 시어' 목록을 넣으세요.\n"
+    "  ④ `space_journey` (공간 · 시선 이동 경로도 — 기행가사·영웅소설·여정 서사 추천): "
+    "`nodes`에 이동 순서대로 공간 2~4개(각 공간의 상징·정서 변화)를 넣고, `relation_labels`에 이동 계기를 적으세요.\n"
+    "  ⑤ `matrix` (`(가)` vs `(나)` 복합 작품 비교표 — 시+시, 시+수필 등 복합 지문 추천): "
+    "`nodes`에 작품명 2개를 넣고 `matrix_rows`에 기준('화자/상황', '핵심 소재', '표현 특징', '정서/태도') 3~4행을 채우세요.\n"
+    "공통 규칙: 각 카드 `details`는 1~3개의 짧은 핵심 구절(26자 이내), `takeaway`는 1줄 핵심 정리."
+)
+
 
 def _sanitize_korean_analysis_output(out: KoreanPassageAnalysisOutput) -> KoreanPassageAnalysisOutput:
     """국어 분석지 출력에서 잔여 문제 표지(㉠~㉤, ⓐ~ⓔ, [A]~[E]) 및 여분 공백을 결정론적으로 정제한다."""
@@ -4620,8 +4637,13 @@ def generate_korean_passage_analysis(
             "비문학(독서) 지문이므로 **반드시** `visual_diagram`을 작성하세요.\n"
             + _KOREAN_DIAGRAM_GUIDE
             if korean_section == "독서"
-            else "개념 비교나 흐름 도식이 이해에 큰 도움이 되는 지문이면 `visual_diagram`을 작성하고, 순수 문학 감상 위주라 도식이 불필요하면 `null`로 두세요.\n"
-            + _KOREAN_DIAGRAM_GUIDE
+            else (
+                "문학 작품이므로 **반드시** 갈래에 맞는 문학 전용 `visual_diagram`을 작성하세요.\n"
+                + _KOREAN_LIT_DIAGRAM_GUIDE
+                if korean_section == "문학"
+                else "개념 비교나 흐름 도식이 이해에 큰 도움이 되는 지문이면 `visual_diagram`을 작성하고, 불필요하면 `null`로 두세요.\n"
+                + _KOREAN_DIAGRAM_GUIDE
+            )
         )
     )
 
@@ -4678,10 +4700,11 @@ def generate_korean_visual_diagram(
         raise ValueError("도식을 생성할 국어 지문 원문이 비어 있습니다.")
 
     client = _build_client(api_key, timeout_seconds=60)
+    diag_guide = _KOREAN_LIT_DIAGRAM_GUIDE if korean_section == "문학" else _KOREAN_DIAGRAM_GUIDE
     system_inst = (
-        "당신은 수능 국어 비문학 일타 강사입니다. 지문 원문만을 100% 근거로, "
-        "학생이 핵심 원리·인과·개념 비교를 그림으로 한눈에 이해할 수 있는 도식 명세(`KoreanVisualDiagram`) JSON을 작성하세요.\n"
-        + _KOREAN_DIAGRAM_GUIDE
+        f"당신은 수능 국어({korean_section}) 일타 강사입니다. 지문 원문만을 100% 근거로, "
+        "학생이 핵심 구조·인물·정서·원리를 그림으로 한눈에 이해할 수 있는 도식 명세(`KoreanVisualDiagram`) JSON을 작성하세요.\n"
+        + diag_guide
     )
     prompt = (
         f"[지문 영역] {korean_section}\n"
