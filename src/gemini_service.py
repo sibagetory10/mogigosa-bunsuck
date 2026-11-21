@@ -30,8 +30,42 @@ from src.config import (
 )
 from src.curriculum_2022 import (
     build_tagging_grounding_context,
+    has_ncic_standards_for_category,
     validate_and_normalize_extracted_tag,
+    validate_standards_only,
 )
+
+
+def _build_lang_ncic_grounding_section(subject_category: str, exam_name: str, max_standards: int = 25) -> tuple[str, str]:
+    """국어/영어에 NCIC 성취기준이 등록된 경우에만 프롬프트용 기준표 섹션과 규칙 문구를 반환한다."""
+    if not has_ncic_standards_for_category(subject_category):
+        return "", ""
+    ctx = build_tagging_grounding_context(
+        subject_category=subject_category,
+        exam_name=exam_name,
+        max_standards=max_standards,
+    )
+    if not ctx:
+        return "", ""
+    rule = (
+        "\n- `standard_code` / `standard_codes`: 아래 제공된 [2022 개정 교육과정 공식 기준표]의 성취기준 코드 중에서만 가장 부합하는 대표 코드 1개(`standard_code`)와 관련 코드 목록(`standard_codes`)을 매핑하세요(목록에 없는 코드를 지어내지 마세요)."
+    )
+    return f"\n{ctx}\n", rule
+
+
+def _apply_lang_standard_validation(item: Any, subject_category: str) -> None:
+    """국어/영어 추출 결과의 성취기준 코드를 정제하고 등록된 NCIC 목록 기준으로 검증한다."""
+    std_code, cleaned_codes, needs_review, review_notes = validate_standards_only(
+        getattr(item, "standard_code", "") or "",
+        list(getattr(item, "standard_codes", []) or []),
+        subject_category=subject_category,
+    )
+    item.standard_code = std_code
+    item.standard_codes = cleaned_codes
+    if needs_review:
+        item.needs_review = True
+        existing_notes = list(getattr(item, "review_notes", []) or [])
+        item.review_notes = list(dict.fromkeys([*existing_notes, *review_notes]))
 from src.models import (
     AutoConceptPageDetectionOutput,
     AutoConceptRangeItem,
@@ -831,6 +865,7 @@ def analyze_exam_pdf_batch_with_gemini(
         + ans_rule_line
     )
 
+    ncic_section, ncic_rule = _build_lang_ncic_grounding_section("국어", exam_name)
     hint_section = (
         "\n[해설지 문항별 발췌]\n" + "\n".join(snippet_lines) + "\n"
         if snippet_lines
@@ -2300,15 +2335,17 @@ def analyze_english_exam_pdf_batch_with_gemini(
         if sn:
             snippet_lines.append(f"[{q}번 해설 발췌] {sn[:650]}")
 
+    ncic_section, ncic_rule = _build_lang_ncic_grounding_section("국어", exam_name)
     hint_section = (
         "\n[해설지 문항별 발췌]\n" + "\n".join(snippet_lines) + "\n"
         if snippet_lines
         else ""
     )
 
+    ncic_section, ncic_rule = _build_lang_ncic_grounding_section("영어", exam_name)
     system_inst = (
         "당신은 대한민국 수능·평가원·교육청 영어 영역(제3교시) 기출 분석 전문가입니다.\n"
-        "영어 과목은 학년 제한(min_grade)이나 2022 성취기준 코드 매핑을 하지 않으며, 아래 규칙에 따라 요청된 모든 문항(1~45번)을 JSON(questions)으로 추출하세요.\n\n"
+        "영어 과목은 학년 제한(min_grade)을 두지 않으며, 아래 규칙에 따라 요청된 모든 문항(1~45번)을 JSON(questions)으로 추출하세요.\n\n"
         "[추출 규칙]\n"
         "1. `english_section`: 1~17번은 반드시 `'듣기'`, 18~45번은 반드시 `'독해'`로 기록하세요.\n"
         "2. **듣기(1~17번) 경량 추출**:\n"
@@ -2325,12 +2362,14 @@ def analyze_english_exam_pdf_batch_with_gemini(
         "   - `key_vocabulary`: 지문 내 주요 어휘 3~6개를 `'단어: 한국어 뜻'` 형식으로 나열하세요.\n"
         "4. `official_explanation`과 `answer`: 해설지 PDF(특히 1페이지 상단 1~45번 빠른 정답표)와 문항별 해설을 대조하여 핵심 풀이 요약과 공식 정답(`'1'`~`'5'`)을 정확히 추출하세요. "
         "**특히 41번(제목 추론)과 42번(밑줄 (a)~(e) 어휘 적절성), 그리고 43번(순서 배열)·44번(지칭 추론 (a)~(e))·45번(내용 일치) 세트 문항의 정답과 해설이 서로 뒤바뀌지 않도록 문항 번호별 발문과 정답표를 반드시 1:1 확인하세요.**"
+        + ncic_rule
     )
 
     q_list_str = ", ".join(str(q) for q in ordered_q)
     prompt = (
         f"시험 회차: {exam_name}\n"
         f"추출 대상 문항 번호(총 {len(ordered_q)}문항): {q_list_str}\n"
+        f"{ncic_section}"
         f"{hint_section}\n"
         "위 영어 문제지 PDF(및 해설지)에서 지정된 모든 문항 번호를 빠짐없이 추출하여 JSON(questions)으로 반환하세요."
     )
@@ -2367,6 +2406,7 @@ def analyze_english_exam_pdf_batch_with_gemini(
             item.answer = _normalize_extracted_answer(item.answer)
             if item.q_num <= 17:
                 item.passage_text = ""
+            _apply_lang_standard_validation(item, "영어")
             out[item.q_num] = item
 
     # 41~42, 43~45 세트 문항 간 공통 지문(passage_text) 및 주제 동기화
@@ -2411,15 +2451,19 @@ def analyze_english_question_with_gemini(
     img_part = types.Part.from_bytes(data=opt_png, mime_type="image/png")
     is_listening = q_num <= 17
 
+    ncic_section, ncic_rule = _build_lang_ncic_grounding_section("영어", exam_name)
     system_inst = (
         "당신은 대한민국 수능·모의고사 영어 기출 문항 분석가입니다.\n"
         f"- 이 문항({q_num}번)은 {'듣기(1~17번)' if is_listening else '독해(18~45번)'} 문항입니다.\n"
         "- 듣기 문항이면 `english_section='듣기'`, `passage_text=''`로 두고 유형·주제·정답·해설만 추출하세요.\n"
         "- 독해 문항이면 `english_section='독해'`, 한국어 발문과 선택지 ①~⑤를 제외한 순수 영어 본문 전체를 `passage_text`에 빠짐없이 추출하고, "
         "원래 유형(`english_question_type`), 주제(`passage_topic`), 핵심 어휘(`key_vocabulary`), 정답(`answer`), 해설(`official_explanation`)을 JSON으로 반환하세요."
+        + ncic_rule
     )
 
     hint_parts: list[str] = [f"시험 회차: {exam_name}", f"문항 번호: {q_num}번"]
+    if ncic_section:
+        hint_parts.append(ncic_section.strip())
     if shared_passage_hint and shared_passage_hint.strip():
         hint_parts.append(f"[세트 문항 공통 지문 텍스트]\n{shared_passage_hint.strip()[:3000]}")
     if question_text_hint and question_text_hint.strip():
@@ -2450,6 +2494,7 @@ def analyze_english_question_with_gemini(
     sec: Any = "듣기" if is_listening else "독해"
     grp_id = _infer_english_group_id(q_num, single.passage_group_id)
     p_text = "" if is_listening else (single.passage_text.strip() or shared_passage_hint.strip())
+    _apply_lang_standard_validation(single, "영어")
     return EnglishQuestionExtractionItem(
         q_num=q_num,
         english_section=sec,
@@ -2460,6 +2505,10 @@ def analyze_english_question_with_gemini(
         key_vocabulary=list(single.key_vocabulary or []),
         official_explanation=single.official_explanation.strip(),
         answer=_normalize_extracted_answer(single.answer),
+        standard_code=single.standard_code,
+        standard_codes=list(single.standard_codes or []),
+        needs_review=single.needs_review,
+        review_notes=list(single.review_notes or []),
     )
 
 
@@ -4059,6 +4108,7 @@ def analyze_korean_exam_pdf_batch_with_gemini(
         mode_tag = "경량 텍스트 모드" if use_lightweight_text_mode else "PDF 비전 모드"
         status_callback(f"📖 국어 모의고사({len(ordered_q)}문항 · {mode_tag}) 일괄 분석 준비 중...")
 
+    ncic_section, ncic_rule = _build_lang_ncic_grounding_section("국어", exam_name)
     hint_section = (
         "\n[해설지 문항별 발췌]\n" + "\n".join(snippet_lines) + "\n"
         if snippet_lines
@@ -4094,6 +4144,7 @@ def analyze_korean_exam_pdf_batch_with_gemini(
         prompt = (
             f"시험 회차: {exam_name}\n"
             f"검토 대상 문항 번호(총 {len(ordered_q)}문항): {', '.join(str(q) for q in ordered_q)}\n\n"
+            f"{ncic_section}"
             f"[문제지 추출 텍스트 (지문 및 문항)]\n{problem_text_section}\n"
             f"{hint_section}\n"
             "위 국어 문제지 텍스트와 해설을 바탕으로 각 문항의 영역(독서/문학/화작/언매), 세부 갈래, 세트 범위, 주제, 어휘, 정답, 해설을 JSON(questions)으로 반환하세요."
@@ -4117,6 +4168,7 @@ def analyze_korean_exam_pdf_batch_with_gemini(
         prompt = (
             f"시험 회차: {exam_name}\n"
             f"검토 대상 문항 번호(총 {len(ordered_q)}문항): {q_list_str}\n"
+            f"{ncic_section}"
             f"{hint_section}\n"
             "위 국어 문제지 PDF(및 해설지)에서 독서·문학 공통 영역 문항의 지문 세트, 주제, 어휘, 정답, 해설을 추출하여 JSON(questions)으로 반환하세요. "
             "(화법과 작문, 언어와 매체 문항은 korean_section만 표기하고 passage_text는 비워 두세요.)"
@@ -4135,6 +4187,7 @@ def analyze_korean_exam_pdf_batch_with_gemini(
         "6. `key_vocabulary`: 지문·문항의 핵심 개념어·어휘·문법/문학 개념 3~5개를 나열하세요.\n"
         "7. `question_type`: 원래 문항 유형(예: `'세부 내용 일치'`, `'핵심 논지 추론'`, `'<보기> 사례 적용'`, `'표현상 특징'`, `'고쳐쓰기·자료 활용'`, `'음운·문장 구조 분석'`).\n"
         "8. `official_explanation`과 `answer`: 해설지 기준 핵심 풀이 근거 요약(1~2문장)과 공식 정답(`'1'`~`'5'`)을 정확히 추출하세요."
+        + ncic_rule
     )
 
     if status_callback is not None:
@@ -4175,6 +4228,7 @@ def analyze_korean_exam_pdf_batch_with_gemini(
                     local_sp = (getattr(cq_ref, "shared_passage_text", "") or getattr(cq_ref, "extracted_text", "") or "").strip()
                 if local_sp:
                     item.passage_text = local_sp
+            _apply_lang_standard_validation(item, "국어")
             seen_q.add(item.q_num)
             items_list.append(item)
 
@@ -4195,12 +4249,16 @@ def analyze_korean_question_with_gemini(
 ) -> KoreanSingleExtractionOutput:
     """국어 단일 누락 문항 보완 추출 (독서·문학·화작·언매 전 영역 판별 및 지문·정답 추출)."""
     client = _build_client(api_key, timeout_seconds=45)
+    ncic_section, ncic_rule = _build_lang_ncic_grounding_section("국어", exam_name)
     system_inst = (
         "당신은 대한민국 수능·모의고사 국어 영역 기출 분석 전문가입니다.\n"
         "제공된 문항 이미지/텍스트와 해설을 보고 영역(`독서`, `문학`, `화법과 작문`, `언어와 매체`), "
         "세부 갈래, 세트 범위(`passage_group_id`), 지문/자료 원문(`passage_text`), 주제/작품명, 핵심 어휘, 해설, 정답(`'1'`~`'5'`)을 추출하세요."
+        + ncic_rule
     )
     hint_parts: list[str] = [f"시험 회차: {exam_name}", f"문항 번호: {q_num}번"]
+    if ncic_section:
+        hint_parts.append(ncic_section.strip())
     if shared_passage_hint.strip():
         hint_parts.append(f"[동일 세트 공통 지문 참고]\n{shared_passage_hint.strip()}")
     if question_text_hint.strip():
@@ -4237,6 +4295,7 @@ def analyze_korean_question_with_gemini(
     out.passage_group_id = normalize_korean_group_id(out.passage_group_id, q_num)
     if not (out.passage_text or "").strip():
         out.passage_text = (shared_passage_hint or question_text_hint or "").strip()
+    _apply_lang_standard_validation(out, "국어")
     return out
 
 

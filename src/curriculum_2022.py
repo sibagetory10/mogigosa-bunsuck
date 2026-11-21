@@ -298,6 +298,78 @@ def merge_ncic_standards_to_catalog(
     return {"added": added, "updated": updated}
 
 
+def clear_ncic_standards_for_category(
+    category: str,
+    path: Path | None = None,
+) -> int:
+    """특정 교과 대분류에 누적 저장된 NCIC 성취기준(standards)만 초기화하고 삭제된 개수를 반환한다."""
+    if category not in CURRICULUM_CATEGORIES:
+        return 0
+    catalog = load_curriculum_2022_catalog(path)
+    cat_map = catalog.setdefault("categories", {})
+    cat_entry = cat_map.get(category)
+    if not cat_entry:
+        return 0
+    existing = cat_entry.get("standards") or []
+    removed_count = len(existing)
+    if removed_count > 0:
+        cat_entry["standards"] = []
+        save_curriculum_2022_catalog(catalog, path)
+    return removed_count
+
+
+def has_ncic_standards_for_category(
+    subject_category: str,
+    catalog: dict[str, Any] | None = None,
+) -> bool:
+    """해당 교과 대분류에 NCIC 고시 성취기준이 1개 이상 등록되어 있는지 반환한다."""
+    cat_obj = catalog or load_curriculum_2022_catalog()
+    entry = cat_obj.get("categories", {}).get(subject_category, {})
+    return bool(entry.get("standards"))
+
+
+def validate_standards_only(
+    standard_code: str,
+    standard_codes: Sequence[str],
+    subject_category: str,
+    catalog: dict[str, Any] | None = None,
+) -> tuple[str, list[str], bool, list[str]]:
+    """
+    국어·영어 등 별도 스키마 교과용 성취기준 코드 정제 및 할루시네이션(가짜 코드) 검증 헬퍼.
+    반환: (정제된_대표코드, 정제된_코드목록, 검토필요_여부, 검토_노트)
+    """
+    cat_obj = catalog or load_curriculum_2022_catalog()
+    cat_entry = cat_obj.get("categories", {}).get(subject_category, {})
+    loaded_stds = {
+        (s.get("code") or "").strip(): s
+        for s in (cat_entry.get("standards") or [])
+        if s.get("code")
+    }
+
+    std_code = re.sub(r"[\[\]\s]+", "", standard_code or "")
+    cleaned_codes: list[str] = []
+    seen_codes: set[str] = set()
+    for rc in ([std_code] if std_code else []) + list(standard_codes or []):
+        c = re.sub(r"[\[\]\s]+", "", rc or "")
+        if c and c not in seen_codes:
+            seen_codes.add(c)
+            cleaned_codes.append(c)
+
+    if not std_code and cleaned_codes:
+        std_code = cleaned_codes[0]
+
+    needs_review = False
+    review_notes: list[str] = []
+    if loaded_stds and cleaned_codes:
+        fake_codes = [c for c in cleaned_codes if _STD_CODE_ONLY_RE.match(c) and c not in loaded_stds]
+        if fake_codes:
+            needs_review = True
+            joined_fake = ", ".join(f"[{c}]" for c in fake_codes)
+            review_notes.append(f"로드된 NCIC 공식 성취기준 목록에 없는 코드입니다(할루시네이션 의심): {joined_fake}")
+
+    return std_code, cleaned_codes, needs_review, review_notes
+
+
 def _infer_target_subject_from_exam_name(exam_name: str, cat_entry: dict[str, Any]) -> str:
     """시험 회차명(예: '2026년 3월 고3 물리학1')에서 2022 공식 과목명을 정밀 추론한다."""
     canon_exam = _canon_subject_key(exam_name)

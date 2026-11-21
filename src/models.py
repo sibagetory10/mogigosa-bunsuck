@@ -460,6 +460,22 @@ class EnglishSingleExtractionOutput(BaseModel):
         ...,
         description="공식 정답 ('1'~'5' 단일 숫자 문자열)",
     )
+    standard_code: str = Field(
+        default="",
+        description="2022 개정 교육과정 성취기준 대표 코드 (기준표가 제공된 경우에만 매칭, 없으면 빈 문자열)",
+    )
+    standard_codes: list[str] = Field(
+        default_factory=list,
+        description="2022 개정 교육과정 관련 성취기준 코드 목록",
+    )
+    needs_review: bool = Field(
+        default=False,
+        description="성취기준 코드 검증 필요 여부",
+    )
+    review_notes: list[str] = Field(
+        default_factory=list,
+        description="검증 시 발견된 주의사항",
+    )
 
 
 class EnglishQuestionExtractionItem(EnglishSingleExtractionOutput):
@@ -512,6 +528,22 @@ class KoreanSingleExtractionOutput(BaseModel):
     answer: str = Field(
         ...,
         description="공식 정답 ('1'~'5' 단일 숫자 문자열)",
+    )
+    standard_code: str = Field(
+        default="",
+        description="2022 개정 교육과정 성취기준 대표 코드 (기준표가 제공된 경우에만 매칭, 없으면 빈 문자열)",
+    )
+    standard_codes: list[str] = Field(
+        default_factory=list,
+        description="2022 개정 교육과정 관련 성취기준 코드 목록",
+    )
+    needs_review: bool = Field(
+        default=False,
+        description="성취기준 코드 검증 필요 여부",
+    )
+    review_notes: list[str] = Field(
+        default_factory=list,
+        description="검증 시 발견된 주의사항",
     )
 
 

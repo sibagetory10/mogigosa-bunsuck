@@ -76,6 +76,7 @@ from src.config import (
 )
 from src.curriculum_2022 import (
     build_tagging_grounding_context,
+    clear_ncic_standards_for_category,
     get_catalog_summary_stats,
     get_official_subjects_for_category,
     merge_ncic_standards_to_catalog,
@@ -1191,11 +1192,11 @@ def _tag_and_save_single_exam_inner(
                 required_terms=k_vocab,
                 advanced_terms=[],
                 basic_terms=k_vocab,
-                standard_code="",
-                standard_codes=[],
+                standard_code=(getattr(extracted, "standard_code", "") or ""),
+                standard_codes=list(getattr(extracted, "standard_codes", []) or []),
                 grade_evidence="",
-                needs_review=False,
-                review_notes=[],
+                needs_review=bool(getattr(extracted, "needs_review", False)),
+                review_notes=list(getattr(extracted, "review_notes", []) or []),
                 is_single_concept=True,
                 answer=extracted.answer,
                 official_explanation=extracted.official_explanation,
@@ -1255,11 +1256,11 @@ def _tag_and_save_single_exam_inner(
                 required_terms=k_vocab,
                 advanced_terms=[],
                 basic_terms=k_vocab,
-                standard_code="",
-                standard_codes=[],
+                standard_code=(getattr(extracted, "standard_code", "") or ""),
+                standard_codes=list(getattr(extracted, "standard_codes", []) or []),
                 grade_evidence="",
-                needs_review=False,
-                review_notes=[],
+                needs_review=bool(getattr(extracted, "needs_review", False)),
+                review_notes=list(getattr(extracted, "review_notes", []) or []),
                 is_single_concept=True,
                 answer=extracted.answer,
                 official_explanation=extracted.official_explanation,
@@ -1659,6 +1660,34 @@ def _render_ncic_curriculum_manager(key_prefix: str = "ncic") -> None:
                 st.success(
                     f"✅ 성취기준 {len(extracted)}개 추출 완료! (신규 {res['added']}개 추가 · 기존 {res['updated']}개 갱신)"
                 )
+                st.rerun()
+
+        st.divider()
+        st.caption("잘못된 PDF를 올렸거나 특정 교과 성취기준을 새로 다시 올리고 싶을 때 아래에서 해당 교과의 성취기준 목록만 비울 수 있습니다. (기본 과목 편제표는 유지됩니다)")
+        rc1, rc2, rc3 = st.columns([1.2, 1.2, 1.4])
+        with rc1:
+            reset_cat = st.selectbox(
+                "초기화할 교과",
+                options=["국어", "영어", "수학", "사회", "과학", "한국사"],
+                format_func=lambda c: f"{c} ({stats[c]['standards']}개)",
+                key=f"{key_prefix}_ncic_reset_cat",
+            )
+        with rc2:
+            confirm_reset = st.checkbox(
+                "초기화 확인",
+                value=False,
+                key=f"{key_prefix}_ncic_reset_confirm",
+            )
+        with rc3:
+            reset_disabled = (stats[reset_cat]["standards"] == 0) or (not confirm_reset)
+            if st.button(
+                f"🗑️ {reset_cat} 성취기준 초기화",
+                key=f"{key_prefix}_ncic_reset_btn",
+                disabled=reset_disabled,
+                use_container_width=True,
+            ):
+                removed = clear_ncic_standards_for_category(reset_cat)
+                st.success(f"🗑️ {reset_cat} 성취기준 {removed}개를 초기화했습니다.")
                 st.rerun()
 
 
