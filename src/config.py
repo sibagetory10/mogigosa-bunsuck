@@ -291,3 +291,62 @@ def resolve_admin_config() -> AdminConfig:
         admin_password=admin_pw,
         source=source,
     )
+
+
+@dataclass
+class GoogleLoginConfig:
+    """사용자 웹 로그인용 Google OAuth 2.0 클라이언트 설정."""
+
+    client_id: str
+    client_secret: str
+    redirect_uri: str
+    source: str
+
+    @property
+    def is_configured(self) -> bool:
+        return bool(self.client_id and self.client_secret and self.redirect_uri)
+
+
+def resolve_google_login_config() -> GoogleLoginConfig:
+    """st.secrets -> 환경변수 순서로 웹 로그인용 Google OAuth 2.0 설정을 로드한다.
+
+    Drive용 GOOGLE_OAUTH(Desktop 앱 토큰)와는 별도로 관리한다.
+    """
+    sec_section = _safe_get_secret(["google_login", "GOOGLE_LOGIN"])
+    section_map = sec_section if isinstance(sec_section, Mapping) else {}
+
+    def _pick(sec_keys: list[str], env_key: str, section_key: str) -> tuple[str, str]:
+        raw_sec = _safe_get_secret(sec_keys)
+        if isinstance(raw_sec, str) and raw_sec.strip():
+            return raw_sec.strip(), "st.secrets"
+        sec_inner = section_map.get(section_key) or section_map.get(section_key.upper())
+        if isinstance(sec_inner, str) and sec_inner.strip():
+            return sec_inner.strip(), "st.secrets"
+        env_val = os.environ.get(env_key, "").strip()
+        if env_val:
+            return env_val, "환경변수"
+        return "", ""
+
+    client_id, src_id = _pick(
+        ["GOOGLE_LOGIN_CLIENT_ID", "google_login_client_id"],
+        "GOOGLE_LOGIN_CLIENT_ID",
+        "client_id",
+    )
+    client_secret, src_sec = _pick(
+        ["GOOGLE_LOGIN_CLIENT_SECRET", "google_login_client_secret"],
+        "GOOGLE_LOGIN_CLIENT_SECRET",
+        "client_secret",
+    )
+    redirect_uri, src_uri = _pick(
+        ["GOOGLE_LOGIN_REDIRECT_URI", "google_login_redirect_uri"],
+        "GOOGLE_LOGIN_REDIRECT_URI",
+        "redirect_uri",
+    )
+
+    source = next((s for s in (src_id, src_sec, src_uri) if s), "미설정")
+    return GoogleLoginConfig(
+        client_id=client_id,
+        client_secret=client_secret,
+        redirect_uri=redirect_uri,
+        source=source,
+    )

@@ -1609,6 +1609,61 @@ class StorageManager:
             self._save_user_exams_unlocked(uname, exams)
             return True
 
+    def rename_user_data(self, old_username: str, new_username: str) -> None:
+        """구글 전용 임시 ID에서 정식 아이디로 전환 시 시험지·영어 이력·개념서 작성자를 이관한다."""
+        old_u = (old_username or "").strip()
+        new_u = (new_username or "").strip()
+        if not old_u or not new_u or old_u == new_u:
+            return
+
+        with self._lock:
+            # 1) 영어 변형 풀이 이력 이관
+            try:
+                history = self._load_user_english_history_unlocked()
+                if old_u in history:
+                    old_list = list(history.pop(old_u) or [])
+                    new_list = list(history.get(new_u) or [])
+                    seen = set(new_list)
+                    for vid in old_list:
+                        if vid not in seen:
+                            seen.add(vid)
+                            new_list.append(vid)
+                    history[new_u] = new_list
+                    self._save_user_english_history_unlocked(history)
+            except Exception:
+                pass
+
+            # 2) 계정별 '나의 시험지' 이관 (exam_id 기준 중복 없이 병합)
+            try:
+                old_exams_path = self._user_saved_exams_path(old_u)
+                if old_exams_path.exists():
+                    old_exams = self._load_user_exams_unlocked(old_u)
+                    new_exams = self._load_user_exams_unlocked(new_u)
+                    merged_map: dict[str, dict[str, Any]] = {}
+                    for ex in old_exams + new_exams:
+                        ex_id = str(ex.get("exam_id") or "")
+                        if ex_id:
+                            merged_map[ex_id] = ex
+                    merged_list = sorted(
+                        merged_map.values(),
+                        key=lambda e: str(e.get("updated_at") or e.get("created_at") or ""),
+                        reverse=True,
+                    )
+                    self._save_user_exams_unlocked(new_u, merged_list)
+                    if old_exams_path != self._user_saved_exams_path(new_u):
+                        old_exams_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+            # 3) 공용 개념서 DB 작성자 표기 이관
+            try:
+                for book in self.load_concept_books():
+                    if (book.created_by or "").strip() == old_u:
+                        book.created_by = new_u
+                        self.save_concept_book(book)
+            except Exception:
+                pass
+
     # -----------------------------------------------------------------------
     # 서버 디스크 및 앱 저장공간 통계 (관리자 모니터링용)
     # -----------------------------------------------------------------------

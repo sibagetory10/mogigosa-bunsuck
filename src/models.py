@@ -853,7 +853,16 @@ class UserRecord(BaseModel):
 
     username: str = Field(..., description="로그인 아이디 (학번 또는 영문·숫자 ID)")
     nickname: str = Field(..., description="표시 닉네임")
-    password_hash: str = Field(..., description="salt$sha256 형식의 암호화 비밀번호")
+    password_hash: str = Field(
+        default="",
+        description="PBKDF2 또는 레거시 salt$sha256 암호화 비밀번호 (구글 전용 가입자는 빈 문자열)",
+    )
+    google_sub: str = Field(default="", description="연동된 Google 계정 고유 식별자 (OIDC sub)")
+    google_email: str = Field(default="", description="연동된 Google 이메일 주소")
+    has_local_credentials: bool = Field(
+        default=True,
+        description="직접 등록한 아이디·비밀번호 보유 여부 (구글 전용 가입자는 False)",
+    )
     tier: TierType = Field(default="FREE", description="회원 등급 (FREE / CUSTOM / PRO / ULTRA / ADMIN)")
     custom_api_key: str = Field(default="", description="CUSTOM 회원의 개인 Gemini API 키")
     daily_count: int = Field(default=0, ge=0, description="금일 사용한 기출 추출 문항 수 (하위 호환)")
