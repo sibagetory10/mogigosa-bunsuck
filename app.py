@@ -6,11 +6,14 @@ import hashlib
 import html as _html
 import json
 import os
+import platform
 import random
 import re
+import subprocess
 import threading
 import time
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Callable
 
 import streamlit as st
@@ -2784,6 +2787,7 @@ def _render_admin_panel() -> None:
                     st.warning(del_note)
 
     _render_server_storage_admin_section()
+    _render_server_git_update_admin_section()
     _render_english_pool_admin_section()
     _render_korean_analysis_pool_admin_section()
 
@@ -2864,6 +2868,116 @@ def _render_server_storage_admin_section() -> None:
             for it in sorted_bd
         ]
         st.dataframe(rows, hide_index=True, width="stretch")
+
+
+def _run_git_cmd(repo_dir: Path, args: list[str], timeout: int = 15) -> tuple[bool, str]:
+    try:
+        proc = subprocess.run(
+            ["git", *args],
+            cwd=str(repo_dir),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            encoding="utf-8",
+            errors="replace",
+        )
+        out = (proc.stdout or "").strip()
+        err = (proc.stderr or "").strip()
+        return proc.returncode == 0, (out or err)
+    except Exception as exc:
+        return False, str(exc)
+
+
+def _render_server_git_update_admin_section() -> None:
+    st.divider()
+    repo_dir = Path(__file__).resolve().parent
+    hdr_c1, hdr_c2 = st.columns([3.5, 1])
+    with hdr_c1:
+        st.subheader("🔄 서버 Git 상태 확인 · 원클릭 동기화")
+    with hdr_c2:
+        st.markdown("<div style='height: 0.45rem;'></div>", unsafe_allow_html=True)
+        check_remote = st.button("🔍 최신 상태 확인", key="admin_git_check_btn", width="stretch")
+
+    ok_head, local_head = _run_git_cmd(repo_dir, ["rev-parse", "--short", "HEAD"])
+    ok_msg, local_msg = _run_git_cmd(repo_dir, ["log", "-1", "--format=%cd · %s", "--date=short"])
+    ok_st, dirty_raw = _run_git_cmd(repo_dir, ["status", "--short"])
+    dirty_lines = [ln for ln in dirty_raw.splitlines() if ln.strip()] if ok_st else []
+
+    if check_remote:
+        _run_git_cmd(repo_dir, ["fetch", "origin", "main", "--quiet"], timeout=20)
+
+    ok_rem, remote_head = _run_git_cmd(repo_dir, ["rev-parse", "--short", "origin/main"])
+
+    g1, g2, g3 = st.columns(3)
+    g1.metric("현재 서버 커밋", local_head if ok_head else "확인 불가")
+    g2.metric(
+        "원격 origin/main",
+        remote_head if ok_rem else "확인 불가",
+        delta=("최신 일치" if ok_head and ok_rem and local_head == remote_head else ("업데이트 있음" if ok_head and ok_rem else None)),
+        delta_color=("normal" if ok_head and ok_rem and local_head == remote_head else "inverse"),
+    )
+    g3.metric(
+        "로컬 작업 트리",
+        "깨끗함" if not dirty_lines else f"변경 {len(dirty_lines)}건",
+    )
+    if ok_msg and local_msg:
+        st.caption(f"현재 적용된 커밋: `{local_msg}`")
+    if dirty_lines:
+        with st.expander(f"⚠️ 커밋되지 않은 로컬 변경 파일 ({len(dirty_lines)}건)", expanded=False):
+            st.code("\n".join(dirty_lines), language="text")
+
+    uc1, uc2 = st.columns([1.4, 2.2])
+    with uc1:
+        force_clean_curriculum = st.checkbox(
+            "curriculum_2022 충돌 자동 이관·해제",
+            value=True,
+            key="admin_git_clean_curriculum",
+        )
+    with uc2:
+        if st.button("🚀 최신 코드 동기화 · 서버 재시작", key="admin_git_pull_restart_btn", type="primary", width="stretch"):
+            if force_clean_curriculum:
+                from src.curriculum_2022 import _DATA_PATH, _load_runtime_standards, _save_runtime_standards
+                if _DATA_PATH.exists():
+                    try:
+                        cur_json = json.loads(_DATA_PATH.read_text(encoding="utf-8"))
+                        rt_stds = _load_runtime_standards()
+                        for k, v in (cur_json.get("categories") or {}).items():
+                            stds = v.get("standards") or []
+                            if stds:
+                                rt_stds[k] = stds
+                        _save_runtime_standards(rt_stds)
+                    except Exception:
+                        pass
+                _run_git_cmd(repo_dir, ["checkout", "--", "data/curriculum_2022.json"])
+
+            is_linux = platform.system().lower() == "linux"
+            script_path = repo_dir / "scripts" / "oracle_auto_update.sh"
+            if is_linux and script_path.exists():
+                try:
+                    proc = subprocess.run(
+                        ["bash", str(script_path)],
+                        cwd=str(repo_dir),
+                        capture_output=True,
+                        text=True,
+                        timeout=60,
+                        encoding="utf-8",
+                        errors="replace",
+                    )
+                    log_txt = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
+                    if proc.returncode == 0:
+                        st.success("✅ 동기화 명령 실행 완료! 서비스가 재시작되면 몇 초 후 새로고침하세요.")
+                    else:
+                        st.error(f"❌ 동기화 실패 (exit={proc.returncode})")
+                    if log_txt:
+                        st.code(log_txt, language="text")
+                except Exception as exc:
+                    st.error(f"❌ 실행 오류: {exc}")
+            else:
+                ok_pull, pull_out = _run_git_cmd(repo_dir, ["pull", "--ff-only", "origin", "main"], timeout=30)
+                if ok_pull:
+                    st.success(f"✅ git pull 완료: {pull_out or 'Already up to date.'}")
+                else:
+                    st.error(f"❌ git pull 실패: {pull_out}")
 
 
 def _render_english_pool_admin_section() -> None:
