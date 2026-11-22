@@ -34,6 +34,7 @@ from src.korean_pdf_generator import (
     merge_korean_analysis_pdfs,
 )
 from src.models import (
+    CURRENT_ENGLISH_ANALYSIS_VERSION,
     ENGLISH_DEFAULT_EXCLUDED_Q_NUMS,
     ENGLISH_TRANSFORM_TYPES,
     QuestionRecord,
@@ -206,6 +207,7 @@ def _execute_english_analysis_jobs(
     ctx: AppContext,
     items: list[dict[str, Any]],
     include_diagrams: bool = True,
+    force_regenerate: bool = False,
 ) -> None:
     """선택된 영어 지문 목록에 대해 DB 캐시 조회/병렬 AI 분석/지문별 PDF 저장/합본 PDF 생성을 수행한다."""
     if not items:
@@ -220,16 +222,22 @@ def _execute_english_analysis_jobs(
         p_txt = str(it.get("passage_text") or "").strip()
         q_lbl = str(it.get("q_label") or "").strip()
         c_key = ctx.storage.build_english_analysis_key(p_txt, q_lbl)
-        cached_an = ctx.storage.get_cached_english_analysis(c_key)
-        cached_pdf = ctx.storage.get_english_analysis_pdf_bytes(c_key) if include_diagrams else None
-        if (
-            cached_an is not None
-            and not getattr(cached_an, "is_source_restored", False)
-            and _needs_english_passage_restoration(p_txt, str(it.get("orig_type", "") or ""))
-        ):
-            # 빈칸·어법·어휘·삽입·순서 등 원문 복원이 필요한 구버전 미복원 캐시는 1회 자동 재분석
-            cached_an = None
-            cached_pdf = None
+        cached_an = None if force_regenerate else ctx.storage.get_cached_english_analysis(c_key)
+        cached_pdf = (
+            None
+            if force_regenerate
+            else (ctx.storage.get_english_analysis_pdf_bytes(c_key) if include_diagrams else None)
+        )
+        if cached_an is not None:
+            is_stale_ver = int(getattr(cached_an, "analysis_version", 1) or 1) < CURRENT_ENGLISH_ANALYSIS_VERSION
+            needs_legacy_restore = (
+                not getattr(cached_an, "is_source_restored", False)
+                and _needs_english_passage_restoration(p_txt, str(it.get("orig_type", "") or ""))
+            )
+            if is_stale_ver or needs_legacy_restore:
+                # 구버전(v1: 원문 무손실 검증·기출 포인트 미적용) 캐시는 최신 엔진으로 자동 재분석
+                cached_an = None
+                cached_pdf = None
         if cached_an is not None and getattr(cached_an, "sentence_analyses", None):
             _dirty_kor = False
             for _sa in cached_an.sentence_analyses:
@@ -297,6 +305,7 @@ def _execute_english_analysis_jobs(
                             answer=it.get("answer", ""),
                             choices=it.get("choices", []),
                             explanation=it.get("explanation", ""),
+                            question_text=it.get("question_text", ""),
                         )
                         return slot_i, an_out
 
@@ -455,6 +464,12 @@ def _render_english_analysis_results_section() -> None:
             ):
                 st.info(f"**📌 핵심 주제:** {an.core_theme}")
                 st.success(f"**🧭 논리 전개 흐름:**\n\n{an.structure_flow}")
+                _ep_note = (getattr(an, "exam_point_note", "") or "").strip()
+                if _ep_note:
+                    st.warning(f"**🎯 기출 포인트 (빈칸 원위치 · 무관한 문장):**\n\n{_ep_note}")
+                _fn_list = [str(f).strip() for f in (getattr(an, "footnotes", None) or []) if str(f).strip()]
+                if _fn_list:
+                    st.caption("📝 **문제지 공식 각주:** " + " · ".join(_fn_list))
                 _v_diag = getattr(an, "visual_diagram", None)
                 if _v_diag is not None and (
                     getattr(_v_diag, "nodes", None)
@@ -472,12 +487,13 @@ def _render_english_analysis_results_section() -> None:
 
                 sent_list = list(getattr(an, "sentence_analyses", None) or [])
                 if sent_list:
-                    st.markdown("**🔍 문장별 정밀 구문 분석** (`/` 끊어읽기 · `[절]` · `(수식어구)` · `★ 주제문`)")
+                    st.markdown("**🔍 문장별 정밀 구문 분석** (`/` 끊어읽기 · `[절]` · `(수식어구)` · `★ 주제문` · `기출 빈칸`)")
                     st.markdown(
                         "<style>"
                         ".eng-slash{color:#DC2626;font-weight:700;}"
                         ".eng-bracket{color:#1D4ED8;font-weight:700;}"
                         ".eng-paren{color:#0F766E;font-weight:700;}"
+                        ".eng-blank-hl{background:#E0E7FF;border-bottom:2px solid #4F46E5;padding:0 2px;border-radius:3px;}"
                         "</style>",
                         unsafe_allow_html=True,
                     )
@@ -485,6 +501,7 @@ def _render_english_analysis_results_section() -> None:
                         s_num = int(getattr(sa, "sentence_num", s_i + 1) or (s_i + 1))
                         n_badge = _ENG_CIRCLED_NUMS[s_num - 1] if 1 <= s_num <= len(_ENG_CIRCLED_NUMS) else f"({s_num})"
                         is_topic = bool(getattr(sa, "is_topic_sentence", False))
+                        blank_phrase = (getattr(sa, "original_blank_phrase", "") or "").strip()
                         topic_html = (
                             " <span style='background:#FEF3C7;color:#B45309;border:1px solid #F59E0B;"
                             "padding:1px 6px;border-radius:4px;font-size:0.8em;font-weight:700;'>"
@@ -492,16 +509,26 @@ def _render_english_analysis_results_section() -> None:
                             if is_topic
                             else ""
                         )
+                        blank_html = (
+                            " <span style='background:#EEF2FF;color:#3730A3;border:1px solid #818CF8;"
+                            "padding:1px 6px;border-radius:4px;font-size:0.8em;font-weight:700;'>"
+                            "📌 기출 빈칸 원위치</span>"
+                            if blank_phrase
+                            else ""
+                        )
                         border_style = (
                             "border:1.5px solid #F59E0B;border-left:4px solid #D97706;background:#FFFBEB;"
                             if is_topic
                             else "border:1px solid #E2E8F0;background:#FFFFFF;"
                         )
-                        chunk_html = _format_chunked_english_html(getattr(sa, "chunked_english", ""))
+                        chunk_html = _format_chunked_english_html(
+                            getattr(sa, "chunked_english", ""),
+                            blank_phrase=blank_phrase,
+                        )
                         kor_txt = _html.escape(normalize_english_korean_translation(getattr(sa, "korean_translation", "") or ""))
                         st.markdown(
                             f"<div style='{border_style}border-radius:6px;padding:10px 12px;margin-bottom:8px;'>"
-                            f"<div style='margin-bottom:4px;'><strong style='color:#1E3A8A;'>{n_badge}</strong>{topic_html}</div>"
+                            f"<div style='margin-bottom:4px;'><strong style='color:#1E3A8A;'>{n_badge}</strong>{topic_html}{blank_html}</div>"
                             f"<div style='font-weight:600;color:#0F172A;line-height:1.6;margin-bottom:4px;'>{chunk_html}</div>"
                             f"<div style='color:#334155;font-size:0.95em;line-height:1.5;'>{kor_txt}</div>"
                             "</div>",
@@ -950,11 +977,19 @@ def _render_english_analysis_submode(ctx: AppContext) -> None:
                     "분석지를 만들 지문을 체크하세요. (`📑 분석지PDF DB` 배지가 붙은 지문은 재호출 없이 즉시 병합됩니다.)"
                 )
                 with st.form("tab2_eng_db_analysis_form", border=True):
-                    include_eng_db_diagrams = st.checkbox(
-                        "🎨 지문 이해용 시각 도식 그림 포함",
-                        value=True,
-                        key="tab2_eng_an_db_include_diagrams",
-                    )
+                    opt_c1, opt_c2 = st.columns([1.0, 1.3])
+                    with opt_c1:
+                        include_eng_db_diagrams = st.checkbox(
+                            "🎨 지문 이해용 시각 도식 그림 포함",
+                            value=True,
+                            key="tab2_eng_an_db_include_diagrams",
+                        )
+                    with opt_c2:
+                        force_regen_db = st.checkbox(
+                            "🔄 기존 캐시 무시하고 최신 정밀 검증 엔진으로 재분석",
+                            value=False,
+                            key="tab2_eng_an_db_force_regen",
+                        )
                     st.markdown("---")
                     st.markdown("**✅ 분석지를 생성할 영어 기출 지문 선택:**")
                     checked_an_rows: list[tuple[QuestionRecord, str]] = []
@@ -995,9 +1030,14 @@ def _render_english_analysis_submode(ctx: AppContext) -> None:
                                 "orig_type": (getattr(rec_p, "english_question_type", "") or rec_p.unit_name).strip(),
                                 "passage_topic": (getattr(rec_p, "passage_topic", "") or "").strip(),
                                 "passage_text": rec_p.passage_text,
+                                "question_text": (getattr(rec_p, "question_text", "") or "").strip(),
                                 "answer": (getattr(rec_p, "answer", "") or "").strip(),
                                 "choices": list(getattr(rec_p, "choices", None) or []),
-                                "explanation": (getattr(rec_p, "explanation", "") or "").strip(),
+                                "explanation": (
+                                    getattr(rec_p, "official_explanation", "")
+                                    or getattr(rec_p, "explanation", "")
+                                    or ""
+                                ).strip(),
                             }
                             for rec_p, q_label in checked_an_rows
                         ]
@@ -1005,6 +1045,7 @@ def _render_english_analysis_submode(ctx: AppContext) -> None:
                             ctx,
                             items=an_items,
                             include_diagrams=include_eng_db_diagrams,
+                            force_regenerate=force_regen_db,
                         )
 
     with an_tab_direct:
@@ -1021,11 +1062,19 @@ def _render_english_analysis_submode(ctx: AppContext) -> None:
                 placeholder="Paste your English reading passage here...",
                 key="tab2_eng_an_direct_text",
             )
-            include_eng_direct_diagrams = st.checkbox(
-                "🎨 지문 이해용 시각 도식 그림 포함",
-                value=True,
-                key="tab2_eng_an_direct_include_diagrams",
-            )
+            d_opt_c1, d_opt_c2 = st.columns([1.0, 1.3])
+            with d_opt_c1:
+                include_eng_direct_diagrams = st.checkbox(
+                    "🎨 지문 이해용 시각 도식 그림 포함",
+                    value=True,
+                    key="tab2_eng_an_direct_include_diagrams",
+                )
+            with d_opt_c2:
+                force_regen_direct = st.checkbox(
+                    "🔄 기존 캐시 무시하고 새로 정밀 분석",
+                    value=False,
+                    key="tab2_eng_an_direct_force_regen",
+                )
             run_eng_direct_analysis_btn = st.form_submit_button(
                 "📑 직접 입력한 영어 지문 분석지 PDF 생성",
                 type="primary",
@@ -1056,6 +1105,7 @@ def _render_english_analysis_submode(ctx: AppContext) -> None:
                     ctx,
                     items=direct_an_items,
                     include_diagrams=include_eng_direct_diagrams,
+                    force_regenerate=force_regen_direct,
                 )
 
     _render_english_analysis_results_section()

@@ -866,17 +866,20 @@ class KoreanPassageAnalysisOutput(BaseModel):
     )
 
 
+CURRENT_ENGLISH_ANALYSIS_VERSION: int = 2
+
+
 class EnglishSentenceAnalysisItem(BaseModel):
     """영어 지문 문장별 끊어읽기·괄호 구문독해 및 해석·어법 포인트."""
 
     sentence_num: int = Field(..., ge=1, description="문장 번호 (1부터 시작)")
     is_topic_sentence: bool = Field(
         default=False,
-        description="이 문장이 지문의 핵심 주제문(Topic Sentence)이면 True",
+        description="이 문장이 지문의 핵심 주제문(Topic Sentence)이면 True (단순 전환·연결 단문에는 False)",
     )
     chunked_english: str = Field(
         ...,
-        description="원문 영문 내에 슬래시(/) 끊어읽기와 [절]·(수식어구) 괄호 기호를 직접 삽입한 구문독해용 영문",
+        description="원문 영문 단어를 100% 그대로 보존한 상태에서 슬래시(/) 끊어읽기와 [절]·(수식어구) 괄호 기호를 삽입한 구문독해용 영문",
     )
     korean_translation: str = Field(
         ...,
@@ -884,7 +887,11 @@ class EnglishSentenceAnalysisItem(BaseModel):
     )
     syntax_notes: list[str] = Field(
         default_factory=list,
-        description="해당 문장의 핵심 구문·어법 구조 해설 (1~3개, 예: 'so ~ that 구문', '목적격 관계대명사 생략')",
+        description="해당 문장의 핵심 구문·어법 구조 해설 (현재 빈 배열 [] 유지)",
+    )
+    original_blank_phrase: str = Field(
+        default="",
+        description="원래 빈칸 추론 문항에서 빈칸이었던 원문 구절 (이 문장에 빈칸이 있었을 때만 기재)",
     )
 
 
@@ -905,9 +912,21 @@ class EnglishPassageAnalysisOutput(BaseModel):
         default_factory=list,
         description="지문 전체 문장에 대한 1번부터 끝번까지의 문장별 정밀 구문독해 리스트",
     )
+    exam_point_note: str = Field(
+        default="",
+        description="원래 기출 유형 핵심 포인트 (빈칸 추론의 원래 빈칸 위치·정답 구절, 무관한 문장의 제거된 정답 문장 및 이탈 이유 등)",
+    )
+    footnotes: list[str] = Field(
+        default_factory=list,
+        description="문제지 공식 각주 어휘 목록 (예: ['delineate: ~의 경계를 정하다'])",
+    )
     is_source_restored: bool = Field(
         default=False,
         description="빈칸·어법·어휘·삽입·순서 등 기출 변형 원문 복원 및 교정 완료 여부",
+    )
+    analysis_version: int = Field(
+        default=1,
+        description="분석지 엔진 스키마·검증 버전 (v2: 원문 100% 무손실 검증·기출 포인트·각주·용어 일관성 강화)",
     )
 
 

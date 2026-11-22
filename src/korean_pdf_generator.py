@@ -1373,14 +1373,26 @@ def merge_korean_analysis_pdfs(pdf_bytes_list: list[bytes]) -> bytes:
         merged.close()
 
 
-def _format_chunked_english_html(chunked_text: str) -> str:
-    """슬래시(/)와 대괄호([]), 소괄호(()) 구문 표기를 시각적으로 구분되는 HTML로 변환한다."""
-    escaped = html.escape((chunked_text or "").strip())
-    if not escaped:
+def _format_chunked_english_html(chunked_text: str, blank_phrase: str = "") -> str:
+    """슬래시(/)와 대괄호([]), 소괄호(()) 구문 표기 및 기출 빈칸 원위치 하이라이트를 안전한 HTML로 변환한다."""
+    raw = (chunked_text or "").strip()
+    if not raw:
         return ""
+    bp = (blank_phrase or "").strip()
+    if bp:
+        bp_words = re.findall(r"[A-Za-z0-9]+(?:['’-][A-Za-z0-9]+)*", bp)
+        if bp_words:
+            sep = r"[\s/\[\]\(\),;:\"'‘’“”-]+"
+            pat = sep.join(re.escape(w).replace("'", "['’]") for w in bp_words)
+            m_bp = re.search(pat, raw, flags=re.IGNORECASE)
+            if m_bp:
+                raw = f"{raw[:m_bp.start()]}@@BLK_S@@{raw[m_bp.start():m_bp.end()]}@@BLK_E@@{raw[m_bp.end():]}"
+
+    escaped = html.escape(raw)
     escaped = escaped.replace(" / ", " <span class='eng-slash'>/</span> ")
     escaped = re.sub(r"(\[|\])", r"<span class='eng-bracket'>\1</span>", escaped)
     escaped = re.sub(r"(\(|\))", r"<span class='eng-paren'>\1</span>", escaped)
+    escaped = escaped.replace("@@BLK_S@@", "<span class='eng-blank-hl'>").replace("@@BLK_E@@", "</span>")
     return escaped
 
 
@@ -1441,9 +1453,29 @@ def _build_english_landscape_css(scale: float = 1.0) -> str:
         border: 0.8pt solid #86EFAC;
         border-radius: 3.5pt;
         padding: {5.5 * s:.2f}pt {7.5 * s:.2f}pt;
-        margin-bottom: {5 * s:.2f}pt;
+        margin-bottom: {4.5 * s:.2f}pt;
         font-size: {8.1 * s:.2f}pt;
         line-height: 1.42;
+    }}
+    .eng-l-point {{
+        background-color: #FAF5FF;
+        border: 0.8pt solid #C4B5FD;
+        border-radius: 3.5pt;
+        padding: {4.5 * s:.2f}pt {7 * s:.2f}pt;
+        margin-bottom: {4 * s:.2f}pt;
+        font-size: {7.6 * s:.2f}pt;
+        line-height: 1.38;
+        color: #3B0764;
+    }}
+    .eng-l-footnote {{
+        background-color: #F8FAFC;
+        border: 0.6pt solid #CBD5E1;
+        border-radius: 3pt;
+        padding: {3.2 * s:.2f}pt {6.5 * s:.2f}pt;
+        margin-bottom: {4 * s:.2f}pt;
+        font-size: {7.3 * s:.2f}pt;
+        line-height: 1.35;
+        color: #475569;
     }}
     .eng-l-diag-wrap {{
         margin-top: {2 * s:.2f}pt;
@@ -1508,6 +1540,22 @@ def _build_english_landscape_css(scale: float = 1.0) -> str:
         font-size: {7.1 * s:.2f}pt;
         padding: 0.8pt 3.5pt;
         border-radius: 2.5pt;
+    }}
+    .eng-blank-badge {{
+        display: inline;
+        background-color: #EEF2FF;
+        color: #3730A3;
+        border: 0.5pt solid #818CF8;
+        font-weight: bold;
+        font-size: {7.1 * s:.2f}pt;
+        padding: 0.8pt 3.5pt;
+        border-radius: 2.5pt;
+    }}
+    .eng-blank-hl {{
+        background-color: #E0E7FF;
+        border-bottom: 1.1pt solid #4F46E5;
+        padding: 0 1.5pt;
+        border-radius: 2pt;
     }}
     .eng-sent-chunk {{
         font-size: {8.3 * s:.2f}pt;
@@ -1589,6 +1637,22 @@ def _render_single_english_landscape_page(
     """
 
     flow_html_inner = _format_structure_flow_html(an.structure_flow)
+    exam_point_txt = (getattr(an, "exam_point_note", "") or "").strip()
+    exam_point_html = ""
+    if exam_point_txt:
+        ep_lines = "<br/>".join(html.escape(ln.strip()) for ln in exam_point_txt.splitlines() if ln.strip())
+        exam_point_html = (
+            "<div class='eng-l-point'>"
+            "<div><b>기출 포인트 (원문 빈칸·무관한 문장)</b></div>"
+            f"<div>{ep_lines}</div>"
+            "</div>"
+        )
+    fn_list = [str(f).strip() for f in (getattr(an, "footnotes", None) or []) if str(f).strip()]
+    fn_html = ""
+    if fn_list:
+        fn_joined = " &nbsp;·&nbsp; ".join(html.escape(f) for f in fn_list)
+        fn_html = f"<div class='eng-l-footnote'><b>* 각주:</b> {fn_joined}</div>"
+
     left_top_html = f"""
     <html><body>
       <div class="eng-l-sec">1. 핵심 주제 및 논리 전개 흐름</div>
@@ -1600,6 +1664,8 @@ def _render_single_english_landscape_page(
         <div><b>논리 전개 흐름</b></div>
         <div>{flow_html_inner}</div>
       </div>
+      {exam_point_html}
+      {fn_html}
     </body></html>
     """
 
@@ -1610,18 +1676,27 @@ def _render_single_english_landscape_page(
         s_num = int(getattr(sa, "sentence_num", s_idx + 1) or (s_idx + 1))
         num_badge = _CIRCLED_NUMS[s_num - 1] if 1 <= s_num <= len(_CIRCLED_NUMS) else f"({s_num})"
         is_topic = bool(getattr(sa, "is_topic_sentence", False))
+        blank_phrase = (getattr(sa, "original_blank_phrase", "") or "").strip()
         card_cls = "eng-sent-card-topic" if is_topic else "eng-sent-card"
         topic_badge = (
             " &nbsp;<span class='eng-topic-badge'>★ 주제문 (Topic Sentence)</span>"
             if is_topic
             else ""
         )
-        chunk_html = _format_chunked_english_html(getattr(sa, "chunked_english", ""))
+        blank_badge = (
+            " &nbsp;<span class='eng-blank-badge'>기출 빈칸 원위치</span>"
+            if blank_phrase
+            else ""
+        )
+        chunk_html = _format_chunked_english_html(
+            getattr(sa, "chunked_english", ""),
+            blank_phrase=blank_phrase,
+        )
         kor_html = html.escape(normalize_english_korean_translation(getattr(sa, "korean_translation", "") or ""))
 
         card_inner = (
             f"<div class='{card_cls}'>"
-            f"<div class='eng-sent-hdr'><span class='eng-sent-num'>{num_badge}</span>{topic_badge}</div>"
+            f"<div class='eng-sent-hdr'><span class='eng-sent-num'>{num_badge}</span>{topic_badge}{blank_badge}</div>"
             f"<div class='eng-sent-chunk'>{chunk_html}</div>"
             f"<div class='eng-sent-kor'>{kor_html}</div>"
             "</div>"
