@@ -62,6 +62,22 @@ def _infer_english_group_id(q_num: int, raw_group: str = "") -> str:
     return normalize_english_group_id(q_num, raw_group)
 
 
+_ENGLISH_PASSAGE_TAGGING_RULES = (
+    "[문항 번호별 영어 지문(passage_text) 정밀 태깅 규칙 — 해설지·정답표 필수 대조]\n"
+    "모든 독해 문항(18~45번)은 한국어 발문과 선택지(①~⑤)를 제외한 순수 영어 본문만 `passage_text`에 담되, 아래 번호별 규칙을 반드시 따르세요:\n"
+    "- **29번 (어법)**: 해설지를 분석해 정답을 찾은 뒤, **해설지가 해설한 대로만** 틀린 어법 표현을 올바른 표현으로 수정하여 태깅하세요. (밑줄/번호 ①~⑤ 마커 제거, 선택형 `(A)(B)(C)`면 정답 표현만 남김)\n"
+    "- **30번 (어휘)**: 해설지를 참고해 정답을 찾은 뒤, **해설지가 해설한 대로만** 문맥상 부적절한 어휘를 해설지가 제시한 적절한 어휘로 수정하여 태깅하세요. (밑줄/번호 ①~⑤ 마커 제거)\n"
+    "- **31, 32, 33, 34번 (빈칸 추론)**: 원문의 빈칸 위치에 해설지 정답에 해당하는 보기(선지) 내용을 자연스럽게 채워 넣어 완전한 지문으로 태깅하세요.\n"
+    "- **35번 (무관한 문장)**: 해설지 정답을 참고해 **전체 흐름과 무관한 해당 번호 문장을 제외(삭제)**하고, ①~⑤ 번호 마커도 제거하여 태깅하세요.\n"
+    "- **36, 37번 (글의 순서)**: 해설지 정답을 참고해 **주어진 글 + 정답 순서대로 단락을 배열**하고, `(A)`, `(B)`, `(C)` 라벨을 제거한 완전한 지문으로 태깅하세요.\n"
+    "- **38, 39번 (문장 삽입)**: 해설지 정답을 참고해 **주어진 문장을 정답 위치(①~⑤)에 삽입**하고, 모든 ①~⑤ 위치 마커를 제거한 완전한 지문으로 태깅하세요.\n"
+    "- **40번 (요약문 완성)**: **요약문(`[요약문]` / `￫` 아래의 `(A)...(B)...` 요약 문장 및 선지)은 지문 태깅에서 제외**하고 본문 영어 지문만 태깅하세요.\n"
+    "- **41~42번 (장문)**: **42번 해설지**를 참고하여 **42번 문항의 틀린 어휘 부분만** 해설지가 바꾸기 적절한 단어라고 제시한 단어로 바꿔서 태깅하세요. (41번과 42번 모두 동일하게 수정된 공통 지문을 저장, `(a)~(e)` 마커 제거)\n"
+    "- **43~45번 (장문)**: **43번 해설지**를 분석하여 **정답 순서대로 단락을 교정·배열**해 태깅하세요. (`(A)~(D)` 단락 라벨 및 `(a)~(e)`/`①~⑤` 마커 정리, 43·44·45번 모두 동일하게 교정된 공통 지문을 저장)\n"
+    "- **그 외 언급되지 않은 문항(18~28번 등)**: 발문과 선지만 제외하고 원문 그대로 태깅하세요.\n"
+)
+
+
 def analyze_english_exam_pdf_batch_with_gemini(
     api_key: str,
     model_name: str,
@@ -118,13 +134,13 @@ def analyze_english_exam_pdf_batch_with_gemini(
         "   - `english_question_type`은 다음 표준 유형명 중 하나로 기록하세요: "
         "'목적', '심경·분위기', '주장', '함축적 의미 추론', '요지 파악', '주제 파악', '제목 추론', '도표·실용문', '내용 일치·불일치', "
         "'어법', '어휘', '빈칸 추론', '무관한 문장', '글의 순서', '문장 삽입', '요약문 완성', '장문 독해(41~42)', '장문 독해(43~45)'.\n"
-        "   - `passage_text`: 한국어 발문(예: '다음 글의 요지로...')과 선택지(①~⑤)를 제외한 **영어 본문 지문 전체**를 빠짐없이 원문 그대로 추출하세요. "
-        "(글의 순서 문항은 주어진 글과 (A)(B)(C) 본문을 자연스럽게 모두 포함하고, 문장 삽입 문항도 주어진 문장과 본문을 모두 포함하세요.)\n"
-        "   - **장문 세트(41~42번, 43~45번)에만** `passage_group_id`를 `'41~42'` 또는 `'43~45'`로 표기하고 공통 장문 지문 전체(43~45번은 (A)~(D) 전체 단락)를 수록하세요. **그 외 모든 문항(예: 31~34, 36~37, 38~39 등 발문 헤더 범위 포함)은 문항마다 지문이 각각 다르므로 `passage_group_id`를 반드시 빈 문자열로 두고 해당 번호 문항의 지문만 추출하세요.**\n"
+        "   - `passage_text`: 아래 [문항 번호별 영어 지문 정밀 태깅 규칙]에 따라 완성된 영어 지문을 추출하세요.\n"
+        "   - **장문 세트(41~42번, 43~45번)에만** `passage_group_id`를 `'41~42'` 또는 `'43~45'`로 표기하세요. **그 외 모든 문항(예: 31~34, 36~37, 38~39 등 발문 헤더 범위 포함)은 문항마다 지문이 각각 다르므로 `passage_group_id`를 반드시 빈 문자열로 두고 해당 번호 문항의 지문만 추출하세요.**\n"
         "   - `passage_topic`: 지문의 핵심 소재·주제를 한국어 1줄로 요약하세요.\n"
         "   - `key_vocabulary`: 지문 내 주요 어휘 3~6개를 `'단어: 한국어 뜻'` 형식으로 나열하세요.\n"
         "4. `official_explanation`과 `answer`: 해설지 PDF(특히 1페이지 상단 1~45번 빠른 정답표)와 문항별 해설을 대조하여 핵심 풀이 요약과 공식 정답(`'1'`~`'5'`)을 정확히 추출하세요. "
-        "**특히 41번(제목 추론)과 42번(밑줄 (a)~(e) 어휘 적절성), 그리고 43번(순서 배열)·44번(지칭 추론 (a)~(e))·45번(내용 일치) 세트 문항의 정답과 해설이 서로 뒤바뀌지 않도록 문항 번호별 발문과 정답표를 반드시 1:1 확인하세요.**"
+        "**특히 41번(제목 추론)과 42번(밑줄 (a)~(e) 어휘 적절성), 그리고 43번(순서 배열)·44번(지칭 추론 (a)~(e))·45번(내용 일치) 세트 문항의 정답과 해설이 서로 뒤바뀌지 않도록 문항 번호별 발문과 정답표를 반드시 1:1 확인하세요.**\n\n"
+        + _ENGLISH_PASSAGE_TAGGING_RULES
         + ncic_rule
     )
 
@@ -172,15 +188,20 @@ def analyze_english_exam_pdf_batch_with_gemini(
             _apply_lang_standard_validation(item, "영어")
             out[item.q_num] = item
 
-    # 41~42, 43~45 세트 문항 간 공통 지문(passage_text) 및 주제 동기화
+    # 41~42(42번 어휘 수정본 우선), 43~45(43번 순서 교정본 우선) 세트 문항 간 공통 지문(passage_text) 및 주제 동기화
     group_best_passage: dict[str, str] = {}
     group_best_topic: dict[str, str] = {}
+    if 42 in out and (out[42].passage_text or "").strip():
+        group_best_passage["41~42"] = (out[42].passage_text or "").strip()
+    if 43 in out and (out[43].passage_text or "").strip():
+        group_best_passage["43~45"] = (out[43].passage_text or "").strip()
+
     for item in out.values():
         gid = item.passage_group_id
         if not gid:
             continue
         txt = (item.passage_text or "").strip()
-        if len(txt) > len(group_best_passage.get(gid, "")):
+        if gid not in group_best_passage and len(txt) > len(group_best_passage.get(gid, "")):
             group_best_passage[gid] = txt
         top = (item.passage_topic or "").strip()
         if len(top) > len(group_best_topic.get(gid, "")):
@@ -189,7 +210,11 @@ def analyze_english_exam_pdf_batch_with_gemini(
     for item in out.values():
         gid = item.passage_group_id
         if gid and gid in group_best_passage and group_best_passage[gid]:
-            if len((item.passage_text or "").strip()) < len(group_best_passage[gid]) * 0.7:
+            if gid == "41~42" and 42 in out and (out[42].passage_text or "").strip():
+                item.passage_text = group_best_passage["41~42"]
+            elif gid == "43~45" and 43 in out and (out[43].passage_text or "").strip():
+                item.passage_text = group_best_passage["43~45"]
+            elif len((item.passage_text or "").strip()) < len(group_best_passage[gid]) * 0.7:
                 item.passage_text = group_best_passage[gid]
         if gid and not (item.passage_topic or "").strip() and gid in group_best_topic:
             item.passage_topic = group_best_topic[gid]
@@ -219,8 +244,9 @@ def analyze_english_question_with_gemini(
         "당신은 대한민국 수능·모의고사 영어 기출 문항 분석가입니다.\n"
         f"- 이 문항({q_num}번)은 {'듣기(1~17번)' if is_listening else '독해(18~45번)'} 문항입니다.\n"
         "- 듣기 문항이면 `english_section='듣기'`, `passage_text=''`로 두고 유형·주제·정답·해설만 추출하세요.\n"
-        "- 독해 문항이면 `english_section='독해'`, 한국어 발문과 선택지 ①~⑤를 제외한 순수 영어 본문 전체를 `passage_text`에 빠짐없이 추출하고, "
-        "원래 유형(`english_question_type`), 주제(`passage_topic`), 핵심 어휘(`key_vocabulary`), 정답(`answer`), 해설(`official_explanation`)을 JSON으로 반환하세요."
+        "- 독해 문항이면 `english_section='독해'`, 아래 [문항 번호별 영어 지문 정밀 태깅 규칙]에 맞춰 순수 영어 본문 전체를 `passage_text`에 추출하고, "
+        "원래 유형(`english_question_type`), 주제(`passage_topic`), 핵심 어휘(`key_vocabulary`), 정답(`answer`), 해설(`official_explanation`)을 JSON으로 반환하세요.\n\n"
+        + ("" if is_listening else _ENGLISH_PASSAGE_TAGGING_RULES)
         + ncic_rule
     )
 
