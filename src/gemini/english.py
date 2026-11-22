@@ -63,19 +63,103 @@ def _infer_english_group_id(q_num: int, raw_group: str = "") -> str:
 
 
 _ENGLISH_PASSAGE_TAGGING_RULES = (
-    "[문항 번호별 영어 지문(passage_text) 정밀 태깅 규칙 — 해설지·정답표 필수 대조]\n"
+    "[문항 번호별 영어 지문(passage_text) 정밀 태깅 규칙 — 해설지·정답표 필수 대조 & 원문 100% 무손실 보존]\n"
+    "⚠️ **절대 규칙 (환각·생략 금지)**: 아래 번호별 규칙에서 지정한 수정 지점(빈칸 1곳, 어법/어휘 오답 1곳, 무관한 문장 1개, 순서/삽입) 외의 **나머지 모든 영어 단어·전치사구·구두점은 단 한 단어도 생략·요약·의역·변형하지 말고 원문 100% 그대로 유지**하세요.\n"
     "모든 독해 문항(18~45번)은 한국어 발문과 선택지(①~⑤)를 제외한 순수 영어 본문만 `passage_text`에 담되, 아래 번호별 규칙을 반드시 따르세요:\n"
-    "- **29번 (어법)**: 해설지를 분석해 정답을 찾은 뒤, **해설지가 해설한 대로만** 틀린 어법 표현을 올바른 표현으로 수정하여 태깅하세요. (밑줄/번호 ①~⑤ 마커 제거, 선택형 `(A)(B)(C)`면 정답 표현만 남김)\n"
-    "- **30번 (어휘)**: 해설지를 참고해 정답을 찾은 뒤, **해설지가 해설한 대로만** 문맥상 부적절한 어휘를 해설지가 제시한 적절한 어휘로 수정하여 태깅하세요. (밑줄/번호 ①~⑤ 마커 제거)\n"
-    "- **31, 32, 33, 34번 (빈칸 추론)**: 원문의 빈칸 위치에 해설지 정답에 해당하는 보기(선지) 내용을 자연스럽게 채워 넣어 완전한 지문으로 태깅하세요.\n"
-    "- **35번 (무관한 문장)**: 해설지 정답을 참고해 **전체 흐름과 무관한 해당 번호 문장을 제외(삭제)**하고, ①~⑤ 번호 마커도 제거하여 태깅하세요.\n"
-    "- **36, 37번 (글의 순서)**: 해설지 정답을 참고해 **주어진 글 + 정답 순서대로 단락을 배열**하고, `(A)`, `(B)`, `(C)` 라벨을 제거한 완전한 지문으로 태깅하세요.\n"
-    "- **38, 39번 (문장 삽입)**: 해설지 정답을 참고해 **주어진 문장을 정답 위치(①~⑤)에 삽입**하고, 모든 ①~⑤ 위치 마커를 제거한 완전한 지문으로 태깅하세요.\n"
-    "- **40번 (요약문 완성)**: **요약문(`[요약문]` / `￫` 아래의 `(A)...(B)...` 요약 문장 및 선지)은 지문 태깅에서 제외**하고 본문 영어 지문만 태깅하세요.\n"
-    "- **41~42번 (장문)**: **42번 해설지**를 참고하여 **42번 문항의 틀린 어휘 부분만** 해설지가 바꾸기 적절한 단어라고 제시한 단어로 바꿔서 태깅하세요. (41번과 42번 모두 동일하게 수정된 공통 지문을 저장, `(a)~(e)` 마커 제거)\n"
+    "- **29번 (어법)**: 해설지를 분석해 정답을 찾은 뒤, **해설지가 해설한 대로만** 틀린 어법 표현 1곳을 올바른 표현으로 수정하여 태깅하세요. (밑줄/번호 ①~⑤ 마커 제거, 선택형 `(A)(B)(C)`면 정답 표현만 남김, 나머지 단어 100% 보존)\n"
+    "- **30번 (어휘)**: 해설지를 참고해 정답을 찾은 뒤, **해설지가 해설한 대로만** 문맥상 부적절한 어휘 1곳을 해설지가 제시한 적절한 어휘로 수정하여 태깅하세요. (밑줄/번호 ①~⑤ 마커 제거, 나머지 단어 100% 보존)\n"
+    "- **31, 32, 33, 34번 (빈칸 추론)**: **빈칸(`____`) 바로 앞과 바로 뒤에 있는 단어·전치사구(예: `at one level of analysis`)를 절대 지우거나 생략하지 마세요.** 오직 `____` 밑줄 자리 그 자체만 해설지 정답에 해당하는 보기(선지) 문자열로 1:1 치환하여 태깅하세요.\n"
+    "- **35번 (무관한 문장)**: 해설지 정답을 참고해 **전체 흐름과 무관한 해당 번호 문장 1개만 제외(삭제)**하고, ①~⑤ 번호 마커를 제거하며 나머지 문장은 100% 그대로 태깅하세요.\n"
+    "- **36, 37번 (글의 순서)**: 해설지 정답을 참고해 **주어진 글 + 정답 순서대로 단락을 배열**하고, `(A)`, `(B)`, `(C)` 라벨을 제거한 완전한 지문으로 태깅하세요. (단어 생략 금지)\n"
+    "- **38, 39번 (문장 삽입)**: 해설지 정답을 참고해 **주어진 문장을 정답 위치(①~⑤)에 삽입**하고, 모든 ①~⑤ 위치 마커를 제거한 완전한 지문으로 태깅하세요. (단어 생략 금지)\n"
+    "- **40번 (요약문 완성)**: **요약문(`[요약문]` / `￫` 아래의 `(A)...(B)...` 요약 문장 및 선지)은 지문 태깅에서 제외**하고 본문 영어 지문만 100% 그대로 태깅하세요.\n"
+    "- **41~42번 (장문)**: **42번 해설지**를 참고하여 **42번 문항의 틀린 어휘 부분만** 해설지가 바꾸기 적절한 단어라고 제시한 단어로 바꿔서 태깅하세요. (41번과 42번 모두 동일하게 수정된 공통 지문을 저장, `(a)~(e)` 마커 제거, 나머지 단어 100% 보존)\n"
     "- **43~45번 (장문)**: **43번 해설지**를 분석하여 **정답 순서대로 단락을 교정·배열**해 태깅하세요. (`(A)~(D)` 단락 라벨 및 `(a)~(e)`/`①~⑤` 마커 정리, 43·44·45번 모두 동일하게 교정된 공통 지문을 저장)\n"
-    "- **그 외 언급되지 않은 문항(18~28번 등)**: 발문과 선지만 제외하고 원문 그대로 태깅하세요.\n"
+    "- **그 외 언급되지 않은 문항(18~28번 등)**: 발문과 선지만 제외하고 원문 100% 그대로 태깅하세요.\n"
 )
+
+
+_NUM_TO_CIRCLED = {"1": "①", "2": "②", "3": "③", "4": "④", "5": "⑤"}
+
+
+def _extract_local_english_body_and_choices(local_text: str) -> tuple[str, dict[str, str]]:
+    """로컬 추출된 영어 문항 텍스트에서 발문·각주·선지를 분리해 (영어 본문, {'1': 선지1, ...})를 반환한다."""
+    raw = (local_text or "").replace("\r\n", "\n").strip()
+    if not raw:
+        return "", {}
+    choices: dict[str, str] = {}
+    # ①~⑤ 선지 추출
+    c_matches = list(re.finditer(r"(?:^|\s)([①②③④⑤])\s*([^\n①②③④⑤]+)", raw))
+    c_map = {"①": "1", "②": "2", "③": "3", "④": "4", "⑤": "5"}
+    body_end = len(raw)
+    if c_matches:
+        # 선지 영역 시작점(연속 선지 첫 번째)
+        first_c_idx = c_matches[0].start()
+        # 본문 내 삽입/어법 ①~⑤가 아니라 하단 선택지 블록인지 확인 (최소 2개 이상 또는 줄 시작)
+        if len(c_matches) >= 3:
+            body_end = first_c_idx
+        for cm in c_matches:
+            sym = cm.group(1)
+            val = re.sub(r"\s+", " ", cm.group(2)).strip()
+            if sym in c_map and val:
+                choices[c_map[sym]] = val
+
+    body_raw = raw[:body_end].strip()
+    body_lines: list[str] = []
+    for ln in body_raw.splitlines():
+        s = ln.strip()
+        if not s:
+            continue
+        # 발문 / 배점 / 각주 제거
+        if re.match(r"^(?:\d{1,2}\.\s*)?.*[가-힣].*[?:]\s*$", s):
+            continue
+        if re.match(r"^\[[1-4]점\]$", s):
+            continue
+        if re.match(r"^\*\s*[A-Za-z-]+:", s):
+            continue
+        body_lines.append(s)
+    body = re.sub(r"\s+", " ", " ".join(body_lines)).strip()
+    return body, choices
+
+
+def _verify_and_fix_english_tagged_passage(
+    q_num: int,
+    passage_text: str,
+    answer: str,
+    local_question_text: str = "",
+) -> str:
+    """AI가 태깅한 영어 지문에서 빈칸 앞뒤 구절 누락(환각)이나 요약문 잔존을 결정론적으로 검증·복구한다."""
+    p = (passage_text or "").strip()
+    if not p or q_num <= 17:
+        return p
+
+    # 40번: 요약문 잔존 시 본문만 남기기
+    if q_num == 40:
+        p = re.split(r"\n\s*(?:\[요약문\]|￫|->)\s*", p, maxsplit=1)[0].strip()
+
+    # 31~34번: 빈칸 앞뒤 원문 구절 누락 환각 방지 (로컬 텍스트와 대조)
+    if q_num in (31, 32, 33, 34) and local_question_text:
+        local_body, choices = _extract_local_english_body_and_choices(local_question_text)
+        ans_key = _normalize_extracted_answer(answer)
+        ans_choice = choices.get(ans_key, "").strip()
+        blank_m = re.search(r"_{3,}", local_body)
+        if local_body and ans_choice and blank_m:
+            # 빈칸 직전 3단어와 직후 3단어가 AI 출력에 보존되어 있는지 확인
+            before_words = re.findall(r"[A-Za-z0-9'-]+", local_body[:blank_m.start()])[-3:]
+            after_words = re.findall(r"[A-Za-z0-9'-]+", local_body[blank_m.end():])[:3]
+            p_norm = re.sub(r"\s+", " ", p).lower()
+            before_ok = (len(before_words) < 2) or (" ".join(before_words).lower() in p_norm)
+            after_ok = (len(after_words) < 2) or (" ".join(after_words).lower() in p_norm)
+            has_leftover_blank = bool(re.search(r"_{3,}", p))
+            if (not before_ok) or (not after_ok) or has_leftover_blank:
+                # 로컬 원문의 빈칸 위치에 정답 선지를 직접 1:1 치환하여 무손실 복원
+                filled = re.sub(r"\s*_{3,}\s*", f" {ans_choice} ", local_body, count=1)
+                filled = re.sub(r"\s+([.,?!;:])", r"\1", filled)
+                filled = re.sub(r"\s+", " ", filled).strip()
+                if filled:
+                    return filled
+
+    return p
 
 
 def analyze_english_exam_pdf_batch_with_gemini(
@@ -87,6 +171,7 @@ def analyze_english_exam_pdf_batch_with_gemini(
     answer_snippets: dict[int, str] | None = None,
     answer_pdf_part: Any | None = None,
     status_callback: Callable[[str], None] | None = None,
+    question_texts: dict[int, str] | None = None,
 ) -> dict[int, EnglishQuestionExtractionItem]:
     """
     영어 모의고사 문제지 PDF(및 해설지)를 일괄 분석하여
@@ -108,6 +193,7 @@ def analyze_english_exam_pdf_batch_with_gemini(
     )
 
     snippets_map = answer_snippets or {}
+    q_texts_map = question_texts or {}
     snippet_lines: list[str] = []
     for q in ordered_q:
         sn = (snippets_map.get(q) or "").strip()
@@ -169,7 +255,7 @@ def analyze_english_exam_pdf_batch_with_gemini(
             system_instruction=system_inst,
             response_mime_type="application/json",
             response_schema=BatchEnglishExamExtractionOutput,
-            temperature=0.1,
+            temperature=0.0,
             max_output_tokens=32768,
         ),
         fast_mode=True,
@@ -185,6 +271,13 @@ def analyze_english_exam_pdf_batch_with_gemini(
             item.answer = _normalize_extracted_answer(item.answer)
             if item.q_num <= 17:
                 item.passage_text = ""
+            else:
+                item.passage_text = _verify_and_fix_english_tagged_passage(
+                    item.q_num,
+                    item.passage_text,
+                    item.answer,
+                    local_question_text=q_texts_map.get(item.q_num, ""),
+                )
             _apply_lang_standard_validation(item, "영어")
             out[item.q_num] = item
 
@@ -275,14 +368,22 @@ def analyze_english_question_with_gemini(
             system_instruction=system_inst,
             response_mime_type="application/json",
             response_schema=EnglishSingleExtractionOutput,
-            temperature=0.1,
+            temperature=0.0,
         ),
         fast_mode=True,
     )
     single = _parse_structured(resp, EnglishSingleExtractionOutput)
     sec: Any = "듣기" if is_listening else "독해"
     grp_id = _infer_english_group_id(q_num, single.passage_group_id)
+    ans_norm = _normalize_extracted_answer(single.answer)
     p_text = "" if is_listening else (single.passage_text.strip() or shared_passage_hint.strip())
+    if not is_listening:
+        p_text = _verify_and_fix_english_tagged_passage(
+            q_num,
+            p_text,
+            ans_norm,
+            local_question_text=question_text_hint,
+        )
     _apply_lang_standard_validation(single, "영어")
     return EnglishQuestionExtractionItem(
         q_num=q_num,

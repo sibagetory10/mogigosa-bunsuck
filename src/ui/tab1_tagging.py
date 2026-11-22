@@ -541,6 +541,7 @@ def _tag_and_save_single_exam_inner(
                     answer_snippets=answer_snippets,
                     answer_pdf_part=answer_pdf_part,
                     status_callback=_status,
+                    question_texts={c.q_num: (c.extracted_text or "") for c in target_crops},
                 )
                 extracted_by_q.update(batch_map)
                 _log(
