@@ -880,7 +880,7 @@ class EnglishSentenceAnalysisItem(BaseModel):
     )
     korean_translation: str = Field(
         ...,
-        description="문맥에 맞춘 정확하고 자연스러운 한국어 해석",
+        description="구문 기호(/, [], ())나 직독직해 끊어쓰기 없이 한국어 어순에 맞게 작성한 자연스러운 일반 한국어 해석 문장",
     )
     syntax_notes: list[str] = Field(
         default_factory=list,

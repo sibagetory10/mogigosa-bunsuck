@@ -39,6 +39,7 @@ from src.models import (
     RewrittenQuestion,
     normalize_english_group_id,
 )
+from src.text_formatter import normalize_english_korean_translation
 from src.ui.common import _ensure_token_quota, _usage_scope
 from src.ui.context import AppContext
 from src.ui_styles import render_chips
@@ -220,6 +221,23 @@ def _execute_english_analysis_jobs(
         c_key = ctx.storage.build_english_analysis_key(p_txt, q_lbl)
         cached_an = ctx.storage.get_cached_english_analysis(c_key)
         cached_pdf = ctx.storage.get_english_analysis_pdf_bytes(c_key) if include_diagrams else None
+        if cached_an is not None and getattr(cached_an, "sentence_analyses", None):
+            _dirty_kor = False
+            for _sa in cached_an.sentence_analyses:
+                _orig_kor = (getattr(_sa, "korean_translation", "") or "").strip()
+                _norm_kor = normalize_english_korean_translation(_orig_kor)
+                if _norm_kor != _orig_kor:
+                    _sa.korean_translation = _norm_kor
+                    _dirty_kor = True
+            if _dirty_kor:
+                cached_pdf = None
+                ctx.storage.save_cached_english_analysis(
+                    c_key,
+                    cached_an,
+                    exam_name=it.get("exam_name", ""),
+                    q_label=q_lbl,
+                    question_type=it.get("orig_type", ""),
+                )
         prepared_slots.append(
             {
                 "item": it,
@@ -468,7 +486,7 @@ def _render_english_analysis_results_section() -> None:
                             else "border:1px solid #E2E8F0;background:#FFFFFF;"
                         )
                         chunk_html = _format_chunked_english_html(getattr(sa, "chunked_english", ""))
-                        kor_txt = _html.escape((getattr(sa, "korean_translation", "") or "").strip())
+                        kor_txt = _html.escape(normalize_english_korean_translation(getattr(sa, "korean_translation", "") or ""))
                         st.markdown(
                             f"<div style='{border_style}border-radius:6px;padding:10px 12px;margin-bottom:8px;'>"
                             f"<div style='margin-bottom:4px;'><strong style='color:#1E3A8A;'>{n_badge}</strong>{topic_html}</div>"

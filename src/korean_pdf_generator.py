@@ -13,6 +13,7 @@ import pymupdf
 from PIL import Image
 
 from src.diagram_renderer import render_korean_diagram_png
+from src.text_formatter import normalize_english_korean_translation
 
 def _join_korean_wrapped_line(prev_line: str, next_line: str) -> str:
     """2단 PDF 줄바꿈으로 끊긴 두 줄을 이어 붙일 때 단어·조사 중간에 불필요한 공백이 들어가지 않도록 보정한다."""
@@ -1616,7 +1617,7 @@ def _render_single_english_landscape_page(
             else ""
         )
         chunk_html = _format_chunked_english_html(getattr(sa, "chunked_english", ""))
-        kor_html = html.escape((getattr(sa, "korean_translation", "") or "").strip())
+        kor_html = html.escape(normalize_english_korean_translation(getattr(sa, "korean_translation", "") or ""))
 
         card_inner = (
             f"<div class='{card_cls}'>"

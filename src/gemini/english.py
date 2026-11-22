@@ -8,6 +8,7 @@ from typing import Any, Callable, Sequence
 from google.genai import types
 
 from src.config import EXAM_TAGGING_MODEL, FLASH_LITE_MODEL
+from src.text_formatter import normalize_english_korean_translation
 from src.gemini.core import (
     DEFAULT_API_TIMEOUT_SECONDS,
     _CIRCLED_DIGIT_TO_NUM,
@@ -684,7 +685,8 @@ def generate_english_passage_analysis(
         "     * **구 수식어(전치사구·분사구·to부정사 형용사/부사적 수식구·삽입구)**는 소괄호 `( ... )`로 감싸기 (예: `(in modern society)`, `(guided by intuition)`).\n"
         "     * **의미 단위/주어부·동사부·목적어 경계**에는 ` / ` 슬래시 넣기 (예: `The ability [to adapt (to rapid change)] / determines / [whether an organization thrives (in the long run)].`).\n"
         "     * 과도한 중첩으로 읽기가 망가지지 않도록 핵심 구문 경계 위주로 깔끔하게 끊고 묶으세요.\n"
-        "   - `korean_translation`: 문맥을 살린 정확하고 자연스러운 한국어 직역·의역 조화 해석.\n"
+        "   - `korean_translation`: **절대 `chunked_english`처럼 `/`, `[ ]`, `( )` 등의 끊어읽기·구문 기호를 넣거나 직독직해 어순으로 끊어 쓰지 마세요.** "
+        "한국어 어순에 맞게 문맥을 살린 정확하고 매끄러운 **일반 한국어 해석 문장**으로만 작성하세요.\n"
         "   - `syntax_notes`: 문장별 문법 설명은 출력하지 않으므로 반드시 빈 배열 `[]`로 두세요."
     )
 
@@ -716,6 +718,8 @@ def generate_english_passage_analysis(
     )
     out = _parse_structured(resp, EnglishPassageAnalysisOutput)
     if out.sentence_analyses:
+        for sa in out.sentence_analyses:
+            sa.korean_translation = normalize_english_korean_translation(sa.korean_translation)
         out.sentence_analyses = sorted(out.sentence_analyses, key=lambda x: x.sentence_num)
     return out
 

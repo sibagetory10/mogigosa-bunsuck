@@ -667,3 +667,27 @@ def strip_english_embedded_choices(stem_text: str) -> str:
                 break
         out.append(raw_ln)
     return "\n".join(out).strip()
+
+
+_ENG_KOR_CHUNK_MARKER_RE = re.compile(r"(?:^|\s)/(?:\s|$)|\[[^\]]+\]")
+
+
+def normalize_english_korean_translation(text: str) -> str:
+    """영어 정밀 지문 분석지의 한국어 해석에서 직독직해용 구문 기호(/, [], ())를 제거해 깔끔한 일반 해석으로 정규화한다."""
+    s = (text or "").strip()
+    if not s:
+        return ""
+    has_chunk_markers = bool(_ENG_KOR_CHUNK_MARKER_RE.search(s))
+    # 끊어읽기 슬래시 제거 (단, 단어 병기용 'A/B'는 유지)
+    s = re.sub(r"\s+/\s+", " ", s)
+    s = re.sub(r"^\s*/\s*|\s*/\s*$", " ", s)
+    # 절 묶음 대괄호 제거
+    s = s.replace("[", "").replace("]", "")
+    # 직독직해 기호가 감지된 경우 수식어구 묶음 소괄호도 제거
+    if has_chunk_markers:
+        s = s.replace("((", "").replace("))", "")
+        s = s.replace("(", "").replace(")", "")
+    s = re.sub(r"[ \t]+", " ", s).strip()
+    s = re.sub(r"\s+([.,?!;:])", r"\1", s)
+    return s
+
