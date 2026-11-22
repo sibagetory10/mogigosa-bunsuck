@@ -1130,9 +1130,22 @@ def _normalize_extracted_translation_by_type(
     qt = (orig_question_type or "").strip()
     ans_int = _parse_answer_int(answer)
 
-    # 40번 요약문: '→', '￫', '↓', '[요약문]' 이하 제거
+    # 40번 요약문: 요약문 해석('→', '->', '[요약문]', '요약문:', '(A)...(B)' 등) 이하 일체 제거
     if q_num == 40 or "요약" in qt:
-        txt = re.split(r"\s*(?:\[요약문\]|￫|→|↓|➜)\s*", txt, maxsplit=1)[0].strip()
+        txt = re.split(
+            r"\s*(?:"
+            r"[\[\<〈【]\s*요\s*약(?:\s*문)?(?:\s*해\s*석)?\s*[\]\>〉】]"
+            r"|[■▶●◆•◈▷▼▽]\s*요\s*약(?:\s*문)?(?:\s*해\s*석)?"
+            r"|(?:요약문(?:\s*해석)?|요약)\s*[:：]"
+            r"|￫|→|↓|➜|⇒|⇨|➡|➔|➝|➞|->"
+            r"|[\ue000-\uf8ff]"
+            r")\s*",
+            txt,
+            maxsplit=1,
+        )[0].strip()
+        m_ab_sent = re.search(r"(?:^|(?<=[.?!])\s+)(?=[^.?!]*\(A\)[^.?!]*\(B\))", txt)
+        if m_ab_sent:
+            txt = txt[: m_ab_sent.start()].strip()
 
     # 31~34번 빈칸: 해석에 ____가 남아 있고 선지 한국어 해석이 있으면 채움
     if (q_num in (31, 32, 33, 34) or "빈칸" in qt) and re.search(r"_{2,}", txt):
