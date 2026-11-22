@@ -31,13 +31,16 @@ from src.auth import (
     verify_session_token,
 )
 from src.config import DEFAULT_MODEL, FLASH_LITE_MODEL
-from src.google_oauth import (
+from src.auth.oauth import (
     build_google_authorize_url,
     create_google_oauth_state,
     exchange_google_code_for_userinfo,
     verify_google_oauth_state,
 )
-from src.storage import StorageManager
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from src.storage import StorageManager
 from src.ui.context import AppContext
 
 
@@ -526,14 +529,12 @@ def render_auth_and_sidebar(
             selected_model = FLASH_LITE_MODEL
 
             # 저장소 & DB 요약
-            all_records = storage.load_db()
-            all_concept_books = storage.load_concept_books()
+            q_count, exam_count, concept_book_count = storage.get_db_summary_counts()
             st.markdown("### 📊 기출 · 개념서 DB & 저장소")
             c1, c2, c3 = st.columns(3)
-            c1.metric("기출 문항", f"{len(all_records)}개")
-            unique_exams = sorted({r.exam_name for r in all_records})
-            c2.metric("등록 회차", f"{len(unique_exams)}회")
-            c3.metric("공용 개념서", f"{len(all_concept_books)}권")
+            c1.metric("기출 문항", f"{q_count}개")
+            c2.metric("등록 회차", f"{exam_count}회")
+            c3.metric("공용 개념서", f"{concept_book_count}권")
             st.caption("💾 서버 영구 저장소 (`./exam_db`, `./concept_db`)")
 
 

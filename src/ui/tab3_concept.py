@@ -10,27 +10,7 @@ import streamlit as st
 
 from src.auth import TIER_LABELS, can_access_shared_concept_db, resolve_model_for_user
 from src.config import CONCEPT_DB_BUILD_MODEL, EXAM_TAGGING_MODEL, MODEL_LABELS
-from src.curriculum_2022 import (
-    clear_ncic_standards_for_category,
-    fetch_and_sync_moe_2022_curriculum,
-    get_catalog_summary_stats,
-    merge_ncic_standards_to_catalog,
-    parse_ncic_curriculum_pdf,
-)
-from src.gemini import (
-    detect_concept_pages_with_ai,
-    extract_concept_book_cover_metadata,
-    extract_concept_book_units,
-)
 from src.models import ConceptBookRecord, ConceptUnit
-from src.pdf_parser import (
-    extract_concept_pages_by_ranges,
-    extract_first_page_for_metadata,
-    extract_pdf_page_catalog,
-    get_pdf_page_count,
-    parse_page_ranges_spec,
-    render_pdf_page_png,
-)
 from src.ui.common import (
     _ensure_token_quota,
     _usage_scope,
@@ -52,6 +32,14 @@ def _render_ncic_curriculum_manager(key_prefix: str = "ncic") -> None:
     with ncic_exp:
         if not is_container_open(ncic_exp):
             return
+        from src.curriculum_2022 import (
+            clear_ncic_standards_for_category,
+            fetch_and_sync_moe_2022_curriculum,
+            get_catalog_summary_stats,
+            merge_ncic_standards_to_catalog,
+            parse_ncic_curriculum_pdf,
+        )
+
         stats = get_catalog_summary_stats()
         st.caption(
             "기본적으로 2022 교육부 고시(제2022-33호) 공식 과목 편제표가 내장되어 있으며, "
@@ -183,6 +171,21 @@ def _render_concept_book_builder_section(ctx: AppContext, key_prefix: str = "tab
             key=f"{key_prefix}_pdf_uploader",
         )
         cb_pdf_bytes: bytes | None = cb_pdf_file.getvalue() if cb_pdf_file is not None else None
+        if cb_pdf_bytes is not None:
+            from src.gemini import (
+                detect_concept_pages_with_ai,
+                extract_concept_book_cover_metadata,
+                extract_concept_book_units,
+            )
+            from src.pdf_parser import (
+                extract_concept_pages_by_ranges,
+                extract_first_page_for_metadata,
+                extract_pdf_page_catalog,
+                get_pdf_page_count,
+                parse_page_ranges_spec,
+                render_pdf_page_png,
+            )
+
         cb_sig = f"{cb_pdf_file.name}:{cb_pdf_file.size}" if cb_pdf_file is not None else ""
 
         if not cb_sig:

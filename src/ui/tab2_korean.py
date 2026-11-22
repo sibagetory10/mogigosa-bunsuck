@@ -15,18 +15,6 @@ from src.config import (
     EXAM_TAGGING_MODEL,
     MODEL_LABELS,
 )
-from src.diagram_renderer import render_korean_diagram_png
-from src.gemini.korean import (
-    generate_korean_passage_analysis,
-    generate_korean_set_reconstruction,
-    generate_korean_visual_diagram,
-)
-from src.korean_pdf_generator import (
-    _is_korean_poetry_item,
-    generate_korean_passage_analysis_pdf,
-    generate_korean_passage_only_pdf,
-    merge_korean_analysis_pdfs,
-)
 from src.models import normalize_korean_group_id
 
 
@@ -48,7 +36,7 @@ def render_tab2_korean_transform_section(
         f"해당 세트의 문항 수만큼 AI가 핵심 출제 포인트를 바탕으로 **자유 유형 세트 문항을 일괄 재창작**합니다. ({max_limit_badge})"
     )
 
-    all_db = storage.load_db()
+    all_db = storage.load_db_readonly()
     kor_recs = [
         r
         for r in all_db
@@ -252,6 +240,8 @@ def render_tab2_korean_transform_section(
                     m_sub = re.search(r"\(([^)]+)\)", curr_subj)
                     kor_sub = m_sub.group(1) if m_sub else ""
                     try:
+                        from src.gemini.korean import generate_korean_set_reconstruction
+
                         pairs = generate_korean_set_reconstruction(
                             api_key=kor_api_key,
                             model_name=EXAM_TAGGING_MODEL,
@@ -352,6 +342,8 @@ def render_tab2_korean_transform_section(
                 ):
                     if missing_ai_indices:
                         def _run_ai_slot(slot_i: int):
+                            from src.gemini.korean import generate_korean_passage_analysis
+
                             slot = prepared_slots[slot_i]
                             s_entry = slot["entry"]
                             an_out = generate_korean_passage_analysis(
@@ -396,6 +388,8 @@ def render_tab2_korean_transform_section(
                     ]
                     if valid_diag_indices:
                         def _run_diag_slot(slot_i: int):
+                            from src.gemini.korean import generate_korean_visual_diagram
+
                             slot = prepared_slots[slot_i]
                             s_entry = slot["entry"]
                             cur_an = slot["analysis"]
@@ -435,6 +429,13 @@ def render_tab2_korean_transform_section(
 
         analyses_list: list[dict[str, Any]] = []
         pdf_parts: list[bytes] = []
+        if prepared_slots:
+            from src.pdf.korean_analysis_pdf import (
+                _is_korean_poetry_item,
+                generate_korean_passage_analysis_pdf,
+                generate_korean_passage_only_pdf,
+            )
+
         for slot in prepared_slots:
             if slot["analysis"] is None and slot["pdf_bytes"] is None:
                 continue
@@ -485,6 +486,8 @@ def render_tab2_korean_transform_section(
 
         if pdf_parts:
             try:
+                from src.pdf.common import merge_korean_analysis_pdfs
+
                 pdf_bytes = merge_korean_analysis_pdfs(pdf_parts)
                 st.session_state["kor_analysis_results"] = analyses_list
                 st.session_state["kor_analysis_pdf"] = pdf_bytes
@@ -534,6 +537,8 @@ def render_tab2_korean_transform_section(
                         or getattr(_v_diag, "emotion_points", None)
                     ):
                         try:
+                            from src.diagram_renderer import render_korean_diagram_png
+
                             st.image(
                                 render_korean_diagram_png(_v_diag),
                                 caption=f"🖼️ {_v_diag.title}",

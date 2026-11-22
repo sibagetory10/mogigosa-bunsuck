@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from src.models import UserRecord
-from src.storage import StorageManager
+if TYPE_CHECKING:
+    from src.models import UserRecord
+    from src.storage import StorageManager
 
 
 @dataclass

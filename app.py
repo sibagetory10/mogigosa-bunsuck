@@ -8,7 +8,6 @@ from src.config import (
     resolve_google_login_config,
 )
 from src.fx_rate import start_daily_midnight_fx_scheduler
-from src.ui.admin_tab import render_admin_panel
 from src.ui.auth_sidebar import render_auth_and_sidebar, render_guest_landing
 from src.ui.common import (
     create_lazy_tabs,
@@ -16,11 +15,6 @@ from src.ui.common import (
     init_session_defaults,
     is_container_open,
 )
-from src.ui.my_exams_tab import render_my_exams_tab
-from src.ui.tab1_upload import render_tab1
-from src.ui.tab2_transform import render_tab2
-from src.ui.tab3_concept import render_tab3
-from src.ui.tab4_dictionary import render_tab4
 from src.ui_styles import inject_responsive_css
 
 st.set_page_config(
@@ -82,25 +76,37 @@ else:
 
 with tab1:
     if is_container_open(tab1):
+        from src.ui.tab1_upload import render_tab1
+
         render_tab1(ctx)
 
 with tab2:
     if is_container_open(tab2):
+        from src.ui.tab2_transform import render_tab2
+
         render_tab2(ctx)
 
 with tab3:
     if is_container_open(tab3):
+        from src.ui.tab3_concept import render_tab3
+
         render_tab3(ctx)
 
 with tab4:
     if is_container_open(tab4):
+        from src.ui.tab4_dictionary import render_tab4
+
         render_tab4(ctx)
 
 with my_exams_tab:
     if is_container_open(my_exams_tab):
+        from src.ui.my_exams_tab import render_my_exams_tab
+
         render_my_exams_tab(ctx)
 
 if admin_tab is not None:
     with admin_tab:
         if is_container_open(admin_tab):
+            from src.ui.admin_tab import render_admin_panel
+
             render_admin_panel(ctx)

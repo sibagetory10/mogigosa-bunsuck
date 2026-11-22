@@ -1,156 +1,17 @@
-"""Backwards-compatible facade for Gemini API services.
-
-Implementations live in the ``src.gemini`` subpackage.
-"""
+"""Backwards-compatible lazy proxy facade for Gemini API services."""
 
 from __future__ import annotations
 
-from src.gemini.core import (  # noqa: F401
-    _ACTIVE_USAGE_RECORDER,
-    _ANSWER_PREFIX_RE,
-    _CHOICE_NUM_ONLY_RE,
-    _CHOICE_NUM_PREFIX_RE,
-    _CIRCLED_DIGIT_TO_NUM,
-    DEFAULT_API_TIMEOUT_SECONDS,
-    FALLBACK_MODEL_ORDER,
-    MAX_VISION_IMAGE_WIDTH,
-    OVERLOAD_RETRY_DELAYS,
-    RATE_LIMIT_FALLBACK_ORDER,
-    ForbiddenTermRemainingError,
-    ScannedBox,
-    ScannedPageBoxes,
-    T,
-    TokenUsageRecord,
-    _apply_lang_standard_validation,
-    _build_400_recovery_configs,
-    _build_client,
-    _build_lang_ncic_grounding_section,
-    _call_with_retry,
-    _clone_config_for_model,
-    _emit_usage_from_response,
-    _generate_content_with_fallback,
-    _is_fatal_config_or_auth_error,
-    _is_flash_lite_model,
-    _is_model_not_found_error,
-    _is_rate_limit_error,
-    _is_server_overload_error,
-    _is_timeout_error,
-    _normalize_extracted_answer,
-    _parse_structured,
-    _with_thinking_config,
-    bind_usage_tracker,
-    build_gemini_client,
-    build_model_fallback_chain,
-    calculate_token_cost_usd,
-    extract_usage_from_response,
-    has_active_usage_tracker,
-    optimize_image_for_vision,
-    prepare_pdf_part,
-    submit_with_usage_context,
-)
-from src.gemini.exam_tagging import (  # noqa: F401
-    MAX_PAIRING_VISION_IMAGES,
-    _append_pairing_vision_parts,
-    _format_pairing_item_summary,
-    analyze_exam_pdf_batch_with_gemini,
-    analyze_question_with_gemini,
-    classify_mixed_exam_pdfs_with_ai,
-    detect_scanned_question_boxes,
-    extract_exam_header_metadata,
-    match_problem_and_answer_pdfs_with_ai,
-)
-from src.gemini.concept_book import (  # noqa: F401
-    _coalesce_concept_ranges,
-    _extract_concept_toc_with_ai,
-    _has_rich_extracted_text,
-    _is_same_unit_hint,
-    _merge_concept_units,
-    _run_chunk_with_backoff,
-    detect_concept_pages_with_ai,
-    extract_concept_book_cover_metadata,
-    extract_concept_book_units,
-    extract_concept_whitelist,
-    match_questions_to_whitelist,
-)
-from src.gemini.rewrite import (  # noqa: F401
-    chat_followup_with_pdf,
-    generate_pdf_grounded_explanation,
-    rewrite_question_for_pdf,
-)
-from src.gemini.english_validators import (  # noqa: F401
-    _AI_META_MONOLOGUE_RE,
-    _COMMON_ENG_VERBS,
-    _DANGLING_TO_END_RE,
-    _EXAM_STRUCTURE_MARKER_RE,
-    _FOREIGN_SCRIPT_RE,
-    _INCOMPLETE_BLANK_RE,
-    _ORDER_SEQ_RE,
-    _REPEATABLE_PREPS,
-    _SENT_ABBREV_RE,
-    _UNEXPECTED_CJK_HANJA_RE,
-    _assemble_english_slim_stem,
-    _build_english_transform_rule,
-    _check_chunked_english_fidelity,
-    _count_english_sentences,
-    _detect_foreign_script_contamination,
-    _enforce_english_analysis_token_guard,
-    _ensure_korean_instruction_prefix,
-    _extract_english_exam_context,
-    _extract_english_footnotes,
-    _extract_english_word_tokens,
-    _extract_given_sentence_from_insertion_stem,
-    _has_exam_structure_markers,
-    _has_incomplete_english_blank,
-    _has_order_scrambled_sentences,
-    _infer_blank_phrase_by_diff,
-    _is_irrelevant_answer_from_source,
-    _is_order_abc_canonical,
-    _needs_english_passage_restoration,
-    _normalize_syntax_bracket_consistency,
-    _preprocess_english_source_passage,
-    _project_chunk_markup_onto_source,
-    _rebuild_insertion_stem_from_source,
-    _reconcile_english_insertion_answer,
-    _reconcile_english_order_answer,
-    _reconcile_english_passage_with_question_text,
-    _reconcile_english_summary_answer,
-    _repair_english_analysis_output,
-    _resolve_english_exam_point_title,
-    _sentence_has_english_verb,
-    _split_english_sentences,
-    _strip_spurious_quotes_against_source,
-    _validate_english_analysis_output,
-    _validate_english_transformed_output,
-)
-from src.gemini.english import (  # noqa: F401
-    _ENGLISH_DIAGRAM_GUIDE,
-    _RESTORED_PASSAGE_CACHE,
-    _RESTORED_PASSAGE_LOCK,
-    _infer_english_group_id,
-    _restore_incomplete_source_passage,
-    analyze_english_exam_pdf_batch_with_gemini,
-    analyze_english_question_with_gemini,
-    chat_followup_with_english,
-    generate_english_explanation,
-    generate_english_passage_analysis,
-    generate_english_transformed_question,
-    generate_english_visual_diagram,
-)
-from src.gemini.korean import (  # noqa: F401
-    _KOREAN_DIAGRAM_GUIDE,
-    _KOREAN_LIT_DIAGRAM_GUIDE,
-    _is_korean_poetry_genre,
-    _sanitize_korean_analysis_output,
-    _strip_korean_exam_noise_lines,
-    _sync_korean_group_passages,
-    analyze_korean_exam_pdf_batch_with_gemini,
-    analyze_korean_question_with_gemini,
-    fetch_korean_literature_web_brief,
-    generate_korean_passage_analysis,
-    generate_korean_set_reconstruction,
-    generate_korean_visual_diagram,
-    proofread_korean_passage_analysis,
-)
-from src.gemini.dictionary import (  # noqa: F401
-    lookup_english_word_with_gemini,
-)
+from typing import Any
+
+import src.gemini as _gemini_pkg
+
+__all__ = list(_gemini_pkg.__all__)
+
+
+def __getattr__(name: str) -> Any:
+    return getattr(_gemini_pkg, name)
+
+
+def __dir__() -> list[str]:
+    return _gemini_pkg.__dir__()

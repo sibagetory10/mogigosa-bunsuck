@@ -6,18 +6,17 @@ import json
 import secrets
 import time
 import urllib.parse
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-import requests
-
-from src.auth import (
+from src.auth.tokens import (
     _b64url_decode,
     _b64url_encode,
     _get_session_signing_key,
     normalize_username,
 )
-from src.config import GoogleLoginConfig
-from src.storage import StorageManager
+if TYPE_CHECKING:
+    from src.config import GoogleLoginConfig
+    from src.storage import StorageManager
 
 GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
@@ -112,6 +111,8 @@ def exchange_google_code_for_userinfo(
     clean_code = (code or "").strip()
     if not clean_code:
         raise ValueError("Google 인증 코드(code)가 비어 있습니다.")
+
+    import requests
 
     token_resp = requests.post(
         GOOGLE_TOKEN_URL,

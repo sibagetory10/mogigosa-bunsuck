@@ -8,8 +8,6 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-import requests
-
 from src.config import DEFAULT_USD_TO_KRW, resolve_usd_to_krw_rate
 
 KST = timezone(timedelta(hours=9))
@@ -65,6 +63,8 @@ def _fetch_google_cloud_billing_krw_rate(api_keys: list[str], timeout_sec: int =
     1순위: Google Cloud Billing Catalog API에서 실제 Google Cloud/Gemini API KRW 고시 환율
     (pricingInfo[].currencyConversionRate)을 직접 조회한다.
     """
+    import requests
+
     seen: set[str] = set()
     for raw_key in api_keys:
         key = (raw_key or "").strip()
@@ -100,6 +100,8 @@ def _fetch_frankfurter_monthly_krw_rate(billing_month: str, timeout_sec: int = 8
     2순위: Google Cloud의 '매월 초 주요 금융기관 고시 환율 고정' 정책에 맞춰
     Frankfurter API(중앙은행 고시 환율)에서 해당 월 1일 기준 USD->KRW 환율을 조회한다.
     """
+    import requests
+
     month_start = f"{billing_month}-01"
     urls = [
         (f"https://api.frankfurter.dev/v1/{month_start}", f"금융기관 월초 고시 환율 (Frankfurter · {month_start})"),
@@ -126,6 +128,8 @@ def _fetch_frankfurter_monthly_krw_rate(billing_month: str, timeout_sec: int = 8
 
 def _fetch_open_er_api_krw_rate(timeout_sec: int = 8) -> tuple[float, str] | None:
     """3순위: ExchangeRate-API(open.er-api.com) 무료 공개 엔드포인트에서 USD->KRW 환율을 조회한다."""
+    import requests
+
     try:
         resp = requests.get("https://open.er-api.com/v6/latest/USD", timeout=timeout_sec)
         if resp.status_code != 200:

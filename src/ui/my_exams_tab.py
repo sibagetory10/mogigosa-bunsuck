@@ -63,7 +63,12 @@ def _render_my_exams_tab(ctx: AppContext) -> None:
                     )
                 st.caption(" · ".join(meta_parts))
             with top_c2:
-                pdf_data = ctx.storage.get_user_exam_pdf_bytes(ctx.current_user.username, ex_id)
+                has_pdf_flag = bool(ex.get("has_pdf") or ex.get("pdf_filename"))
+                pdf_data = (
+                    ctx.storage.get_user_exam_pdf_bytes(ctx.current_user.username, ex_id)
+                    if has_pdf_flag
+                    else None
+                )
                 if pdf_data:
                     st.download_button(
                         label=f"⬇️ PDF ({len(pdf_data) // 1024}KB)",

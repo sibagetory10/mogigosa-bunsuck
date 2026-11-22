@@ -23,13 +23,7 @@ from src.auth import (
     resolve_active_gemini_api_key,
 )
 from src.config import CONCEPT_SCOPE_MODEL, EXAM_TAGGING_MODEL
-from src.gemini import (
-    ForbiddenTermRemainingError,
-    extract_concept_whitelist,
-    match_questions_to_whitelist,
-    rewrite_question_for_pdf,
-    submit_with_usage_context,
-)
+from src.gemini.usage import ForbiddenTermRemainingError
 from src.models import (
     ConceptUnit,
     ConceptWhitelist,
@@ -37,13 +31,6 @@ from src.models import (
     RewrittenQuestion,
     build_whitelist_from_concept_units,
     resolve_question_concept_reference,
-)
-from src.pdf_generator import generate_custom_exam_pdf
-from src.pdf_parser import (
-    extract_concept_pages_by_ranges,
-    get_pdf_page_count,
-    parse_page_ranges_spec,
-    render_pdf_page_png,
 )
 from src.text_formatter import has_visual_reference
 from src.ui.common import (
@@ -59,10 +46,6 @@ from src.ui.common import (
     sanitize_id_part,
 )
 from src.ui.context import AppContext
-from src.ui.tab2_english import _render_tab2_english_transform_section
-from src.ui.tab2_korean import render_tab2_korean_transform_section
-from src.ui.tab2_quiz import _render_mode_b_solve_fragment
-from src.ui.tab3_concept import render_concept_book_builder_section
 from src.ui_styles import render_chips
 
 
@@ -212,6 +195,8 @@ def _render_tab2_shared_concept_db_panel(ctx: AppContext) -> None:
             )
             with cb_inline_exp:
                 if is_container_open(cb_inline_exp):
+                    from src.ui.tab3_concept import render_concept_book_builder_section
+
                     render_concept_book_builder_section(ctx, key_prefix="tab2_inline")
 
 
@@ -224,6 +209,13 @@ def _render_tab2_direct_pdf_panel(ctx: AppContext) -> None:
 
     concept_pdf_bytes: bytes | None = concept_file.getvalue() if concept_file is not None else None
     if concept_pdf_bytes is not None:
+        from src.pdf_parser import (
+            extract_concept_pages_by_ranges,
+            get_pdf_page_count,
+            parse_page_ranges_spec,
+            render_pdf_page_png,
+        )
+
         cur_pdf_hash = hashlib.sha256(concept_pdf_bytes).hexdigest()[:16]
         if st.session_state["concept_pdf_hash"] and st.session_state["concept_pdf_hash"] != cur_pdf_hash:
             st.session_state["concept_whitelist"] = None
@@ -295,6 +287,8 @@ def _render_tab2_direct_pdf_panel(ctx: AppContext) -> None:
                             concept_pdf_bytes, parsed_direct_ranges
                         )
                         try:
+                            from src.gemini import extract_concept_whitelist
+
                             with _usage_scope(ctx):
                                 wl = extract_concept_whitelist(
                                     api_key=scope_api_key,
@@ -321,6 +315,8 @@ def _render_tab2_direct_pdf_panel(ctx: AppContext) -> None:
 
 def _render_tab2_korean_transform_section(ctx: AppContext) -> None:
     """[탭 2 - 국어 모드] src/ui/tab2_korean.py로 분리된 국어 세트 변형·분석 UI를 호출한다."""
+    from src.ui.tab2_korean import render_tab2_korean_transform_section
+
     render_tab2_korean_transform_section(
         storage=ctx.storage,
         current_user=ctx.current_user,
@@ -345,6 +341,8 @@ def render_tab2(ctx: AppContext) -> None:
     is_tab2_korean_mode = tab2_domain_mode.startswith("📖")
     is_tab2_concept_mode = not is_tab2_english_mode and not is_tab2_korean_mode
     if is_tab2_english_mode:
+        from src.ui.tab2_english import _render_tab2_english_transform_section
+
         _render_tab2_english_transform_section(ctx)
     elif is_tab2_korean_mode:
         _render_tab2_korean_transform_section(ctx)
@@ -439,7 +437,7 @@ def render_tab2(ctx: AppContext) -> None:
                 )
 
             if run_extract_btn:
-                db_list = ctx.storage.load_db()
+                db_list = ctx.storage.load_db_readonly()
                 match_api_key, match_key_label = resolve_active_gemini_api_key(
                     ctx.current_user, ctx.creds.gemini_api_key, model_name=match_model
                 )
@@ -479,6 +477,12 @@ def render_tab2(ctx: AppContext) -> None:
                     else:
                         with _usage_scope(ctx):
                             with st.spinner(f"후보 {len(candidates)}개 문항의 핵심 원리를 개념서 범위와 대조 중..."):
+                                from src.gemini import (
+                                    match_questions_to_whitelist,
+                                    rewrite_question_for_pdf,
+                                    submit_with_usage_context,
+                                )
+
                                 try:
                                     judgments = match_questions_to_whitelist(
                                         api_key=match_api_key,
@@ -783,6 +787,8 @@ def render_tab2(ctx: AppContext) -> None:
 
                     if build_pdf_btn:
                         with st.spinner("PDF 조판 및 뒷장 정답·해설 페이지 생성 중..."):
+                            from src.pdf.exam_pdf import generate_custom_exam_pdf
+
                             pdf_bytes = generate_custom_exam_pdf(
                                 items=matched_items,
                                 exam_title=pdf_title.strip() or "맞춤형 기출 모의고사",
@@ -818,6 +824,8 @@ def render_tab2(ctx: AppContext) -> None:
 
         # ----- 모드 B: 웹에서 바로 풀기 & 자동 채점 + AI 자동 해설 -----
         with mode_tab_b:
+            from src.ui.tab2_quiz import _render_mode_b_solve_fragment
+
             _render_mode_b_solve_fragment(ctx, 
                 matched_items=matched_items,
                 whitelist=whitelist,

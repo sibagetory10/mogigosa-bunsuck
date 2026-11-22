@@ -7,15 +7,7 @@ import streamlit as st
 
 from src.auth import resolve_active_gemini_api_key
 from src.config import EXAM_TAGGING_MODEL
-from src.gemini import (
-    ForbiddenTermRemainingError,
-    chat_followup_with_english,
-    chat_followup_with_pdf,
-    generate_english_explanation,
-    generate_english_transformed_question,
-    generate_pdf_grounded_explanation,
-    rewrite_question_for_pdf,
-)
+from src.gemini.usage import ForbiddenTermRemainingError
 from src.models import (
     ConceptWhitelist,
     QuestionRecord,
@@ -274,6 +266,8 @@ def _render_mode_b_solve_fragment(
                     elif is_eng_item:
                         with st.spinner("영어 구문·논리·오답 분석 해설 생성 중..."):
                             try:
+                                from src.gemini import generate_english_explanation
+
                                 with _usage_scope(ctx):
                                     exp_md = generate_english_explanation(
                                         api_key=active_gemini_key,
@@ -291,6 +285,8 @@ def _render_mode_b_solve_fragment(
                     else:
                         with st.spinner("개념서 범위 내 용어만 사용하여 맞춤 해설 작성 중..."):
                             try:
+                                from src.gemini import generate_pdf_grounded_explanation
+
                                 with _usage_scope(ctx):
                                     exp_md = generate_pdf_grounded_explanation(
                                         api_key=active_gemini_key,
@@ -330,6 +326,8 @@ def _render_mode_b_solve_fragment(
                         eff_eng_key = eng_rw_key or active_gemini_key
                         with st.spinner(f"'{eng_target_type}' 유형으로 이 지문을 새롭게 다시 변형 중..."):
                             try:
+                                from src.gemini import generate_english_transformed_question
+
                                 with _usage_scope(ctx):
                                     new_rw = generate_english_transformed_question(
                                         api_key=eff_eng_key,
@@ -365,6 +363,8 @@ def _render_mode_b_solve_fragment(
                                     or []
                                 )
                                 math_rw_model = EXAM_TAGGING_MODEL
+                                from src.gemini import rewrite_question_for_pdf
+
                                 with _usage_scope(ctx):
                                     new_rw = rewrite_question_for_pdf(
                                         api_key=active_gemini_key,
@@ -423,6 +423,8 @@ def _render_mode_b_solve_fragment(
                             try:
                                 with _usage_scope(ctx):
                                     if is_eng_item:
+                                        from src.gemini import chat_followup_with_english
+
                                         reply = chat_followup_with_english(
                                             api_key=active_gemini_key,
                                             model_name=selected_model,
@@ -432,6 +434,8 @@ def _render_mode_b_solve_fragment(
                                             user_query=followup_q.strip(),
                                         )
                                     else:
+                                        from src.gemini import chat_followup_with_pdf
+
                                         reply = chat_followup_with_pdf(
                                             api_key=active_gemini_key,
                                             model_name=selected_model,

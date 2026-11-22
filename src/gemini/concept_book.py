@@ -35,7 +35,6 @@ from src.models import (
     QuestionRecord,
     TocExtractionOutput,
 )
-from src.pdf_parser import extract_specific_pages_slice
 
 
 def _extract_concept_toc_with_ai(
@@ -90,6 +89,8 @@ def _extract_concept_toc_with_ai(
             )
             contents: Any = prompt
         else:
+            from src.pdf_parser import extract_specific_pages_slice
+
             slice_b, _ = extract_specific_pages_slice(
                 pdf_bytes,
                 target_pages[:15],
@@ -395,6 +396,8 @@ def detect_concept_pages_with_ai(
             )
 
         def _detect_scan_batch(batch_pages: list[int]) -> AutoConceptPageDetectionOutput:
+            from src.pdf_parser import extract_specific_pages_slice
+
             b_label = f"p.{batch_pages[0]}~p.{batch_pages[-1]}"
             slice_b, _ = extract_specific_pages_slice(
                 pdf_bytes,
@@ -609,6 +612,8 @@ def extract_concept_book_units(
     chunk_size = 50 if is_text_rich_book else 25
 
     if original_pdf_bytes is not None and kept_pages and len(kept_pages) > chunk_size:
+        from src.pdf_parser import extract_specific_pages_slice
+
         chunk_specs: list[tuple[bytes | None, str, str, int]] = []
         total_chunks = (len(kept_pages) + chunk_size - 1) // chunk_size
         for c_idx, offset in enumerate(range(0, len(kept_pages), chunk_size), start=1):

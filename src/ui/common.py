@@ -6,7 +6,7 @@ import html as _html
 import json
 import re
 import threading
-from typing import Any, Sequence
+from typing import TYPE_CHECKING, Any, Sequence
 
 import streamlit as st
 
@@ -19,22 +19,12 @@ from src.auth import (
     record_token_usage,
     resolve_model_for_user,
 )
-from src.exporters import build_exam_ai_jsonl, build_exam_html, build_exam_markdown
-from src.gemini import TokenUsageRecord, bind_usage_tracker, has_active_usage_tracker
-from src.models import (
-    QuestionMatchJudgment,
-    QuestionRecord,
-    RewrittenQuestion,
-    infer_subject_category,
-)
-from src.storage import StorageManager
-from src.text_formatter import (
-    format_chemical_scripts,
-    render_english_inline_html,
-    split_english_stem_blocks,
-    split_stem_blocks,
-)
+from src.gemini.usage import TokenUsageRecord, bind_usage_tracker, has_active_usage_tracker
 from src.ui.context import AppContext
+
+if TYPE_CHECKING:
+    from src.models import QuestionMatchJudgment, QuestionRecord, RewrittenQuestion
+    from src.storage import StorageManager
 
 CIRCLED_MAP = {"1": "①", "2": "②", "3": "③", "4": "④", "5": "⑤"}
 REVERSE_CIRCLED_MAP = {v: k for k, v in CIRCLED_MAP.items()}
@@ -111,6 +101,8 @@ init_session_defaults = _init_session_defaults
 
 @st.cache_resource(ttl=1800, show_spinner=False)
 def _get_cached_storage(local_root: str) -> StorageManager:
+    from src.storage import StorageManager
+
     return StorageManager(local_root=local_root)
 
 
@@ -249,6 +241,8 @@ def _build_cached_exam_exports(
     except Exception:
         pass
 
+    from src.exporters import build_exam_ai_jsonl, build_exam_html, build_exam_markdown
+
     html_str = build_exam_html(
         exam_name,
         subj_cat,
@@ -279,6 +273,8 @@ build_cached_exam_exports = _build_cached_exam_exports
 
 def _render_english_rewritten_card_html(rw: RewrittenQuestion) -> str:
     """영어 수능형 변형 문항의 밑줄(<u>)·빈칸·[주어진 문장]·(A)-(B)-(C) 순서·[요약문] 박스 HTML을 조립한다."""
+    from src.text_formatter import render_english_inline_html, split_english_stem_blocks
+
     blocks = split_english_stem_blocks(rw.rewritten_stem)
     body_parts: list[str] = []
     for kind, content in blocks:
@@ -329,6 +325,8 @@ def _render_rewritten_card_html(rw: RewrittenQuestion) -> str:
     """개조 문항의 <자료>·<보기> 분리 박스, 화학식 첨자(영어는 수능형 밑줄/박스), 선지 HTML을 모던 학습지 스타일로 조립한다."""
     if getattr(rw, "subject_domain", "") == "영어":
         return _render_english_rewritten_card_html(rw)
+    from src.text_formatter import format_chemical_scripts, split_stem_blocks
+
     blocks = split_stem_blocks(rw.rewritten_stem)
     body_parts: list[str] = []
     for kind, content in blocks:
@@ -436,6 +434,8 @@ record_english_seen_for_user = _record_english_seen_for_user
 
 
 def _infer_exam_subject(items: list[dict[str, Any]]) -> str:
+    from src.models import infer_subject_category
+
     subjects: list[str] = []
     for it in items:
         q_obj: QuestionRecord = it["question"]
@@ -488,6 +488,8 @@ def _serialize_matched_items(items: list[dict[str, Any]]) -> list[dict[str, Any]
 
 
 def _deserialize_matched_items(raw_items: list[dict[str, Any]], storage: StorageManager) -> list[dict[str, Any]]:
+    from src.models import QuestionMatchJudgment, QuestionRecord, RewrittenQuestion
+
     restored: list[dict[str, Any]] = []
     for raw in raw_items:
         try:

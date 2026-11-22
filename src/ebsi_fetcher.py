@@ -4,9 +4,6 @@ import re
 from dataclasses import dataclass, field
 from urllib.parse import urljoin, urlparse
 
-import requests
-from bs4 import BeautifulSoup
-
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -59,6 +56,9 @@ def attempt_ebsi_pdf_fetch(url: str, timeout_sec: int = 15) -> EbsiFetchResult:
             success=False,
             message="올바른 http/https URL을 입력해 주세요. 바로 아래 [수동 업로드]를 이용하시면 가장 빠르고 정확합니다.",
         )
+
+    import requests
+    from bs4 import BeautifulSoup
 
     session = requests.Session()
     session.headers.update(
