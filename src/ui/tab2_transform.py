@@ -667,7 +667,10 @@ def render_tab2(ctx: AppContext) -> None:
                     + ref_preview
                 )
 
-    if matched_items:
+    is_eng_analysis_submode = is_tab2_english_mode and str(
+        st.session_state.get("tab2_eng_sub_mode", "")
+    ).startswith("📑")
+    if matched_items and not is_eng_analysis_submode:
         st.markdown("---")
         if len(matched_items) >= 2:
             shuf_c1, shuf_c2, shuf_c3 = st.columns([1.15, 1.05, 2.3])

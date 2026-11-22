@@ -485,9 +485,119 @@ def _render_english_analysis_results_section() -> None:
                         )
 
 
-def _render_tab2_english_transform_section(ctx: AppContext) -> None:
-    """탭 2 영어 과목 전용: 기출 영어 지문 검색/직접 입력, 정밀 지문 분석지 PDF 생성 및 수능 11개 독해 유형 변형 UI."""
-    st.subheader("1️⃣ 영어 지문 선택 · 정밀 분석지 PDF & 수능 독해 유형 변형")
+def _filter_english_db_passages(
+    ctx: AppContext,
+    key_prefix: str,
+) -> tuple[bool, list[tuple[QuestionRecord, str]]]:
+    """기출 DB 영어 독해 지문을 조회하고 회차·원래 유형·키워드·제외문항 필터 UI를 렌더링한다."""
+    all_db = ctx.storage.load_db()
+    eng_reading_recs = [
+        r
+        for r in all_db
+        if r.subject_category == "영어"
+        and (getattr(r, "english_section", "") == "독해" or r.q_num >= 18)
+        and bool((getattr(r, "passage_text", "") or "").strip())
+    ]
+
+    if not eng_reading_recs:
+        st.info(
+            "아직 DB에 저장된 **영어 독해(18~45번) 지문**이 없습니다. "
+            "**[📥 탭 1]**에서 영어 모의고사 문제지+해설지 PDF를 먼저 수집·추출하거나, "
+            "우측 **[✍️ 새 영어 지문 직접 붙여넣기]** 탭을 이용해 주세요."
+        )
+        return False, []
+
+    f_c1, f_c2, f_c3 = st.columns([1.2, 1.1, 1.3])
+    avail_eng_exams = sorted({r.exam_name for r in eng_reading_recs}, reverse=True)
+    avail_eng_types = sorted(
+        {
+            (getattr(r, "english_question_type", "") or r.unit_name).strip()
+            for r in eng_reading_recs
+            if (getattr(r, "english_question_type", "") or r.unit_name).strip()
+        }
+    )
+    with f_c1:
+        sel_eng_exam = st.selectbox(
+            "모의고사 회차 필터",
+            options=["전체"] + avail_eng_exams,
+            key=f"{key_prefix}_filter_exam",
+        )
+    with f_c2:
+        sel_eng_orig_type = st.selectbox(
+            "원래 문항 유형 필터",
+            options=["전체"] + avail_eng_types,
+            key=f"{key_prefix}_filter_type",
+        )
+    with f_c3:
+        eng_kw = st.text_input(
+            "주제·어휘·지문 키워드 검색",
+            placeholder="예: artificial intelligence, climate, 감정...",
+            key=f"{key_prefix}_filter_kw",
+        )
+
+    include_excluded_q = st.checkbox(
+        "목적·심경·도표·내용일치·실용문·장문(18, 19, 25, 26, 27, 28, 43, 44, 45번) 지문도 목록에 포함",
+        value=False,
+        key=f"{key_prefix}_include_excluded_q",
+    )
+
+    # 필터링 및 세트 지문(41~42, 43~45) 중복 묶음 처리
+    filtered_passages: list[tuple[QuestionRecord, str]] = []
+    seen_group_keys: set[tuple[str, str]] = set()
+    kw_low = (eng_kw or "").strip().lower()
+
+    for r in sorted(eng_reading_recs, key=lambda x: (x.exam_name, x.q_num)):
+        if not include_excluded_q and r.q_num in ENGLISH_DEFAULT_EXCLUDED_Q_NUMS:
+            continue
+        if sel_eng_exam != "전체" and r.exam_name != sel_eng_exam:
+            continue
+        r_orig_t = (getattr(r, "english_question_type", "") or r.unit_name).strip()
+        if sel_eng_orig_type != "전체" and r_orig_t != sel_eng_orig_type:
+            continue
+        if kw_low:
+            blob = " ".join(
+                [
+                    r.exam_name,
+                    r_orig_t,
+                    getattr(r, "passage_topic", ""),
+                    " ".join(getattr(r, "key_vocabulary", []) or []),
+                    getattr(r, "passage_text", ""),
+                ]
+            ).lower()
+            if kw_low not in blob:
+                continue
+
+        gid = normalize_english_group_id(r.q_num)
+        if gid:
+            g_key = (r.exam_name, gid)
+            if g_key in seen_group_keys:
+                continue
+            seen_group_keys.add(g_key)
+            q_label = f"{r.exam_name} {gid}번"
+        else:
+            q_label = f"{r.exam_name} {r.q_num}번"
+        filtered_passages.append((r, q_label))
+
+    return True, filtered_passages
+
+
+def _render_english_passage_preview_expander(filtered_passages: list[tuple[QuestionRecord, str]]) -> None:
+    """조회된 영어 기출 지문 원문·어휘 미리보기 Expander를 렌더링한다."""
+    with st.expander("📖 조회된 기출 영어 지문 원문·어휘 미리보기", expanded=False):
+        for rec_p, q_label in filtered_passages[:30]:
+            r_orig_t = (getattr(rec_p, "english_question_type", "") or rec_p.unit_name).strip()
+            r_topic = (getattr(rec_p, "passage_topic", "") or "-").strip()
+            st.markdown(f"**📌 {q_label}** (`{r_orig_t}` · 주제: {r_topic})")
+            if getattr(rec_p, "key_vocabulary", None):
+                render_chips(rec_p.key_vocabulary, variant="amber", limit=10)
+            st.markdown(
+                f"<div class='eng-given-box' style='white-space:pre-wrap;'>{_html.escape(rec_p.passage_text)}</div>",
+                unsafe_allow_html=True,
+            )
+
+
+def _render_english_transform_submode(ctx: AppContext) -> None:
+    """영어 서브모드 1: 수능 독해 11개 유형 변형문제 생성 UI."""
     rewrite_model, use_precision_mode = _resolve_tab2_english_rewrite_model(key_suffix="eng")
     user_max_jobs = get_max_batch_questions(ctx.current_user)
     max_limit_badge = f"1회 최대 **{user_max_jobs}문항**" if user_max_jobs is not None else "1회 문항 수 **제한 없음**"
@@ -500,105 +610,18 @@ def _render_tab2_english_transform_section(ctx: AppContext) -> None:
     )
 
     with eng_tab_db:
-        all_db = ctx.storage.load_db()
-        eng_reading_recs = [
-            r
-            for r in all_db
-            if r.subject_category == "영어"
-            and (getattr(r, "english_section", "") == "독해" or r.q_num >= 18)
-            and bool((getattr(r, "passage_text", "") or "").strip())
-        ]
-
-        if not eng_reading_recs:
-            st.info(
-                "아직 DB에 저장된 **영어 독해(18~45번) 지문**이 없습니다. "
-                "**[📥 탭 1]**에서 영어 모의고사 문제지+해설지 PDF를 먼저 수집·추출하거나, "
-                "우측 **[✍️ 새 영어 지문 직접 붙여넣기]** 탭을 이용해 주세요."
+        has_db_recs, filtered_passages = _filter_english_db_passages(ctx, key_prefix="tab2_eng_tr")
+        if has_db_recs:
+            assign_mode = st.radio(
+                "목표 변형 유형 지정 방식",
+                options=[
+                    "⚡ 일괄 유형 적용 (선택 지문 전체에 동일 유형 적용)",
+                    "🎯 지문별 개별 유형 지정 (지문마다 원하는 유형 복수 선택)",
+                ],
+                horizontal=True,
+                key="tab2_eng_assign_mode",
             )
-        else:
-            f_c1, f_c2, f_c3 = st.columns([1.2, 1.1, 1.3])
-            avail_eng_exams = sorted({r.exam_name for r in eng_reading_recs}, reverse=True)
-            avail_eng_types = sorted(
-                {
-                    (getattr(r, "english_question_type", "") or r.unit_name).strip()
-                    for r in eng_reading_recs
-                    if (getattr(r, "english_question_type", "") or r.unit_name).strip()
-                }
-            )
-            with f_c1:
-                sel_eng_exam = st.selectbox(
-                    "모의고사 회차 필터",
-                    options=["전체"] + avail_eng_exams,
-                    key="tab2_eng_filter_exam",
-                )
-            with f_c2:
-                sel_eng_orig_type = st.selectbox(
-                    "원래 문항 유형 필터",
-                    options=["전체"] + avail_eng_types,
-                    key="tab2_eng_filter_type",
-                )
-            with f_c3:
-                eng_kw = st.text_input(
-                    "주제·어휘·지문 키워드 검색",
-                    placeholder="예: artificial intelligence, climate, 감정...",
-                    key="tab2_eng_filter_kw",
-                )
-
-            opt_row1, opt_row2 = st.columns([1.3, 1.2])
-            with opt_row1:
-                include_excluded_q = st.checkbox(
-                    "목적·심경·도표·내용일치·실용문·장문(18, 19, 25, 26, 27, 28, 43, 44, 45번) 지문도 목록에 포함",
-                    value=False,
-                    key="tab2_eng_include_excluded_q",
-                )
-            with opt_row2:
-                assign_mode = st.radio(
-                    "목표 변형 유형 지정 방식",
-                    options=[
-                        "⚡ 일괄 유형 적용 (선택 지문 전체에 동일 유형 적용)",
-                        "🎯 지문별 개별 유형 지정 (지문마다 원하는 유형 복수 선택)",
-                    ],
-                    horizontal=True,
-                    key="tab2_eng_assign_mode",
-                )
             is_per_passage_mode = assign_mode.startswith("🎯")
-
-            # 필터링 및 세트 지문(41~42, 43~45) 중복 묶음 처리
-            filtered_passages: list[tuple[QuestionRecord, str]] = []
-            seen_group_keys: set[tuple[str, str]] = set()
-            kw_low = (eng_kw or "").strip().lower()
-
-            for r in sorted(eng_reading_recs, key=lambda x: (x.exam_name, x.q_num)):
-                if not include_excluded_q and r.q_num in ENGLISH_DEFAULT_EXCLUDED_Q_NUMS:
-                    continue
-                if sel_eng_exam != "전체" and r.exam_name != sel_eng_exam:
-                    continue
-                r_orig_t = (getattr(r, "english_question_type", "") or r.unit_name).strip()
-                if sel_eng_orig_type != "전체" and r_orig_t != sel_eng_orig_type:
-                    continue
-                if kw_low:
-                    blob = " ".join(
-                        [
-                            r.exam_name,
-                            r_orig_t,
-                            getattr(r, "passage_topic", ""),
-                            " ".join(getattr(r, "key_vocabulary", []) or []),
-                            getattr(r, "passage_text", ""),
-                        ]
-                    ).lower()
-                    if kw_low not in blob:
-                        continue
-
-                gid = normalize_english_group_id(r.q_num)
-                if gid:
-                    g_key = (r.exam_name, gid)
-                    if g_key in seen_group_keys:
-                        continue
-                    seen_group_keys.add(g_key)
-                    q_label = f"{r.exam_name} {gid}번"
-                else:
-                    q_label = f"{r.exam_name} {r.q_num}번"
-                filtered_passages.append((r, q_label))
 
             if not filtered_passages:
                 st.warning("조건에 맞는 영어 독해 지문이 없습니다. 필터를 완화하거나 상단 제외 문항 포함 체크박스를 켜 보세요.")
@@ -654,10 +677,8 @@ def _render_tab2_english_transform_section(ctx: AppContext) -> None:
                         r_orig_t = (getattr(rec_p, "english_question_type", "") or rec_p.unit_name).strip()
                         r_topic = (getattr(rec_p, "passage_topic", "") or "").strip()
                         p_preview = re.sub(r"\s+", " ", (rec_p.passage_text or "").strip())[:115]
-                        c_key_chk = ctx.storage.build_english_analysis_key(rec_p.passage_text, q_label)
-                        pdf_status_tag = " · 📑 분석지PDF DB" if ctx.storage.has_english_analysis_pdf(c_key_chk) else ""
                         row_label = (
-                            f"[{q_label}] 원래 유형: {r_orig_t}{pdf_status_tag}"
+                            f"[{q_label}] 원래 유형: {r_orig_t}"
                             + (f" · 주제: {r_topic}" if r_topic else "")
                             + f" — \"{p_preview}...\""
                         )
@@ -706,36 +727,13 @@ def _render_tab2_english_transform_section(ctx: AppContext) -> None:
                             "체크한 지문 × 선택 유형 수만큼 호출됩니다."
                         )
 
-                    include_eng_db_diagrams = st.checkbox(
-                        "🎨 지문 이해용 시각 도식 그림 포함 (분석지 PDF 생성 시 적용)",
-                        value=True,
-                        key="tab2_eng_db_include_diagrams",
+                    run_eng_db_btn = st.form_submit_button(
+                        "🚀 선택한 기출 영어 지문 수능형 변형 문제 생성",
+                        type="primary",
+                        width="stretch",
                     )
-                    eb_c1, eb_c2 = st.columns(2)
-                    with eb_c1:
-                        run_eng_db_btn = st.form_submit_button(
-                            "🚀 선택한 기출 영어 지문 수능형 변형 문제 생성",
-                            type="primary",
-                            width="stretch",
-                        )
-                    with eb_c2:
-                        run_eng_db_analysis_btn = st.form_submit_button(
-                            "📑 선택한 영어 지문 분석지 PDF 생성",
-                            type="secondary",
-                            width="stretch",
-                        )
 
-                with st.expander("📖 조회된 기출 영어 지문 원문·어휘 미리보기", expanded=False):
-                    for rec_p, q_label in filtered_passages[:30]:
-                        r_orig_t = (getattr(rec_p, "english_question_type", "") or rec_p.unit_name).strip()
-                        r_topic = (getattr(rec_p, "passage_topic", "") or "-").strip()
-                        st.markdown(f"**📌 {q_label}** (`{r_orig_t}` · 주제: {r_topic})")
-                        if getattr(rec_p, "key_vocabulary", None):
-                            render_chips(rec_p.key_vocabulary, variant="amber", limit=10)
-                        st.markdown(
-                            f"<div class='eng-given-box' style='white-space:pre-wrap;'>{_html.escape(rec_p.passage_text)}</div>",
-                            unsafe_allow_html=True,
-                        )
+                _render_english_passage_preview_expander(filtered_passages)
 
                 if run_eng_db_btn:
                     if not checked_rows:
@@ -771,32 +769,13 @@ def _render_tab2_english_transform_section(ctx: AppContext) -> None:
                                 if len(used_exams) > 1
                                 else f"{used_exams[0]} ({len(jobs)}문항)"
                             )
-                            _execute_english_transform_jobs(ctx, 
+                            _execute_english_transform_jobs(
+                                ctx,
                                 jobs=jobs,
                                 rewrite_model=rewrite_model,
                                 source_summary_label=summary_lbl,
                                 use_precision_mode=use_precision_mode,
                             )
-
-                if run_eng_db_analysis_btn:
-                    if not checked_rows:
-                        st.error("분석지를 생성할 영어 지문을 최소 1개 이상 체크해 주세요.")
-                    else:
-                        an_items = [
-                            {
-                                "exam_name": rec_p.exam_name,
-                                "q_label": q_label,
-                                "orig_type": (getattr(rec_p, "english_question_type", "") or rec_p.unit_name).strip(),
-                                "passage_topic": (getattr(rec_p, "passage_topic", "") or "").strip(),
-                                "passage_text": rec_p.passage_text,
-                            }
-                            for rec_p, q_label, _ in checked_rows
-                        ]
-                        _execute_english_analysis_jobs(
-                            ctx,
-                            items=an_items,
-                            include_diagrams=include_eng_db_diagrams,
-                        )
 
     with eng_tab_direct:
         with st.form("tab2_eng_direct_transform_form", border=True):
@@ -855,24 +834,11 @@ def _render_tab2_english_transform_section(ctx: AppContext) -> None:
                 f"📊 **예상 AI 호출: {est_direct_calls}건 {lim_note_d}** · "
                 f"선택 유형 {len(direct_types)}개 × 지문 수"
             )
-            include_eng_direct_diagrams = st.checkbox(
-                "🎨 지문 이해용 시각 도식 그림 포함 (분석지 PDF 생성 시 적용)",
-                value=True,
-                key="tab2_eng_direct_include_diagrams",
+            run_eng_direct_btn = st.form_submit_button(
+                "🚀 직접 입력한 영어 지문으로 수능형 변형 문제 생성",
+                type="primary",
+                width="stretch",
             )
-            ed_c1, ed_c2 = st.columns(2)
-            with ed_c1:
-                run_eng_direct_btn = st.form_submit_button(
-                    "🚀 직접 입력한 영어 지문으로 수능형 변형 문제 생성",
-                    type="primary",
-                    width="stretch",
-                )
-            with ed_c2:
-                run_eng_direct_analysis_btn = st.form_submit_button(
-                    "📑 직접 입력한 영어 지문 분석지 PDF 생성",
-                    type="secondary",
-                    width="stretch",
-                )
 
         if run_eng_direct_btn:
             raw_chunks = [
@@ -927,23 +893,128 @@ def _render_tab2_english_transform_section(ctx: AppContext) -> None:
                         f"(요청 {len(direct_jobs)}건 중 앞의 {user_max_jobs}문항만 실행)"
                     )
                     direct_jobs = direct_jobs[:user_max_jobs]
-                _execute_english_transform_jobs(ctx, 
+                _execute_english_transform_jobs(
+                    ctx,
                     jobs=direct_jobs,
                     rewrite_model=rewrite_model,
                     source_summary_label=base_src,
                     use_precision_mode=use_precision_mode,
                 )
 
+
+def _render_english_analysis_submode(ctx: AppContext) -> None:
+    """영어 서브모드 2: 영어 지문 정밀 분석지 PDF 생성 전용 UI."""
+    st.caption(
+        "💡 선택한 영어 지문의 **핵심 주제 · 논리 전개 흐름 · 이해용 시각 도식 · 문장별 `/` 끊어읽기 및 `[절]`/`(수식어구)` 구문독해(주제문 ★ 표시)** 분석지 PDF를 생성합니다."
+    )
+
+    an_tab_db, an_tab_direct = st.tabs(
+        [
+            "📂 기출 DB 영어 지문에서 선택 (회차·원래 유형별 검색)",
+            "✍️ 새 영어 지문 직접 붙여넣기",
+        ]
+    )
+
+    with an_tab_db:
+        has_db_recs, filtered_passages = _filter_english_db_passages(ctx, key_prefix="tab2_eng_an")
+        if has_db_recs:
+            if not filtered_passages:
+                st.warning("조건에 맞는 영어 독해 지문이 없습니다. 필터를 완화하거나 상단 제외 문항 포함 체크박스를 켜 보세요.")
+            else:
+                st.caption(
+                    f"총 **{len(filtered_passages)}개** 영어 독해 지문이 조회되었습니다. "
+                    "분석지를 만들 지문을 체크하세요. (`📑 분석지PDF DB` 배지가 붙은 지문은 재호출 없이 즉시 병합됩니다.)"
+                )
+                with st.form("tab2_eng_db_analysis_form", border=True):
+                    include_eng_db_diagrams = st.checkbox(
+                        "🎨 지문 이해용 시각 도식 그림 포함",
+                        value=True,
+                        key="tab2_eng_an_db_include_diagrams",
+                    )
+                    st.markdown("---")
+                    st.markdown("**✅ 분석지를 생성할 영어 기출 지문 선택:**")
+                    checked_an_rows: list[tuple[QuestionRecord, str]] = []
+                    for p_idx, (rec_p, q_label) in enumerate(filtered_passages):
+                        r_orig_t = (getattr(rec_p, "english_question_type", "") or rec_p.unit_name).strip()
+                        r_topic = (getattr(rec_p, "passage_topic", "") or "").strip()
+                        p_preview = re.sub(r"\s+", " ", (rec_p.passage_text or "").strip())[:115]
+                        c_key_chk = ctx.storage.build_english_analysis_key(rec_p.passage_text, q_label)
+                        pdf_status_tag = " · 📑 분석지PDF DB" if ctx.storage.has_english_analysis_pdf(c_key_chk) else ""
+                        row_label = (
+                            f"[{q_label}] 원래 유형: {r_orig_t}{pdf_status_tag}"
+                            + (f" · 주제: {r_topic}" if r_topic else "")
+                            + f" — \"{p_preview}...\""
+                        )
+                        if st.checkbox(
+                            row_label,
+                            value=False,
+                            key=f"tab2_eng_an_chk_{rec_p.id}_{p_idx}",
+                        ):
+                            checked_an_rows.append((rec_p, q_label))
+
+                    run_eng_db_analysis_btn = st.form_submit_button(
+                        "📑 선택한 기출 영어 지문 분석지 PDF 생성",
+                        type="primary",
+                        width="stretch",
+                    )
+
+                _render_english_passage_preview_expander(filtered_passages)
+
+                if run_eng_db_analysis_btn:
+                    if not checked_an_rows:
+                        st.error("분석지를 생성할 영어 지문을 최소 1개 이상 체크해 주세요.")
+                    else:
+                        an_items = [
+                            {
+                                "exam_name": rec_p.exam_name,
+                                "q_label": q_label,
+                                "orig_type": (getattr(rec_p, "english_question_type", "") or rec_p.unit_name).strip(),
+                                "passage_topic": (getattr(rec_p, "passage_topic", "") or "").strip(),
+                                "passage_text": rec_p.passage_text,
+                            }
+                            for rec_p, q_label in checked_an_rows
+                        ]
+                        _execute_english_analysis_jobs(
+                            ctx,
+                            items=an_items,
+                            include_diagrams=include_eng_db_diagrams,
+                        )
+
+    with an_tab_direct:
+        with st.form("tab2_eng_direct_analysis_form", border=True):
+            st.markdown("**✍️ 정밀 분석할 영어 지문을 붙여넣으세요:**")
+            an_src_name = st.text_input(
+                "출처 표기 (분석지 상단 표시용)",
+                value="직접 입력 영어 지문",
+                key="tab2_eng_an_direct_src",
+            )
+            an_passage_raw = st.text_area(
+                "영어 지문 원문 입력 (여러 개의 지문을 한 번에 넣으려면 지문 사이에 '---' 줄을 넣어 구분하세요)",
+                height=230,
+                placeholder="Paste your English reading passage here...",
+                key="tab2_eng_an_direct_text",
+            )
+            include_eng_direct_diagrams = st.checkbox(
+                "🎨 지문 이해용 시각 도식 그림 포함",
+                value=True,
+                key="tab2_eng_an_direct_include_diagrams",
+            )
+            run_eng_direct_analysis_btn = st.form_submit_button(
+                "📑 직접 입력한 영어 지문 분석지 PDF 생성",
+                type="primary",
+                width="stretch",
+            )
+
         if run_eng_direct_analysis_btn:
             raw_chunks = [
                 ch.strip()
-                for ch in re.split(r"\n\s*-{3,}\s*\n", (direct_passage_raw or "").strip())
+                for ch in re.split(r"\n\s*-{3,}\s*\n", (an_passage_raw or "").strip())
                 if ch.strip()
             ]
             if not raw_chunks:
                 st.error("분석지를 생성할 영어 지문 텍스트를 입력해 주세요.")
             else:
-                base_src = (direct_src_name or "직접 입력 영어 지문").strip()
+                base_src = (an_src_name or "직접 입력 영어 지문").strip()
                 direct_an_items = [
                     {
                         "exam_name": f"{base_src} #{c_idx}" if len(raw_chunks) > 1 else base_src,
@@ -961,6 +1032,24 @@ def _render_tab2_english_transform_section(ctx: AppContext) -> None:
                 )
 
     _render_english_analysis_results_section()
+
+
+def _render_tab2_english_transform_section(ctx: AppContext) -> None:
+    """탭 2 영어 과목 전용: [변형문제 생성]과 [영어 지문 분석지 PDF 생성] 작업 모드로 분리해 렌더링한다."""
+    st.subheader("1️⃣ 영어 작업 모드 선택")
+    eng_sub_mode = st.radio(
+        "수행할 영어 작업을 선택하세요",
+        options=[
+            "🚀 수능 독해 유형 변형문제 생성",
+            "📑 영어 지문 정밀 분석지 PDF 생성",
+        ],
+        horizontal=True,
+        key="tab2_eng_sub_mode",
+    )
+    if eng_sub_mode.startswith("📑"):
+        _render_english_analysis_submode(ctx)
+    else:
+        _render_english_transform_submode(ctx)
 
 
 render_tab2_english_transform_section = _render_tab2_english_transform_section
