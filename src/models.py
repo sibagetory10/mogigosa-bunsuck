@@ -866,6 +866,47 @@ class KoreanPassageAnalysisOutput(BaseModel):
     )
 
 
+class EnglishSentenceAnalysisItem(BaseModel):
+    """영어 지문 문장별 끊어읽기·괄호 구문독해 및 해석·어법 포인트."""
+
+    sentence_num: int = Field(..., ge=1, description="문장 번호 (1부터 시작)")
+    is_topic_sentence: bool = Field(
+        default=False,
+        description="이 문장이 지문의 핵심 주제문(Topic Sentence)이면 True",
+    )
+    chunked_english: str = Field(
+        ...,
+        description="원문 영문 내에 슬래시(/) 끊어읽기와 [절]·(수식어구) 괄호 기호를 직접 삽입한 구문독해용 영문",
+    )
+    korean_translation: str = Field(
+        ...,
+        description="문맥에 맞춘 정확하고 자연스러운 한국어 해석",
+    )
+    syntax_notes: list[str] = Field(
+        default_factory=list,
+        description="해당 문장의 핵심 구문·어법 구조 해설 (1~3개, 예: 'so ~ that 구문', '목적격 관계대명사 생략')",
+    )
+
+
+class EnglishPassageAnalysisOutput(BaseModel):
+    """내신·수능형 영어 지문 정밀 분석지 구조화 출력 스키마 (주제 · 논리 흐름 · 시각 도식 · 문장별 구문 분석)."""
+
+    title: str = Field(..., description="지문 핵심 제목 (한국어 중심 또는 영문+한국어 병기)")
+    core_theme: str = Field(..., description="지문 전체의 핵심 주제 · 요지 요약 (1~2문장)")
+    structure_flow: str = Field(
+        ...,
+        description="지문 전체의 논리 전개 흐름 요약 (예: '도입 : ...\\n전개 : ...\\n결론 : ...')",
+    )
+    visual_diagram: KoreanVisualDiagram | None = Field(
+        default=None,
+        description="지문의 핵심 논리·비교·인과·과정을 시각화하는 도식 그림 명세",
+    )
+    sentence_analyses: list[EnglishSentenceAnalysisItem] = Field(
+        default_factory=list,
+        description="지문 전체 문장에 대한 1번부터 끝번까지의 문장별 정밀 구문독해 리스트",
+    )
+
+
 class ExamHeaderMetadata(BaseModel):
     year: str = Field(..., description="시행 년도 (예: '2026')")
     month: str = Field(..., description="시행 월 (예: '3월', '6월', '9월', '11월')")

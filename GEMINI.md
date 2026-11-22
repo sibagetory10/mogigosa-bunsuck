@@ -21,7 +21,7 @@
 - **서비스명**: 2022 개정 교육과정 맞춤형 기출 추출 & 상위 문제 개조 플랫폼 (`mogigosa-bunsuck`)
 - **핵심 도메인 로직**:
   - **수학 · 사회 · 과학 · 한국사**: 개념서·교과서 PDF(또는 공용 개념서 DB)에 실제로 등장한 핵심 원리(`core_principles`)와 용어(`required_terms` / `basic_terms`)만 허용하고, 원리는 같지만 상위 학년·선택과목 전문 용어(`advanced_terms`)가 포함된 기출문제를 학생의 개념서 언어로 자동 개조(`RewrittenQuestion`)한다.
-  - **영어**: 수능/모의고사 영어 독해 지문을 기반으로 11종 수능 유형(`ENGLISH_TRANSFORM_TYPES`)으로 변형 문제를 생성하고, `english_validators.py`의 결정론적 후처리 검증을 거쳐 고품질 문제·해설·영단어장 PDF를 제공한다.
+  - **영어**: 수능/모의고사 영어 독해 지문을 기반으로 11종 수능 유형(`ENGLISH_TRANSFORM_TYPES`)으로 변형 문제를 생성하고, `english_validators.py`의 결정론적 후처리 검증을 거쳐 고품질 문제·해설·영단어장 PDF를 제공한다. 또한 **영어 정밀 지문 분석지**(주제 · 논리 전개 흐름 · 이해용 시각 도식 · 문장별 `/` 끊어읽기 및 `[절]`/`(수식어)` 구문독해 · 주제문 `★` 표시)를 생성·캐싱·PDF 출력할 수 있다.
   - **국어**: 독서·문학·화법과 작문·언어와 매체 세트 지문을 분석하고, 자유 유형 세트 문항 재구성, Pillow 기반 시각 구조도(`diagram_renderer.py`), 2단/분석본 PDF(`korean_pdf_generator.py`)를 생성한다.
 - **기술 스택**: Python, Streamlit (`>=1.50.0`), PyMuPDF (`pymupdf`), Google GenAI SDK (`google-genai`), Pydantic v2 (`pydantic`), Pillow (`pillow`), Requests, BeautifulSoup4.
 
@@ -59,7 +59,7 @@
 - **`src/ui/auth_sidebar.py`**: 로그인/회원가입/Google OAuth 연동, 개인 Gemini API 키 등록/삭제, 월간 토큰 잔여량 표시, 게스트 랜딩(`render_guest_landing`).
 - **`src/ui/tab1_upload.py` & `src/ui/tab1_tagging.py` [탭 1]**: 모의고사 PDF(문제지+해설지, 혼합 PDF 자동 분류/매칭, EBSi 연동 `src/ebsi_fetcher.py`) 업로드, 문항 크롭(`CroppedQuestion`), 2022 개정 성취기준·원리·용어 AI 분해 및 인라인 태그 교정, 과목별 기출 DB 조회/삭제/내보내기.
 - **`src/ui/tab2_transform.py` [탭 2 메인]**: 기준 개념서 범위 설정(공용 개념서 DB 단원 선택 또는 1회성 PDF 업로드) → 화이트리스트 추출 → 기출 매칭 & 상위 용어 개조, 영어/국어 전용 변형 섹션 분기.
-- **`src/ui/tab2_english.py` [탭 2 - 영어]**: 영어 지문 기반 11종 수능 독해 유형 변형 배치 실행 및 결과 렌더링.
+- **`src/ui/tab2_english.py` [탭 2 - 영어]**: 영어 지문 기반 11종 수능 독해 유형 변형 배치 실행 및 **영어 정밀 지문 분석지 PDF 생성/미리보기** 렌더링.
 - **`src/ui/tab2_korean.py` [탭 2 - 국어]**: 독서·문학·화작·언매 지문 세트 선택, 지문 심층 분석, 시각 구조도 생성, 세트 전체 문항 재구성 및 PDF 생성/병합.
 - **`src/ui/tab2_quiz.py` [탭 2 - 실전 풀이]**: `@st.fragment` 기반 웹 바로 풀기(`_render_mode_b_solve_fragment`), 자동 채점 성적표, 개념서 근거 기반 AI 해설 & 후속 질문 채팅, 문항별 개별 재변환.
 - **`src/ui/tab3_concept.py` [탭 3]**: 공용 개념서·교과서 DB 구축(목차/단원 AI 자동 감지, 화이트리스트 추출) 및 2022 개정 교육과정 공식 기준표(NCIC 고시 별책 5·7·8·9·14 PDF 업로드 및 교육부 고시 원문 동기화) 관리.
@@ -72,13 +72,13 @@
 - **`src/gemini/exam_tagging.py`**: 시험지 헤더 메타데이터 추출, 문제지-해설지 AI 자동 페어링, 스캔본 문항 박스 감지, 과목별 배치 문항 태깅.
 - **`src/gemini/concept_book.py`**: 개념서 표지/목차/본문 단원 추출, 개념 화이트리스트(`ConceptWhitelist`) 추출, 문항-화이트리스트 적합성 매칭.
 - **`src/gemini/rewrite.py`**: 금지 상위 용어 제거 문항 개조(`rewrite_question_for_pdf`), 개념서 근거 해설(`generate_pdf_grounded_explanation`), 후속 질의응답(`chat_followup_with_pdf`).
-- **`src/gemini/english.py` & `src/gemini/english_validators.py`**: 영어 문항 태깅, 불완전 지문 복원, 11종 유형 변형 생성 및 결정론적 후처리 검증(문장 삽입/순서 배열/무관한 문장/빈칸/어법/요약문 정답 정합성 검사 및 재조립).
+- **`src/gemini/english.py` & `src/gemini/english_validators.py`**: 영어 문항 태깅, 불완전 지문 복원, 11종 유형 변형 생성, 정밀 지문 구문 분석(`generate_english_passage_analysis`)·시각 도식(`generate_english_visual_diagram`) 및 결정론적 후처리 검증.
 - **`src/gemini/korean.py`**: 국어 지문 노이즈 제거, 세트 지문 동기화(`_sync_korean_group_passages`), 문학 작품 웹 브리프 조회, 지문 심층 분석·교열, 시각 다이어그램 데이터 생성, 세트 문항 재구성.
 - **`src/gemini/dictionary.py`**: 영단어 Gemini 사전 조회(`lookup_english_word_with_gemini`).
 - **하위 호환 파사드**: `src/gemini/__init__.py` (`_SUBMODULE_EXPORTS`), `src/gemini_service.py`, `src/korean_gemini_service.py`.
 
 ### 4.3 코어 스키마 · 저장소 · PDF · 교육과정 엔진 (`src/`)
-- **`src/models.py`**: 모든 Pydantic v2 모델(`QuestionRecord`, `RewrittenQuestion`, `ConceptBookRecord`, `ConceptUnit`, `ConceptWhitelist`, `UserRecord`, `EnglishDictEntry`, `UserVocabItem`, `KoreanPassageAnalysisOutput` 등), `ENGLISH_TRANSFORM_TYPES`, `normalize_english_group_id()`, `normalize_korean_group_id()`.
+- **`src/models.py`**: 모든 Pydantic v2 모델(`QuestionRecord`, `RewrittenQuestion`, `ConceptBookRecord`, `ConceptUnit`, `ConceptWhitelist`, `UserRecord`, `EnglishDictEntry`, `UserVocabItem`, `KoreanPassageAnalysisOutput`, `EnglishPassageAnalysisOutput` 등), `ENGLISH_TRANSFORM_TYPES`, `normalize_english_group_id()`, `normalize_korean_group_id()`.
 - **`src/storage.py`**: `StorageManager` — 로컬 영구 디스크(`./exam_db`, `./concept_db`) 기반 스레드 안전(`threading.RLock`) + 원자적 파일 교체(`_atomic_write_text`, `_atomic_write_bytes` via `.tmp` + `os.replace`) 및 파일 `mtime_ns`/`size` 기반 인메모리 캐시.
 - **`src/curriculum_2022.py`**: 2022 개정 교육과정 편제표 및 성취기준 카탈로그(`data/curriculum_2022.json`, `data/curriculum_2022_moe_seed.json`, `exam_db/ncic_standards.json`) 로드·파싱·검증.
 - **`src/pdf_parser.py`**: PyMuPDF 기반 문항 영역 크롭, 2단 레이아웃 파싱, 공통 지문(`SHARED_PASSAGE_RE`) 분리, 해설지 정답·해설 매칭.
@@ -98,7 +98,7 @@
   - `exam_db/pdfs/`, `exam_db/crops/`: 업로드된 원본 PDF 및 크롭 문항/지문 PNG
   - `exam_db/users.json`: 회원 계정, 등급, 월간 토큰·원화 비용 통계
   - `exam_db/fx_rate_cache.json`: 일일 USD→KRW 환율 캐시
-  - `exam_db/english_question_pool.json`, `user_english_history.json`, `english_dict_cache.json`, `user_vocab/`
+  - `exam_db/english_question_pool.json`, `english_analysis_pool.json`, `english_analysis_pdfs/`, `user_english_history.json`, `english_dict_cache.json`, `user_vocab/`
   - `exam_db/korean_analysis_pool.json`, `korean_analysis_pdfs/`
   - `exam_db/saved_exams/`: 사용자별 자동 저장된 맞춤형 시험지 및 PDF
   - `exam_db/ncic_standards.json`: 런타임에 추가된 NCIC 성취기준 (자동 업데이트 시 `data/curriculum_2022.json` 충돌 방지를 위해 우선 이관됨)

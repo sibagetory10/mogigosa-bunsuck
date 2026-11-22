@@ -336,7 +336,7 @@ def render_tab2(ctx: AppContext) -> None:
         options=[
             "📚 수학 · 사회 · 과학 · 한국사 (개념서 범위 추출 & 상위 용어 개조)",
             "📖 국어 (지문 분석지 PDF & 변형문제 세트 생성)",
-            "🔤 영어 (기출 지문 선택 & 수능 독해 유형 변형)",
+            "🔤 영어 (지문 분석지 PDF & 수능 독해 유형 변형)",
         ],
         horizontal=True,
         key="tab2_domain_mode",

@@ -313,6 +313,7 @@ def _render_admin_panel(ctx: AppContext) -> None:
     _render_server_storage_admin_section(ctx)
     _render_server_git_update_admin_section()
     _render_english_pool_admin_section(ctx)
+    _render_english_analysis_pool_admin_section(ctx)
     _render_korean_analysis_pool_admin_section(ctx)
 
 
@@ -761,6 +762,129 @@ def _render_korean_analysis_pool_admin_section(ctx: AppContext) -> None:
                     st.rerun()
 
 
+
+
+def _render_english_analysis_pool_admin_section(ctx: AppContext) -> None:
+    st.divider()
+    st.subheader("🔤 영어 지문 분석지 캐시 · PDF DB 관리")
+    st.caption(
+        "최초 생성된 영어 지문 분석지는 `./exam_db/english_analysis_pool.json`과 "
+        "지문별 PDF(`./exam_db/english_analysis_pdfs/*.pdf`)로 영구 저장되어 "
+        "동일 지문 선택 시 재렌더링 없이 즉시 이어 붙여 제공합니다."
+    )
+
+    pool = ctx.storage.load_english_analysis_pool()
+    total_cnt = len(pool)
+    pdf_saved_cnt = sum(1 for ck in pool if ctx.storage.has_english_analysis_pdf(ck))
+    exam_names: set[str] = set()
+    type_counts: dict[str, int] = {}
+    entries_list: list[tuple[str, dict[str, Any]]] = []
+    for ck, entry in pool.items():
+        if not isinstance(entry, dict):
+            continue
+        ex_name = str(entry.get("exam_name") or "직접 입력 / 미분류").strip() or "직접 입력 / 미분류"
+        q_type = str(entry.get("question_type") or "기타").strip() or "기타"
+        exam_names.add(ex_name)
+        type_counts[q_type] = type_counts.get(q_type, 0) + 1
+        entries_list.append((ck, entry))
+
+    e_m1, e_m2, e_m3, e_m4 = st.columns(4)
+    e_m1.metric("저장된 분석지 수", f"{total_cnt}지문")
+    e_m2.metric("저장된 지문 PDF", f"{pdf_saved_cnt}개")
+    e_m3.metric("포함된 출처/회차", f"{len(exam_names)}종")
+    e_m4.metric("원래 유형 수", f"{len(type_counts)}종")
+
+    if total_cnt == 0:
+        st.info("현재 저장된 영어 지문 분석지 캐시가 없습니다.")
+        return
+
+    col_clr1, col_clr2 = st.columns([2, 1])
+    with col_clr1:
+        confirm_clear = st.checkbox(
+            "영어 분석지 캐시 전체 비우기 확인 (기출 DB·회원 DB는 유지됨)",
+            key="admin_confirm_clear_eng_an_pool",
+        )
+    with col_clr2:
+        if st.button(
+            "🧹 영어 분석지 캐시 전체 비우기",
+            disabled=not confirm_clear,
+            width="stretch",
+            key="admin_clear_eng_an_pool_btn",
+        ):
+            removed_cnt = ctx.storage.clear_english_analysis_pool()
+            st.success(f"🧹 영어 지문 분석지 캐시 {removed_cnt}건을 모두 비웠습니다.")
+            st.rerun()
+
+    eng_an_exp = create_lazy_expander(
+        f"📋 저장된 영어 지문 분석지 상세 조회 / 개별 삭제 ({total_cnt}건)",
+        expanded=False,
+        key="admin_eng_an_pool_detail_exp",
+    )
+    with eng_an_exp:
+        if not is_container_open(eng_an_exp):
+            return
+        f_col1, f_col2 = st.columns([1.2, 2.0])
+        with f_col1:
+            sel_exam = st.selectbox(
+                "회차/출처 필터",
+                options=["전체"] + sorted(exam_names, reverse=True),
+                key="admin_eng_an_pool_exam_filter",
+            )
+        with f_col2:
+            eng_q = st.text_input(
+                "제목/주제/출처/키 검색",
+                placeholder="키워드 또는 캐시 키 입력...",
+                key="admin_eng_an_pool_search",
+            ).strip().lower()
+
+        sorted_entries = sorted(
+            entries_list,
+            key=lambda kv: (str(kv[1].get("saved_at") or ""), str(kv[1].get("exam_name") or "")),
+            reverse=True,
+        )
+        filtered_entries = []
+        for ck, ent in sorted_entries:
+            ex_n = str(ent.get("exam_name") or "직접 입력 / 미분류").strip() or "직접 입력 / 미분류"
+            if sel_exam != "전체" and ex_n != sel_exam:
+                continue
+            an_dict = ent.get("analysis") if isinstance(ent.get("analysis"), dict) else {}
+            an_title = str(an_dict.get("title") or "")
+            an_theme = str(an_dict.get("core_theme") or "")
+            q_lbl = str(ent.get("q_label") or "")
+            if eng_q and not (
+                eng_q in ck.lower()
+                or eng_q in ex_n.lower()
+                or eng_q in q_lbl.lower()
+                or eng_q in an_title.lower()
+                or eng_q in an_theme.lower()
+            ):
+                continue
+            filtered_entries.append((ck, ent, an_dict))
+
+        st.caption(f"검색 결과: {len(filtered_entries)}건 (최대 25건 표시)")
+        for ck, ent, an_dict in filtered_entries[:25]:
+            q_lbl = str(ent.get("q_label") or ent.get("exam_name") or "미분류")
+            q_type = str(ent.get("question_type") or "독해")
+            an_title = str(an_dict.get("title") or "제목 없음")
+            theme_prev = " ".join(str(an_dict.get("core_theme") or "").split())[:120]
+            saved_at = str(ent.get("saved_at") or "")
+            sent_cnt = len(an_dict.get("sentence_analyses") or [])
+
+            r_col1, r_col2 = st.columns([5, 1])
+            with r_col1:
+                pdf_badge = "📑 분석PDF" if ctx.storage.has_english_analysis_pdf(ck) else "📝 JSON만"
+                st.markdown(
+                    f"**[{q_lbl}]** {an_title} (`{q_type}` · {sent_cnt}문장 · {pdf_badge}) · 키 `{ck}`"
+                )
+                cap_parts = [p for p in (f"저장: {saved_at}" if saved_at else "", theme_prev) if p]
+                if cap_parts:
+                    st.caption(" · ".join(cap_parts))
+            with r_col2:
+                if st.button("🗑️ 삭제", key=f"del_eng_an_pool_{ck}", width="stretch"):
+                    removed = ctx.storage.delete_english_analysis_entry(ck)
+                    if removed > 0:
+                        st.success(f"영어 분석지 캐시(`{ck}`)를 삭제했습니다.")
+                    st.rerun()
 
 
 render_admin_panel = _render_admin_panel

@@ -369,10 +369,87 @@ _KOREAN_ANALYSIS_CSS = """
         break-inside: avoid;
         page-break-inside: avoid;
     }
+    .eng-sent-card {
+        border: 0.8pt solid #CBD5E1;
+        border-radius: 4pt;
+        background-color: #FFFFFF;
+        padding: 6.5pt 9.5pt;
+        margin-bottom: 6pt;
+        break-inside: avoid;
+        page-break-inside: avoid;
+    }
+    .eng-sent-card-topic {
+        border: 1.2pt solid #F59E0B;
+        border-left: 3.5pt solid #D97706;
+        border-radius: 4pt;
+        background-color: #FFFBEB;
+        padding: 6.5pt 9.5pt;
+        margin-bottom: 6pt;
+        break-inside: avoid;
+        page-break-inside: avoid;
+    }
+    .eng-sent-hdr {
+        margin-bottom: 2.5pt;
+    }
+    .eng-sent-num {
+        font-weight: bold;
+        color: #1E3A8A;
+        font-size: 9.5pt;
+    }
+    .eng-topic-badge {
+        display: inline;
+        background-color: #FEF3C7;
+        color: #B45309;
+        border: 0.6pt solid #F59E0B;
+        font-weight: bold;
+        font-size: 7.8pt;
+        padding: 1pt 4.5pt;
+        border-radius: 3pt;
+    }
+    .eng-sent-chunk {
+        font-size: 9.4pt;
+        font-weight: bold;
+        color: #0F172A;
+        line-height: 1.56;
+        margin-bottom: 2.5pt;
+    }
+    .eng-slash {
+        color: #DC2626;
+        font-weight: bold;
+    }
+    .eng-bracket {
+        color: #1D4ED8;
+        font-weight: bold;
+    }
+    .eng-paren {
+        color: #0F766E;
+        font-weight: bold;
+    }
+    .eng-sent-kor {
+        font-size: 8.9pt;
+        color: #334155;
+        line-height: 1.5;
+        margin-bottom: 3pt;
+    }
+    .eng-syntax-box {
+        background-color: #F8FAFC;
+        border-top: 0.5pt solid #E2E8F0;
+        padding: 3.5pt 5pt 1pt 5pt;
+        margin-top: 2pt;
+    }
+    .eng-syntax-li {
+        font-size: 8.4pt;
+        color: #1E40AF;
+        line-height: 1.44;
+        margin-bottom: 1.5pt;
+    }
     """
 
 
-_CIRCLED_NUMS = ("①", "②", "③", "④", "⑤", "⑥", "⑦", "⑧", "⑨", "⑩")
+_CIRCLED_NUMS = (
+    "①", "②", "③", "④", "⑤", "⑥", "⑦", "⑧", "⑨", "⑩",
+    "⑪", "⑫", "⑬", "⑭", "⑮", "⑯", "⑰", "⑱", "⑲", "⑳",
+)
 
 
 def _is_korean_poetry_item(
@@ -1293,4 +1370,130 @@ def merge_korean_analysis_pdfs(pdf_bytes_list: list[bytes]) -> bytes:
         return merged.tobytes(garbage=3, deflate=True)
     finally:
         merged.close()
+
+
+def _format_chunked_english_html(chunked_text: str) -> str:
+    """슬래시(/)와 대괄호([]), 소괄호(()) 구문 표기를 시각적으로 구분되는 HTML로 변환한다."""
+    escaped = html.escape((chunked_text or "").strip())
+    if not escaped:
+        return ""
+    escaped = escaped.replace(" / ", " <span class='eng-slash'>/</span> ")
+    escaped = re.sub(r"(\[|\])", r"<span class='eng-bracket'>\1</span>", escaped)
+    escaped = re.sub(r"(\(|\))", r"<span class='eng-paren'>\1</span>", escaped)
+    return escaped
+
+
+def generate_english_passage_analysis_pdf(
+    analyses: list[dict[str, Any]],
+    doc_title: str = "수능·모의고사 영어 정밀 지문 분석지",
+    include_diagrams: bool = True,
+) -> bytes:
+    """
+    영어 지문 분석 결과(EnglishPassageAnalysisOutput + 출처 메타) 리스트를
+    내신·수능형 정밀 지문 분석지 PDF로 렌더링한다 (PyMuPDF Story 기반 자동 페이지 넘김).
+    구성: [1] 핵심 주제 & 논리 전개 흐름, [2] 이해용 시각 도식, [3] 문장별 정밀 구문 분석.
+    """
+    if not analyses:
+        raise ValueError("생성할 영어 지문 분석 데이터가 없습니다.")
+
+    sections_html: list[str] = []
+    today_str = datetime.now().strftime("%Y.%m.%d")
+
+    def _keep_block(inner_html: str) -> str:
+        return (
+            "<table class='sec-keep-tbl'><tr class='sec-keep-tr'>"
+            f"<td class='sec-keep-td'>{inner_html}</td>"
+            "</tr></table>"
+        )
+
+    for idx, item in enumerate(analyses):
+        an = item["analysis"]
+        q_label = str(item.get("q_label") or item.get("exam_name") or "영어 독해").strip()
+        orig_type = str(item.get("orig_type") or "영어 독해").strip()
+
+        pb_cls = " class='page-break'" if idx > 0 else ""
+        banner_html = f"""
+        <div{pb_cls}>
+          <div class="hdr-banner">
+            <div class="hdr-sub">{html.escape(doc_title)} · {html.escape(orig_type)}</div>
+            <div class="hdr-title">{html.escape(an.title)}</div>
+            <div class="hdr-meta">출처: {html.escape(q_label)} &nbsp;|&nbsp; 생성일: {today_str}</div>
+          </div>
+        """
+
+        flow_html_inner = _format_structure_flow_html(an.structure_flow)
+        theme_html = _keep_block(f"""
+          <div class="sec-title">1. 핵심 주제 및 논리 전개 흐름</div>
+          <div class="theme-box">
+            <div><b>핵심 주제</b></div>
+            <div>{html.escape(an.core_theme)}</div>
+          </div>
+          <div class="flow-box">
+            <div><b>논리 전개 흐름:</b></div>
+            <div class="flow-lines">{flow_html_inner}</div>
+          </div>
+        """)
+
+        diagram_html = ""
+        v_diag = getattr(an, "visual_diagram", None)
+        if include_diagrams and v_diag is not None and (
+            getattr(v_diag, "nodes", None)
+            or getattr(v_diag, "graph_spec", None)
+            or getattr(v_diag, "emotion_points", None)
+        ):
+            try:
+                diag_png = render_korean_diagram_png(v_diag)
+                diag_b64 = base64.b64encode(diag_png).decode("ascii")
+                diagram_html = _keep_block(
+                    "<div class='sec-title'>2. 한눈에 보는 논리 · 구조 도식</div>"
+                    f"<div class='diagram-wrap'><img class='diagram-img' width='505' src='data:image/png;base64,{diag_b64}'/></div>"
+                )
+            except Exception:
+                diagram_html = ""
+
+        sent_sec_num = "3" if diagram_html else "2"
+        sent_cards_html: list[str] = []
+        sent_list = list(getattr(an, "sentence_analyses", None) or [])
+        for s_idx, sa in enumerate(sent_list):
+            s_num = int(getattr(sa, "sentence_num", s_idx + 1) or (s_idx + 1))
+            num_badge = _CIRCLED_NUMS[s_num - 1] if 1 <= s_num <= len(_CIRCLED_NUMS) else f"({s_num})"
+            is_topic = bool(getattr(sa, "is_topic_sentence", False))
+            card_cls = "eng-sent-card-topic" if is_topic else "eng-sent-card"
+            topic_badge = (
+                " &nbsp;<span class='eng-topic-badge'>★ 주제문 (Topic Sentence)</span>"
+                if is_topic
+                else ""
+            )
+            chunk_html = _format_chunked_english_html(getattr(sa, "chunked_english", ""))
+            kor_html = html.escape((getattr(sa, "korean_translation", "") or "").strip())
+            notes = [str(n).strip() for n in (getattr(sa, "syntax_notes", None) or []) if str(n).strip()]
+            notes_html = ""
+            if notes:
+                li_html = "".join(f"<div class='eng-syntax-li'>▸ {html.escape(n)}</div>" for n in notes)
+                notes_html = f"<div class='eng-syntax-box'>{li_html}</div>"
+
+            card_inner = (
+                f"<div class='{card_cls}'>"
+                f"<div class='eng-sent-hdr'><span class='eng-sent-num'>{num_badge}</span>{topic_badge}</div>"
+                f"<div class='eng-sent-chunk'>{chunk_html}</div>"
+                f"<div class='eng-sent-kor'>{kor_html}</div>"
+                f"{notes_html}"
+                "</div>"
+            )
+            if s_idx == 0:
+                sent_cards_html.append(
+                    _keep_block(
+                        f"<div class='sec-title'>{sent_sec_num}. 문장별 정밀 구문 분석</div>{card_inner}"
+                    )
+                )
+            else:
+                sent_cards_html.append(_keep_block(card_inner))
+
+        sections_html.append(
+            f"{banner_html}{theme_html}{diagram_html}{''.join(sent_cards_html)}</div>"
+        )
+
+    full_html = f"<html><body>{''.join(sections_html)}</body></html>"
+    return _render_story_pdf(full_html, _KOREAN_ANALYSIS_CSS)
+
 

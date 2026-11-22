@@ -39,8 +39,11 @@ from src.gemini.english_validators import (
 )
 from src.models import (
     BatchEnglishExamExtractionOutput,
+    EnglishPassageAnalysisOutput,
     EnglishQuestionExtractionItem,
+    EnglishSentenceAnalysisItem,
     EnglishSingleExtractionOutput,
+    KoreanVisualDiagram,
     QuestionRecord,
     RewrittenQuestion,
     normalize_english_group_id,
@@ -611,3 +614,154 @@ def chat_followup_with_english(
         fast_mode=True,
     )
     return format_explanation_text(getattr(resp, "text", "") or "", for_markdown=True)
+
+
+_ENGLISH_DIAGRAM_GUIDE = (
+    "영어 지문의 핵심 논리 구조와 개념 관계를 한눈에 이해할 수 있도록 아래 12종 중 가장 적합한 `diagram_type`을 고르세요 "
+    "(모두 한국어로 작성하며, 단순 박스 나열 `flow`만 반복하지 말고 지문 성격에 가장 직관적인 형식을 선택하세요):\n"
+    "  ① `matrix` (항목별 비교 매트릭스표): 두 이론·관점·실험군·대상의 기준별 차이를 비교할 때 사용. "
+    "`nodes`에 비교 대상 2~3개 제목을 넣고, `matrix_rows`에 기준(`criterion`)과 대상별 값(`values`) 3~5행을 채우세요.\n"
+    "  ② `graph` (X-Y 비례/함수 그래프): 두 변수 간의 비례·반비례·임계점 관계를 설명할 때 사용. "
+    "`graph_spec`(`x_label`, `y_label`, `curves`, `highlight_point`)을 채우고 `nodes`에 1~2개 해석을 넣으세요.\n"
+    "  ③ `anatomy` (구성 요소·구조 모식도): 시스템·장치·인지 과정·현상의 구성 요소와 역할을 설명할 때 사용. "
+    "`center_label`에 중심 개념명을, `nodes`에 3~4개 구성 요소를 넣으세요.\n"
+    "  ④ `cycle` (원형 순환·피드백 루프): 상호작용, 악순환/선순환, 반복 과정에 사용. `center_label`과 `nodes` 3~4개, 짧은 `relation_labels`(6자 이내)를 넣으세요.\n"
+    "  ⑤ `timeline` (시대·단계 변천 연표): 연구 발전, 역사적 변화, 시간 흐름에 사용. `nodes`에 시간순 3~4개 단계를 넣으세요.\n"
+    "  ⑥ `venn` (공통점·차이점 벤다이어그램): 두 개념의 교집합(`center_label`)과 고유 특성을 구분할 때 사용.\n"
+    "  ⑦ `scale` (대립·균형 저울도): 두 상충 주장·장단점·트레이드오프를 비교할 때 사용 (`nodes` 2개, `scale_tilt`: balanced/left/right).\n"
+    "  ⑧ `fishbone` (피쉬본 어골도): 여러 복합 원인/요인(`nodes` 2~4개)이 하나의 결과/현상(`center_label`)으로 모이는 다발적 인과 분석에 사용.\n"
+    "  ⑨ `quadrant` (2×2 사분면 분류): 두 개의 직교 기준(`quadrant_x_label`, `quadrant_y_label`)으로 4가지 유형(`nodes` 4개)을 분류할 때 사용.\n"
+    "  ⑩ `decision_tree` (조건분기 결정 트리): 특정 조건(`center_label`)에 따라 `예 (O)` / `아니오 (X)`로 결과가 갈리는 논리 구조에 사용.\n"
+    "  ⑪ `pyramid` (위계·계층 피라미드): 상하 위계나 단계별 중요도가 쌓이는 구조(`nodes` 최상위→최하위 3~4개)에 사용.\n"
+    "  ⑫ `flow` (원리·논리 흐름도): 통념 제시 → 반박 → 실험/근거 → 결론처럼 순차적 인과·논증 흐름에 사용 (`nodes` 2~4개, 짧은 `relation_labels` 6자 이내).\n"
+    "공통 규칙: 각 카드 `details`는 1~3개의 짧은 한국어 핵심 구절(26자 이내), `takeaway`는 1줄 한국어 핵심 정리."
+)
+
+
+def generate_english_passage_analysis(
+    api_key: str,
+    model_name: str,
+    passage_text: str,
+    source_label: str = "",
+    orig_question_type: str = "",
+    passage_topic: str = "",
+) -> EnglishPassageAnalysisOutput:
+    """
+    영어 독해 지문을 내신·수능형 정밀 지문 분석지(핵심 주제, 논리 전개 흐름, 이해용 시각 도식,
+    문장별 슬래시(/) 끊어읽기 + [절]/(수식어) 구문독해 + 주제문 ★ 표시 + 해석 + 구문/어법 해설)로 구조화 분석한다.
+    """
+    clean_passage = _preprocess_english_source_passage(passage_text)
+    if not clean_passage:
+        raise ValueError("분석할 영어 지문 원문(passage_text)이 비어 있습니다.")
+
+    eff_model = (model_name or "").strip() or EXAM_TAGGING_MODEL
+    if _has_incomplete_english_blank(clean_passage):
+        clean_passage = _restore_incomplete_source_passage(api_key, eff_model, clean_passage)
+
+    sents = _split_english_sentences(clean_passage)
+    numbered_sents_block = (
+        "\n".join(f"{idx}. {s}" for idx, s in enumerate(sents, start=1))
+        if sents
+        else clean_passage
+    )
+
+    client = _build_client(api_key, timeout_seconds=90)
+    system_inst = (
+        "당신은 대한민국 대치동·수능 영어 1등급 전문 구문독해 일타 강사입니다.\n"
+        "주어진 영어 독해 지문을 바탕으로, 학생이 지문의 논리 구조와 모든 문장의 구문을 완벽히 이해할 수 있는 "
+        "**정밀 지문 분석지**를 JSON(`EnglishPassageAnalysisOutput`)으로 작성하세요.\n\n"
+        "[절대 준수 규칙 — 반드시 아래 4가지 핵심 파트만 정확히 작성하고 불필요한 어휘/단어장 목록이나 출제포인트 필드는 만들지 마세요]\n"
+        "1. `title`: 지문의 핵심 소재와 주제를 담은 간결한 제목 (한국어 제목 또는 영문 핵심구(한국어)).\n"
+        "2. `core_theme`: 지문 전체의 핵심 주제·요지를 한국어 1~2문장으로 명쾌하게 요약.\n"
+        "3. `structure_flow`: 글 전체의 논리 전개 흐름을 `도입 : ...\\n전개 : ...\\n심화/반전 : ...\\n결론 : ...` 형식의 단계별 줄바꿈으로 작성.\n"
+        "4. `visual_diagram`: 지문의 논리·비교·인과·순환 구조를 한눈에 파악할 수 있는 도식 그림(`KoreanVisualDiagram`)을 반드시 한국어로 작성.\n"
+        f"{_ENGLISH_DIAGRAM_GUIDE}\n"
+        "5. `sentence_analyses`: 지문의 1번 문장부터 마지막 문장까지 단 한 문장도 빠뜨리지 말고 순서대로(`sentence_num` 1..N) 분석하세요.\n"
+        "   - `is_topic_sentence`: 지문의 핵심 주장·결론이 담긴 **가장 중요한 주제문(보통 1~2문장)**에만 `true`, 나머지는 `false`로 표시.\n"
+        "   - `chunked_english`: 원문 영어 문장의 단어를 절대 생략·변경·축약하지 말고 100% 그대로 유지한 상태에서, "
+        "의미 단위 끊어읽기 슬래시(` / `)와 구문 괄호를 직접 삽입하세요.\n"
+        "     * **절(명사절·관계사절·부사절)**은 대괄호 `[ ... ]`로 감싸기 (예: `[that we perceive reality]`, `[which influences behavior]`, `[When people face uncertainty]`).\n"
+        "     * **구 수식어(전치사구·분사구·to부정사 형용사/부사적 수식구·삽입구)**는 소괄호 `( ... )`로 감싸기 (예: `(in modern society)`, `(guided by intuition)`).\n"
+        "     * **의미 단위/주어부·동사부·목적어 경계**에는 ` / ` 슬래시 넣기 (예: `The ability [to adapt (to rapid change)] / determines / [whether an organization thrives (in the long run)].`).\n"
+        "     * 과도한 중첩으로 읽기가 망가지지 않도록 핵심 구문 경계 위주로 깔끔하게 끊고 묶으세요.\n"
+        "   - `korean_translation`: 문맥을 살린 정확하고 자연스러운 한국어 직역·의역 조화 해석.\n"
+        "   - `syntax_notes`: 해당 문장에서 학생이 꼭 알아야 할 **핵심 구문·어법 포인트** 1~3개를 한국어로 간결하고 명확하게 설명 "
+        "(예: `'to adapt to ~: 앞의 명사 ability를 수식하는 to부정사 형용사적 용법'`, `'whether + S + V: 동사 determines의 목적어 역할을 하는 명사절'`). "
+        "단순 단어 뜻 풀이는 넣지 말고 문장 구조·어법 원리만 설명하세요."
+    )
+
+    prompt = (
+        f"[지문 출처] {source_label or '-'} (원래 유형: {orig_question_type or '-'})\n"
+        f"[참고 주제] {passage_topic or '-'}\n\n"
+        f"[지문 원문]\n{clean_passage}\n\n"
+        f"[문장 분리 참고 (총 {len(sents) if sents else 1}문장 — 번호 순서대로 누락 없이 모두 분석)]\n"
+        f"{numbered_sents_block}\n\n"
+        "위 영어 지문에 대한 정밀 구문·논리 분석지 JSON을 작성하세요."
+    )
+
+    resp = _generate_content_with_fallback(
+        client=client,
+        model_name=eff_model,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            system_instruction=system_inst,
+            response_mime_type="application/json",
+            response_schema=EnglishPassageAnalysisOutput,
+            temperature=0.2,
+            max_output_tokens=8192,
+            thinking_config=types.ThinkingConfig(
+                thinking_level=types.ThinkingLevel.MINIMAL,
+                include_thoughts=False,
+            ),
+        ),
+        fast_mode=True,
+    )
+    out = _parse_structured(resp, EnglishPassageAnalysisOutput)
+    if out.sentence_analyses:
+        out.sentence_analyses = sorted(out.sentence_analyses, key=lambda x: x.sentence_num)
+    return out
+
+
+def generate_english_visual_diagram(
+    *,
+    api_key: str,
+    model_name: str,
+    passage_text: str,
+    title: str = "",
+    core_theme: str = "",
+) -> KoreanVisualDiagram:
+    """기존에 분석된 영어 지문에 대해 이해를 돕는 도식 그림 스펙만 보완 생성한다."""
+    clean_passage = _preprocess_english_source_passage(passage_text)
+    if not clean_passage:
+        raise ValueError("도식을 생성할 영어 지문 원문이 비어 있습니다.")
+
+    eff_model = (model_name or "").strip() or EXAM_TAGGING_MODEL
+    client = _build_client(api_key, timeout_seconds=60)
+    system_inst = (
+        "당신은 수능 영어 일타 강사입니다. 주어진 영어 지문 원문만을 100% 근거로, "
+        "학생이 핵심 논리·비교·인과·구조를 그림으로 한눈에 이해할 수 있는 도식 명세(`KoreanVisualDiagram`) JSON을 한국어로 작성하세요.\n"
+        + _ENGLISH_DIAGRAM_GUIDE
+    )
+    prompt = (
+        f"[제목/주제] {title or '-'} / {core_theme or '-'}\n\n"
+        f"[영어 지문 원문]\n{clean_passage[:4500]}\n\n"
+        "위 영어 지문의 핵심 논리 구조를 시각화한 한국어 도식 JSON을 작성하세요."
+    )
+    resp = _generate_content_with_fallback(
+        client=client,
+        model_name=eff_model,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            system_instruction=system_inst,
+            response_mime_type="application/json",
+            response_schema=KoreanVisualDiagram,
+            temperature=0.2,
+            max_output_tokens=2048,
+            thinking_config=types.ThinkingConfig(
+                thinking_level=types.ThinkingLevel.MINIMAL,
+                include_thoughts=False,
+            ),
+        ),
+        fast_mode=True,
+    )
+    return _parse_structured(resp, KoreanVisualDiagram)

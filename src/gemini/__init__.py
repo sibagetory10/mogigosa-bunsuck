@@ -105,6 +105,7 @@ _SUBMODULE_EXPORTS: dict[str, tuple[str, ...]] = {
         "_validate_english_transformed_output",
     ),
     "src.gemini.english": (
+        "_ENGLISH_DIAGRAM_GUIDE",
         "_RESTORED_PASSAGE_CACHE",
         "_RESTORED_PASSAGE_LOCK",
         "_infer_english_group_id",
@@ -113,7 +114,9 @@ _SUBMODULE_EXPORTS: dict[str, tuple[str, ...]] = {
         "analyze_english_question_with_gemini",
         "chat_followup_with_english",
         "generate_english_explanation",
+        "generate_english_passage_analysis",
         "generate_english_transformed_question",
+        "generate_english_visual_diagram",
     ),
     "src.gemini.korean": (
         "_KOREAN_DIAGRAM_GUIDE",

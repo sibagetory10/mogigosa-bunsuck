@@ -104,6 +104,7 @@ from src.gemini.english_validators import (  # noqa: F401
     _validate_english_transformed_output,
 )
 from src.gemini.english import (  # noqa: F401
+    _ENGLISH_DIAGRAM_GUIDE,
     _RESTORED_PASSAGE_CACHE,
     _RESTORED_PASSAGE_LOCK,
     _infer_english_group_id,
@@ -112,7 +113,9 @@ from src.gemini.english import (  # noqa: F401
     analyze_english_question_with_gemini,
     chat_followup_with_english,
     generate_english_explanation,
+    generate_english_passage_analysis,
     generate_english_transformed_question,
+    generate_english_visual_diagram,
 )
 from src.gemini.korean import (  # noqa: F401
     _KOREAN_DIAGRAM_GUIDE,

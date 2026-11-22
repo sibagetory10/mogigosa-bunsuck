@@ -15,6 +15,7 @@ from src.exporters import build_exam_ai_jsonl, build_exam_html, build_exam_markd
 from src.models import (
     ConceptBookRecord,
     EnglishDictEntry,
+    EnglishPassageAnalysisOutput,
     KoreanPassageAnalysisOutput,
     LEGACY_TIER_MAP,
     QuestionRecord,
@@ -103,6 +104,8 @@ class StorageManager:
         self.db_path = self.local_root / "db.json"
         self.users_path = self.local_root / "users.json"
         self.english_pool_path = self.local_root / "english_question_pool.json"
+        self.english_analysis_pool_path = self.local_root / "english_analysis_pool.json"
+        self.english_analysis_pdfs_root = self.local_root / "english_analysis_pdfs"
         self.korean_analysis_pool_path = self.local_root / "korean_analysis_pool.json"
         self.korean_analysis_pdfs_root = self.local_root / "korean_analysis_pdfs"
         self.user_english_history_path = self.local_root / "user_english_history.json"
@@ -119,6 +122,7 @@ class StorageManager:
         self.pdfs_dir.mkdir(parents=True, exist_ok=True)
         self.crops_dir.mkdir(parents=True, exist_ok=True)
         self.organized_dir.mkdir(parents=True, exist_ok=True)
+        self.english_analysis_pdfs_root.mkdir(parents=True, exist_ok=True)
         self.korean_analysis_pdfs_root.mkdir(parents=True, exist_ok=True)
         self.saved_exams_root.mkdir(parents=True, exist_ok=True)
         self.saved_exams_pdfs_root.mkdir(parents=True, exist_ok=True)
@@ -511,6 +515,7 @@ class StorageManager:
 
             self.save_db(remaining)
             self.delete_korean_analyses_by_exam(exam_name)
+            self.delete_english_analyses_by_exam(exam_name)
             return len(to_delete)
 
     def rename_exam(self, old_exam_name: str, new_exam_name: str) -> int:
@@ -541,13 +546,19 @@ class StorageManager:
                         pass
             self.save_db(records)
             self.rename_korean_analyses_exam(old_n, new_n)
+            self.rename_english_analyses_exam(old_n, new_n)
             return changed
 
     def reset_exam_database(self, delete_users: bool = False) -> dict[str, Any]:
         """로컬 영구 디스크에 누적된 기출 DB·이미지·PDF 파일을 모두 삭제(초기화)한다."""
         with self._lock:
             removed_local = 0
-            for folder in (self.crops_dir, self.pdfs_dir, self.korean_analysis_pdfs_root):
+            for folder in (
+                self.crops_dir,
+                self.pdfs_dir,
+                self.korean_analysis_pdfs_root,
+                self.english_analysis_pdfs_root,
+            ):
                 if folder.exists():
                     for child in folder.iterdir():
                         if child.is_file():
@@ -565,6 +576,8 @@ class StorageManager:
             _atomic_write_text(self.db_path, "[]", encoding="utf-8")
             if self.english_pool_path.exists():
                 _atomic_write_text(self.english_pool_path, "{}", encoding="utf-8")
+            if self.english_analysis_pool_path.exists():
+                _atomic_write_text(self.english_analysis_pool_path, "{}", encoding="utf-8")
             if self.korean_analysis_pool_path.exists():
                 _atomic_write_text(self.korean_analysis_pool_path, "{}", encoding="utf-8")
             if delete_users and self.users_path.exists():
@@ -1048,6 +1061,7 @@ class StorageManager:
             ("기출 원본 PDF", str(self.pdfs_dir), _dir_stats(self.pdfs_dir)),
             ("크롭 문항 이미지", str(self.crops_dir), _dir_stats(self.crops_dir)),
             ("과목별 정리 파일", str(self.organized_dir), _dir_stats(self.organized_dir)),
+            ("영어 지문 분석지 PDF", str(self.english_analysis_pdfs_root), _dir_stats(self.english_analysis_pdfs_root)),
             ("국어 지문 분석지 PDF", str(self.korean_analysis_pdfs_root), _dir_stats(self.korean_analysis_pdfs_root)),
             ("나의 시험지 보관함", str(self.saved_exams_root), _dir_stats(self.saved_exams_root)),
             ("개인 영단어장", str(self.user_vocab_root), _dir_stats(self.user_vocab_root)),
@@ -1331,6 +1345,198 @@ class StorageManager:
                     changed += 1
             if changed > 0:
                 self._save_korean_analysis_pool_unlocked(pool)
+            return changed
+
+    # -----------------------------------------------------------------------
+    # 영어 정밀 지문 분석지 캐시 풀(Pool) 영구 저장 / 조회 / 관리
+    # -----------------------------------------------------------------------
+    @staticmethod
+    def build_english_analysis_key(
+        passage_text: str,
+        q_label: str = "",
+    ) -> str:
+        """영어 지문 원문 정규화 텍스트로 분석지 캐시 키를 생성한다."""
+        norm_p = re.sub(r"\s+", " ", (passage_text or "").strip())
+        return hashlib.sha256(f"eng_an||{norm_p}".encode("utf-8")).hexdigest()[:24]
+
+    def _load_english_analysis_pool_unlocked(self) -> dict[str, dict[str, Any]]:
+        if not self.english_analysis_pool_path.exists():
+            return {}
+        sig = _file_stat_sig(self.english_analysis_pool_path)
+        if sig is None or sig[1] == 0:
+            return {}
+        cache_key = f"eng_an_pool::{self.english_analysis_pool_path.resolve()}"
+        with _GLOBAL_CACHE_LOCK:
+            cached = _GLOBAL_JSON_CACHE.get(cache_key)
+            if cached is not None and cached[0] == sig:
+                return {k: dict(v) for k, v in cached[1].items()}
+        try:
+            data = json.loads(self.english_analysis_pool_path.read_text(encoding="utf-8"))
+            clean = {
+                str(k): dict(v)
+                for k, v in (data if isinstance(data, dict) else {}).items()
+                if isinstance(v, dict)
+            }
+            with _GLOBAL_CACHE_LOCK:
+                _GLOBAL_JSON_CACHE[cache_key] = (sig, clean)
+            return {k: dict(v) for k, v in clean.items()}
+        except Exception:
+            return {}
+
+    def _save_english_analysis_pool_unlocked(self, pool: dict[str, dict[str, Any]]) -> None:
+        raw = json.dumps(pool, ensure_ascii=False, indent=2)
+        _atomic_write_text(self.english_analysis_pool_path, raw, encoding="utf-8")
+        new_sig = _file_stat_sig(self.english_analysis_pool_path)
+        if new_sig is not None:
+            with _GLOBAL_CACHE_LOCK:
+                _GLOBAL_JSON_CACHE[f"eng_an_pool::{self.english_analysis_pool_path.resolve()}"] = (
+                    new_sig,
+                    {str(k): dict(v) for k, v in pool.items() if isinstance(v, dict)},
+                )
+
+    def load_english_analysis_pool(self) -> dict[str, dict[str, Any]]:
+        """저장된 영어 지문 분석지 풀(Pool) 전체를 안전하게 조회한다."""
+        with self._lock:
+            pool = self._load_english_analysis_pool_unlocked()
+            return {k: dict(v) for k, v in pool.items() if isinstance(v, dict)}
+
+    def get_cached_english_analysis(self, cache_key: str) -> EnglishPassageAnalysisOutput | None:
+        """영어 분석지 풀에서 캐시 히트 시 EnglishPassageAnalysisOutput을 즉시 반환한다."""
+        if not cache_key:
+            return None
+        with self._lock:
+            pool = self._load_english_analysis_pool_unlocked()
+            entry = pool.get(cache_key)
+            if not isinstance(entry, dict):
+                return None
+            raw_analysis = entry.get("analysis")
+            if not isinstance(raw_analysis, dict):
+                return None
+            try:
+                return EnglishPassageAnalysisOutput.model_validate(raw_analysis)
+            except Exception:
+                return None
+
+    def save_cached_english_analysis(
+        self,
+        cache_key: str,
+        analysis: EnglishPassageAnalysisOutput,
+        *,
+        exam_name: str = "",
+        q_label: str = "",
+        question_type: str = "",
+    ) -> None:
+        """AI로 신규 생성한 영어 지문 분석지를 서버 풀에 영구 저장한다."""
+        if not cache_key or analysis is None:
+            return
+        with self._lock:
+            pool = self._load_english_analysis_pool_unlocked()
+            pool[cache_key] = {
+                "exam_name": (exam_name or "").strip(),
+                "q_label": (q_label or "").strip(),
+                "question_type": (question_type or "").strip(),
+                "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "analysis": analysis.model_dump(),
+            }
+            self._save_english_analysis_pool_unlocked(pool)
+
+    def get_english_analysis_pdf_path(self, cache_key: str) -> Path:
+        """지문별 영어 분석지 PDF 파일 경로를 반환한다."""
+        return self.english_analysis_pdfs_root / f"{self._safe_kor_cache_key(cache_key)}_eng_analysis_v1.pdf"
+
+    def _unlink_eng_pdfs_for_key(self, cache_key: str) -> bool:
+        pdf_p = self.get_english_analysis_pdf_path(cache_key)
+        if pdf_p.exists():
+            pdf_p.unlink(missing_ok=True)
+            return True
+        return False
+
+    def has_english_analysis_pdf(self, cache_key: str) -> bool:
+        """지문별 영어 분석지 PDF가 서버 DB에 저장되어 있는지 반환한다."""
+        return bool(cache_key) and self._has_nonempty_file(self.get_english_analysis_pdf_path(cache_key))
+
+    def get_english_analysis_pdf_bytes(self, cache_key: str) -> bytes | None:
+        """서버 DB에 저장된 지문별 영어 분석지 PDF 바이트를 반환한다."""
+        if not cache_key:
+            return None
+        return self._read_nonempty_bytes(self.get_english_analysis_pdf_path(cache_key))
+
+    def save_english_analysis_pdf_bytes(self, cache_key: str, pdf_bytes: bytes) -> None:
+        """지문별 영어 분석지 PDF 바이트를 서버 DB에 영구 저장한다."""
+        if not cache_key or not pdf_bytes:
+            return
+        with self._lock:
+            self.english_analysis_pdfs_root.mkdir(parents=True, exist_ok=True)
+            _atomic_write_bytes(self.get_english_analysis_pdf_path(cache_key), pdf_bytes)
+            with _GLOBAL_CACHE_LOCK:
+                _GLOBAL_STORAGE_STATS_CACHE.clear()
+
+    def delete_english_analysis_entry(self, cache_key: str) -> int:
+        """영어 지문 분석지 캐시 및 저장된 지문 PDF 1건을 삭제한다."""
+        if not cache_key:
+            return 0
+        with self._lock:
+            pool = self._load_english_analysis_pool_unlocked()
+            removed = 0
+            if cache_key in pool:
+                pool.pop(cache_key, None)
+                self._save_english_analysis_pool_unlocked(pool)
+                removed = 1
+            if self._unlink_eng_pdfs_for_key(cache_key):
+                removed = 1
+            with _GLOBAL_CACHE_LOCK:
+                _GLOBAL_STORAGE_STATS_CACHE.clear()
+            return removed
+
+    def clear_english_analysis_pool(self) -> int:
+        """영어 지문 분석지 캐시 및 저장된 지문별 PDF 전체를 비운다."""
+        with self._lock:
+            pool = self._load_english_analysis_pool_unlocked()
+            removed = len(pool)
+            self._save_english_analysis_pool_unlocked({})
+            if self.english_analysis_pdfs_root.exists():
+                for child in self.english_analysis_pdfs_root.iterdir():
+                    if child.is_file():
+                        child.unlink(missing_ok=True)
+            with _GLOBAL_CACHE_LOCK:
+                _GLOBAL_STORAGE_STATS_CACHE.clear()
+            return removed
+
+    def delete_english_analyses_by_exam(self, exam_name: str) -> int:
+        """특정 회차가 삭제될 때 해당 회차의 영어 분석지 캐시 및 지문별 PDF도 함께 삭제한다."""
+        target_exam = (exam_name or "").strip()
+        if not target_exam:
+            return 0
+        with self._lock:
+            pool = self._load_english_analysis_pool_unlocked()
+            to_del = [
+                k
+                for k, v in pool.items()
+                if isinstance(v, dict) and str(v.get("exam_name") or "").strip() == target_exam
+            ]
+            if not to_del:
+                return 0
+            for k in to_del:
+                pool.pop(k, None)
+                self._unlink_eng_pdfs_for_key(k)
+            self._save_english_analysis_pool_unlocked(pool)
+            return len(to_del)
+
+    def rename_english_analyses_exam(self, old_exam_name: str, new_exam_name: str) -> int:
+        """회차명 변경 시 영어 분석지 캐시의 exam_name 메타데이터를 동기화한다."""
+        old_n = (old_exam_name or "").strip()
+        new_n = re.sub(r"\s+", " ", (new_exam_name or "").strip())
+        if not old_n or not new_n or old_n == new_n:
+            return 0
+        with self._lock:
+            pool = self._load_english_analysis_pool_unlocked()
+            changed = 0
+            for k, v in pool.items():
+                if isinstance(v, dict) and str(v.get("exam_name") or "").strip() == old_n:
+                    v["exam_name"] = new_n
+                    changed += 1
+            if changed > 0:
+                self._save_english_analysis_pool_unlocked(pool)
             return changed
 
     # -----------------------------------------------------------------------

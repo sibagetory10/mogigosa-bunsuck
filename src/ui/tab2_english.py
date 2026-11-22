@@ -20,7 +20,18 @@ from src.auth import (
     resolve_active_gemini_api_key,
 )
 from src.config import EXAM_TAGGING_MODEL, FLASH_LITE_MODEL, MODEL_LABELS
-from src.gemini import generate_english_transformed_question, submit_with_usage_context
+from src.diagram_renderer import render_korean_diagram_png
+from src.gemini import (
+    generate_english_passage_analysis,
+    generate_english_transformed_question,
+    generate_english_visual_diagram,
+    submit_with_usage_context,
+)
+from src.korean_pdf_generator import (
+    _format_chunked_english_html,
+    generate_english_passage_analysis_pdf,
+    merge_korean_analysis_pdfs,
+)
 from src.models import (
     ENGLISH_DEFAULT_EXCLUDED_Q_NUMS,
     ENGLISH_TRANSFORM_TYPES,
@@ -183,9 +194,300 @@ def _execute_english_transform_jobs(
     st.success(f"🎯 총 **{len(assembled)}문항**의 수능형 영어 변형 문제 출제가 완료되었습니다! 아래 모드 A(시험지 PDF) 또는 모드 B(웹 바로 풀기)에서 확인하세요.{rem_msg}")
 
 
+_ENG_CIRCLED_NUMS = (
+    "①", "②", "③", "④", "⑤", "⑥", "⑦", "⑧", "⑨", "⑩",
+    "⑪", "⑫", "⑬", "⑭", "⑮", "⑯", "⑰", "⑱", "⑲", "⑳",
+)
+
+
+def _execute_english_analysis_jobs(
+    ctx: AppContext,
+    items: list[dict[str, Any]],
+    include_diagrams: bool = True,
+) -> None:
+    """선택된 영어 지문 목록에 대해 DB 캐시 조회/병렬 AI 분석/지문별 PDF 저장/합본 PDF 생성을 수행한다."""
+    if not items:
+        st.warning("분석지를 생성할 영어 지문을 최소 1개 이상 선택해 주세요.")
+        return
+
+    prepared_slots: list[dict[str, Any]] = []
+    missing_ai_indices: list[int] = []
+    missing_diag_indices: list[int] = []
+
+    for idx_s, it in enumerate(items):
+        p_txt = str(it.get("passage_text") or "").strip()
+        q_lbl = str(it.get("q_label") or "").strip()
+        c_key = ctx.storage.build_english_analysis_key(p_txt, q_lbl)
+        cached_an = ctx.storage.get_cached_english_analysis(c_key)
+        cached_pdf = ctx.storage.get_english_analysis_pdf_bytes(c_key) if include_diagrams else None
+        prepared_slots.append(
+            {
+                "item": it,
+                "cache_key": c_key,
+                "analysis": cached_an,
+                "pdf_bytes": cached_pdf,
+            }
+        )
+        if cached_an is None:
+            missing_ai_indices.append(idx_s)
+        elif include_diagrams and getattr(cached_an, "visual_diagram", None) is None:
+            missing_diag_indices.append(idx_s)
+            prepared_slots[idx_s]["pdf_bytes"] = None
+
+    pdf_hit_cnt = sum(1 for sl in prepared_slots if sl["pdf_bytes"] is not None)
+    json_to_pdf_cnt = 0
+    ai_gen_cnt = 0
+
+    if missing_ai_indices or missing_diag_indices:
+        if not _ensure_token_quota(ctx):
+            return
+        an_model = FLASH_LITE_MODEL
+        an_api_key, an_key_label = resolve_active_gemini_api_key(
+            ctx.current_user, ctx.creds.gemini_api_key, model_name=an_model
+        )
+        if not an_api_key:
+            st.error(f"영어 지문 분석용 Gemini API 키({an_key_label})가 설정되지 않았습니다.")
+            return
+
+        need_total = len(missing_ai_indices) + len(missing_diag_indices)
+        with _usage_scope(ctx):
+            with st.spinner(
+                f"📑 {MODEL_LABELS.get(an_model, an_model)}로 "
+                f"영어 정밀 지문 분석지·도식 생성 {need_total}건 병렬 진행 중 "
+                f"(DB 로드 {len(items) - len(missing_ai_indices)}건)..."
+            ):
+                if missing_ai_indices:
+                    def _run_ai_slot(slot_i: int):
+                        slot = prepared_slots[slot_i]
+                        it = slot["item"]
+                        an_out = generate_english_passage_analysis(
+                            api_key=an_api_key,
+                            model_name=an_model,
+                            passage_text=it["passage_text"],
+                            source_label=it["q_label"],
+                            orig_question_type=it.get("orig_type", ""),
+                            passage_topic=it.get("passage_topic", ""),
+                        )
+                        return slot_i, an_out
+
+                    with concurrent.futures.ThreadPoolExecutor(
+                        max_workers=min(4, len(missing_ai_indices))
+                    ) as executor:
+                        fut_map = {
+                            submit_with_usage_context(executor, _run_ai_slot, si): si
+                            for si in missing_ai_indices
+                        }
+                        for fut in concurrent.futures.as_completed(fut_map):
+                            si = fut_map[fut]
+                            slot = prepared_slots[si]
+                            it = slot["item"]
+                            try:
+                                _, an_out = fut.result()
+                                slot["analysis"] = an_out
+                                ai_gen_cnt += 1
+                                ctx.storage.save_cached_english_analysis(
+                                    slot["cache_key"],
+                                    an_out,
+                                    exam_name=it.get("exam_name", ""),
+                                    q_label=it.get("q_label", ""),
+                                    question_type=it.get("orig_type", ""),
+                                )
+                            except Exception as exc:
+                                st.error(f"[{it.get('q_label', '영어 지문')}] 지문 분석 실패: {exc}")
+
+                valid_diag_indices = [
+                    si for si in missing_diag_indices if prepared_slots[si]["analysis"] is not None
+                ]
+                if valid_diag_indices:
+                    def _run_diag_slot(slot_i: int):
+                        slot = prepared_slots[slot_i]
+                        it = slot["item"]
+                        cur_an = slot["analysis"]
+                        diag_out = generate_english_visual_diagram(
+                            api_key=an_api_key,
+                            model_name=an_model,
+                            passage_text=it["passage_text"],
+                            title=cur_an.title,
+                            core_theme=cur_an.core_theme,
+                        )
+                        return slot_i, diag_out
+
+                    with concurrent.futures.ThreadPoolExecutor(
+                        max_workers=min(4, len(valid_diag_indices))
+                    ) as executor:
+                        fut_map = {
+                            submit_with_usage_context(executor, _run_diag_slot, si): si
+                            for si in valid_diag_indices
+                        }
+                        for fut in concurrent.futures.as_completed(fut_map):
+                            si = fut_map[fut]
+                            slot = prepared_slots[si]
+                            it = slot["item"]
+                            cur_an = slot["analysis"]
+                            try:
+                                _, diag_out = fut.result()
+                                updated_an = cur_an.model_copy(update={"visual_diagram": diag_out})
+                                slot["analysis"] = updated_an
+                                ctx.storage.save_cached_english_analysis(
+                                    slot["cache_key"],
+                                    updated_an,
+                                    exam_name=it.get("exam_name", ""),
+                                    q_label=it.get("q_label", ""),
+                                    question_type=it.get("orig_type", ""),
+                                )
+                            except Exception as exc:
+                                st.warning(f"[{it.get('q_label', '영어 지문')}] 이해 도식 생성 건너뜀: {exc}")
+
+    analyses_list: list[dict[str, Any]] = []
+    pdf_parts: list[bytes] = []
+    missing_ai_set = set(missing_ai_indices)
+    for idx_sl, slot in enumerate(prepared_slots):
+        if slot["analysis"] is None and slot["pdf_bytes"] is None:
+            continue
+        it = slot["item"]
+        single_item = {
+            "exam_name": it.get("exam_name", ""),
+            "q_label": it.get("q_label", ""),
+            "orig_type": it.get("orig_type", "영어 독해"),
+            "passage_text": it.get("passage_text", ""),
+            "analysis": slot["analysis"],
+        }
+        if slot["pdf_bytes"] is None:
+            try:
+                single_pdf = generate_english_passage_analysis_pdf(
+                    [single_item],
+                    include_diagrams=include_diagrams,
+                )
+                if include_diagrams:
+                    ctx.storage.save_english_analysis_pdf_bytes(slot["cache_key"], single_pdf)
+                slot["pdf_bytes"] = single_pdf
+                if idx_sl not in missing_ai_set:
+                    json_to_pdf_cnt += 1
+            except Exception as exc:
+                st.error(f"[{it.get('q_label', '영어 지문')}] 분석 PDF 생성 실패: {exc}")
+                continue
+        pdf_parts.append(slot["pdf_bytes"])
+        if slot["analysis"] is not None:
+            analyses_list.append(single_item)
+
+    if pdf_parts:
+        try:
+            merged_pdf = merge_korean_analysis_pdfs(pdf_parts)
+            st.session_state["eng_analysis_results"] = analyses_list
+            st.session_state["eng_analysis_pdf"] = merged_pdf
+            detail_notes: list[str] = [f"저장 PDF 즉시 이어붙이기 {pdf_hit_cnt}건"]
+            if json_to_pdf_cnt > 0:
+                detail_notes.append(f"기존 분석 JSON→PDF 저장 {json_to_pdf_cnt}건")
+            if ai_gen_cnt > 0:
+                detail_notes.append(f"신규 AI 분석+PDF 저장 {ai_gen_cnt}건")
+            st.success(
+                f"📑 총 {len(analyses_list)}개 영어 지문 분석지 합본 PDF가 생성되었습니다! "
+                f"({' · '.join(detail_notes)})"
+            )
+        except Exception as exc:
+            st.error(f"영어 지문 분석지 PDF 병합 실패: {exc}")
+
+
+def _render_english_analysis_results_section() -> None:
+    """세션에 생성된 영어 지문 정밀 분석지 웹 미리보기 및 합본 PDF 다운로드 버튼을 렌더링한다."""
+    saved_analyses: list[dict[str, Any]] = st.session_state.get("eng_analysis_results") or []
+    saved_pdf: bytes | None = st.session_state.get("eng_analysis_pdf")
+    if not (saved_analyses and saved_pdf):
+        return
+
+    st.markdown("---")
+    st.markdown("#### 📑 생성된 영어 정밀 지문 분석지 (주제 · 논리 흐름 · 도식 · 문장별 구문독해)")
+    with st.container(border=True):
+        dl_c1, dl_c2 = st.columns([2.2, 1.0])
+        with dl_c1:
+            st.write(
+                f"총 **{len(saved_analyses)}개** 영어 지문 정밀 분석 완료 "
+                "(핵심 주제 · 논리 전개 흐름 · 시각 도식 · 문장별 `/`·`[ ]`·`( )` 구문독해 · 주제문 ★ 표시)"
+            )
+        with dl_c2:
+            st.download_button(
+                "📥 영어 지문 분석지 PDF 다운로드",
+                data=saved_pdf,
+                file_name="영어_정밀_지문_분석지.pdf",
+                mime="application/pdf",
+                type="primary",
+                width="stretch",
+                key="eng_analysis_pdf_dl_btn",
+            )
+
+        for idx_a, an_item in enumerate(saved_analyses, start=1):
+            an = an_item["analysis"]
+            q_lbl = an_item.get("q_label") or an_item.get("exam_name") or "영어 지문"
+            orig_t = an_item.get("orig_type") or "독해"
+            with st.expander(
+                f"{idx_a}. [{q_lbl}] {an.title} ({orig_t})",
+                expanded=(idx_a == 1),
+            ):
+                st.info(f"**📌 핵심 주제:** {an.core_theme}")
+                st.success(f"**🧭 논리 전개 흐름:**\n\n{an.structure_flow}")
+                _v_diag = getattr(an, "visual_diagram", None)
+                if _v_diag is not None and (
+                    getattr(_v_diag, "nodes", None)
+                    or getattr(_v_diag, "graph_spec", None)
+                    or getattr(_v_diag, "emotion_points", None)
+                ):
+                    try:
+                        st.image(
+                            render_korean_diagram_png(_v_diag),
+                            caption=f"🖼️ {_v_diag.title}",
+                            width="stretch",
+                        )
+                    except Exception:
+                        pass
+
+                sent_list = list(getattr(an, "sentence_analyses", None) or [])
+                if sent_list:
+                    st.markdown("**🔍 문장별 정밀 구문 분석** (`/` 끊어읽기 · `[절]` · `(수식어구)` · `★ 주제문`)")
+                    st.markdown(
+                        "<style>"
+                        ".eng-slash{color:#DC2626;font-weight:700;}"
+                        ".eng-bracket{color:#1D4ED8;font-weight:700;}"
+                        ".eng-paren{color:#0F766E;font-weight:700;}"
+                        "</style>",
+                        unsafe_allow_html=True,
+                    )
+                    for s_i, sa in enumerate(sent_list):
+                        s_num = int(getattr(sa, "sentence_num", s_i + 1) or (s_i + 1))
+                        n_badge = _ENG_CIRCLED_NUMS[s_num - 1] if 1 <= s_num <= len(_ENG_CIRCLED_NUMS) else f"({s_num})"
+                        is_topic = bool(getattr(sa, "is_topic_sentence", False))
+                        topic_html = (
+                            " <span style='background:#FEF3C7;color:#B45309;border:1px solid #F59E0B;"
+                            "padding:1px 6px;border-radius:4px;font-size:0.8em;font-weight:700;'>"
+                            "★ 주제문 (Topic Sentence)</span>"
+                            if is_topic
+                            else ""
+                        )
+                        border_style = (
+                            "border:1.5px solid #F59E0B;border-left:4px solid #D97706;background:#FFFBEB;"
+                            if is_topic
+                            else "border:1px solid #E2E8F0;background:#FFFFFF;"
+                        )
+                        chunk_html = _format_chunked_english_html(getattr(sa, "chunked_english", ""))
+                        kor_txt = _html.escape((getattr(sa, "korean_translation", "") or "").strip())
+                        notes = [str(n).strip() for n in (getattr(sa, "syntax_notes", None) or []) if str(n).strip()]
+                        notes_html = ""
+                        if notes:
+                            li = "".join(f"<div style='color:#1E40AF;font-size:0.88em;'>▸ {_html.escape(n)}</div>" for n in notes)
+                            notes_html = f"<div style='margin-top:5px;padding-top:4px;border-top:1px dashed #CBD5E1;'>{li}</div>"
+                        st.markdown(
+                            f"<div style='{border_style}border-radius:6px;padding:10px 12px;margin-bottom:8px;'>"
+                            f"<div style='margin-bottom:4px;'><strong style='color:#1E3A8A;'>{n_badge}</strong>{topic_html}</div>"
+                            f"<div style='font-weight:600;color:#0F172A;line-height:1.6;margin-bottom:4px;'>{chunk_html}</div>"
+                            f"<div style='color:#334155;font-size:0.95em;line-height:1.5;'>{kor_txt}</div>"
+                            f"{notes_html}"
+                            "</div>",
+                            unsafe_allow_html=True,
+                        )
+
+
 def _render_tab2_english_transform_section(ctx: AppContext) -> None:
-    """탭 2 영어 과목 전용: 기출 영어 지문 검색/직접 입력 및 수능 11개 독해 유형 변형 UI."""
-    st.subheader("1️⃣ 영어 지문 선택 & 수능 독해 유형 변형 엔진")
+    """탭 2 영어 과목 전용: 기출 영어 지문 검색/직접 입력, 정밀 지문 분석지 PDF 생성 및 수능 11개 독해 유형 변형 UI."""
+    st.subheader("1️⃣ 영어 지문 선택 · 정밀 분석지 PDF & 수능 독해 유형 변형")
     rewrite_model, use_precision_mode = _resolve_tab2_english_rewrite_model(key_suffix="eng")
     user_max_jobs = get_max_batch_questions(ctx.current_user)
     max_limit_badge = f"1회 최대 **{user_max_jobs}문항**" if user_max_jobs is not None else "1회 문항 수 **제한 없음**"
@@ -352,8 +654,10 @@ def _render_tab2_english_transform_section(ctx: AppContext) -> None:
                         r_orig_t = (getattr(rec_p, "english_question_type", "") or rec_p.unit_name).strip()
                         r_topic = (getattr(rec_p, "passage_topic", "") or "").strip()
                         p_preview = re.sub(r"\s+", " ", (rec_p.passage_text or "").strip())[:115]
+                        c_key_chk = ctx.storage.build_english_analysis_key(rec_p.passage_text, q_label)
+                        pdf_status_tag = " · 📑 분석지PDF DB" if ctx.storage.has_english_analysis_pdf(c_key_chk) else ""
                         row_label = (
-                            f"[{q_label}] 원래 유형: {r_orig_t}"
+                            f"[{q_label}] 원래 유형: {r_orig_t}{pdf_status_tag}"
                             + (f" · 주제: {r_topic}" if r_topic else "")
                             + f" — \"{p_preview}...\""
                         )
@@ -402,11 +706,24 @@ def _render_tab2_english_transform_section(ctx: AppContext) -> None:
                             "체크한 지문 × 선택 유형 수만큼 호출됩니다."
                         )
 
-                    run_eng_db_btn = st.form_submit_button(
-                        "🚀 선택한 기출 영어 지문 수능형 변형 문제 생성",
-                        type="primary",
-                        width="stretch",
+                    include_eng_db_diagrams = st.checkbox(
+                        "🎨 지문 이해용 시각 도식 그림 포함 (분석지 PDF 생성 시 적용)",
+                        value=True,
+                        key="tab2_eng_db_include_diagrams",
                     )
+                    eb_c1, eb_c2 = st.columns(2)
+                    with eb_c1:
+                        run_eng_db_btn = st.form_submit_button(
+                            "🚀 선택한 기출 영어 지문 수능형 변형 문제 생성",
+                            type="primary",
+                            width="stretch",
+                        )
+                    with eb_c2:
+                        run_eng_db_analysis_btn = st.form_submit_button(
+                            "📑 선택한 영어 지문 분석지 PDF 생성",
+                            type="secondary",
+                            width="stretch",
+                        )
 
                 with st.expander("📖 조회된 기출 영어 지문 원문·어휘 미리보기", expanded=False):
                     for rec_p, q_label in filtered_passages[:30]:
@@ -460,6 +777,26 @@ def _render_tab2_english_transform_section(ctx: AppContext) -> None:
                                 source_summary_label=summary_lbl,
                                 use_precision_mode=use_precision_mode,
                             )
+
+                if run_eng_db_analysis_btn:
+                    if not checked_rows:
+                        st.error("분석지를 생성할 영어 지문을 최소 1개 이상 체크해 주세요.")
+                    else:
+                        an_items = [
+                            {
+                                "exam_name": rec_p.exam_name,
+                                "q_label": q_label,
+                                "orig_type": (getattr(rec_p, "english_question_type", "") or rec_p.unit_name).strip(),
+                                "passage_topic": (getattr(rec_p, "passage_topic", "") or "").strip(),
+                                "passage_text": rec_p.passage_text,
+                            }
+                            for rec_p, q_label, _ in checked_rows
+                        ]
+                        _execute_english_analysis_jobs(
+                            ctx,
+                            items=an_items,
+                            include_diagrams=include_eng_db_diagrams,
+                        )
 
     with eng_tab_direct:
         with st.form("tab2_eng_direct_transform_form", border=True):
@@ -518,11 +855,24 @@ def _render_tab2_english_transform_section(ctx: AppContext) -> None:
                 f"📊 **예상 AI 호출: {est_direct_calls}건 {lim_note_d}** · "
                 f"선택 유형 {len(direct_types)}개 × 지문 수"
             )
-            run_eng_direct_btn = st.form_submit_button(
-                "🚀 직접 입력한 영어 지문으로 수능형 변형 문제 생성",
-                type="primary",
-                width="stretch",
+            include_eng_direct_diagrams = st.checkbox(
+                "🎨 지문 이해용 시각 도식 그림 포함 (분석지 PDF 생성 시 적용)",
+                value=True,
+                key="tab2_eng_direct_include_diagrams",
             )
+            ed_c1, ed_c2 = st.columns(2)
+            with ed_c1:
+                run_eng_direct_btn = st.form_submit_button(
+                    "🚀 직접 입력한 영어 지문으로 수능형 변형 문제 생성",
+                    type="primary",
+                    width="stretch",
+                )
+            with ed_c2:
+                run_eng_direct_analysis_btn = st.form_submit_button(
+                    "📑 직접 입력한 영어 지문 분석지 PDF 생성",
+                    type="secondary",
+                    width="stretch",
+                )
 
         if run_eng_direct_btn:
             raw_chunks = [
@@ -584,7 +934,33 @@ def _render_tab2_english_transform_section(ctx: AppContext) -> None:
                     use_precision_mode=use_precision_mode,
                 )
 
+        if run_eng_direct_analysis_btn:
+            raw_chunks = [
+                ch.strip()
+                for ch in re.split(r"\n\s*-{3,}\s*\n", (direct_passage_raw or "").strip())
+                if ch.strip()
+            ]
+            if not raw_chunks:
+                st.error("분석지를 생성할 영어 지문 텍스트를 입력해 주세요.")
+            else:
+                base_src = (direct_src_name or "직접 입력 영어 지문").strip()
+                direct_an_items = [
+                    {
+                        "exam_name": f"{base_src} #{c_idx}" if len(raw_chunks) > 1 else base_src,
+                        "q_label": f"{base_src} #{c_idx}" if len(raw_chunks) > 1 else base_src,
+                        "orig_type": "직접 입력 지문",
+                        "passage_topic": "",
+                        "passage_text": chunk_txt,
+                    }
+                    for c_idx, chunk_txt in enumerate(raw_chunks, start=1)
+                ]
+                _execute_english_analysis_jobs(
+                    ctx,
+                    items=direct_an_items,
+                    include_diagrams=include_eng_direct_diagrams,
+                )
 
+    _render_english_analysis_results_section()
 
 
 render_tab2_english_transform_section = _render_tab2_english_transform_section
