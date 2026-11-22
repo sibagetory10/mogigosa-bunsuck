@@ -306,12 +306,6 @@ def _render_admin_panel(ctx: AppContext) -> None:
                 elif del_note:
                     st.warning(del_note)
 
-    _render_server_storage_admin_section(ctx)
-    _render_server_git_update_admin_section()
-    _render_english_pool_admin_section(ctx)
-    _render_english_analysis_pool_admin_section(ctx)
-    _render_korean_analysis_pool_admin_section(ctx)
-
     storage_exp = create_lazy_expander(
         "💾 서버 디스크 저장공간 · 앱 DB 용량 모니터링",
         expanded=False,

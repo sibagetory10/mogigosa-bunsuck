@@ -476,13 +476,13 @@ def render_tab2(ctx: AppContext) -> None:
                         st.warning("선택한 과목/학년/단일개념 조건에 맞는 후보 문항이 DB에 없습니다.")
                     else:
                         with _usage_scope(ctx):
-                            with st.spinner(f"후보 {len(candidates)}개 문항의 핵심 원리를 개념서 범위와 대조 중..."):
-                                from src.gemini import (
-                                    match_questions_to_whitelist,
-                                    rewrite_question_for_pdf,
-                                    submit_with_usage_context,
-                                )
+                            from src.gemini import (
+                                match_questions_to_whitelist,
+                                rewrite_question_for_pdf,
+                                submit_with_usage_context,
+                            )
 
+                            with st.spinner(f"후보 {len(candidates)}개 문항의 핵심 원리를 개념서 범위와 대조 중..."):
                                 try:
                                     judgments = match_questions_to_whitelist(
                                         api_key=match_api_key,
