@@ -84,9 +84,21 @@ def _validate_english_transformed_output(
 
     if len(rw.rewritten_choices or []) != 5:
         issues.append(f"선택지(rewritten_choices)는 정확히 5개여야 합니다 (현재: {len(rw.rewritten_choices or [])}개).")
+    else:
+        norm_c_set = {(c or "").strip().lower() for c in (rw.rewritten_choices or []) if (c or "").strip()}
+        if len(norm_c_set) != 5:
+            issues.append("5개 선택지(rewritten_choices) 중에 빈 선지 또는 서로 중복된 선지가 포함되어 있습니다.")
+
+    if len(stem.strip()) < 70 or re.search(
+        r"(?:^\s*(?:SPLIT|INSERT_AT|SENTENCE)\s*:|^\s*[1-5①②③④⑤]\s*[:.)]\s*[A-Za-z\-']+(?:\s*(?:->|→)\s*[A-Za-z\-']+)?\s*$)",
+        stem,
+        flags=re.IGNORECASE | re.MULTILINE,
+    ):
+        issues.append("지문 조립이 완료되지 않아 슬림 텍스트 포맷이 그대로 남아 있거나 본문이 누락되었습니다.")
 
     u_matches = re.findall(r"<u\b[^>]*>(.*?)</u>", stem, flags=re.I | re.S)
     u_count = len(u_matches)
+    is_selective_vocab = "어휘" in t and ("선택형" in vocab_style or "(A)" in vocab_style or "선택형" in t or "(A)" in t)
     if "어휘" in t and source_passage:
         src_cnt = _count_english_sentences(source_passage)
         gen_cnt = _count_english_sentences(stem)
@@ -96,7 +108,25 @@ def _validate_english_transformed_output(
                 "지문 끝에 새 문장을 추가하거나 기존 문장을 삭제하지 말고 원문 본문 단어만 교체하세요."
             )
 
-    if "어법" in t or ("어휘" in t and "선택형" not in vocab_style and "(A)" not in vocab_style):
+    if is_selective_vocab:
+        box_matches = re.findall(
+            r"\(([ABC])\)\s*\[\s*([A-Za-z][A-Za-z\-']*)\s*/\s*([A-Za-z][A-Za-z\-']*)\s*\]",
+            stem,
+        )
+        found_labels = [m[0] for m in box_matches]
+        if found_labels != ["A", "B", "C"]:
+            issues.append(
+                f"선택형 어휘 지문에는 `(A) [w1 / w2]`, `(B) [w3 / w4]`, `(C) [w5 / w6]` 네모 표기 3개가 순서대로 포함되어야 합니다 (현재 감지: {found_labels})."
+            )
+        else:
+            for lbl, w1, w2 in box_matches:
+                if w1.lower() == w2.lower():
+                    issues.append(f"선택형 어휘 `({lbl}) [{w1} / {w2}]`의 두 단어가 동일합니다. 서로 반의어 관계인 두 단어로 구성하세요.")
+        for idx_c, ch in enumerate(rw.rewritten_choices or [], start=1):
+            if not re.search(r"\(A\)\s*[A-Za-z\-']+.*\(B\)\s*[A-Za-z\-']+.*\(C\)\s*[A-Za-z\-']+", ch or ""):
+                issues.append(f"선택형 어휘 {idx_c}번 선지({ch!r})가 `(A) w1 — (B) w2 — (C) w3` 형식이 아닙니다.")
+                break
+    elif "어법" in t or "어휘" in t:
         missing_markers = [mk for mk in ("①", "②", "③", "④", "⑤") if stem.count(mk) != 1]
         if u_count != 5 or missing_markers:
             issues.append(
@@ -119,6 +149,23 @@ def _validate_english_transformed_output(
                 issues.append(
                     "어법 문제 해설이 정답 밑줄을 '적절하다/타당하다'고 모순되게 설명했습니다. 명백한 문법 오류 1개만 출제하고 왜 틀렸는지 설명하세요."
                 )
+            if source_passage and ans in ("1", "2", "3", "4", "5"):
+                u_words = [re.sub(r"<[^>]+>", "", w).strip() for w in u_matches]
+                ans_span = u_words[int(ans) - 1]
+                # 원문에서 밑줄 태그만 벗긴 본문이 source_passage와 100% 동일하면 어법 변형을 전혀 하지 않은 것
+                stripped_u_body = re.sub(r"[①②③④⑤]\s*<u\b[^>]*>(.*?)</u>", r"\1", stem, flags=re.I | re.S)
+                stripped_u_lines = [
+                    ln.strip()
+                    for ln in stripped_u_body.splitlines()
+                    if ln.strip() and not re.search(r"어법상\s*틀린\s*것은", ln)
+                ]
+                norm_stripped = re.sub(r"\s+", " ", " ".join(stripped_u_lines)).strip().lower()
+                norm_src = re.sub(r"\s+", " ", source_passage).strip().lower()
+                if norm_stripped == norm_src:
+                    issues.append(
+                        f"어법 문제에서 정답 {ans}번 밑줄({ans_span!r})을 포함해 5개 밑줄이 모두 원문 정상 표현 그대로입니다. "
+                        "정답 밑줄 1곳을 실제로 틀린 어법 형태로 변형하세요."
+                    )
         elif "어휘" in t and ans in ("1", "2", "3", "4", "5"):
             # 2. 문맥상 어휘 적절성: 해설/치환목록에 적힌 교체 단어가 실제 지문 정답 밑줄에 반영되었는지 확인
             u_words = [re.sub(r"<[^>]+>", "", w).strip() for w in u_matches]
@@ -284,9 +331,18 @@ def _validate_english_transformed_output(
     elif "요약" in t:
         if "[요약문]" not in stem and "요약문" not in stem:
             issues.append("요약문 완성 지문에 `[요약문]` 섹션 헤더가 누락되었습니다.")
-        sum_section = re.split(r"\[요약문\]", stem, maxsplit=1)[-1]
-        if not re.search(r"\(A\)\s*_{2,}", sum_section) or not re.search(r"\(B\)\s*_{2,}", sum_section):
-            issues.append("요약문 섹션 안에 `(A) ________`와 `(B) ________` 빈칸 표기가 모두 포함되어야 합니다.")
+        else:
+            parts_sum = re.split(r"\[요약문\]", stem, maxsplit=1)
+            before_sum = parts_sum[0] if len(parts_sum) >= 2 else ""
+            sum_section = parts_sum[-1]
+            if len(re.findall(r"[A-Za-z]+", before_sum)) < 20:
+                issues.append("요약문 완성 지문에서 `[요약문]` 앞의 본문 영어 지문이 누락되었습니다.")
+            if not re.search(r"\(A\)\s*_{2,}", sum_section) or not re.search(r"\(B\)\s*_{2,}", sum_section):
+                issues.append("요약문 섹션 안에 `(A) ________`와 `(B) ________` 빈칸 표기가 모두 포함되어야 합니다.")
+            for idx_c, ch in enumerate(rw.rewritten_choices or [], start=1):
+                if not re.search(r"\(A\)\s*[A-Za-z\-']+.*\(B\)\s*[A-Za-z\-']+", ch or ""):
+                    issues.append(f"요약문 완성 {idx_c}번 선지({ch!r})가 `(A) word1 — (B) word2` 형식이 아닙니다.")
+                    break
 
     return issues
 

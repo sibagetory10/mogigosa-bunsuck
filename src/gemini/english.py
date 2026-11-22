@@ -25,6 +25,7 @@ _TRANSFORM_EXPORTS = {
     "generate_english_passage_analysis",
     "generate_english_transformed_question",
     "generate_english_visual_diagram",
+    "prepare_clean_english_source_passage",
 }
 
 __all__ = sorted(_TAGGING_EXPORTS | _TRANSFORM_EXPORTS)

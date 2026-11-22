@@ -328,6 +328,13 @@ def _render_mode_b_solve_fragment(
                             try:
                                 from src.gemini import generate_english_transformed_question
 
+                                src_pdf_b = None
+                                if getattr(q, "source_pdf", "") and hasattr(ctx.storage, "get_pdf_bytes"):
+                                    src_pdf_b = ctx.storage.get_pdf_bytes(
+                                        q.source_pdf,
+                                        subject_category="영어",
+                                        exam_name=getattr(q, "exam_name", ""),
+                                    )
                                 with _usage_scope(ctx):
                                     new_rw = generate_english_transformed_question(
                                         api_key=eff_eng_key,
@@ -343,6 +350,8 @@ def _render_mode_b_solve_fragment(
                                         storage=ctx.storage,
                                         use_cache=False,
                                         username=ctx.current_user.username if ctx.current_user is not None else "",
+                                        base_question=q,
+                                        source_pdf_bytes=src_pdf_b,
                                     )
                                 st.session_state["matched_items"][seq_num - 1]["rewritten"] = new_rw
                                 st.session_state["ai_explanations"].pop(q.id, None)

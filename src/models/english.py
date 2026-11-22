@@ -70,6 +70,228 @@ class BatchEnglishExamExtractionOutput(BaseModel):
 
     questions: list[EnglishQuestionExtractionItem] = Field(default_factory=list)
 CURRENT_ENGLISH_ANALYSIS_VERSION: int = 5
+CURRENT_ENGLISH_TRANSFORM_VERSION: int = 2
+
+
+class EnglishGistTransformSpec(BaseModel):
+    """요지 파악 · 주제 파악 · 제목 추론 전용 구조화 출력 스키마."""
+
+    choices: list[str] = Field(
+        ...,
+        description="번호(①~⑤)를 제외한 정확히 5개의 선택지 리스트 (요지는 한국어 완결 문장, 주제는 영어 명사구, 제목은 영어 타이틀 형식)",
+    )
+    correct_index: int = Field(
+        ...,
+        ge=1,
+        le=5,
+        description="유일한 정답 선지 번호 (1~5 정수)",
+    )
+    explanation: str = Field(
+        ...,
+        description="정답 도출 근거와 오답 핵심 요약 (한국어 2문장, 120자 이내)",
+    )
+    key_terms: list[str] = Field(
+        default_factory=list,
+        description="지문 핵심 어휘 2개 ('word → 한국어 뜻' 형식)",
+    )
+
+
+class EnglishSpanTargetTransformSpec(BaseModel):
+    """빈칸 추론(단어/구/절) · 함축적 의미 추론 전용 구조화 출력 스키마."""
+
+    target_sentence_index: int = Field(
+        ...,
+        ge=0,
+        description="[S0]~[Sn-1] 중 빈칸으로 비우거나 밑줄을 그을 구절이 포함된 원문 문장 번호 (0부터 시작)",
+    )
+    target_span: str = Field(
+        ...,
+        description="해당 문장 안에 실제로 존재하는 연속된 영어 원문 구절 (원문 철자 100% 그대로)",
+    )
+    correct_choice: str = Field(
+        ...,
+        description="정답 영어 선지 1개 (빈칸 추론은 빈칸에 들어갈 정답 표현, 함축적 의미는 밑줄 구절의 문맥상 함축 의미를 나타낸 영어 표현)",
+    )
+    distractor_choices: list[str] = Field(
+        ...,
+        description="정답과 길이·품사·문법 구조가 동일하면서 문맥상 틀린 매력적인 영어 오답 선지 4개 (번호 제외)",
+    )
+    explanation: str = Field(
+        ...,
+        description="정답 도출 근거 및 문맥 단서 요약 (한국어 2문장, 120자 이내)",
+    )
+    key_terms: list[str] = Field(
+        default_factory=list,
+        description="지문 핵심 어휘 2개 ('word → 한국어 뜻' 형식)",
+    )
+
+
+class EnglishUnderlineFiveItem(BaseModel):
+    """어법/어휘 밑줄형(①~⑤) 단일 밑줄 포인트 명세."""
+
+    sentence_index: int = Field(
+        ...,
+        ge=0,
+        description="해당 구절이 위치한 원문 문장 번호 ([S0] -> 0)",
+    )
+    original_span: str = Field(
+        ...,
+        description="해당 원문 문장에 실제로 존재하는 1~3단어 영어 구절 (원문 철자 그대로)",
+    )
+    displayed_span: str = Field(
+        ...,
+        description="시험지에 밑줄 그어 표시할 구절 (정상 항목 4개는 original_span과 동일, 정답인 1개만 틀린 어법 또는 문맥상 반의어로 변형)",
+    )
+    is_error_target: bool = Field(
+        default=False,
+        description="이 항목이 어법상 틀리거나 문맥상 부적절한 유일한 정답 항목이면 True, 나머지 4개는 False",
+    )
+
+
+class EnglishUnderlineFiveTransformSpec(BaseModel):
+    """어법상 틀린 것(①~⑤) · 문맥상 어휘 적절성(밑줄형 ①~⑤) 전용 구조화 출력 스키마."""
+
+    items: list[EnglishUnderlineFiveItem] = Field(
+        ...,
+        description="원문 등장 순서대로 선정한 정확히 5개의 밑줄 항목 (반드시 1개만 is_error_target=True 및 original_span != displayed_span)",
+    )
+    explanation: str = Field(
+        ...,
+        description="정답 밑줄이 왜 틀렸는지(원래 올바른 형태 명시 포함) 한국어 2문장 이내 해설",
+    )
+    key_terms: list[str] = Field(
+        default_factory=list,
+        description="지문 핵심 어휘 2개 ('word → 한국어 뜻' 형식)",
+    )
+
+
+class EnglishVocabChoiceTripleItem(BaseModel):
+    """선택형 어휘((A)(B)(C)) 단일 네모 어휘 쌍 명세."""
+
+    sentence_index: int = Field(
+        ...,
+        ge=0,
+        description="해당 단어가 위치한 원문 문장 번호 ([S0] -> 0)",
+    )
+    original_word: str = Field(
+        ...,
+        description="해당 원문 문장에 실제로 존재하는 문맥상 올바른 핵심 영단어 1개",
+    )
+    antonym_word: str = Field(
+        ...,
+        description="original_word와 품사·어미 형태가 100% 동일한 문맥상 반대(부적절) 영단어 1개",
+    )
+
+
+class EnglishVocabChoiceTransformSpec(BaseModel):
+    """문맥상 어휘 적절성(선택형 (A)(B)(C)) 전용 구조화 출력 스키마."""
+
+    items: list[EnglishVocabChoiceTripleItem] = Field(
+        ...,
+        description="원문 등장 순서대로 선정한 정확히 3개의 (A), (B), (C) 어휘 쌍",
+    )
+    explanation: str = Field(
+        ...,
+        description="(A), (B), (C) 각 위치에서 왜 원문 어휘가 문맥상 적절한지 한국어 2문장 이내 해설",
+    )
+    key_terms: list[str] = Field(
+        default_factory=list,
+        description="지문 핵심 어휘 2개 ('word → 한국어 뜻' 형식)",
+    )
+
+
+class EnglishOrderTransformSpec(BaseModel):
+    """글의 순서((A)-(B)-(C)) 전용 구조화 출력 스키마."""
+
+    split_sentence_indices: list[int] = Field(
+        ...,
+        description="[주어진 글] 뒤의 3개 단락이 시작되는 문장 인덱스 3개 [s1, s2, s3] (반드시 0 < s1 < s2 < s3 < 전체 문장 수)",
+    )
+    explanation: str = Field(
+        ...,
+        description="단락 간 지시어·연결어·논리 흐름 근거 한국어 2문장 이내 해설",
+    )
+    key_terms: list[str] = Field(
+        default_factory=list,
+        description="지문 핵심 어휘 2개 ('word → 한국어 뜻' 형식)",
+    )
+
+
+class EnglishInsertionTransformSpec(BaseModel):
+    """주어진 문장 삽입 전용 구조화 출력 스키마."""
+
+    extracted_sentence_index: int = Field(
+        ...,
+        ge=1,
+        description="[주어진 문장]으로 발췌할 원문 문장 인덱스 (첫 문장 S0을 제외한 1 이상 인덱스 중 연결어·지시어 단서가 명확한 문장 1개)",
+    )
+    explanation: str = Field(
+        ...,
+        description="주어진 문장의 연결어·지시어와 앞뒤 문장 단서를 바탕으로 한 한국어 2문장 이내 해설",
+    )
+    key_terms: list[str] = Field(
+        default_factory=list,
+        description="지문 핵심 어휘 2개 ('word → 한국어 뜻' 형식)",
+    )
+
+
+class EnglishIrrelevantTransformSpec(BaseModel):
+    """전체 흐름과 무관한 문장 전용 구조화 출력 스키마."""
+
+    insert_position: int = Field(
+        ...,
+        ge=2,
+        le=4,
+        description="①~⑤ 중 무관한 문장을 삽입할 정답 번호 (2, 3, 4 중 하나)",
+    )
+    unrelated_sentence: str = Field(
+        ...,
+        description="원문의 핵심 소재 단어만 표면적으로 공유하되 글의 중심 논지와 어긋나는 자연스러운 새 영어 문장 1개",
+    )
+    explanation: str = Field(
+        ...,
+        description="글의 중심 주제와 비교해 해당 번호 문장이 왜 흐름과 무관한지 한국어 2문장 이내 해설",
+    )
+    key_terms: list[str] = Field(
+        default_factory=list,
+        description="지문 핵심 어휘 2개 ('word → 한국어 뜻' 형식)",
+    )
+
+
+class EnglishSummaryPairItem(BaseModel):
+    """요약문 완성 (A), (B) 오답 어휘 쌍."""
+
+    word_a: str = Field(..., description="(A)에 들어갈 영단어 1개")
+    word_b: str = Field(..., description="(B)에 들어갈 영단어 1개")
+
+
+class EnglishSummaryTransformSpec(BaseModel):
+    """요약문 완성((A), (B)) 전용 구조화 출력 스키마."""
+
+    summary_template: str = Field(
+        ...,
+        description="지문 전체를 1문장으로 요약한 영어 문장 (반드시 '(A) ________'와 '(B) ________' 빈칸 표기 포함)",
+    )
+    correct_word_a: str = Field(
+        ...,
+        description="빈칸 (A)의 정답 영단어 1개 (원문 핵심어를 패러프레이징한 어휘)",
+    )
+    correct_word_b: str = Field(
+        ...,
+        description="빈칸 (B)의 정답 영단어 1개 (원문 핵심어를 패러프레이징한 어휘)",
+    )
+    distractor_pairs: list[EnglishSummaryPairItem] = Field(
+        ...,
+        description="정답 쌍과 구별되는 매력적인 오답 (A)-(B) 영단어 쌍 4개",
+    )
+    explanation: str = Field(
+        ...,
+        description="지문 핵심 내용을 바탕으로 (A), (B)에 해당 어휘가 들어가야 하는 근거 한국어 2문장 이내 해설",
+    )
+    key_terms: list[str] = Field(
+        default_factory=list,
+        description="지문 핵심 어휘 2개 ('word → 한국어 뜻' 형식)",
+    )
 
 
 class EnglishPassageSummaryDiagramOutput(BaseModel):

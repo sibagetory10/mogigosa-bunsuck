@@ -84,6 +84,25 @@ def _execute_english_transform_jobs(
     results_by_idx: dict[int, RewrittenQuestion] = {}
     errors_by_idx: dict[int, str] = {}
 
+    pdf_bytes_cache: dict[tuple[str, str], bytes | None] = {}
+
+    def _get_job_source_pdf_bytes(base_q: QuestionRecord | None) -> bytes | None:
+        if base_q is None:
+            return None
+        fn = (getattr(base_q, "source_pdf", "") or "").strip()
+        if not fn or not hasattr(ctx.storage, "get_pdf_bytes"):
+            return None
+        key = ((getattr(base_q, "exam_name", "") or "").strip(), fn)
+        if key not in pdf_bytes_cache:
+            pdf_bytes_cache[key] = ctx.storage.get_pdf_bytes(
+                fn,
+                subject_category="영어",
+                exam_name=key[0],
+            )
+        return pdf_bytes_cache[key]
+
+    job_pdf_bytes = [_get_job_source_pdf_bytes(job.get("base_question")) for job in jobs]
+
     with _usage_scope(ctx):
         with concurrent.futures.ThreadPoolExecutor(max_workers=n_workers) as executor:
             future_map = {
@@ -102,6 +121,8 @@ def _execute_english_transform_jobs(
                     storage=ctx.storage,
                     use_cache=True,
                     username=ctx.current_user.username if ctx.current_user is not None else "",
+                    base_question=job.get("base_question"),
+                    source_pdf_bytes=job_pdf_bytes[idx],
                 ): idx
                 for idx, job in enumerate(jobs)
             }

@@ -16,6 +16,43 @@ from src.storage.base import (
 if TYPE_CHECKING:
     from src.models import RewrittenQuestion
 
+CURRENT_ENGLISH_POOL_VERSION = "v2"
+_DSL_REMNANT_RE = re.compile(
+    r"(?:^\s*(?:SPLIT|INSERT_AT|SENTENCE)\s*:|^\s*[1-5①②③④⑤]\s*[:.)]\s*[A-Za-z\-']+(?:\s*(?:->|→)\s*[A-Za-z\-']+)?\s*$)",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _is_valid_cached_english_question(rw: Any) -> bool:
+    """캐시 풀에서 로드한 영어 변형 문항이 정상 조립된 문항인지 빠른 무결성 검사를 수행한다."""
+    if rw is None:
+        return False
+    stem = (getattr(rw, "rewritten_stem", "") or "").strip()
+    choices = list(getattr(rw, "rewritten_choices", []) or [])
+    ans = str(getattr(rw, "preserved_answer", "") or "").strip()
+    t = (getattr(rw, "target_question_type", "") or "").strip()
+    if len(stem) < 70 or len(choices) != 5 or ans not in ("1", "2", "3", "4", "5"):
+        return False
+    if _DSL_REMNANT_RE.search(stem):
+        return False
+    if "빈칸" in t and "____" not in stem:
+        return False
+    if "함축" in t and "<u" not in stem.lower():
+        return False
+    if ("어법" in t or ("어휘" in t and "선택형" not in t and "(A)" not in t)) and len(
+        re.findall(r"<u\b[^>]*>.*?</u>", stem, flags=re.I | re.S)
+    ) != 5:
+        return False
+    if "선택형" in t and not all(mk in stem for mk in ("(A)", "(B)", "(C)")):
+        return False
+    if "순서" in t and not all(mk in stem for mk in ("(A)", "(B)", "(C)")):
+        return False
+    if ("삽입" in t or "무관" in t) and not all(mk in stem for mk in ("①", "②", "③", "④", "⑤")):
+        return False
+    if "요약" in t and ("(A)" not in stem or "(B)" not in stem):
+        return False
+    return True
+
 
 class EnglishPoolStoreMixin:
     @staticmethod
@@ -26,11 +63,11 @@ class EnglishPoolStoreMixin:
         blank_unit: str = "",
         vocab_style: str = "",
     ) -> str:
-        """지문 원문과 변형 옵션 조합으로 영어 변형 풀(Pool) 캐시 키를 생성한다."""
+        """지문 원문과 변형 옵션 조합으로 영어 변형 풀(Pool) v2 캐시 키를 생성한다."""
         norm_p = re.sub(r"\s+", " ", (source_passage or "").strip())
         t = (target_type or "").strip()
         opt = blank_unit if "빈칸" in t else (vocab_style if "어휘" in t else "")
-        raw_key = f"{norm_p}||{t}||{(difficulty or '').strip()}||{(opt or '').strip()}"
+        raw_key = f"{CURRENT_ENGLISH_POOL_VERSION}::{norm_p}||{t}||{(difficulty or '').strip()}||{(opt or '').strip()}"
         return hashlib.sha256(raw_key.encode("utf-8")).hexdigest()[:24]
 
     def _load_english_pool_unlocked(self) -> dict[str, list[dict[str, Any]]]:
@@ -232,7 +269,8 @@ class EnglishPoolStoreMixin:
             from src.models.concept import RewrittenQuestion
 
             try:
-                return RewrittenQuestion.model_validate(chosen)
+                rw_obj = RewrittenQuestion.model_validate(chosen)
+                return rw_obj if _is_valid_cached_english_question(rw_obj) else None
             except Exception:
                 return None
 

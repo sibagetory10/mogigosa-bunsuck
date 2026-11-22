@@ -4,7 +4,10 @@ import os
 from collections.abc import Mapping
 from dataclasses import dataclass
 
-import streamlit as st
+try:
+    import streamlit as st
+except ImportError:  # pragma: no cover
+    st = None  # type: ignore[assignment]
 
 FLASH_LITE_MODEL: str = "gemini-3.5-flash-lite"
 FLASH_LITE_LABEL: str = "Gemini 3.5 Flash-Lite"

@@ -78,11 +78,23 @@ _SUBMODULE_EXPORTS: dict[str, tuple[str, ...]] = {
     "src.models.english": (
         "BatchEnglishExamExtractionOutput",
         "CURRENT_ENGLISH_ANALYSIS_VERSION",
+        "CURRENT_ENGLISH_TRANSFORM_VERSION",
+        "EnglishGistTransformSpec",
+        "EnglishInsertionTransformSpec",
+        "EnglishIrrelevantTransformSpec",
+        "EnglishOrderTransformSpec",
         "EnglishPassageAnalysisOutput",
         "EnglishPassageSummaryDiagramOutput",
         "EnglishQuestionExtractionItem",
         "EnglishSentenceAnalysisItem",
         "EnglishSingleExtractionOutput",
+        "EnglishSpanTargetTransformSpec",
+        "EnglishSummaryPairItem",
+        "EnglishSummaryTransformSpec",
+        "EnglishUnderlineFiveItem",
+        "EnglishUnderlineFiveTransformSpec",
+        "EnglishVocabChoiceTransformSpec",
+        "EnglishVocabChoiceTripleItem",
     ),
 }
 

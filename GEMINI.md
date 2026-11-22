@@ -24,7 +24,7 @@
 - **서비스명**: 2022 개정 교육과정 맞춤형 기출 추출 & 상위 문제 개조 플랫폼 (`mogigosa-bunsuck`)
 - **핵심 도메인 로직**:
   - **수학 · 사회 · 과학 · 한국사**: 개념서·교과서 PDF(또는 공용 개념서 DB)에 실제로 등장한 핵심 원리(`core_principles`)와 용어(`required_terms` / `basic_terms`)만 허용하고, 원리는 같지만 상위 학년·선택과목 전문 용어(`advanced_terms`)가 포함된 기출문제를 학생의 개념서 언어로 자동 개조(`RewrittenQuestion`)한다.
-  - **영어**: 수능/모의고사 영어 독해 지문을 기반으로 11종 수능 유형(`ENGLISH_TRANSFORM_TYPES`)으로 변형 문제를 생성하고, `english_validators.py`의 결정론적 후처리 검증을 거쳐 고품질 문제·해설·영단어장 PDF를 제공한다. 또한 **영어 지문 분석지**(주제 · 논리 전개 흐름 · 공식 각주 · 이해용 시각 도식 · AI 미사용 문제지/해설지 PDF 순수 복붙 문장별 원문+해설 매칭, `analysis_version=5` / PDF `v7`, 기출 포인트 제거)를 생성·캐싱·PDF 출력할 수 있다.
+  - **영어**: 수능/모의고사 영어 독해 지문을 기반으로 11종 수능 유형(`ENGLISH_TRANSFORM_TYPES`)으로 변형 문제를 생성하며(`Transform Engine v2`: 원문 정화·복원 `prepare_clean_english_source_passage` + 문장 인덱싱 `[S0]~[Sn-1]` + 유형군별 전용 Pydantic 스키마 6종 + 100% 파이썬 결정론적 조립·검증 + `v2` 캐시 풀 격리), 고품질 문제·해설·영단어장 PDF를 제공한다. 또한 **영어 지문 분석지**(주제 · 논리 전개 흐름 · 공식 각주 · 이해용 시각 도식 · AI 미사용 문제지/해설지 PDF 순수 복붙 문장별 원문+해설 매칭, `analysis_version=5` / PDF `v7`, 기출 포인트 제거)를 생성·캐싱·PDF 출력할 수 있다.
   - **국어**: 독서·문학·화법과 작문·언어와 매체 세트 지문을 분석하고, 자유 유형 세트 문항 재구성, Pillow 기반 시각 구조도(`diagram_renderer.py`), 2단/분석본 PDF(`korean_pdf_generator.py`)를 생성한다.
 - **기술 스택**: Python, Streamlit (`>=1.50.0`), PyMuPDF (`pymupdf`), Google GenAI SDK (`google-genai`), Pydantic v2 (`pydantic`), Pillow (`pillow`), Requests, BeautifulSoup4.
 
@@ -75,7 +75,7 @@
 - **`src/gemini/exam_tagging.py`**: 시험지 헤더 메타데이터 추출, 문제지-해설지 AI 자동 페어링, 스캔본 문항 박스 감지, 과목별 배치 문항 태깅.
 - **`src/gemini/concept_book.py`**: 개념서 표지/목차/본문 단원 추출, 개념 화이트리스트(`ConceptWhitelist`) 추출, 문항-화이트리스트 적합성 매칭.
 - **`src/gemini/rewrite.py`**: 금지 상위 용어 제거 문항 개조(`rewrite_question_for_pdf`), 개념서 근거 해설, 후속 질의응답.
-- **`src/gemini/english_tagging.py`, `english_transform.py`, `english.py`(지연 파사드), `english_validators/` (`transform_helpers.py`, `transform_validate.py`, `exam_context.py`, `analysis_validate.py`)**: 영어 문항 태깅, 11종 유형 변형, 정밀 지문 구문 분석·시각 도식 및 결정론적 후처리 검증.
+- **`src/gemini/english_tagging.py`, `english_transform.py`, `english.py`(지연 파사드), `english_validators/` (`transform_helpers.py`, `transform_validate.py`, `exam_context.py`, `analysis_validate.py`)**: 영어 문항 태깅, 11종 유형 변형(`Transform Engine v2` 유형별 전용 Pydantic 스키마 + 파이썬 결정론적 조립), 정밀 지문 구문 분석·시각 도식 및 결정론적 후처리 검증.
 - **`src/gemini/korean.py`**: 국어 지문 노이즈 제거, 세트 지문 동기화, 문학 작품 웹 브리프 조회, 지문 심층 분석·교열, 시각 다이어그램, 세트 문항 재구성.
 - **`src/gemini/dictionary.py`**: 영단어 Gemini 사전 조회(`lookup_english_word_with_gemini`).
 - **하위 호환 지연 파사드**: `src/gemini/__init__.py` (`_SUBMODULE_EXPORTS`), `src/gemini_service.py`, `src/korean_gemini_service.py`.

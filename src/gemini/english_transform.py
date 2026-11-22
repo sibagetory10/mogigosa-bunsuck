@@ -22,6 +22,7 @@ from src.gemini.english_validators import (
     _AI_META_MONOLOGUE_RE,
     _DANGLING_TO_END_RE,
     _assemble_english_slim_stem,
+    _assemble_rewritten_question_from_spec,
     _build_english_transform_rule,
     _detect_foreign_script_contamination,
     _ensure_korean_instruction_prefix,
@@ -29,12 +30,14 @@ from src.gemini.english_validators import (
     _has_incomplete_english_blank,
     _is_irrelevant_answer_from_source,
     _needs_english_passage_restoration,
+    _prepare_indexed_sentences_for_transform,
     _preprocess_english_source_passage,
     _rebuild_insertion_stem_from_source,
     _reconcile_english_insertion_answer,
     _reconcile_english_order_answer,
     _reconcile_english_passage_with_question_text,
     _reconcile_english_summary_answer,
+    _resolve_english_transform_schema_and_rule,
     _split_english_sentences,
     _validate_english_summary_diagram_output,
     _validate_english_transformed_output,
@@ -150,6 +153,105 @@ def _restore_incomplete_source_passage(
     return _preprocess_english_source_passage(passage)
 
 
+def prepare_clean_english_source_passage(
+    *,
+    api_key: str = "",
+    model_name: str = "",
+    source_passage: str = "",
+    base_question: QuestionRecord | None = None,
+    question_text: str = "",
+    source_pdf_bytes: bytes | None = None,
+    q_num: int = 0,
+    passage_group_id: str = "",
+    orig_question_type: str = "",
+    orig_answer: str = "",
+    orig_choices: Sequence[str] | None = None,
+    orig_explanation: str = "",
+) -> str:
+    """
+    변형 문제 출제 전 원문 영어 지문을 정밀 정화·복원한다 (Source Sanitizer v2):
+    1) 기출 DB 레코드(`base_question`)나 원본 `question_text` / `source_pdf_bytes`가 있으면
+       `extract_english_passage_from_problem_source` 및 `_reconcile_english_passage_with_question_text`를 통해
+       글의 순서 재배열, 문장 삽입 원위치 복원, 무관한 문장 제거, 빈칸 정답 채움, 요약문 분리를 결정론적으로 수행한다.
+    2) 여전히 미완성 빈칸(`____`), 선택형 네모(`[a / b]`), 기출 마커가 남아 있는 경우에만
+       원래 문항의 메타데이터(유형·정답·선지·해설)를 모두 주입해 `_restore_incomplete_source_passage`로 복원한다.
+    """
+    raw_passage = (source_passage or (getattr(base_question, "passage_text", "") if base_question is not None else "") or "").strip()
+    raw_q_text = (question_text or (getattr(base_question, "question_text", "") if base_question is not None else "") or "").strip()
+    eff_q_num = int(q_num or (getattr(base_question, "q_num", 0) if base_question is not None else 0) or 0)
+    eff_gid = (passage_group_id or (getattr(base_question, "passage_group_id", "") if base_question is not None else "") or "").strip()
+    eff_orig_type = (
+        orig_question_type
+        or (getattr(base_question, "english_question_type", "") if base_question is not None else "")
+        or (getattr(base_question, "unit_name", "") if base_question is not None else "")
+        or ""
+    ).strip()
+    eff_ans = (orig_answer or (getattr(base_question, "answer", "") if base_question is not None else "") or "").strip()
+    eff_exp = (orig_explanation or (getattr(base_question, "official_explanation", "") if base_question is not None else "") or "").strip()
+
+    candidate = raw_passage
+
+    # 1. question_text가 있거나 원문에 기출 구조 마커/빈칸이 남아 있으면 결정론적 복원기 우선 실행
+    if raw_q_text:
+        try:
+            reconciled, _ = _reconcile_english_passage_with_question_text(
+                passage_text=candidate,
+                question_text=raw_q_text,
+                orig_question_type=eff_orig_type,
+                answer=eff_ans,
+            )
+            if reconciled:
+                candidate = reconciled
+        except Exception:
+            pass
+
+    if source_pdf_bytes or raw_q_text or _needs_english_passage_restoration(candidate, eff_orig_type):
+        try:
+            from src.pdf_parser.english_source_extractor import (
+                _reconstruct_english_from_raw_qtext,
+                extract_english_passage_from_problem_source,
+            )
+
+            extracted, _ = extract_english_passage_from_problem_source(
+                passage_text=candidate,
+                question_text=raw_q_text or candidate,
+                source_pdf_bytes=source_pdf_bytes,
+                q_num=eff_q_num,
+                passage_group_id=eff_gid,
+                orig_question_type=eff_orig_type,
+                answer=eff_ans,
+            )
+            if extracted and len(extracted) >= 60:
+                candidate = extracted
+            elif not raw_q_text and eff_ans and _needs_english_passage_restoration(candidate, eff_orig_type):
+                rebuilt = _reconstruct_english_from_raw_qtext(
+                    candidate,
+                    q_num=eff_q_num,
+                    passage_group_id=eff_gid,
+                    orig_question_type=eff_orig_type,
+                    answer=eff_ans,
+                )
+                if rebuilt and len(rebuilt) >= 60:
+                    candidate = rebuilt
+        except Exception:
+            pass
+
+    # 2. 아직도 미복원 빈칸/선택형/기출 마커가 남아 있으면 메타데이터 포함 AI 복원 수행
+    if api_key and _needs_english_passage_restoration(candidate, eff_orig_type):
+        eff_model = (model_name or "").strip() or EXAM_TAGGING_MODEL
+        candidate = _restore_incomplete_source_passage(
+            api_key=api_key,
+            model_name=eff_model,
+            passage=candidate,
+            orig_question_type=eff_orig_type,
+            answer=eff_ans,
+            choices=orig_choices,
+            explanation=eff_exp,
+        )
+
+    return _preprocess_english_source_passage(candidate)
+
+
 def generate_english_transformed_question(
     api_key: str,
     model_name: str,
@@ -164,20 +266,44 @@ def generate_english_transformed_question(
     storage: Any | None = None,
     use_cache: bool = True,
     username: str = "",
+    *,
+    base_question: QuestionRecord | None = None,
+    question_text: str = "",
+    source_pdf_bytes: bytes | None = None,
+    q_num: int = 0,
+    passage_group_id: str = "",
+    orig_question_type: str = "",
+    orig_answer: str = "",
+    orig_choices: Sequence[str] | None = None,
+    orig_explanation: str = "",
 ) -> RewrittenQuestion:
     """
-    원문 영어 독해 지문을 지정된 수능 독해 유형(1개 유형 규칙만 동적 주입)으로 변형·출제한다.
-    비변형 유형(요지·주제·제목·요약·삽입·빈칸·함축)은 지문 재출력을 생략하고 파이썬이 원문을 조립하며,
-    검증 통과 문항은 storage DB 풀(Pool)에 캐싱해 동일 요청 시 0원으로 즉시 반환한다.
+    원문 영어 독해 지문을 지정된 수능 독해 유형으로 변형·출제한다 (Transform Engine v2):
+    1) 원문 지문 정밀 정화·복원(`prepare_clean_english_source_passage`)
+    2) 문장 인덱싱(`[S0]`~`[Sn-1]`) 및 짧은 복합문 절 경계 안전 분할
+    3) 유형군별 전용 Pydantic 스키마로 Gemini 구조화 호출
+    4) 100% 파이썬 결정론적 조립(`_assemble_rewritten_question_from_spec`) 및 사후 검증
+    5) 검증 통과 문항만 v2 풀(Pool)에 캐싱하며, 최종 실패 시 불량 문항 반환 차단
     """
-    clean_passage = _preprocess_english_source_passage(source_passage)
+    eff_model = (model_name or "").strip() or EXAM_TAGGING_MODEL
+    clean_passage = prepare_clean_english_source_passage(
+        api_key=api_key,
+        model_name=eff_model,
+        source_passage=source_passage,
+        base_question=base_question,
+        question_text=question_text,
+        source_pdf_bytes=source_pdf_bytes,
+        q_num=q_num,
+        passage_group_id=passage_group_id,
+        orig_question_type=orig_question_type,
+        orig_answer=orig_answer,
+        orig_choices=orig_choices,
+        orig_explanation=orig_explanation,
+    )
     if not clean_passage:
         raise ValueError("변형할 영어 지문(source_passage)이 비어 있습니다.")
 
-    eff_model = (model_name or "").strip() or EXAM_TAGGING_MODEL
-    if _has_incomplete_english_blank(clean_passage):
-        clean_passage = _restore_incomplete_source_passage(api_key, eff_model, clean_passage)
-    canonical_type, type_rule_block = _build_english_transform_rule(
+    canonical_type, schema_cls, type_rule_block = _resolve_english_transform_schema_and_rule(
         target_type=target_type,
         blank_unit=blank_unit,
         vocab_style=vocab_style,
@@ -197,6 +323,24 @@ def generate_english_transformed_question(
             if cached_rw is not None:
                 return cached_rw
 
+    norm_passage, sent_list, sent_spans = _prepare_indexed_sentences_for_transform(
+        clean_passage,
+        canonical_type=canonical_type,
+    )
+    n_sents = len(sent_list)
+    if "순서" in canonical_type and n_sents < 4:
+        raise ValueError(
+            f"글의 순서 유형은 최소 4문장(또는 4절) 이상인 지문에서만 출제할 수 있습니다 (현재 지문: {n_sents}문장)."
+        )
+    if "무관" in canonical_type and n_sents < 5:
+        raise ValueError(
+            f"전체 흐름과 무관한 문장 유형은 최소 5문장(또는 5절) 이상인 지문에서만 출제할 수 있습니다 (현재 지문: {n_sents}문장)."
+        )
+    if "삽입" in canonical_type and n_sents < 6:
+        raise ValueError(
+            f"주어진 문장 삽입 유형은 최소 6문장(또는 6절) 이상인 지문에서만 출제할 수 있습니다 (현재 지문: {n_sents}문장)."
+        )
+
     target_thinking_level = (
         types.ThinkingLevel.LOW
         if (use_precision_mode and not _is_flash_lite_model(eff_model))
@@ -205,57 +349,53 @@ def generate_english_transformed_question(
 
     client = _build_client(api_key, timeout_seconds=90)
     system_inst = (
-        "수능·평가원 영어 출제위원으로서 지정된 **[목표 유형 1개]**에 맞춰 `RewrittenQuestion` JSON 1건을 생성하세요.\n\n"
-        f"[유형: {canonical_type} | 난이도: {difficulty}]\n"
+        "대한민국 수능·평가원 영어 출제위원으로서 지정된 **[목표 유형 1개]**의 전용 JSON 스키마를 정확히 생성하세요.\n\n"
+        f"[유형: {canonical_type} | 난이도: {difficulty} | 총 문장 수: {n_sents}문장 (S0 ~ S{max(0, n_sents - 1)})]\n"
         f"{type_rule_block}\n\n"
-        "[출력 및 토큰 절감 규칙]\n"
-        "1. `rewritten_stem`: 위 '출력 절감 규칙'이 지정된 유형은 원문 재출력 없이 지정값만 반환하고, 지문 변형 유형만 발문+지문을 반환하세요.\n"
-        "2. `rewritten_choices`: 정확히 5개 선지 반환(번호 ①~⑤ 제외).\n"
-        "3. `preserved_answer`: 유일한 정답 `'1'`~`'5'` 단일 숫자 문자열.\n"
-        "4. `pdf_grounded_explanation`: 정답 근거와 오답 핵심만 담아 **2문장(공백 포함 120자) 이내**로 작성.\n"
-        "5. `replaced_terms_map`: 핵심 어휘 2개만 `'영단어 → 뜻'` 형식으로 기록.\n"
-        "6. `self_verification_note`: 20자 이내 단문."
+        "[공통 필수 규칙]\n"
+        "1. 원문 각 문장 앞에 붙은 `[S0]`, `[S1]`, ... 번호가 `sentence_index`(0부터 시작하는 정수)입니다.\n"
+        "2. 원문 구절(`target_span`, `original_span`, `original_word`)을 적을 때는 `[S0]` 같은 인덱스 라벨을 제외하고 해당 문장 안에 실제로 존재하는 영어 구절만 철자 그대로 적으세요.\n"
+        "3. `explanation`은 한국어 2문장(공백 포함 120자) 이내로 정답 도출 근거만 명쾌하게 작성하고, AI 내부 사고 독백('Wait, let me...', '수정 필요' 등)은 절대 출력하지 마세요.\n"
+        "4. `key_terms`는 지문 핵심 어휘 2개만 `'영단어 → 한국어 뜻'` 형식으로 기록하세요."
     )
 
     prev_feedback_block = ""
     if previous_attempt is not None:
         prev_feedback_block = (
-            "\n[이전 생성본 (재변환 요청 — 다른 포인트/오답 구성으로 새롭게 출제)]\n"
-            f"- 이전 지문/발문: {previous_attempt.rewritten_stem[:500]}\n"
-            f"- 이전 정답: {previous_attempt.preserved_answer}\n"
+            "\n[이전 생성본 (재변환 요청 — 이전과 다른 문장/구절/어휘 포인트를 선택하여 새롭게 출제)]\n"
+            f"- 이전 지문/발문 일부: {previous_attempt.rewritten_stem[:450]}\n"
+            f"- 이전 정답: {previous_attempt.preserved_answer} / 이전 치환: {', '.join(previous_attempt.replaced_terms_map or [])}\n"
         )
 
-    passage_for_prompt = clean_passage
-    if "순서" in canonical_type:
-        indexed_sents = _split_english_sentences(clean_passage)
-        if len(indexed_sents) >= 4:
-            passage_for_prompt = "\n".join(f"[S{i}] {s}" for i, s in enumerate(indexed_sents))
-
+    indexed_passage_block = "\n".join(f"[S{i}] {s}" for i, s in enumerate(sent_list))
     base_prompt = (
         f"[출처]: {source_label or '영어 기출 독해 지문'}\n"
         f"[목표 수능 유형]: {canonical_type} | [난이도]: {difficulty}\n"
         f"{prev_feedback_block}\n"
-        f"[원문 영어 지문]\n{passage_for_prompt}\n\n"
-        "위 원문 영어 지문을 바탕으로 목표 유형의 출제 규칙만 엄격히 준수하여 변형 문제와 2줄 이내 핵심 정답 근거를 JSON으로 생성하세요."
+        f"[문장 번호가 부여된 원문 영어 지문 (총 {n_sents}문장: S0 ~ S{max(0, n_sents - 1)})]\n"
+        f"{indexed_passage_block}\n\n"
+        "위 원문 영어 지문을 바탕으로 목표 유형의 JSON 스키마를 엄격히 준수하여 출제 명세를 생성하세요."
     )
 
     prompt = base_prompt
     rw: RewrittenQuestion | None = None
-    # 출력에는 지문 전체(+선지)가 포함되므로 지문 길이에 비례해 출력 토큰 상한을 잡는다 (JSON 중간 잘림 방지).
-    base_out_tokens = min(8192, max(3072, int(len(clean_passage) / 2.0) + 1800))
+    issues: list[str] = []
+    last_error_msg = ""
+    base_out_tokens = 3072
+
     for attempt in range(3):
-        out_tokens = base_out_tokens if attempt == 0 else min(12288, int(base_out_tokens * 1.6))
+        out_tokens = base_out_tokens if attempt == 0 else 4096
         try:
-            parsed_rw = _generate_structured_with_fallback(
+            parsed_spec = _generate_structured_with_fallback(
                 client=client,
                 model_name=eff_model,
                 contents=prompt,
-                schema_cls=RewrittenQuestion,
+                schema_cls=schema_cls,
                 config=types.GenerateContentConfig(
                     system_instruction=system_inst,
                     response_mime_type="application/json",
-                    response_schema=RewrittenQuestion,
-                    temperature=0.35 if previous_attempt is not None else 0.25,
+                    response_schema=schema_cls,
+                    temperature=0.35 if (previous_attempt is not None or attempt > 0) else 0.2,
                     max_output_tokens=out_tokens,
                     thinking_config=types.ThinkingConfig(
                         thinking_level=target_thinking_level,
@@ -265,79 +405,97 @@ def generate_english_transformed_question(
                 fast_mode=not use_precision_mode,
                 max_parse_retries=2,
             )
-        except Exception:
-            if attempt == 0:
+        except Exception as api_exc:
+            last_error_msg = str(api_exc)
+            if attempt < 2:
                 continue
-            if rw is not None:
-                break
             raise
-        rw = parsed_rw
-        # 번호형 선택지(어법/무관한 문장/문장 삽입 등)에서 선택지가 비어 있으면 ①~⑤ 자동 보완
-        if not rw.rewritten_choices and any(k in canonical_type for k in ("어법", "무관", "삽입", "밑줄")):
-            rw.rewritten_choices = ["①", "②", "③", "④", "⑤"]
-        # 선지 텍스트 앞에 중복된 ①~⑤가 붙어있고 뒤에 텍스트가 있으면 정리
-        cleaned_choices: list[str] = []
-        for ch in rw.rewritten_choices or []:
-            c_str = (ch or "").strip()
-            if len(c_str) > 1 and c_str[0] in _CIRCLED_DIGIT_TO_NUM:
-                c_str = c_str[1:].strip()
-            cleaned_choices.append(c_str)
-        rw.rewritten_choices = cleaned_choices[:5]
-        rw.preserved_answer = _normalize_extracted_answer(rw.preserved_answer)
-        _assemble_english_slim_stem(rw, canonical_type, clean_passage)
-        if "순서" in canonical_type:
-            _reconcile_english_order_answer(rw)
-        elif "삽입" in canonical_type:
-            if not _rebuild_insertion_stem_from_source(rw, clean_passage):
-                _reconcile_english_insertion_answer(rw)
-        elif "요약" in canonical_type:
-            _reconcile_english_summary_answer(rw)
 
+        try:
+            if isinstance(parsed_spec, RewrittenQuestion):
+                # 하위 호환: 테스트 목(Mock) 등에서 RewrittenQuestion을 직접 반환한 경우
+                cand_rw = parsed_spec
+                if not cand_rw.rewritten_choices and any(
+                    k in canonical_type for k in ("어법", "무관", "삽입", "밑줄")
+                ):
+                    cand_rw.rewritten_choices = ["①", "②", "③", "④", "⑤"]
+                cleaned_choices: list[str] = []
+                for ch in cand_rw.rewritten_choices or []:
+                    c_str = (ch or "").strip()
+                    if len(c_str) > 1 and c_str[0] in _CIRCLED_DIGIT_TO_NUM:
+                        c_str = c_str[1:].strip()
+                    cleaned_choices.append(c_str)
+                cand_rw.rewritten_choices = cleaned_choices[:5]
+                cand_rw.preserved_answer = _normalize_extracted_answer(cand_rw.preserved_answer)
+                _assemble_english_slim_stem(cand_rw, canonical_type, norm_passage)
+                if "순서" in canonical_type:
+                    _reconcile_english_order_answer(cand_rw)
+                elif "삽입" in canonical_type:
+                    if not _rebuild_insertion_stem_from_source(cand_rw, norm_passage):
+                        _reconcile_english_insertion_answer(cand_rw)
+                elif "요약" in canonical_type:
+                    _reconcile_english_summary_answer(cand_rw)
+            else:
+                cand_rw = _assemble_rewritten_question_from_spec(
+                    spec=parsed_spec,
+                    canonical_type=canonical_type,
+                    clean_passage=norm_passage,
+                    sent_list=sent_list,
+                    sent_spans=sent_spans,
+                    blank_unit=blank_unit,
+                    vocab_style=vocab_style,
+                    attempt_seed=attempt + (10 if previous_attempt is not None else 0),
+                )
+        except Exception as asm_exc:
+            last_error_msg = str(asm_exc)
+            issues = [f"조립 오류: {last_error_msg}"]
+            if attempt < 2:
+                prompt = (
+                    base_prompt
+                    + "\n\n[⚠️ 직전 출력 조립 오류 — 아래 사항을 반드시 수정하여 다시 생성하세요]\n"
+                    + f"- {last_error_msg}\n"
+                    + "- 원문에 실제로 존재하는 영어 구절(`original_span` / `target_span` / `original_word`)과 정확한 문장 번호(`sentence_index`)만 지정하세요."
+                )
+                continue
+            break
+
+        norm_stem = normalize_english_exam_text(cand_rw.rewritten_stem)
+        if any(k in canonical_type for k in ("어법", "어휘")) and "<u" in norm_stem.lower():
+            cand_rw.rewritten_stem = norm_stem
+        else:
+            cand_rw.rewritten_stem = strip_english_embedded_choices(norm_stem)
+        if "빈칸" in canonical_type:
+            cand_rw.rewritten_stem = re.sub(r"[ \t]*\(\s*[①②③④⑤]\s*\)[ \t]*", " ", cand_rw.rewritten_stem)
+            cand_rw.rewritten_stem = re.sub(r"[ \t]*[①②③④⑤][ \t]*", " ", cand_rw.rewritten_stem)
+            cand_rw.rewritten_stem = re.sub(r"[ \t]{2,}", " ", cand_rw.rewritten_stem).strip()
+        cand_rw.rewritten_stem = _ensure_korean_instruction_prefix(cand_rw.rewritten_stem, canonical_type, vocab_style)
+        cand_rw.pdf_grounded_explanation = format_explanation_text(cand_rw.pdf_grounded_explanation)
+        cand_rw.preserved_answer = _normalize_extracted_answer(cand_rw.preserved_answer) or "1"
+        cand_rw.target_question_type = canonical_type
+        cand_rw.subject_domain = "영어"
+
+        rw = cand_rw
         issues = _validate_english_transformed_output(
             rw,
             canonical_type,
             vocab_style,
-            source_passage=clean_passage,
+            source_passage=norm_passage,
         )
         if not issues:
             break
         if attempt < 2:
-            fallback_hint = ""
-            if "빈칸" in canonical_type or "함축" in canonical_type:
-                fallback_hint = "\n- 구절 치환 매칭 실패 시 이번 재시도에서는 지문 전체와 빈칸/밑줄을 직접 완성해 `rewritten_stem`에 반환하세요."
-            elif "요약" in canonical_type:
-                fallback_hint = "\n- `[요약문]` 섹션에는 선지 단어만 나열하지 말고 반드시 `(A) ________ ... (B) ________.` 형태의 완전한 요약문 1문장을 작성하세요."
-            elif any(k in canonical_type for k in ("어법", "어휘", "무관", "순서")):
-                fallback_hint = "\n- 슬림 포맷 조립 실패 시 이번 재시도에서는 원문 전체를 포함해 완성된 문제 지문을 `rewritten_stem`에 직접 반환하세요."
             prompt = (
                 base_prompt
-                + "\n\n[⚠️ 직전 출력 형식 오류 — 반드시 아래 누락 사항을 모두 수정하여 다시 생성하세요]\n"
+                + "\n\n[⚠️ 직전 출력 검증 오류 — 반드시 아래 누락/오류 사항을 모두 수정하여 다시 생성하세요]\n"
                 + "\n".join(f"- {iss}" for iss in issues)
-                + fallback_hint
             )
 
-    assert rw is not None
-    norm_stem = normalize_english_exam_text(rw.rewritten_stem)
-    if any(k in canonical_type for k in ("어법", "어휘")) and "<u" in norm_stem.lower():
-        rw.rewritten_stem = norm_stem
-    else:
-        rw.rewritten_stem = strip_english_embedded_choices(norm_stem)
-    if "빈칸" in canonical_type:
-        rw.rewritten_stem = re.sub(r"[ \t]*\(\s*[①②③④⑤]\s*\)[ \t]*", " ", rw.rewritten_stem)
-        rw.rewritten_stem = re.sub(r"[ \t]*[①②③④⑤][ \t]*", " ", rw.rewritten_stem)
-        rw.rewritten_stem = re.sub(r"[ \t]{2,}", " ", rw.rewritten_stem).strip()
-    rw.rewritten_stem = _ensure_korean_instruction_prefix(rw.rewritten_stem, canonical_type, vocab_style)
-    rw.pdf_grounded_explanation = format_explanation_text(rw.pdf_grounded_explanation)
-    rw.preserved_answer = _normalize_extracted_answer(rw.preserved_answer) or "1"
-    if len(rw.rewritten_choices) < 5:
-        default_syms = ["①", "②", "③", "④", "⑤"]
-        while len(rw.rewritten_choices) < 5:
-            rw.rewritten_choices.append(default_syms[len(rw.rewritten_choices)])
-    rw.target_question_type = canonical_type
-    rw.subject_domain = "영어"
+    if rw is None or issues:
+        err_detail = "; ".join(issues) if issues else (last_error_msg or "알 수 없는 조립/검증 오류")
+        raise ValueError(f"[{canonical_type}] 영어 변형 문항 생성·검증에 실패했습니다: {err_detail}")
+
     if (
-        not issues
-        and cache_key
+        cache_key
         and storage is not None
         and hasattr(storage, "save_cached_english_question")
     ):
