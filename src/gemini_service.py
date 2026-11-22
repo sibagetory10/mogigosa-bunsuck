@@ -129,3 +129,6 @@ from src.gemini.korean import (  # noqa: F401
     generate_korean_visual_diagram,
     proofread_korean_passage_analysis,
 )
+from src.gemini.dictionary import (  # noqa: F401
+    lookup_english_word_with_gemini,
+)

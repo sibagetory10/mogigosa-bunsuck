@@ -14,11 +14,14 @@ from typing import Any
 from src.exporters import build_exam_ai_jsonl, build_exam_html, build_exam_markdown
 from src.models import (
     ConceptBookRecord,
+    EnglishDictEntry,
     KoreanPassageAnalysisOutput,
     LEGACY_TIER_MAP,
     QuestionRecord,
     RewrittenQuestion,
     UserRecord,
+    UserVocabItem,
+    normalize_english_dict_key,
 )
 
 _GLOBAL_CACHE_LOCK = threading.RLock()
@@ -105,6 +108,8 @@ class StorageManager:
         self.user_english_history_path = self.local_root / "user_english_history.json"
         self.saved_exams_root = self.local_root / "saved_exams"
         self.saved_exams_pdfs_root = self.saved_exams_root / "pdfs"
+        self.english_dict_cache_path = self.local_root / "english_dict_cache.json"
+        self.user_vocab_root = self.local_root / "user_vocab"
 
         self.concept_root = Path(concept_root)
         self.concept_books_path = self.concept_root / "concept_books.json"
@@ -116,6 +121,7 @@ class StorageManager:
         self.korean_analysis_pdfs_root.mkdir(parents=True, exist_ok=True)
         self.saved_exams_root.mkdir(parents=True, exist_ok=True)
         self.saved_exams_pdfs_root.mkdir(parents=True, exist_ok=True)
+        self.user_vocab_root.mkdir(parents=True, exist_ok=True)
         self.concept_root.mkdir(parents=True, exist_ok=True)
 
     def _local_exam_dir(self, subject_category: str, exam_name: str) -> Path:
@@ -962,6 +968,23 @@ class StorageManager:
             except Exception:
                 pass
 
+            # 4) 계정별 개인 영단어장 이관 (normalized_key 기준 중복 없이 병합)
+            try:
+                old_vocab_path = self._user_vocab_path(old_u)
+                if old_vocab_path.exists():
+                    old_v = self._load_user_vocab_unlocked(old_u)
+                    new_v = self._load_user_vocab_unlocked(new_u)
+                    merged_v_map: dict[str, dict[str, Any]] = {}
+                    for row in old_v + new_v:
+                        nk = str(row.get("normalized_key") or "").strip()
+                        if nk and nk not in merged_v_map:
+                            merged_v_map[nk] = row
+                    self._save_user_vocab_unlocked(new_u, list(merged_v_map.values()))
+                    if old_vocab_path != self._user_vocab_path(new_u):
+                        old_vocab_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
     # -----------------------------------------------------------------------
     # 서버 디스크 및 앱 저장공간 통계 (관리자 모니터링용)
     # -----------------------------------------------------------------------
@@ -1026,6 +1049,7 @@ class StorageManager:
             ("과목별 정리 파일", str(self.organized_dir), _dir_stats(self.organized_dir)),
             ("국어 지문 분석지 PDF", str(self.korean_analysis_pdfs_root), _dir_stats(self.korean_analysis_pdfs_root)),
             ("나의 시험지 보관함", str(self.saved_exams_root), _dir_stats(self.saved_exams_root)),
+            ("개인 영단어장", str(self.user_vocab_root), _dir_stats(self.user_vocab_root)),
             ("DB JSON · 캐시 파일", str(self.local_root), _root_files_stats(self.local_root)),
             ("공용 개념서 DB", str(self.concept_root), _dir_stats(self.concept_root)),
         ]
@@ -1307,3 +1331,319 @@ class StorageManager:
             if changed > 0:
                 self._save_korean_analysis_pool_unlocked(pool)
             return changed
+
+    # -----------------------------------------------------------------------
+    # 공용 영단어 사전 캐시 DB (english_dict_cache.json)
+    # -----------------------------------------------------------------------
+    def _load_english_dict_cache_unlocked(self) -> dict[str, Any]:
+        if not self.english_dict_cache_path.exists():
+            return {"entries": {}, "aliases": {}}
+        sig = _file_stat_sig(self.english_dict_cache_path)
+        if sig is None or sig[1] == 0:
+            return {"entries": {}, "aliases": {}}
+        cache_key = f"eng_dict::{self.english_dict_cache_path.resolve()}"
+        with _GLOBAL_CACHE_LOCK:
+            cached = _GLOBAL_JSON_CACHE.get(cache_key)
+            if cached is not None and cached[0] == sig:
+                return {
+                    "entries": {k: dict(v) for k, v in cached[1]["entries"].items()},
+                    "aliases": dict(cached[1]["aliases"]),
+                }
+        try:
+            data = json.loads(self.english_dict_cache_path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                return {"entries": {}, "aliases": {}}
+            entries = {
+                str(k): dict(v)
+                for k, v in (data.get("entries") or {}).items()
+                if isinstance(v, dict)
+            }
+            aliases = {
+                str(k): str(v)
+                for k, v in (data.get("aliases") or {}).items()
+                if isinstance(v, str)
+            }
+            clean = {"entries": entries, "aliases": aliases}
+            with _GLOBAL_CACHE_LOCK:
+                _GLOBAL_JSON_CACHE[cache_key] = (sig, clean)
+            return {
+                "entries": {k: dict(v) for k, v in entries.items()},
+                "aliases": dict(aliases),
+            }
+        except Exception:
+            return {"entries": {}, "aliases": {}}
+
+    def _save_english_dict_cache_unlocked(self, payload: dict[str, Any]) -> None:
+        raw = json.dumps(payload, ensure_ascii=False, indent=2)
+        _atomic_write_text(self.english_dict_cache_path, raw, encoding="utf-8")
+        new_sig = _file_stat_sig(self.english_dict_cache_path)
+        if new_sig is not None:
+            entries = {
+                str(k): dict(v)
+                for k, v in (payload.get("entries") or {}).items()
+                if isinstance(v, dict)
+            }
+            aliases = {
+                str(k): str(v)
+                for k, v in (payload.get("aliases") or {}).items()
+                if isinstance(v, str)
+            }
+            with _GLOBAL_CACHE_LOCK:
+                _GLOBAL_JSON_CACHE[f"eng_dict::{self.english_dict_cache_path.resolve()}"] = (
+                    new_sig,
+                    {"entries": entries, "aliases": aliases},
+                )
+
+    def get_cached_english_dict_entry(self, query: str) -> EnglishDictEntry | None:
+        """단어·숙어·한글 검색어에 해당하는 캐시된 영단어 사전 엔트리를 반환한다."""
+        q_norm = normalize_english_dict_key(query)
+        if not q_norm:
+            return None
+        with self._lock:
+            payload = self._load_english_dict_cache_unlocked()
+            entries = payload["entries"]
+            aliases = payload["aliases"]
+            raw = entries.get(q_norm)
+            if raw is None and q_norm in aliases:
+                raw = entries.get(aliases[q_norm])
+            if not isinstance(raw, dict):
+                return None
+            try:
+                return EnglishDictEntry.model_validate(raw)
+            except Exception:
+                return None
+
+    def save_cached_english_dict_entry(
+        self,
+        entry: EnglishDictEntry,
+        aliases: list[str] | None = None,
+    ) -> None:
+        """영단어 사전 조회 결과를 공용 캐시에 저장하고 검색 별칭을 함께 등록한다."""
+        canonical_key = normalize_english_dict_key(entry.headword or entry.query_normalized)
+        if not canonical_key:
+            return
+        with self._lock:
+            payload = self._load_english_dict_cache_unlocked()
+            entry_copy = entry.model_copy(
+                update={
+                    "query_normalized": canonical_key,
+                    "updated_at": entry.updated_at or time.strftime("%Y-%m-%d %H:%M:%S"),
+                }
+            )
+            payload["entries"][canonical_key] = entry_copy.model_dump()
+            for al in aliases or []:
+                al_norm = normalize_english_dict_key(al)
+                if al_norm and al_norm != canonical_key:
+                    payload["aliases"][al_norm] = canonical_key
+            self._save_english_dict_cache_unlocked(payload)
+
+    def list_cached_english_dict_entries(
+        self,
+        search: str = "",
+        limit: int = 100,
+    ) -> list[EnglishDictEntry]:
+        """공용 영단어 사전 캐시에 저장된 엔트리를 최신순·검색어 필터로 반환한다."""
+        with self._lock:
+            payload = self._load_english_dict_cache_unlocked()
+            raw_vals = list(payload["entries"].values())
+        q_low = (search or "").strip().lower()
+        out: list[EnglishDictEntry] = []
+        for raw in raw_vals:
+            try:
+                ent = EnglishDictEntry.model_validate(raw)
+            except Exception:
+                continue
+            if q_low:
+                hay = " ".join(
+                    [
+                        ent.headword,
+                        ent.summary_ko,
+                        *(s.meaning_ko for s in ent.senses),
+                    ]
+                ).lower()
+                if q_low not in hay:
+                    continue
+            out.append(ent)
+        out.sort(key=lambda e: str(e.updated_at or ""), reverse=True)
+        return out[: max(1, int(limit))]
+
+    def count_cached_english_dict_entries(self) -> int:
+        with self._lock:
+            payload = self._load_english_dict_cache_unlocked()
+            return len(payload["entries"])
+
+    def delete_cached_english_dict_entry(self, key: str) -> bool:
+        k_norm = normalize_english_dict_key(key)
+        if not k_norm:
+            return False
+        with self._lock:
+            payload = self._load_english_dict_cache_unlocked()
+            target_key = k_norm if k_norm in payload["entries"] else payload["aliases"].get(k_norm, "")
+            if not target_key or target_key not in payload["entries"]:
+                return False
+            payload["entries"].pop(target_key, None)
+            payload["aliases"] = {
+                ak: av for ak, av in payload["aliases"].items() if av != target_key and ak != target_key
+            }
+            self._save_english_dict_cache_unlocked(payload)
+            return True
+
+    # -----------------------------------------------------------------------
+    # 계정별 나만의 영단어장 (user_vocab/{username}.json)
+    # -----------------------------------------------------------------------
+    def _user_vocab_path(self, username: str) -> Path:
+        safe_user = _safe_segment((username or "").strip() or "anonymous")
+        return self.user_vocab_root / f"{safe_user}.json"
+
+    def _load_user_vocab_unlocked(self, username: str) -> list[dict[str, Any]]:
+        p = self._user_vocab_path(username)
+        if not p.exists():
+            return []
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            return [dict(it) for it in data if isinstance(it, dict)] if isinstance(data, list) else []
+        except Exception:
+            return []
+
+    def _save_user_vocab_unlocked(self, username: str, rows: list[dict[str, Any]]) -> None:
+        self.user_vocab_root.mkdir(parents=True, exist_ok=True)
+        p = self._user_vocab_path(username)
+        _atomic_write_text(p, json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def load_user_vocab(self, username: str) -> list[UserVocabItem]:
+        """특정 회원의 나만의 단어장 목록을 로드한다."""
+        uname = (username or "").strip()
+        if not uname:
+            return []
+        with self._lock:
+            rows = self._load_user_vocab_unlocked(uname)
+        items: list[UserVocabItem] = []
+        for row in rows:
+            try:
+                items.append(UserVocabItem.model_validate(row))
+            except Exception:
+                continue
+        return items
+
+    def save_user_vocab_item(self, username: str, item: UserVocabItem) -> list[UserVocabItem]:
+        """단일 영단어를 개인 단어장에 추가 또는 갱신(기존 암기/오답/메모 보존)하고 최신 목록을 반환한다."""
+        uname = (username or "").strip()
+        if not uname:
+            return []
+        nk = normalize_english_dict_key(item.normalized_key or item.headword)
+        if not nk:
+            return self.load_user_vocab(uname)
+        with self._lock:
+            rows = self._load_user_vocab_unlocked(uname)
+            existing_idx = next(
+                (i for i, r in enumerate(rows) if str(r.get("normalized_key") or "") == nk),
+                None,
+            )
+            now_str = item.added_at or time.strftime("%Y-%m-%d %H:%M:%S")
+            new_dict = item.model_copy(update={"normalized_key": nk, "added_at": now_str}).model_dump()
+            if existing_idx is not None:
+                prev = rows.pop(existing_idx)
+                new_dict["mastered"] = bool(prev.get("mastered", False))
+                new_dict["wrong_count"] = int(prev.get("wrong_count", 0) or 0)
+                if not (new_dict.get("memo") or "").strip():
+                    new_dict["memo"] = str(prev.get("memo") or "")
+                if not (new_dict.get("source_exam") or "").strip():
+                    new_dict["source_exam"] = str(prev.get("source_exam") or "")
+            rows.insert(0, new_dict)
+            self._save_user_vocab_unlocked(uname, rows)
+        return self.load_user_vocab(uname)
+
+    def save_user_vocab_batch(self, username: str, items: list[UserVocabItem]) -> tuple[int, int]:
+        """여러 영단어를 기존 항목을 덮어쓰지 않고 일괄 추가한다. 반환: (신규 추가 수, 기존 건너뜀 수)."""
+        uname = (username or "").strip()
+        if not uname or not items:
+            return 0, 0
+        with self._lock:
+            rows = self._load_user_vocab_unlocked(uname)
+            existing_keys = {str(r.get("normalized_key") or "") for r in rows}
+            added = 0
+            skipped = 0
+            to_prepend: list[dict[str, Any]] = []
+            now_str = time.strftime("%Y-%m-%d %H:%M:%S")
+            for item in items:
+                nk = normalize_english_dict_key(item.normalized_key or item.headword)
+                if not nk:
+                    continue
+                if nk in existing_keys:
+                    skipped += 1
+                    continue
+                existing_keys.add(nk)
+                to_prepend.append(
+                    item.model_copy(
+                        update={"normalized_key": nk, "added_at": item.added_at or now_str}
+                    ).model_dump()
+                )
+                added += 1
+            if added > 0:
+                rows = to_prepend + rows
+                self._save_user_vocab_unlocked(uname, rows)
+            return added, skipped
+
+    def update_user_vocab_item(
+        self,
+        username: str,
+        normalized_key: str,
+        *,
+        mastered: bool | None = None,
+        memo: str | None = None,
+        increment_wrong: bool = False,
+        reset_wrong: bool = False,
+    ) -> bool:
+        """개인 단어장 단어의 암기 완료 여부·메모·오답 횟수를 부분 업데이트한다."""
+        uname = (username or "").strip()
+        nk = normalize_english_dict_key(normalized_key)
+        if not uname or not nk:
+            return False
+        with self._lock:
+            rows = self._load_user_vocab_unlocked(uname)
+            for row in rows:
+                if str(row.get("normalized_key") or "") == nk:
+                    if mastered is not None:
+                        row["mastered"] = bool(mastered)
+                    if memo is not None:
+                        row["memo"] = str(memo).strip()
+                    if reset_wrong:
+                        row["wrong_count"] = 0
+                    elif increment_wrong:
+                        row["wrong_count"] = int(row.get("wrong_count", 0) or 0) + 1
+                    self._save_user_vocab_unlocked(uname, rows)
+                    return True
+            return False
+
+    def delete_user_vocab_item(self, username: str, normalized_key: str) -> bool:
+        """개인 단어장에서 단어 1건을 삭제한다."""
+        uname = (username or "").strip()
+        nk = normalize_english_dict_key(normalized_key)
+        if not uname or not nk:
+            return False
+        with self._lock:
+            rows = self._load_user_vocab_unlocked(uname)
+            new_rows = [r for r in rows if str(r.get("normalized_key") or "") != nk]
+            if len(new_rows) == len(rows):
+                return False
+            self._save_user_vocab_unlocked(uname, new_rows)
+            return True
+
+    def clear_user_vocab(self, username: str, only_mastered: bool = False) -> int:
+        """개인 단어장 전체 또는 암기 완료 항목만 비운다."""
+        uname = (username or "").strip()
+        if not uname:
+            return 0
+        with self._lock:
+            rows = self._load_user_vocab_unlocked(uname)
+            if not rows:
+                return 0
+            if only_mastered:
+                rem = [r for r in rows if not bool(r.get("mastered", False))]
+                removed = len(rows) - len(rem)
+                if removed > 0:
+                    self._save_user_vocab_unlocked(uname, rem)
+                return removed
+            self._save_user_vocab_unlocked(uname, [])
+            return len(rows)
+

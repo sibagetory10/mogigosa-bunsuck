@@ -130,6 +130,9 @@ _SUBMODULE_EXPORTS: dict[str, tuple[str, ...]] = {
         "generate_korean_visual_diagram",
         "proofread_korean_passage_analysis",
     ),
+    "src.gemini.dictionary": (
+        "lookup_english_word_with_gemini",
+    ),
 }
 
 _SYMBOL_TO_MODULE: dict[str, str] = {
