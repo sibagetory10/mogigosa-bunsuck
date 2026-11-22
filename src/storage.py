@@ -1441,15 +1441,20 @@ class StorageManager:
             self._save_english_analysis_pool_unlocked(pool)
 
     def get_english_analysis_pdf_path(self, cache_key: str) -> Path:
-        """지문별 영어 분석지 PDF 파일 경로를 반환한다."""
-        return self.english_analysis_pdfs_root / f"{self._safe_kor_cache_key(cache_key)}_eng_analysis_v1.pdf"
+        """지문별 영어 분석지 PDF 파일 경로를 반환한다 (v2: A4 가로 1장 1지문 레이아웃)."""
+        return self.english_analysis_pdfs_root / f"{self._safe_kor_cache_key(cache_key)}_eng_analysis_v2.pdf"
 
     def _unlink_eng_pdfs_for_key(self, cache_key: str) -> bool:
-        pdf_p = self.get_english_analysis_pdf_path(cache_key)
-        if pdf_p.exists():
-            pdf_p.unlink(missing_ok=True)
-            return True
-        return False
+        safe_key = self._safe_kor_cache_key(cache_key)
+        removed_any = False
+        for pdf_p in (
+            self.get_english_analysis_pdf_path(cache_key),
+            self.english_analysis_pdfs_root / f"{safe_key}_eng_analysis_v1.pdf",
+        ):
+            if pdf_p.exists():
+                pdf_p.unlink(missing_ok=True)
+                removed_any = True
+        return removed_any
 
     def has_english_analysis_pdf(self, cache_key: str) -> bool:
         """지문별 영어 분석지 PDF가 서버 DB에 저장되어 있는지 반환한다."""
@@ -1468,6 +1473,9 @@ class StorageManager:
         with self._lock:
             self.english_analysis_pdfs_root.mkdir(parents=True, exist_ok=True)
             _atomic_write_bytes(self.get_english_analysis_pdf_path(cache_key), pdf_bytes)
+            legacy_v1 = self.english_analysis_pdfs_root / f"{self._safe_kor_cache_key(cache_key)}_eng_analysis_v1.pdf"
+            if legacy_v1.exists():
+                legacy_v1.unlink(missing_ok=True)
             with _GLOBAL_CACHE_LOCK:
                 _GLOBAL_STORAGE_STATS_CACHE.clear()
 

@@ -1383,6 +1383,391 @@ def _format_chunked_english_html(chunked_text: str) -> str:
     return escaped
 
 
+def _build_english_landscape_css(scale: float = 1.0) -> str:
+    """A4 가로(Landscape) 1페이지 1지문 영어 정밀 분석지용 스케일 가변 CSS를 생성한다."""
+    s = max(0.58, min(1.05, float(scale)))
+    return f"""
+    body {{
+        font-family: "NanumGothic", "Malgun Gothic", sans-serif;
+        font-size: {8.6 * s:.2f}pt;
+        line-height: {1.42:.2f};
+        color: #0F172A;
+        margin: 0;
+        padding: 0;
+    }}
+    .eng-l-hdr {{
+        border: 1.2pt solid #1E293B;
+        border-radius: 4pt;
+        background-color: #F8FAFC;
+        padding: {5.5 * s:.2f}pt {9 * s:.2f}pt;
+    }}
+    .eng-l-hdr-top {{
+        font-size: {7.6 * s:.2f}pt;
+        font-weight: bold;
+        color: #1D4ED8;
+    }}
+    .eng-l-hdr-title {{
+        font-size: {12.2 * s:.2f}pt;
+        font-weight: bold;
+        color: #0F172A;
+        margin-top: {1.5 * s:.2f}pt;
+    }}
+    .eng-l-hdr-meta {{
+        font-size: {7.6 * s:.2f}pt;
+        color: #475569;
+        margin-top: {1.5 * s:.2f}pt;
+    }}
+    .eng-l-sec {{
+        font-size: {9.2 * s:.2f}pt;
+        font-weight: bold;
+        color: #1E3A8A;
+        border-left: 3pt solid #2563EB;
+        padding-left: {5 * s:.2f}pt;
+        margin-top: {2 * s:.2f}pt;
+        margin-bottom: {4 * s:.2f}pt;
+    }}
+    .eng-l-theme {{
+        background-color: #EFF6FF;
+        border: 0.8pt solid #93C5FD;
+        border-radius: 3.5pt;
+        padding: {5.5 * s:.2f}pt {7.5 * s:.2f}pt;
+        margin-bottom: {4.5 * s:.2f}pt;
+        font-size: {8.3 * s:.2f}pt;
+        line-height: 1.42;
+    }}
+    .eng-l-flow {{
+        background-color: #F0FDF4;
+        border: 0.8pt solid #86EFAC;
+        border-radius: 3.5pt;
+        padding: {5.5 * s:.2f}pt {7.5 * s:.2f}pt;
+        margin-bottom: {5 * s:.2f}pt;
+        font-size: {8.1 * s:.2f}pt;
+        line-height: 1.42;
+    }}
+    .eng-l-diag-wrap {{
+        margin-top: {2 * s:.2f}pt;
+        text-align: center;
+    }}
+    .eng-l-diag-img {{
+        max-width: 100%;
+        height: auto;
+    }}
+    .sec-keep-tbl {{
+        width: 100%;
+        border-collapse: collapse;
+        border: none;
+        margin: 0;
+        padding: 0;
+        break-inside: avoid;
+        page-break-inside: avoid;
+    }}
+    .sec-keep-tr {{
+        break-inside: avoid;
+        page-break-inside: avoid;
+    }}
+    .sec-keep-td {{
+        padding: 0;
+        margin: 0;
+        border: none;
+        vertical-align: top;
+    }}
+    .eng-sent-card {{
+        border: 0.7pt solid #CBD5E1;
+        border-radius: 3.5pt;
+        background-color: #FFFFFF;
+        padding: {4.5 * s:.2f}pt {7 * s:.2f}pt;
+        margin-bottom: {4 * s:.2f}pt;
+        break-inside: avoid;
+        page-break-inside: avoid;
+    }}
+    .eng-sent-card-topic {{
+        border: 1.0pt solid #F59E0B;
+        border-left: 3pt solid #D97706;
+        border-radius: 3.5pt;
+        background-color: #FFFBEB;
+        padding: {4.5 * s:.2f}pt {7 * s:.2f}pt;
+        margin-bottom: {4 * s:.2f}pt;
+        break-inside: avoid;
+        page-break-inside: avoid;
+    }}
+    .eng-sent-hdr {{
+        margin-bottom: {1.5 * s:.2f}pt;
+    }}
+    .eng-sent-num {{
+        font-weight: bold;
+        color: #1E3A8A;
+        font-size: {8.5 * s:.2f}pt;
+    }}
+    .eng-topic-badge {{
+        display: inline;
+        background-color: #FEF3C7;
+        color: #B45309;
+        border: 0.5pt solid #F59E0B;
+        font-weight: bold;
+        font-size: {7.1 * s:.2f}pt;
+        padding: 0.8pt 3.5pt;
+        border-radius: 2.5pt;
+    }}
+    .eng-sent-chunk {{
+        font-size: {8.3 * s:.2f}pt;
+        font-weight: bold;
+        color: #0F172A;
+        line-height: 1.4;
+        margin-bottom: {1.5 * s:.2f}pt;
+    }}
+    .eng-slash {{
+        color: #DC2626;
+        font-weight: bold;
+    }}
+    .eng-bracket {{
+        color: #1D4ED8;
+        font-weight: bold;
+    }}
+    .eng-paren {{
+        color: #0F766E;
+        font-weight: bold;
+    }}
+    .eng-sent-kor {{
+        font-size: {7.9 * s:.2f}pt;
+        color: #334155;
+        line-height: 1.38;
+        margin-bottom: {1.5 * s:.2f}pt;
+    }}
+    .eng-syntax-box {{
+        background-color: #F8FAFC;
+        border-top: 0.4pt solid #E2E8F0;
+        padding: {2.2 * s:.2f}pt {4 * s:.2f}pt 0 {4 * s:.2f}pt;
+        margin-top: {1.5 * s:.2f}pt;
+    }}
+    .eng-syntax-li {{
+        font-size: {7.5 * s:.2f}pt;
+        color: #1E40AF;
+        line-height: 1.35;
+        margin-bottom: {1 * s:.2f}pt;
+    }}
+    """
+
+
+def _render_single_english_landscape_page(
+    item: dict[str, Any],
+    doc_title: str,
+    today_str: str,
+    include_diagrams: bool,
+) -> bytes:
+    """영어 지문 1개를 A4 가로(842x595pt) 정확히 1페이지 안에 좌·우 분할 레이아웃으로 렌더링한다."""
+    an = item["analysis"]
+    q_label = str(item.get("q_label") or item.get("exam_name") or "영어 독해").strip()
+    orig_type = str(item.get("orig_type") or "영어 독해").strip()
+
+    mediabox = pymupdf.paper_rect("a4-l")  # 842 x 595 pt
+    page_w = mediabox.width
+    page_h = mediabox.height
+    margin_x = 24.0
+    margin_top = 18.0
+    margin_bottom = 26.0
+    col_gap = 12.0
+
+    # 시각 도식 PNG 사전 생성
+    diag_b64 = ""
+    v_diag = getattr(an, "visual_diagram", None)
+    if include_diagrams and v_diag is not None and (
+        getattr(v_diag, "nodes", None)
+        or getattr(v_diag, "graph_spec", None)
+        or getattr(v_diag, "emotion_points", None)
+    ):
+        try:
+            diag_png = render_korean_diagram_png(v_diag)
+            diag_b64 = base64.b64encode(diag_png).decode("ascii")
+        except Exception:
+            diag_b64 = ""
+
+    content_w = page_w - 2 * margin_x
+    left_ratio = 0.37 if diag_b64 else 0.29
+    left_w = content_w * left_ratio
+    right_w = content_w - left_w - col_gap
+
+    header_html = f"""
+    <html><body>
+      <div class="eng-l-hdr">
+        <div class="eng-l-hdr-top">{html.escape(doc_title)} · {html.escape(orig_type)} &nbsp;|&nbsp; 출처: {html.escape(q_label)} &nbsp;|&nbsp; 생성일: {today_str}</div>
+        <div class="eng-l-hdr-title">{html.escape(an.title)}</div>
+      </div>
+    </body></html>
+    """
+
+    flow_html_inner = _format_structure_flow_html(an.structure_flow)
+    diag_img_w = max(160, int(left_w - 6))
+    diag_block = (
+        "<div class='eng-l-sec' style='margin-top:5pt;'>2. 한눈에 보는 논리 · 구조 도식</div>"
+        f"<div class='eng-l-diag-wrap'><img class='eng-l-diag-img' width='{diag_img_w}' src='data:image/png;base64,{diag_b64}'/></div>"
+        if diag_b64
+        else ""
+    )
+    left_html = f"""
+    <html><body>
+      <div class="eng-l-sec">1. 핵심 주제 및 논리 전개 흐름</div>
+      <div class="eng-l-theme">
+        <div><b>핵심 주제</b></div>
+        <div>{html.escape(an.core_theme)}</div>
+      </div>
+      <div class="eng-l-flow">
+        <div><b>논리 전개 흐름</b></div>
+        <div>{flow_html_inner}</div>
+      </div>
+      {diag_block}
+    </body></html>
+    """
+
+    sent_sec_num = "3" if diag_b64 else "2"
+    sent_cards_html: list[str] = []
+    sent_list = list(getattr(an, "sentence_analyses", None) or [])
+    for s_idx, sa in enumerate(sent_list):
+        s_num = int(getattr(sa, "sentence_num", s_idx + 1) or (s_idx + 1))
+        num_badge = _CIRCLED_NUMS[s_num - 1] if 1 <= s_num <= len(_CIRCLED_NUMS) else f"({s_num})"
+        is_topic = bool(getattr(sa, "is_topic_sentence", False))
+        card_cls = "eng-sent-card-topic" if is_topic else "eng-sent-card"
+        topic_badge = (
+            " &nbsp;<span class='eng-topic-badge'>★ 주제문 (Topic Sentence)</span>"
+            if is_topic
+            else ""
+        )
+        chunk_html = _format_chunked_english_html(getattr(sa, "chunked_english", ""))
+        kor_html = html.escape((getattr(sa, "korean_translation", "") or "").strip())
+        notes = [str(n).strip() for n in (getattr(sa, "syntax_notes", None) or []) if str(n).strip()]
+        notes_html = ""
+        if notes:
+            li_html = "".join(f"<div class='eng-syntax-li'>▸ {html.escape(n)}</div>" for n in notes)
+            notes_html = f"<div class='eng-syntax-box'>{li_html}</div>"
+
+        card_inner = (
+            f"<div class='{card_cls}'>"
+            f"<div class='eng-sent-hdr'><span class='eng-sent-num'>{num_badge}</span>{topic_badge}</div>"
+            f"<div class='eng-sent-chunk'>{chunk_html}</div>"
+            f"<div class='eng-sent-kor'>{kor_html}</div>"
+            f"{notes_html}"
+            "</div>"
+        )
+        sent_cards_html.append(
+            "<table class='sec-keep-tbl'><tr class='sec-keep-tr'>"
+            f"<td class='sec-keep-td'>{card_inner}</td>"
+            "</tr></table>"
+        )
+
+    right_html = f"""
+    <html><body>
+      <div class="eng-l-sec">{sent_sec_num}. 문장별 정밀 구문 분석</div>
+      {''.join(sent_cards_html)}
+    </body></html>
+    """
+    mid_idx = max(1, (len(sent_cards_html) + 1) // 2)
+    right_html_col1 = f"""
+    <html><body>
+      <div class="eng-l-sec">{sent_sec_num}. 문장별 정밀 구문 분석</div>
+      {''.join(sent_cards_html[:mid_idx])}
+    </body></html>
+    """
+    right_html_col2 = f"""
+    <html><body>
+      <div class="eng-l-sec" style="visibility:hidden;">{sent_sec_num}. 문장별 정밀 구문 분석</div>
+      {''.join(sent_cards_html[mid_idx:])}
+    </body></html>
+    """
+
+    def _try_render_1page(scale: float, two_col_right: bool = False, canvas_h: float = page_h) -> bytes | None:
+        css_txt = _build_english_landscape_css(scale)
+        hdr_story = pymupdf.Story(html=header_html, user_css=css_txt)
+        l_story = pymupdf.Story(html=left_html, user_css=css_txt)
+
+        buf = io.BytesIO()
+        c_rect = pymupdf.Rect(0, 0, page_w, canvas_h)
+        writer = pymupdf.DocumentWriter(buf)
+        dev = writer.begin_page(c_rect)
+
+        hdr_rect = pymupdf.Rect(margin_x, margin_top, page_w - margin_x, canvas_h - margin_bottom)
+        more_h, filled_h = hdr_story.place(hdr_rect)
+        if more_h:
+            writer.end_page()
+            writer.close()
+            return None
+        hdr_story.draw(dev, None)
+
+        body_top = float(filled_h[3]) + 7.0
+        body_bottom = canvas_h - margin_bottom
+
+        l_rect = pymupdf.Rect(margin_x, body_top, margin_x + left_w, body_bottom)
+        more_l, _ = l_story.place(l_rect)
+        if more_l:
+            writer.end_page()
+            writer.close()
+            return None
+        l_story.draw(dev, None)
+
+        r_start_x = margin_x + left_w + col_gap
+        if not two_col_right:
+            r_story = pymupdf.Story(html=right_html, user_css=css_txt)
+            r_rect = pymupdf.Rect(r_start_x, body_top, page_w - margin_x, body_bottom)
+            more_r, _ = r_story.place(r_rect)
+            if more_r:
+                writer.end_page()
+                writer.close()
+                return None
+            r_story.draw(dev, None)
+        else:
+            sub_gap = 8.0
+            sub_w = (right_w - sub_gap) / 2.0
+            r_rect1 = pymupdf.Rect(r_start_x, body_top, r_start_x + sub_w, body_bottom)
+            r_rect2 = pymupdf.Rect(r_start_x + sub_w + sub_gap, body_top, page_w - margin_x, body_bottom)
+            r_story1 = pymupdf.Story(html=right_html_col1, user_css=css_txt)
+            more_r1, _ = r_story1.place(r_rect1)
+            if more_r1:
+                writer.end_page()
+                writer.close()
+                return None
+            r_story1.draw(dev, None)
+            if sent_cards_html[mid_idx:]:
+                r_story2 = pymupdf.Story(html=right_html_col2, user_css=css_txt)
+                more_r2, _ = r_story2.place(r_rect2)
+                if more_r2:
+                    writer.end_page()
+                    writer.close()
+                    return None
+                r_story2.draw(dev, None)
+
+        writer.end_page()
+        writer.close()
+        return buf.getvalue()
+
+    # 1) 우측 1컬럼으로 들어가는 최대 스케일 탐색
+    for sc in (1.0, 0.92, 0.85, 0.78, 0.72, 0.66):
+        out_b = _try_render_1page(sc, two_col_right=False, canvas_h=page_h)
+        if out_b is not None:
+            return out_b
+
+    # 2) 문장 수가 많은 경우 우측 영역을 2열 서브컬럼으로 자동 분할
+    for sc in (0.85, 0.78, 0.72, 0.66, 0.60):
+        out_b = _try_render_1page(sc, two_col_right=True, canvas_h=page_h)
+        if out_b is not None:
+            return out_b
+
+    # 3) 초장문 지문 최종 폴백: 세로로 넉넉한 가상 캔버스에 그린 뒤 A4 가로 1페이지에 비율 유지 축소
+    for virt_h in (760.0, 960.0, 1280.0):
+        tall_b = _try_render_1page(0.75, two_col_right=True, canvas_h=virt_h)
+        if tall_b is not None:
+            src_doc = pymupdf.open("pdf", tall_b)
+            dst_doc = pymupdf.open()
+            try:
+                dst_page = dst_doc.new_page(width=page_w, height=page_h)
+                target_rect = pymupdf.Rect(0, 0, page_w, page_h - 14.0)
+                dst_page.show_pdf_page(target_rect, src_doc, 0, keep_proportion=True)
+                return dst_doc.tobytes(garbage=3, deflate=True)
+            finally:
+                src_doc.close()
+                dst_doc.close()
+
+    # 최악의 폴백 (도달 가능성 극히 낮음)
+    return _try_render_1page(0.60, two_col_right=True, canvas_h=1600.0) or b""
+
+
 def generate_english_passage_analysis_pdf(
     analyses: list[dict[str, Any]],
     doc_title: str = "수능·모의고사 영어 정밀 지문 분석지",
@@ -1390,110 +1775,34 @@ def generate_english_passage_analysis_pdf(
 ) -> bytes:
     """
     영어 지문 분석 결과(EnglishPassageAnalysisOutput + 출처 메타) 리스트를
-    내신·수능형 정밀 지문 분석지 PDF로 렌더링한다 (PyMuPDF Story 기반 자동 페이지 넘김).
+    A4 가로(Landscape) 1페이지당 1지문 레이아웃 PDF로 렌더링한다.
     구성: [1] 핵심 주제 & 논리 전개 흐름, [2] 이해용 시각 도식, [3] 문장별 정밀 구문 분석.
     """
     if not analyses:
         raise ValueError("생성할 영어 지문 분석 데이터가 없습니다.")
 
-    sections_html: list[str] = []
     today_str = datetime.now().strftime("%Y.%m.%d")
-
-    def _keep_block(inner_html: str) -> str:
-        return (
-            "<table class='sec-keep-tbl'><tr class='sec-keep-tr'>"
-            f"<td class='sec-keep-td'>{inner_html}</td>"
-            "</tr></table>"
+    page_pdfs: list[bytes] = []
+    for item in analyses:
+        p_bytes = _render_single_english_landscape_page(
+            item=item,
+            doc_title=doc_title,
+            today_str=today_str,
+            include_diagrams=include_diagrams,
         )
+        if p_bytes:
+            page_pdfs.append(p_bytes)
 
-    for idx, item in enumerate(analyses):
-        an = item["analysis"]
-        q_label = str(item.get("q_label") or item.get("exam_name") or "영어 독해").strip()
-        orig_type = str(item.get("orig_type") or "영어 독해").strip()
+    if not page_pdfs:
+        raise ValueError("영어 지문 분석지 PDF 페이지를 생성하지 못했습니다.")
 
-        pb_cls = " class='page-break'" if idx > 0 else ""
-        banner_html = f"""
-        <div{pb_cls}>
-          <div class="hdr-banner">
-            <div class="hdr-sub">{html.escape(doc_title)} · {html.escape(orig_type)}</div>
-            <div class="hdr-title">{html.escape(an.title)}</div>
-            <div class="hdr-meta">출처: {html.escape(q_label)} &nbsp;|&nbsp; 생성일: {today_str}</div>
-          </div>
-        """
-
-        flow_html_inner = _format_structure_flow_html(an.structure_flow)
-        theme_html = _keep_block(f"""
-          <div class="sec-title">1. 핵심 주제 및 논리 전개 흐름</div>
-          <div class="theme-box">
-            <div><b>핵심 주제</b></div>
-            <div>{html.escape(an.core_theme)}</div>
-          </div>
-          <div class="flow-box">
-            <div><b>논리 전개 흐름:</b></div>
-            <div class="flow-lines">{flow_html_inner}</div>
-          </div>
-        """)
-
-        diagram_html = ""
-        v_diag = getattr(an, "visual_diagram", None)
-        if include_diagrams and v_diag is not None and (
-            getattr(v_diag, "nodes", None)
-            or getattr(v_diag, "graph_spec", None)
-            or getattr(v_diag, "emotion_points", None)
-        ):
-            try:
-                diag_png = render_korean_diagram_png(v_diag)
-                diag_b64 = base64.b64encode(diag_png).decode("ascii")
-                diagram_html = _keep_block(
-                    "<div class='sec-title'>2. 한눈에 보는 논리 · 구조 도식</div>"
-                    f"<div class='diagram-wrap'><img class='diagram-img' width='505' src='data:image/png;base64,{diag_b64}'/></div>"
-                )
-            except Exception:
-                diagram_html = ""
-
-        sent_sec_num = "3" if diagram_html else "2"
-        sent_cards_html: list[str] = []
-        sent_list = list(getattr(an, "sentence_analyses", None) or [])
-        for s_idx, sa in enumerate(sent_list):
-            s_num = int(getattr(sa, "sentence_num", s_idx + 1) or (s_idx + 1))
-            num_badge = _CIRCLED_NUMS[s_num - 1] if 1 <= s_num <= len(_CIRCLED_NUMS) else f"({s_num})"
-            is_topic = bool(getattr(sa, "is_topic_sentence", False))
-            card_cls = "eng-sent-card-topic" if is_topic else "eng-sent-card"
-            topic_badge = (
-                " &nbsp;<span class='eng-topic-badge'>★ 주제문 (Topic Sentence)</span>"
-                if is_topic
-                else ""
-            )
-            chunk_html = _format_chunked_english_html(getattr(sa, "chunked_english", ""))
-            kor_html = html.escape((getattr(sa, "korean_translation", "") or "").strip())
-            notes = [str(n).strip() for n in (getattr(sa, "syntax_notes", None) or []) if str(n).strip()]
-            notes_html = ""
-            if notes:
-                li_html = "".join(f"<div class='eng-syntax-li'>▸ {html.escape(n)}</div>" for n in notes)
-                notes_html = f"<div class='eng-syntax-box'>{li_html}</div>"
-
-            card_inner = (
-                f"<div class='{card_cls}'>"
-                f"<div class='eng-sent-hdr'><span class='eng-sent-num'>{num_badge}</span>{topic_badge}</div>"
-                f"<div class='eng-sent-chunk'>{chunk_html}</div>"
-                f"<div class='eng-sent-kor'>{kor_html}</div>"
-                f"{notes_html}"
-                "</div>"
-            )
-            if s_idx == 0:
-                sent_cards_html.append(
-                    _keep_block(
-                        f"<div class='sec-title'>{sent_sec_num}. 문장별 정밀 구문 분석</div>{card_inner}"
-                    )
-                )
-            else:
-                sent_cards_html.append(_keep_block(card_inner))
-
-        sections_html.append(
-            f"{banner_html}{theme_html}{diagram_html}{''.join(sent_cards_html)}</div>"
-        )
-
-    full_html = f"<html><body>{''.join(sections_html)}</body></html>"
-    return _render_story_pdf(full_html, _KOREAN_ANALYSIS_CSS)
+    merged = pymupdf.open()
+    try:
+        for raw_p in page_pdfs:
+            with pymupdf.open("pdf", raw_p) as src_doc:
+                merged.insert_pdf(src_doc)
+        return merged.tobytes(garbage=3, deflate=True)
+    finally:
+        merged.close()
 
 
