@@ -109,6 +109,7 @@ class StorageManager:
         self.saved_exams_root = self.local_root / "saved_exams"
         self.saved_exams_pdfs_root = self.saved_exams_root / "pdfs"
         self.english_dict_cache_path = self.local_root / "english_dict_cache.json"
+        self.english_dict_seed_path = Path(__file__).resolve().parent.parent / "data" / "csat_vocab_seed.json"
         self.user_vocab_root = self.local_root / "user_vocab"
 
         self.concept_root = Path(concept_root)
@@ -1333,24 +1334,14 @@ class StorageManager:
             return changed
 
     # -----------------------------------------------------------------------
-    # 공용 영단어 사전 캐시 DB (english_dict_cache.json)
+    # 공용 영단어 사전 캐시 DB (data/csat_vocab_seed.json + english_dict_cache.json)
     # -----------------------------------------------------------------------
-    def _load_english_dict_cache_unlocked(self) -> dict[str, Any]:
-        if not self.english_dict_cache_path.exists():
+    @staticmethod
+    def _read_english_dict_file_unlocked(path: Path) -> dict[str, Any]:
+        if not path.exists():
             return {"entries": {}, "aliases": {}}
-        sig = _file_stat_sig(self.english_dict_cache_path)
-        if sig is None or sig[1] == 0:
-            return {"entries": {}, "aliases": {}}
-        cache_key = f"eng_dict::{self.english_dict_cache_path.resolve()}"
-        with _GLOBAL_CACHE_LOCK:
-            cached = _GLOBAL_JSON_CACHE.get(cache_key)
-            if cached is not None and cached[0] == sig:
-                return {
-                    "entries": {k: dict(v) for k, v in cached[1]["entries"].items()},
-                    "aliases": dict(cached[1]["aliases"]),
-                }
         try:
-            data = json.loads(self.english_dict_cache_path.read_text(encoding="utf-8"))
+            data = json.loads(path.read_text(encoding="utf-8"))
             if not isinstance(data, dict):
                 return {"entries": {}, "aliases": {}}
             entries = {
@@ -1363,36 +1354,51 @@ class StorageManager:
                 for k, v in (data.get("aliases") or {}).items()
                 if isinstance(v, str)
             }
-            clean = {"entries": entries, "aliases": aliases}
-            with _GLOBAL_CACHE_LOCK:
-                _GLOBAL_JSON_CACHE[cache_key] = (sig, clean)
-            return {
-                "entries": {k: dict(v) for k, v in entries.items()},
-                "aliases": dict(aliases),
-            }
+            return {"entries": entries, "aliases": aliases}
         except Exception:
             return {"entries": {}, "aliases": {}}
+
+    def _load_english_dict_cache_unlocked(self) -> dict[str, Any]:
+        seed_sig = _file_stat_sig(self.english_dict_seed_path)
+        cache_sig = _file_stat_sig(self.english_dict_cache_path)
+        has_seed = seed_sig is not None and seed_sig[1] > 0
+        has_cache = cache_sig is not None and cache_sig[1] > 0
+        if not has_seed and not has_cache:
+            return {"entries": {}, "aliases": {}}
+        sig = (seed_sig, cache_sig)
+        cache_key = f"eng_dict::{self.english_dict_cache_path.resolve()}"
+        with _GLOBAL_CACHE_LOCK:
+            cached = _GLOBAL_JSON_CACHE.get(cache_key)
+            if cached is not None and cached[0] == sig:
+                return {
+                    "entries": {k: dict(v) for k, v in cached[1]["entries"].items()},
+                    "aliases": dict(cached[1]["aliases"]),
+                }
+
+        entries: dict[str, dict[str, Any]] = {}
+        aliases: dict[str, str] = {}
+        if has_seed:
+            seed_data = self._read_english_dict_file_unlocked(self.english_dict_seed_path)
+            entries.update(seed_data["entries"])
+            aliases.update(seed_data["aliases"])
+        if has_cache:
+            cache_data = self._read_english_dict_file_unlocked(self.english_dict_cache_path)
+            entries.update(cache_data["entries"])
+            aliases.update(cache_data["aliases"])
+
+        clean = {"entries": entries, "aliases": aliases}
+        with _GLOBAL_CACHE_LOCK:
+            _GLOBAL_JSON_CACHE[cache_key] = (sig, clean)
+        return {
+            "entries": {k: dict(v) for k, v in entries.items()},
+            "aliases": dict(aliases),
+        }
 
     def _save_english_dict_cache_unlocked(self, payload: dict[str, Any]) -> None:
         raw = json.dumps(payload, ensure_ascii=False, indent=2)
         _atomic_write_text(self.english_dict_cache_path, raw, encoding="utf-8")
-        new_sig = _file_stat_sig(self.english_dict_cache_path)
-        if new_sig is not None:
-            entries = {
-                str(k): dict(v)
-                for k, v in (payload.get("entries") or {}).items()
-                if isinstance(v, dict)
-            }
-            aliases = {
-                str(k): str(v)
-                for k, v in (payload.get("aliases") or {}).items()
-                if isinstance(v, str)
-            }
-            with _GLOBAL_CACHE_LOCK:
-                _GLOBAL_JSON_CACHE[f"eng_dict::{self.english_dict_cache_path.resolve()}"] = (
-                    new_sig,
-                    {"entries": entries, "aliases": aliases},
-                )
+        with _GLOBAL_CACHE_LOCK:
+            _GLOBAL_JSON_CACHE.pop(f"eng_dict::{self.english_dict_cache_path.resolve()}", None)
 
     def get_cached_english_dict_entry(self, query: str) -> EnglishDictEntry | None:
         """단어·숙어·한글 검색어에 해당하는 캐시된 영단어 사전 엔트리를 반환한다."""
@@ -1423,7 +1429,7 @@ class StorageManager:
         if not canonical_key:
             return
         with self._lock:
-            payload = self._load_english_dict_cache_unlocked()
+            payload = self._read_english_dict_file_unlocked(self.english_dict_cache_path)
             entry_copy = entry.model_copy(
                 update={
                     "query_normalized": canonical_key,
@@ -1447,25 +1453,38 @@ class StorageManager:
             payload = self._load_english_dict_cache_unlocked()
             raw_vals = list(payload["entries"].values())
         q_low = (search or "").strip().lower()
-        out: list[EnglishDictEntry] = []
+        filtered_raw: list[dict[str, Any]] = []
         for raw in raw_vals:
-            try:
-                ent = EnglishDictEntry.model_validate(raw)
-            except Exception:
+            if not isinstance(raw, dict):
                 continue
             if q_low:
+                senses_raw = raw.get("senses") or []
+                sense_meanings = [
+                    str(s.get("meaning_ko") or "")
+                    for s in senses_raw
+                    if isinstance(s, dict)
+                ]
                 hay = " ".join(
                     [
-                        ent.headword,
-                        ent.summary_ko,
-                        *(s.meaning_ko for s in ent.senses),
+                        str(raw.get("headword") or ""),
+                        str(raw.get("summary_ko") or ""),
+                        *sense_meanings,
                     ]
                 ).lower()
                 if q_low not in hay:
                     continue
-            out.append(ent)
-        out.sort(key=lambda e: str(e.updated_at or ""), reverse=True)
-        return out[: max(1, int(limit))]
+            filtered_raw.append(raw)
+        filtered_raw.sort(key=lambda r: str(r.get("updated_at") or ""), reverse=True)
+        max_items = max(1, int(limit))
+        out: list[EnglishDictEntry] = []
+        for raw in filtered_raw:
+            try:
+                out.append(EnglishDictEntry.model_validate(raw))
+                if len(out) >= max_items:
+                    break
+            except Exception:
+                continue
+        return out
 
     def count_cached_english_dict_entries(self) -> int:
         with self._lock:
@@ -1477,7 +1496,7 @@ class StorageManager:
         if not k_norm:
             return False
         with self._lock:
-            payload = self._load_english_dict_cache_unlocked()
+            payload = self._read_english_dict_file_unlocked(self.english_dict_cache_path)
             target_key = k_norm if k_norm in payload["entries"] else payload["aliases"].get(k_norm, "")
             if not target_key or target_key not in payload["entries"]:
                 return False
