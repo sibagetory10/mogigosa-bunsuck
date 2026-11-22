@@ -122,18 +122,23 @@ def _measure_card_height(
     f_sub: ImageFont.FreeTypeFont | ImageFont.ImageFont,
     f_title: ImageFont.FreeTypeFont | ImageFont.ImageFont,
     f_body: ImageFont.FreeTypeFont | ImageFont.ImageFont,
+    *,
+    sub_h: int = 28,
+    title_lh: int = 28,
+    body_lh: int = 24,
+    min_h: int = 112,
 ) -> int:
     inner_w = max(80, card_w - 34)
     h = 18
     if (node.subtitle or "").strip():
-        h += 28
+        h += sub_h
     title_lines = _wrap_text(draw, node.title, f_title, inner_w)
-    h += max(1, len(title_lines)) * 28 + 10
+    h += max(1, len(title_lines)) * title_lh + 10
     for d in node.details or []:
         d_lines = _wrap_text(draw, f"• {d}", f_body, inner_w)
-        h += max(1, len(d_lines)) * 24 + 4
+        h += max(1, len(d_lines)) * body_lh + 4
     h += 14
-    return max(112, h)
+    return max(min_h, h)
 
 
 def _draw_node_card(
@@ -146,6 +151,10 @@ def _draw_node_card(
     f_sub: ImageFont.FreeTypeFont | ImageFont.ImageFont,
     f_title: ImageFont.FreeTypeFont | ImageFont.ImageFont,
     f_body: ImageFont.FreeTypeFont | ImageFont.ImageFont,
+    *,
+    sub_h: int = 30,
+    title_lh: int = 28,
+    body_lh: int = 24,
 ) -> None:
     pal = _PALETTES.get(node.accent_color, _PALETTES["blue"])
     draw.rounded_rectangle(
@@ -165,23 +174,24 @@ def _draw_node_card(
     sub = (node.subtitle or "").strip()
     if sub:
         badge_w = int(min(inner_w, draw.textlength(sub, font=f_sub) + 18))
+        badge_h = max(23, sub_h - 4)
         draw.rounded_rectangle(
-            [inner_x, cur_y, inner_x + badge_w, cur_y + 23],
+            [inner_x, cur_y, inner_x + badge_w, cur_y + badge_h],
             radius=8,
             fill=pal["badge_bg"],
         )
         draw.text((inner_x + 9, cur_y + 3), sub, font=f_sub, fill=pal["badge_fg"])
-        cur_y += 30
+        cur_y += sub_h + 2
 
     for t_ln in _wrap_text(draw, node.title, f_title, inner_w):
         draw.text((inner_x, cur_y), t_ln, font=f_title, fill=(15, 23, 42))
-        cur_y += 28
+        cur_y += title_lh
     cur_y += 5
 
     for d in node.details or []:
         for d_ln in _wrap_text(draw, f"• {d}", f_body, inner_w):
             draw.text((inner_x, cur_y), d_ln, font=f_body, fill=(51, 65, 85))
-            cur_y += 24
+            cur_y += body_lh
         cur_y += 3
 
 
@@ -1398,37 +1408,247 @@ def _render_card_layout(
     return body_h, [_draw_fn]
 
 
-def render_korean_diagram_png(diagram: KoreanVisualDiagram) -> bytes:
-    """KoreanVisualDiagram 스펙을 16종(비문학 12종+문학 4종) 고해상도 한글 도식 PNG로 렌더링한다."""
+def _render_compact_vertical_layout(
+    diagram: KoreanVisualDiagram,
+    dtype: str,
+    W: int,
+    PAD_X: int,
+    body_top: int,
+    fonts: dict[str, Any],
+) -> tuple[int, list[Any]]:
+    """좁은 컬럼(영어 분석지 좌측 등)에서 글씨가 큼직하게 읽히도록 세로 중심 고가독성 레이아웃을 계산한다."""
+    probe = ImageDraw.Draw(Image.new("RGB", (W, 100)))
+    inner_full_w = W - PAD_X * 2
+    nodes = list(diagram.nodes or [])[:5]
+    rel_labels = list(diagram.relation_labels or [])
+
+    # 1) 비교 매트릭스표 (760px 폭 + 큰 폰트)
+    if dtype == "matrix" and (nodes or diagram.matrix_rows):
+        m_nodes = nodes[:3] if len(nodes) >= 2 else (nodes + [KoreanDiagramNode(title="대상 B")])[:2]
+        col_cnt = len(m_nodes)
+        rows = list(diagram.matrix_rows or [])
+        if not rows:
+            max_d = max((len(nd.details or []) for nd in m_nodes), default=1)
+            for ri in range(max(1, min(4, max_d))):
+                rows.append(
+                    type("_Row", (), {
+                        "criterion": f"기준 {ri + 1}",
+                        "values": [
+                            (nd.details[ri] if ri < len(nd.details or []) else "-")
+                            for nd in m_nodes
+                        ],
+                    })()
+                )
+        crit_w = 152
+        val_w = (inner_full_w - crit_w) // col_cnt
+        hdr_h = 52
+        row_heights: list[int] = []
+        for r in rows[:5]:
+            c_lines = _wrap_text(probe, r.criterion, fonts["sub"], crit_w - 18)
+            max_l = len(c_lines)
+            for ci in range(col_cnt):
+                vt = r.values[ci] if ci < len(r.values) else "-"
+                max_l = max(max_l, len(_wrap_text(probe, vt, fonts["body"], val_w - 18)))
+            row_heights.append(max(48, max_l * 27 + 18))
+        total_h = hdr_h + sum(row_heights) + 6
+
+        def _draw_compact_matrix(draw: ImageDraw.ImageDraw) -> None:
+            x0, y0 = PAD_X, body_top
+            draw.rounded_rectangle([x0, y0, x0 + crit_w - 2, y0 + hdr_h], radius=8, fill=(30, 41, 59))
+            draw.text((x0 + 14, y0 + 14), "비교 기준", font=fonts["sub"], fill=(255, 255, 255))
+            for ci, nd in enumerate(m_nodes):
+                pal = _PALETTES.get(nd.accent_color or _COLOR_CYCLE[ci % len(_COLOR_CYCLE)], _PALETTES["blue"])
+                cx = x0 + crit_w + ci * val_w + 2
+                draw.rounded_rectangle([cx, y0, cx + val_w - 4, y0 + hdr_h], radius=8, fill=pal["hdr"])
+                tl = _wrap_text(draw, nd.title, fonts["sub"], val_w - 16)
+                draw.text((cx + 10, y0 + (14 if len(tl) == 1 else 6)), tl[0], font=fonts["sub"], fill=(255, 255, 255))
+                if len(tl) > 1:
+                    draw.text((cx + 10, y0 + 27), tl[1], font=fonts["sub"], fill=(255, 255, 255))
+            cur_y = y0 + hdr_h + 4
+            for ri, r in enumerate(rows[:5]):
+                rh = row_heights[ri]
+                bg_c = (248, 250, 252) if ri % 2 == 0 else (255, 255, 255)
+                draw.rectangle([x0, cur_y, x0 + inner_full_w, cur_y + rh], fill=bg_c, outline=(203, 213, 225), width=2)
+                draw.rectangle([x0, cur_y, x0 + crit_w, cur_y + rh], fill=(241, 245, 249), outline=(203, 213, 225), width=2)
+                cy_t = cur_y + 10
+                for cl in _wrap_text(draw, r.criterion, fonts["sub"], crit_w - 18):
+                    draw.text((x0 + 10, cy_t), cl, font=fonts["sub"], fill=(30, 58, 138))
+                    cy_t += 26
+                for ci in range(col_cnt):
+                    cx = x0 + crit_w + ci * val_w
+                    draw.line([(cx, cur_y), (cx, cur_y + rh)], fill=(203, 213, 225), width=2)
+                    vt = r.values[ci] if ci < len(r.values) else "-"
+                    vy = cur_y + 10
+                    for vl in _wrap_text(draw, vt, fonts["body"], val_w - 18):
+                        draw.text((cx + 10, vy), vl, font=fonts["body"], fill=(30, 41, 59))
+                        vy += 26
+                cur_y += rh
+
+        return total_h, [_draw_compact_matrix]
+
+    # 2) 2자 대립/비교/저울/벤다이어그램 (노드 2개 → 2열 큰 카드)
+    if dtype in ("comparison", "scale", "venn") and len(nodes) == 2:
+        gap = 36
+        card_w = (inner_full_w - gap) // 2
+        card_h = max(
+            _measure_card_height(
+                probe, nd, card_w, fonts["sub"], fonts["title"], fonts["body"],
+                sub_h=30, title_lh=30, body_lh=27, min_h=120,
+            )
+            for nd in nodes
+        )
+        c_lbl = (diagram.center_label or "").strip()
+        extra_h = 52 if (dtype == "venn" and c_lbl) else 0
+        total_h = card_h + extra_h
+
+        def _draw_compact_pair(draw: ImageDraw.ImageDraw) -> None:
+            _draw_node_card(
+                draw, nodes[0], PAD_X, body_top, card_w, card_h,
+                fonts["sub"], fonts["title"], fonts["body"], sub_h=30, title_lh=30, body_lh=27,
+            )
+            _draw_node_card(
+                draw, nodes[1], PAD_X + card_w + gap, body_top, card_w, card_h,
+                fonts["sub"], fonts["title"], fonts["body"], sub_h=30, title_lh=30, body_lh=27,
+            )
+            mx = PAD_X + card_w + gap // 2
+            my = body_top + card_h // 2
+            vs_txt = (rel_labels[0] if rel_labels and rel_labels[0].strip() else "VS")[:6]
+            tw = max(44, int(draw.textlength(vs_txt, font=fonts["lbl"])) + 16)
+            draw.rounded_rectangle(
+                [mx - tw // 2, my - 18, mx + tw // 2, my + 18],
+                radius=12, fill=(239, 246, 255), outline=(59, 130, 246), width=2,
+            )
+            draw.text((mx - tw // 2 + 8, my - 10), vs_txt, font=fonts["lbl"], fill=(29, 78, 216))
+            if dtype == "venn" and c_lbl:
+                cy = body_top + card_h + 12
+                draw.rounded_rectangle(
+                    [PAD_X, cy, W - PAD_X, cy + 38],
+                    radius=10, fill=(238, 242, 255), outline=(99, 102, 241), width=2,
+                )
+                txt = f"공통점: {c_lbl}"
+                draw.text((PAD_X + 16, cy + 8), txt, font=fonts["sub"], fill=(55, 48, 163))
+
+        return total_h, [_draw_compact_pair]
+
+    # 3) 기본 세로 흐름 스택 (flow / timeline / hierarchy / cycle / anatomy / fishbone / pyramid / decision_tree 등)
+    if not nodes:
+        nodes = [KoreanDiagramNode(title=diagram.title or "핵심 구조", details=[diagram.takeaway] if diagram.takeaway else [])]
+
+    show_center_banner = (
+        dtype in ("anatomy", "cycle", "fishbone", "decision_tree")
+        and bool((diagram.center_label or "").strip())
+    )
+    banner_h = 46 if show_center_banner else 0
+    arrow_gap = 38
+    card_w = inner_full_w
+    card_hs = [
+        _measure_card_height(
+            probe, nd, card_w, fonts["sub"], fonts["title"], fonts["body"],
+            sub_h=30, title_lh=30, body_lh=27, min_h=88,
+        )
+        for nd in nodes
+    ]
+    total_h = (banner_h + 14 if show_center_banner else 0) + sum(card_hs) + arrow_gap * max(0, len(nodes) - 1)
+
+    def _draw_compact_stack(draw: ImageDraw.ImageDraw) -> None:
+        cur_y = body_top
+        if show_center_banner:
+            c_txt = (diagram.center_label or "").strip()
+            draw.rounded_rectangle(
+                [PAD_X, cur_y, W - PAD_X, cur_y + banner_h],
+                radius=12, fill=(239, 246, 255), outline=(37, 99, 235), width=2,
+            )
+            prefix = "핵심 중심 · " if dtype != "decision_tree" else "분기 조건 · "
+            lbl_full = f"{prefix}{c_txt}"
+            tw = draw.textlength(lbl_full, font=fonts["sub"])
+            draw.text(((W - tw) / 2, cur_y + 12), lbl_full, font=fonts["sub"], fill=(29, 78, 216))
+            cur_y += banner_h + 14
+
+        cx = W // 2
+        for i, nd in enumerate(nodes):
+            ch = card_hs[i]
+            _draw_node_card(
+                draw, nd, PAD_X, cur_y, card_w, ch,
+                fonts["sub"], fonts["title"], fonts["body"],
+                sub_h=30, title_lh=30, body_lh=27,
+            )
+            if i < len(nodes) - 1:
+                y1 = cur_y + ch + 3
+                y2 = cur_y + ch + arrow_gap - 4
+                draw.line([(cx, y1), (cx, y2)], fill=(71, 85, 105), width=3)
+                draw.polygon([(cx, y2 + 2), (cx - 8, y2 - 10), (cx + 8, y2 - 10)], fill=(71, 85, 105))
+                lbl = " ".join((rel_labels[i] if i < len(rel_labels) else "").split()).strip()
+                if lbl:
+                    tw = int(draw.textlength(lbl, font=fonts["lbl"])) + 18
+                    ly_mid = (y1 + y2) // 2
+                    draw.rounded_rectangle(
+                        [cx + 16, ly_mid - 14, cx + 16 + tw, ly_mid + 14],
+                        radius=8, fill=(255, 255, 255), outline=(148, 163, 184), width=2,
+                    )
+                    draw.text((cx + 25, ly_mid - 10), lbl, font=fonts["lbl"], fill=(30, 58, 138))
+            cur_y += ch + arrow_gap
+
+    return total_h, [_draw_compact_stack]
+
+
+def render_korean_diagram_png(
+    diagram: KoreanVisualDiagram,
+    *,
+    compact_vertical: bool = False,
+) -> bytes:
+    """KoreanVisualDiagram 스펙을 16종(비문학 12종+문학 4종) 고해상도 한글 도식 PNG로 렌더링한다.
+
+    compact_vertical=True이면 영어 정밀 분석지 좌측 컬럼 등 좁은 폭에서도 글씨가 크게 읽히도록
+    760px 세로 중심 고가독성 캔버스로 렌더링한다.
+    """
     dtype = (diagram.diagram_type or "flow").strip().lower()
     if not (diagram.nodes or []) and dtype not in ("graph", "emotion_arc"):
         raise ValueError("도식에 표시할 노드가 없습니다.")
 
-    W = 1400
-    PAD_X = 36
-    fonts = {
-        "hdr_tag": _load_font(17, bold=True),
-        "hdr_title": _load_font(26, bold=True),
-        "sub": _load_font(16, bold=True),
-        "title": _load_font(21, bold=True),
-        "body": _load_font(18, bold=False),
-        "lbl": _load_font(14, bold=True),
-        "take": _load_font(19, bold=True),
-    }
+    if compact_vertical and dtype not in ("graph", "emotion_arc"):
+        W = 760
+        PAD_X = 22
+        fonts = {
+            "hdr_tag": _load_font(19, bold=True),
+            "hdr_title": _load_font(26, bold=True),
+            "sub": _load_font(18, bold=True),
+            "title": _load_font(23, bold=True),
+            "body": _load_font(20, bold=False),
+            "lbl": _load_font(17, bold=True),
+            "take": _load_font(20, bold=True),
+        }
+        title_lh = 34
+        take_lh = 28
+    else:
+        W = 1400
+        PAD_X = 36
+        fonts = {
+            "hdr_tag": _load_font(17, bold=True),
+            "hdr_title": _load_font(26, bold=True),
+            "sub": _load_font(16, bold=True),
+            "title": _load_font(21, bold=True),
+            "body": _load_font(18, bold=False),
+            "lbl": _load_font(14, bold=True),
+            "take": _load_font(19, bold=True),
+        }
+        title_lh = 34
+        take_lh = 28
 
     probe = ImageDraw.Draw(Image.new("RGB", (W, 200), (255, 255, 255)))
     title_lines = _wrap_text(probe, diagram.title or "핵심 원리 도식", fonts["hdr_title"], W - PAD_X * 2 - 20)
-    header_h = 26 + 26 + max(1, len(title_lines)) * 34 + 16
-    body_top = header_h + 18
+    header_h = 24 + 28 + max(1, len(title_lines)) * title_lh + 14
+    body_top = header_h + 16
 
     takeaway_lines = (
-        _wrap_text(probe, f"핵심 정리: {diagram.takeaway}", fonts["take"], W - PAD_X * 2 - 44)
+        _wrap_text(probe, f"핵심 정리: {diagram.takeaway}", fonts["take"], W - PAD_X * 2 - 36)
         if (diagram.takeaway or "").strip()
         else []
     )
-    takeaway_h = (len(takeaway_lines) * 28 + 28) if takeaway_lines else 0
+    takeaway_h = (len(takeaway_lines) * take_lh + 24) if takeaway_lines else 0
 
-    if dtype == "matrix":
+    if compact_vertical and dtype not in ("graph", "emotion_arc"):
+        body_h, draw_fns = _render_compact_vertical_layout(diagram, dtype, W, PAD_X, body_top, fonts)
+    elif dtype == "matrix":
         body_h, draw_fns = _render_matrix(diagram, W, PAD_X, body_top, fonts)
     elif dtype == "graph":
         body_h, draw_fns = _render_graph(diagram, W, PAD_X, body_top, fonts)
@@ -1459,7 +1679,7 @@ def render_korean_diagram_png(diagram: KoreanVisualDiagram) -> bytes:
     else:
         body_h, draw_fns = _render_card_layout(diagram, dtype, W, PAD_X, body_top, fonts)
 
-    total_h = body_top + body_h + 24 + (takeaway_h + 18 if takeaway_h else 0)
+    total_h = body_top + body_h + 22 + (takeaway_h + 16 if takeaway_h else 0)
     img = Image.new("RGB", (W, total_h), (255, 255, 255))
     draw = ImageDraw.Draw(img)
 
@@ -1491,18 +1711,18 @@ def render_korean_diagram_png(diagram: KoreanVisualDiagram) -> bytes:
         "hierarchy": "개념 체계 · 분류 구조도",
     }
     tag_text = type_tag_map.get(dtype, "개념 이해 도식")
-    draw.text((PAD_X, 24), f"◆ {tag_text}", font=fonts["hdr_tag"], fill=(29, 78, 216))
+    draw.text((PAD_X, 22), f"◆ {tag_text}", font=fonts["hdr_tag"], fill=(29, 78, 216))
     ty = 52
     for tl in title_lines:
         draw.text((PAD_X, ty), tl, font=fonts["hdr_title"], fill=(15, 23, 42))
-        ty += 34
+        ty += title_lh
     draw.line([(PAD_X, header_h - 4), (W - PAD_X, header_h - 4)], fill=(226, 232, 240), width=2)
 
     for fn in draw_fns:
         fn(draw)
 
     if takeaway_lines:
-        ty_box = body_top + body_h + 22
+        ty_box = body_top + body_h + 18
         draw.rounded_rectangle(
             [PAD_X, ty_box, W - PAD_X, ty_box + takeaway_h],
             radius=12,
@@ -1510,10 +1730,10 @@ def render_korean_diagram_png(diagram: KoreanVisualDiagram) -> bytes:
             outline=(245, 158, 11),
             width=2,
         )
-        cur_ty = ty_box + 14
+        cur_ty = ty_box + 12
         for tl in takeaway_lines:
-            draw.text((PAD_X + 20, cur_ty), tl, font=fonts["take"], fill=(146, 64, 14))
-            cur_ty += 28
+            draw.text((PAD_X + 18, cur_ty), tl, font=fonts["take"], fill=(146, 64, 14))
+            cur_ty += take_lh
 
     out = io.BytesIO()
     img.save(out, format="PNG", optimize=True)

@@ -1531,19 +1531,7 @@ def _build_english_landscape_css(scale: float = 1.0) -> str:
         font-size: {7.9 * s:.2f}pt;
         color: #334155;
         line-height: 1.38;
-        margin-bottom: {1.5 * s:.2f}pt;
-    }}
-    .eng-syntax-box {{
-        background-color: #F8FAFC;
-        border-top: 0.4pt solid #E2E8F0;
-        padding: {2.2 * s:.2f}pt {4 * s:.2f}pt 0 {4 * s:.2f}pt;
-        margin-top: {1.5 * s:.2f}pt;
-    }}
-    .eng-syntax-li {{
-        font-size: {7.5 * s:.2f}pt;
-        color: #1E40AF;
-        line-height: 1.35;
-        margin-bottom: {1 * s:.2f}pt;
+        margin-bottom: 0;
     }}
     """
 
@@ -1567,8 +1555,9 @@ def _render_single_english_landscape_page(
     margin_bottom = 26.0
     col_gap = 12.0
 
-    # 시각 도식 PNG 사전 생성
+    # 시각 도식 PNG 사전 생성 (좁은 좌측 컬럼 전용 세로 고가독성 레이아웃)
     diag_b64 = ""
+    diag_aspect = 1.0  # w / h
     v_diag = getattr(an, "visual_diagram", None)
     if include_diagrams and v_diag is not None and (
         getattr(v_diag, "nodes", None)
@@ -1576,13 +1565,16 @@ def _render_single_english_landscape_page(
         or getattr(v_diag, "emotion_points", None)
     ):
         try:
-            diag_png = render_korean_diagram_png(v_diag)
+            diag_png = render_korean_diagram_png(v_diag, compact_vertical=True)
+            with Image.open(io.BytesIO(diag_png)) as _dim:
+                dw_px, dh_px = _dim.size
+            diag_aspect = float(max(1, dw_px)) / float(max(1, dh_px))
             diag_b64 = base64.b64encode(diag_png).decode("ascii")
         except Exception:
             diag_b64 = ""
 
     content_w = page_w - 2 * margin_x
-    left_ratio = 0.37 if diag_b64 else 0.29
+    left_ratio = 0.43 if diag_b64 else 0.29
     left_w = content_w * left_ratio
     right_w = content_w - left_w - col_gap
 
@@ -1596,14 +1588,7 @@ def _render_single_english_landscape_page(
     """
 
     flow_html_inner = _format_structure_flow_html(an.structure_flow)
-    diag_img_w = max(160, int(left_w - 6))
-    diag_block = (
-        "<div class='eng-l-sec' style='margin-top:5pt;'>2. 한눈에 보는 논리 · 구조 도식</div>"
-        f"<div class='eng-l-diag-wrap'><img class='eng-l-diag-img' width='{diag_img_w}' src='data:image/png;base64,{diag_b64}'/></div>"
-        if diag_b64
-        else ""
-    )
-    left_html = f"""
+    left_top_html = f"""
     <html><body>
       <div class="eng-l-sec">1. 핵심 주제 및 논리 전개 흐름</div>
       <div class="eng-l-theme">
@@ -1614,7 +1599,6 @@ def _render_single_english_landscape_page(
         <div><b>논리 전개 흐름</b></div>
         <div>{flow_html_inner}</div>
       </div>
-      {diag_block}
     </body></html>
     """
 
@@ -1633,18 +1617,12 @@ def _render_single_english_landscape_page(
         )
         chunk_html = _format_chunked_english_html(getattr(sa, "chunked_english", ""))
         kor_html = html.escape((getattr(sa, "korean_translation", "") or "").strip())
-        notes = [str(n).strip() for n in (getattr(sa, "syntax_notes", None) or []) if str(n).strip()]
-        notes_html = ""
-        if notes:
-            li_html = "".join(f"<div class='eng-syntax-li'>▸ {html.escape(n)}</div>" for n in notes)
-            notes_html = f"<div class='eng-syntax-box'>{li_html}</div>"
 
         card_inner = (
             f"<div class='{card_cls}'>"
             f"<div class='eng-sent-hdr'><span class='eng-sent-num'>{num_badge}</span>{topic_badge}</div>"
             f"<div class='eng-sent-chunk'>{chunk_html}</div>"
             f"<div class='eng-sent-kor'>{kor_html}</div>"
-            f"{notes_html}"
             "</div>"
         )
         sent_cards_html.append(
@@ -1676,7 +1654,7 @@ def _render_single_english_landscape_page(
     def _try_render_1page(scale: float, two_col_right: bool = False, canvas_h: float = page_h) -> bytes | None:
         css_txt = _build_english_landscape_css(scale)
         hdr_story = pymupdf.Story(html=header_html, user_css=css_txt)
-        l_story = pymupdf.Story(html=left_html, user_css=css_txt)
+        l_top_story = pymupdf.Story(html=left_top_html, user_css=css_txt)
 
         buf = io.BytesIO()
         c_rect = pymupdf.Rect(0, 0, page_w, canvas_h)
@@ -1694,13 +1672,50 @@ def _render_single_english_landscape_page(
         body_top = float(filled_h[3]) + 7.0
         body_bottom = canvas_h - margin_bottom
 
-        l_rect = pymupdf.Rect(margin_x, body_top, margin_x + left_w, body_bottom)
-        more_l, _ = l_story.place(l_rect)
-        if more_l:
+        l_top_rect = pymupdf.Rect(margin_x, body_top, margin_x + left_w, body_bottom)
+        more_lt, filled_lt = l_top_story.place(l_top_rect)
+        if more_lt:
             writer.end_page()
             writer.close()
             return None
-        l_story.draw(dev, None)
+        l_top_story.draw(dev, None)
+
+        if diag_b64:
+            diag_top = float(filled_lt[3]) + 5.0
+            avail_h = body_bottom - diag_top
+            if avail_h < 95.0:
+                writer.end_page()
+                writer.close()
+                return None
+            # 섹션 제목 높이(~18pt)를 제외한 가용 영역에 도식을 최대 크기로 맞춤
+            max_img_h = max(60.0, avail_h - 20.0)
+            fit_w = min(left_w - 4.0, max_img_h * diag_aspect)
+            diag_img_w = max(140, int(fit_w))
+            diag_only_html = (
+                "<html><body>"
+                "<div class='eng-l-sec' style='margin-top:0;'>2. 한눈에 보는 논리 · 구조 도식</div>"
+                f"<div class='eng-l-diag-wrap'><img class='eng-l-diag-img' width='{diag_img_w}' src='data:image/png;base64,{diag_b64}'/></div>"
+                "</body></html>"
+            )
+            diag_story = pymupdf.Story(html=diag_only_html, user_css=css_txt)
+            diag_rect = pymupdf.Rect(margin_x, diag_top, margin_x + left_w, body_bottom)
+            more_d, _ = diag_story.place(diag_rect)
+            if more_d:
+                # 1~2pt 여유 오차 보정 후 재시도
+                diag_img_w = max(120, int(fit_w * 0.92))
+                diag_only_html = (
+                    "<html><body>"
+                    "<div class='eng-l-sec' style='margin-top:0;'>2. 한눈에 보는 논리 · 구조 도식</div>"
+                    f"<div class='eng-l-diag-wrap'><img class='eng-l-diag-img' width='{diag_img_w}' src='data:image/png;base64,{diag_b64}'/></div>"
+                    "</body></html>"
+                )
+                diag_story = pymupdf.Story(html=diag_only_html, user_css=css_txt)
+                more_d, _ = diag_story.place(diag_rect)
+                if more_d:
+                    writer.end_page()
+                    writer.close()
+                    return None
+            diag_story.draw(dev, None)
 
         r_start_x = margin_x + left_w + col_gap
         if not two_col_right:

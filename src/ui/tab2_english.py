@@ -469,17 +469,11 @@ def _render_english_analysis_results_section() -> None:
                         )
                         chunk_html = _format_chunked_english_html(getattr(sa, "chunked_english", ""))
                         kor_txt = _html.escape((getattr(sa, "korean_translation", "") or "").strip())
-                        notes = [str(n).strip() for n in (getattr(sa, "syntax_notes", None) or []) if str(n).strip()]
-                        notes_html = ""
-                        if notes:
-                            li = "".join(f"<div style='color:#1E40AF;font-size:0.88em;'>▸ {_html.escape(n)}</div>" for n in notes)
-                            notes_html = f"<div style='margin-top:5px;padding-top:4px;border-top:1px dashed #CBD5E1;'>{li}</div>"
                         st.markdown(
                             f"<div style='{border_style}border-radius:6px;padding:10px 12px;margin-bottom:8px;'>"
                             f"<div style='margin-bottom:4px;'><strong style='color:#1E3A8A;'>{n_badge}</strong>{topic_html}</div>"
                             f"<div style='font-weight:600;color:#0F172A;line-height:1.6;margin-bottom:4px;'>{chunk_html}</div>"
                             f"<div style='color:#334155;font-size:0.95em;line-height:1.5;'>{kor_txt}</div>"
-                            f"{notes_html}"
                             "</div>",
                             unsafe_allow_html=True,
                         )

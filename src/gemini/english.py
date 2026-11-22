@@ -685,9 +685,7 @@ def generate_english_passage_analysis(
         "     * **의미 단위/주어부·동사부·목적어 경계**에는 ` / ` 슬래시 넣기 (예: `The ability [to adapt (to rapid change)] / determines / [whether an organization thrives (in the long run)].`).\n"
         "     * 과도한 중첩으로 읽기가 망가지지 않도록 핵심 구문 경계 위주로 깔끔하게 끊고 묶으세요.\n"
         "   - `korean_translation`: 문맥을 살린 정확하고 자연스러운 한국어 직역·의역 조화 해석.\n"
-        "   - `syntax_notes`: 해당 문장에서 학생이 꼭 알아야 할 **핵심 구문·어법 포인트** 1~3개를 한국어로 간결하고 명확하게 설명 "
-        "(예: `'to adapt to ~: 앞의 명사 ability를 수식하는 to부정사 형용사적 용법'`, `'whether + S + V: 동사 determines의 목적어 역할을 하는 명사절'`). "
-        "단순 단어 뜻 풀이는 넣지 말고 문장 구조·어법 원리만 설명하세요."
+        "   - `syntax_notes`: 문장별 문법 설명은 출력하지 않으므로 반드시 빈 배열 `[]`로 두세요."
     )
 
     prompt = (
