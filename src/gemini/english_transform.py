@@ -35,14 +35,14 @@ from src.gemini.english_validators import (
     _reconcile_english_order_answer,
     _reconcile_english_passage_with_question_text,
     _reconcile_english_summary_answer,
-    _repair_english_analysis_output,
     _split_english_sentences,
-    _validate_english_analysis_output,
+    _validate_english_summary_diagram_output,
     _validate_english_transformed_output,
 )
 from src.models import (
     CURRENT_ENGLISH_ANALYSIS_VERSION,
     EnglishPassageAnalysisOutput,
+    EnglishPassageSummaryDiagramOutput,
     EnglishSentenceAnalysisItem,
     KoreanVisualDiagram,
     QuestionRecord,
@@ -477,201 +477,114 @@ def generate_english_passage_analysis(
     choices: Sequence[str] | None = None,
     explanation: str = "",
     question_text: str = "",
+    *,
+    source_pdf_bytes: bytes | None = None,
+    answer_pdf_bytes: bytes | None = None,
+    q_num: int = 0,
+    passage_group_id: str = "",
+    direct_korean_translation: str = "",
+    include_diagrams: bool = True,
 ) -> EnglishPassageAnalysisOutput:
     """
-    영어 독해 지문을 내신·수능형 정밀 지문 분석지(핵심 주제, 논리 전개 흐름, 이해용 시각 도식,
-    유형별 기출 포인트·공식 각주, 문장별 원문 100% 무손실 슬래시(/) 끊어읽기 + [절]/(수식어) 구문독해 + 주제문 ★ 표시 + 해석)로
-    구조화 분석하고, 치명적 오류 전용 재시도 및 결정론적 최종 토큰 일치·괄호 보정을 수행한다.
+    영어 독해 지문 분석지를 생성한다 (v5):
+    - [3. 문장별 정밀 구문 분석] 및 [공식 각주]: AI를 일절 사용하지 않고 저장된 문제지 PDF / DB 원문과
+      해설지 PDF([해석] 섹션)에서 순수 Python/PyMuPDF로 결정론적 추출·정렬한다.
+    - [1. 핵심 주제 · 논리 전개 흐름] 및 [2. 구조 도식]: Gemini API로 순수 한국어 요약·도식만 생성한다.
+    - 기출 포인트 박스는 생성하지 않는다.
     """
-    raw_passage = (passage_text or "").strip()
-    if not raw_passage:
-        raise ValueError("분석할 영어 지문 원문(passage_text)이 비어 있습니다.")
+    from src.pdf_parser.english_source_extractor import (
+        build_english_sentence_items,
+        extract_english_passage_from_problem_source,
+        extract_english_question_translation_from_pdf,
+    )
 
-    # 1) 원본 PyMuPDF question_text(+정답)와 대조해 각주·빈칸·무관한 문장·순서·삽입 추출 및 원문 무손실 복구
-    reconciled_raw, exam_ctx = _reconcile_english_passage_with_question_text(
-        passage_text=raw_passage,
+    _ = choices  # 하위 호환 인자 유지
+
+    # 1단계 (AI 0%): 문제지 PDF / DB 원문에서 영어 원문·각주 추출, 해설지 PDF에서 한국어 해석 추출
+    clean_passage, footnotes = extract_english_passage_from_problem_source(
+        passage_text=passage_text,
         question_text=question_text,
+        source_pdf_bytes=source_pdf_bytes,
+        q_num=q_num,
+        passage_group_id=passage_group_id,
         orig_question_type=orig_question_type,
         answer=answer,
-        explanation=explanation,
     )
-    eff_choices: list[str] = [str(c).strip() for c in (choices or []) if str(c).strip()]
-    if not eff_choices and isinstance(exam_ctx.get("choices"), dict):
-        c_dict = exam_ctx["choices"]
-        eff_choices = [c_dict[str(k)] for k in range(1, 6) if str(k) in c_dict]
-
-    eff_model = (model_name or "").strip() or EXAM_TAGGING_MODEL
-    orig_blank_phrase = (exam_ctx.get("original_blank_phrase") or "").strip()
-    # 2) 마커 제거 전에 실제 미복원 흔적(____ / ①~⑤ / (A)(B)(C) / <u> / 불완전 문장)이 있을 때만 제한적으로 복원
-    if _needs_english_passage_restoration(reconciled_raw, orig_question_type):
-        restore_exp_hint = explanation
-        if orig_blank_phrase and orig_blank_phrase.lower() not in reconciled_raw.lower():
-            restore_exp_hint = f"[정확한 빈칸 정답 원문 구절: {orig_blank_phrase}]\n{explanation or ''}".strip()
-        clean_passage = _restore_incomplete_source_passage(
-            api_key,
-            eff_model,
-            reconciled_raw,
-            orig_question_type=orig_question_type,
-            answer=answer,
-            choices=eff_choices,
-            explanation=restore_exp_hint,
-        )
-    else:
-        clean_passage = _preprocess_english_source_passage(reconciled_raw)
-
     if not clean_passage:
         raise ValueError("분석할 영어 지문 원문(passage_text)이 비어 있습니다.")
 
-    sents = _split_english_sentences(clean_passage)
-    numbered_sents_block = (
-        "\n".join(f"{idx}. {s}" for idx, s in enumerate(sents, start=1))
-        if sents
-        else clean_passage
-    )
+    direct_kor = (direct_korean_translation or "").strip()
+    if direct_kor:
+        kor_translation = direct_kor
+        translation_source = "direct_input"
+    elif answer_pdf_bytes and q_num > 0:
+        kor_translation = extract_english_question_translation_from_pdf(
+            answer_pdf_bytes=answer_pdf_bytes,
+            q_num=q_num,
+            passage_group_id=passage_group_id,
+            orig_question_type=orig_question_type,
+            answer=answer,
+        )
+        translation_source = "answer_pdf" if kor_translation else "none"
+    else:
+        kor_translation = ""
+        translation_source = "none"
 
-    footnotes = list(exam_ctx.get("footnotes") or [])
-    irrel_sent = (exam_ctx.get("irrelevant_sentence") or "").strip()
-    irrel_sym = (exam_ctx.get("irrelevant_answer_sym") or "").strip()
-    order_seq = (exam_ctx.get("order_answer_seq") or "").strip()
-    order_given = (exam_ctx.get("order_given_text") or "").strip()
-    order_blocks = dict(exam_ctx.get("order_blocks") or {})
-    ins_sent = (exam_ctx.get("inserted_sentence") or "").strip()
-    ins_sym = (exam_ctx.get("inserted_answer_sym") or "").strip()
+    sentence_items = build_english_sentence_items(clean_passage, kor_translation)
 
+    # 2단계 (AI): 제목, 핵심 주제, 논리 전개 흐름, 구조 도식만 생성 (문장별 구문/번역 생성 금지)
+    eff_model = (model_name or "").strip() or EXAM_TAGGING_MODEL
     client = _build_client(api_key, timeout_seconds=90)
-    system_inst = (
-        "당신은 대한민국 대치동·수능·내신 영어 1등급 전문 구문독해 일타 강사입니다.\n"
-        "주어진 영어 독해 지문을 바탕으로, 학생이 내신 서술형·어법·변형 대비까지 단 하나의 오류 없이 학습할 수 있는 "
-        "**초정밀 지문 분석지**를 JSON(`EnglishPassageAnalysisOutput`)으로 작성하세요.\n\n"
-        "[절대 준수 규칙 — 원문 무손실 · 괄호 일관성 · 외국어 혼입 0%]\n"
-        "1. `title`: 지문의 핵심 소재와 주제를 담은 간결한 제목 (순수 한국어 중심 또는 영문 핵심구(한국어)).\n"
-        "2. `core_theme`: 지문 전체의 핵심 주제·요지를 한국어 1~2문장으로 명쾌하게 요약.\n"
-        "3. `structure_flow`: 글 전체의 논리 전개 흐름을 `도입 : ...\\n전개 : ...\\n심화/반전 : ...\\n결론 : ...` 형식의 단계별 줄바꿈으로 작성. "
-        "지문 본문의 모든 핵심 전개를 빠뜨리지 말고, 문장 해석·도식과 **100% 동일한 한국어 용어**를 사용하세요.\n"
+
+    diagram_inst = (
         "4. `visual_diagram`: 지문의 논리·비교·인과·순환 구조를 한눈에 파악할 수 있는 도식 그림(`KoreanVisualDiagram`)을 반드시 순수 한국어로 작성.\n"
         f"{_ENGLISH_DIAGRAM_GUIDE}\n"
-        "5. `exam_point_note`: 기출 원문 참고 정보가 주어진 경우에만 1~2줄로 간결히 작성(없으면 빈 문자열 `\"\"`).\n"
-        "   - 빈칸 추론: 빈칸 원위치 문장 번호·원문 구절과 정답 논리 근거를 1~2줄로 명시.\n"
-        "   - 무관한 문장: 제거된 정답 번호·원문 문장과 전체 흐름에서 벗어나는 이유를 1~2줄로 명시.\n"
-        "   - 글의 순서: 정답 배열 순서(예: `(B) - (A) - (C)`)와 단락 연결 단서를 1~2줄로 명시.\n"
-        "   - 문장 삽입: 주어진 삽입 문장과 정답 위치, 앞뒤 논리 연결 근거를 1~2줄로 명시.\n"
-        "6. `footnotes`: `[문제지 공식 각주]`가 주어졌으면 그대로 리스트로 담아 반환하고, 없으면 빈 배열 `[]`.\n"
-        "7. `sentence_analyses`: 지문의 1번 문장부터 마지막 문장까지 단 한 문장도 빠뜨리거나 합치지 말고 순서대로(`sentence_num` 1..N) 1:1 분석하세요.\n"
-        "   - **원문 100% 무손실 보존(최우선 절대 규칙)**: `chunked_english`에는 원문의 모든 단어·철자·관사·대명사·원래 괄호 구절·구두점을 **단 한 글자도 바꾸거나 빼거나 추가하지 마세요.**\n"
-        "     * **사전지식 덮어쓰기 엄금**: 유명한 격언·관용표현처럼 보이더라도 원문의 특이한 어휘·관사를 사전지식으로 임의 수정하지 말고 원문 철자 그대로 유지·번역하세요.\n"
-        "     * **원문 따옴표 임의 삽입 금지**: 빈칸 구절이나 강조 표현을 표시하기 위해 영어 원문 텍스트 자체에 큰따옴표(`\"...\"`)를 임의로 넣지 마세요. (강조는 시스템이 스타일로 하이라이트합니다.)\n"
-        "   - **구문 괄호·슬래시 일관성 기준**:\n"
-        "     * **대괄호 `[ ... ]`**: 반드시 **절(명사절·간접의문문·관계사절·부사절)**에만 사용하세요. `why/how/what/whether` 간접의문문 명사절도 반드시 대괄호 `[ ... ]`로 통일하고 소괄호 `( ... )`로 묶지 마세요.\n"
-        "     * **소괄호 `( ... )`**: **구 수식어(전치사구·분사구·to부정사 형용사/부사적 수식구·삽입구)**에만 사용하세요. 원문 자체에 이미 들어있는 괄호 삽입구는 절대 삭제하지 말고 원문 그대로 보존하세요.\n"
-        "     * **병렬 구조 주의**: 주어를 공유하는 동사구 병렬에서 주어까지 앞 대괄호에 묶지 말고 슬래시(`/`)로만 구분하세요.\n"
-        "     * **괄호 짝 & 기호 제한 엄수**: 구문 표기는 오직 `/`, `[ ]`, `( )`만 사용하세요. **중괄호 `{ }`는 절대 사용하지 마세요.** 모든 `[ ]`와 `( )`는 교차 중첩 없이 열림/닫힘 짝이 정확히 맞아야 합니다.\n"
-        "   - **`is_topic_sentence` 엄격 기준**: 글 전체의 핵심 주장·결론이 **구체적으로 완결 서술된 문장(1~2문장)**에만 `true`를 부여하고, 짧은 전환·연결 단문에는 `false`를 유지하세요.\n"
-        "   - **`original_blank_phrase`**: 오직 빈칸 추론 문항에서 `[원래 기출 빈칸 구절]`이 포함된 문장에만 원문 철자 그대로 기재하고, 빈칸 문항이 아니거나 나머지 문장은 반드시 빈 문자열 `\"\"`로 두세요.\n"
-        "   - **`korean_translation` 정밀 번역 & 언어 순수성 규칙**:\n"
-        "     * `/`, `[ ]`, `( )` 구문 기호나 직독직해 끊어쓰기 없이 자연스러운 일반 한국어 문장으로 작성하세요.\n"
-        "     * **단독 부정(`not merely / not simply / not just`) 번역 엄수**: 같은 문장에 `but`이 없는 `not merely A`는 절대 `~일 뿐만 아니라`로 번역하지 말고 `단순히 A인 것이 아니다 / A에 불과한 것이 아니다`로 정확히 번역하세요.\n"
-        "     * **임의 비유·단어 추가 금지**: 원문에 없는 명사·비유(예: '용기', '그릇' 등)를 임의로 덧붙이지 마세요.\n"
-        "     * **외국어 혼입 절대 금지**: 일본어(히라가나·가타카나), 중국어 한자, 기타 비한글 외국 문자를 한국어 출력 필드 어디에도 절대 섞지 마세요.\n"
-        "     * **동일 핵심어·고유명사 일관성**: 지문 내 반복 핵심어, 인명(표준 외래어 표기), 과학·해부학 전문 용어는 모든 문장 해석·논리 흐름·도식에서 100% 동일한 정확한 한국어로 통일하세요.\n"
-        "     * **공식 해설·각주 존중**: `[공식 해설 참고]`와 `[문제지 공식 각주]`가 제공되면 각주 단어의 한국어 뜻과 공식 해설의 맥락적 번역을 최우선으로 반영하세요.\n"
-        "   - `syntax_notes`: 문장별 문법 설명은 출력하지 않으므로 반드시 빈 배열 `[]`로 두세요.\n"
-        "   - **정수 필드 안정성**: `analysis_version`은 정수 `4`, `sentence_num`은 `1`부터 문장 수까지의 작은 정수로만 출력하고 숫자 `0`을 반복하지 마세요."
+        if include_diagrams
+        else "4. `visual_diagram`: 이번 요청에서는 도식을 생성하지 않으므로 반드시 `null`로 두세요.\n"
+    )
+    system_inst = (
+        "당신은 대한민국 수능·내신 영어 1등급 전문 강사입니다.\n"
+        "주어진 영어 독해 지문을 바탕으로, 학생이 글의 핵심 구조와 논리 흐름을 한눈에 파악할 수 있도록 "
+        "`EnglishPassageSummaryDiagramOutput` JSON만 작성하세요.\n\n"
+        "[출력 필드 규칙 — 순수 한국어 · 원문 근거 엄수]\n"
+        "1. `title`: 지문의 핵심 소재와 주제를 담은 간결한 제목 (순수 한국어 중심 또는 영문 핵심구(한국어)).\n"
+        "2. `core_theme`: 지문 전체의 핵심 주제·요지를 한국어 1~2문장으로 명쾌하게 요약.\n"
+        "3. `structure_flow`: 글 전체의 논리 전개 흐름을 `도입 : ...\\n전개 : ...\\n심화/반전 : ...\\n결론 : ...` 형식의 단계별 줄바꿈으로 작성.\n"
+        f"{diagram_inst}"
+        "5. 문장별 구문독해(`/`·`[]`·`()`), 문장별 한국어 해석, 기출 포인트는 시스템이 별도로 처리하므로 절대 생성하지 마세요.\n"
+        "6. 일본어·중국어 한자 등 비한글 외국 문자를 한국어 출력 필드 어디에도 절대 섞지 마세요."
     )
 
-    extra_blocks: list[str] = []
-    if (explanation or "").strip():
-        extra_blocks.append(f"[공식 해설 참고 — 용어·인명·번역·정답 근거 기준]\n{explanation.strip()[:1400]}")
-    if footnotes:
-        extra_blocks.append(
-            "[문제지 공식 각주 — 해당 단어 해석에 아래 뜻을 반드시 그대로 반영]\n"
-            + "\n".join(f"- {fn}" for fn in footnotes)
-        )
-    if orig_blank_phrase:
-        extra_blocks.append(
-            f"[원래 기출 빈칸 구절 (정답 {answer or '-'})]\n{orig_blank_phrase}\n"
-            "→ 이 구절이 포함된 문장의 `original_blank_phrase`에 그대로 기록하고(영문 본문에 따옴표 추가 금지), `exam_point_note`에 빈칸 원위치와 정답 근거를 명시하세요."
-        )
-    if irrel_sent:
-        extra_blocks.append(
-            f"[원래 기출 무관한 문장 (제거된 정답 {irrel_sym or answer or '-'})]\n{irrel_sent}\n"
-            "→ 본문 `sentence_analyses`에는 넣지 말고, `exam_point_note`에 이 제거된 문장 원문과 전체 흐름에서 벗어나는 이유를 반드시 명시하세요."
-        )
-    if order_seq:
-        order_boundary_lines: list[str] = []
-        if order_given and order_blocks and sents:
-            def _find_sent_span(block_txt: str) -> str:
-                b_sents = _split_english_sentences(block_txt)
-                if not b_sents:
-                    return ""
-                matched_nums: list[int] = []
-                for bs in b_sents:
-                    bs_set = set(re.findall(r"[a-z0-9]+", bs.lower()))
-                    if not bs_set:
-                        continue
-                    best_i, best_sc = -1, 0.0
-                    for si, ss in enumerate(sents):
-                        ss_set = set(re.findall(r"[a-z0-9]+", ss.lower()))
-                        if not ss_set:
-                            continue
-                        sc = len(bs_set & ss_set) / max(1, len(bs_set | ss_set))
-                        if sc > best_sc:
-                            best_sc, best_i = sc, si + 1
-                    if best_i != -1 and best_sc >= 0.55:
-                        matched_nums.append(best_i)
-                if not matched_nums:
-                    return ""
-                if len(matched_nums) == 1:
-                    return f"{matched_nums[0]}번 문장"
-                return f"{min(matched_nums)}~{max(matched_nums)}번 문장"
-
-            g_span = _find_sent_span(order_given)
-            order_boundary_lines.append(
-                f"  - [주어진 글]{f' ({g_span})' if g_span else ''}: {order_given[:140]}"
-            )
-            seq_labels = re.findall(r"\(([ABC])\)", order_seq)
-            for lbl in (seq_labels or ["A", "B", "C"]):
-                b_txt = order_blocks.get(lbl, "")
-                if b_txt:
-                    b_span = _find_sent_span(b_txt)
-                    order_boundary_lines.append(
-                        f"  - ({lbl}) 단락{f' ({b_span})' if b_span else ''}: {b_txt[:140]}"
-                    )
-        boundary_block = ("\n" + "\n".join(order_boundary_lines)) if order_boundary_lines else ""
-        extra_blocks.append(
-            f"[원래 기출 글의 순서 (정답 배열: {order_seq})]{boundary_block}\n"
-            "→ `exam_point_note`에 정답 배열 순서와 위 실제 단락 경계·내용에 맞춘 `(A)/(B)/(C)` 단락별 연결 단서를 1~2줄로 정확히 명시하세요 (단락 라벨과 내용을 절대 뒤바꾸지 마세요)."
-        )
-    if ins_sent:
-        extra_blocks.append(
-            f"[원래 기출 문장 삽입 (정답 {ins_sym or answer or '-'}번 위치)]\n{ins_sent}\n"
-            "→ `exam_point_note`에 주어진 삽입 문장과 정답 위치, 앞뒤 연결 근거를 1~2줄로 명시하세요."
-        )
-    extra_section = ("\n\n" + "\n\n".join(extra_blocks)) if extra_blocks else ""
-
+    exp_hint = f"\n[공식 해설 참고]\n{explanation.strip()[:1000]}" if (explanation or "").strip() else ""
+    fn_hint = (
+        "\n[공식 각주 참고]\n" + "\n".join(f"- {fn}" for fn in footnotes)
+        if footnotes
+        else ""
+    )
     base_prompt = (
         f"[지문 출처] {source_label or '-'} (원래 유형: {orig_question_type or '-'})\n"
         f"[참고 주제] {passage_topic or '-'}"
-        f"{extra_section}\n\n"
-        f"[지문 원문]\n{clean_passage}\n\n"
-        f"[문장 분리 기준 (총 {len(sents) if sents else 1}문장 — 1번부터 끝번까지 단 한 단어도 변조·누락하지 말고 1:1 분석)]\n"
-        f"{numbered_sents_block}\n\n"
-        "위 영어 지문에 대한 초정밀 구문·논리 분석지 JSON을 작성하세요."
+        f"{exp_hint}{fn_hint}\n\n"
+        f"[영어 지문 원문]\n{clean_passage}\n\n"
+        "위 영어 지문의 핵심 제목, 핵심 주제, 논리 전개 흐름"
+        + (" 및 구조 도식" if include_diagrams else "")
+        + "을 JSON으로 작성하세요."
     )
 
     prompt = base_prompt
-    out: EnglishPassageAnalysisOutput | None = None
+    summary_out: EnglishPassageSummaryDiagramOutput | None = None
     for attempt in range(2):
-        out = _generate_structured_with_fallback(
+        summary_out = _generate_structured_with_fallback(
             client=client,
             model_name=eff_model,
             contents=prompt,
-            schema_cls=EnglishPassageAnalysisOutput,
+            schema_cls=EnglishPassageSummaryDiagramOutput,
             config=types.GenerateContentConfig(
                 system_instruction=system_inst,
                 response_mime_type="application/json",
-                response_schema=EnglishPassageAnalysisOutput,
+                response_schema=EnglishPassageSummaryDiagramOutput,
                 temperature=0.15 if attempt == 0 else 0.25,
-                max_output_tokens=8192,
+                max_output_tokens=4096,
                 thinking_config=types.ThinkingConfig(
                     thinking_level=types.ThinkingLevel.MINIMAL,
                     include_thoughts=False,
@@ -680,34 +593,33 @@ def generate_english_passage_analysis(
             fast_mode=True,
             max_parse_retries=2,
         )
-        # 치명적 오류(문장 누락, 외국어 혼입, 심각한 문장 변조, 각주 미반영)에만 LLM 재시도 발동
-        critical_issues = _validate_english_analysis_output(
-            out,
-            sents,
-            clean_passage=clean_passage,
-            exam_context=exam_ctx,
+        issues = _validate_english_summary_diagram_output(
+            summary_out,
+            require_diagram=include_diagrams,
         )
-        if not critical_issues:
+        if not issues:
             break
         if attempt == 0:
             prompt = (
                 base_prompt
-                + "\n\n[⚠️ 직전 분석 결과에서 치명적 오류가 감지되었습니다 — 아래 항목을 100% 수정하여 다시 생성하세요]\n"
-                + "\n".join(f"- {iss}" for iss in critical_issues)
+                + "\n\n[⚠️ 직전 출력에서 오류가 감지되었습니다 — 아래 항목을 수정하여 다시 생성하세요]\n"
+                + "\n".join(f"- {iss}" for iss in issues)
             )
 
-    assert out is not None
-    # 파이썬 결정론적 후처리(토큰 투영·최종 토큰 일치 가드·괄호 짝/일관성·따옴표 제거·유형별 기출 포인트·각주 보강)
-    out = _repair_english_analysis_output(
-        out,
-        sents,
-        clean_passage=clean_passage,
-        orig_question_type=orig_question_type,
-        exam_context=exam_ctx,
+    assert summary_out is not None
+    return EnglishPassageAnalysisOutput(
+        title=(summary_out.title or "").strip() or (passage_topic or source_label or "영어 지문 분석"),
+        core_theme=(summary_out.core_theme or "").strip(),
+        structure_flow=(summary_out.structure_flow or "").strip(),
+        visual_diagram=summary_out.visual_diagram if include_diagrams else None,
+        sentence_analyses=sentence_items,
+        exam_point_title="",
+        exam_point_note="",
+        footnotes=footnotes,
+        translation_source=translation_source,
+        is_source_restored=True,
+        analysis_version=CURRENT_ENGLISH_ANALYSIS_VERSION,
     )
-    out.is_source_restored = True
-    out.analysis_version = CURRENT_ENGLISH_ANALYSIS_VERSION
-    return out
 
 
 def generate_english_visual_diagram(

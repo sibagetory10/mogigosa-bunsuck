@@ -69,41 +69,60 @@ class BatchEnglishExamExtractionOutput(BaseModel):
     """영어 모의고사 PDF 전체 일괄 추출 출력 스키마."""
 
     questions: list[EnglishQuestionExtractionItem] = Field(default_factory=list)
-CURRENT_ENGLISH_ANALYSIS_VERSION: int = 4
+CURRENT_ENGLISH_ANALYSIS_VERSION: int = 5
+
+
+class EnglishPassageSummaryDiagramOutput(BaseModel):
+    """AI 전용 영어 지문 핵심 주제 · 논리 전개 흐름 · 구조 도식 출력 스키마 (문장별 분석 제외)."""
+
+    title: str = Field(..., description="지문 핵심 제목 (한국어 중심 또는 영문+한국어 병기)")
+    core_theme: str = Field(..., description="지문 전체의 핵심 주제 · 요지 요약 (1~2문장)")
+    structure_flow: str = Field(
+        ...,
+        description="지문 전체의 논리 전개 흐름 요약 (예: '도입 : ...\\n전개 : ...\\n결론 : ...')",
+    )
+    visual_diagram: KoreanVisualDiagram | None = Field(
+        default=None,
+        description="지문의 핵심 논리·비교·인과·과정을 시각화하는 도식 그림 명세",
+    )
 
 
 class EnglishSentenceAnalysisItem(BaseModel):
-    """영어 지문 문장별 끊어읽기·괄호 구문독해 및 해석·어법 포인트."""
+    """영어 지문 문장별 원문 및 해설지 기반 한국어 해석 항목 (AI 미사용, 순수 PDF/DB 복붙)."""
 
     sentence_num: int = Field(..., ge=1, description="문장 번호 (1부터 시작)")
     is_topic_sentence: bool = Field(
         default=False,
-        description="이 문장이 지문의 핵심 주제문(Topic Sentence)이면 True (단순 전환·연결 단문에는 False)",
+        description="하위 호환용 필드 (v5부터 미사용)",
+    )
+    original_english: str = Field(
+        default="",
+        description="문제지/DB 원문에서 분리한 순수 영어 원문 문장 (AI 미사용)",
     )
     chunked_english: str = Field(
-        ...,
-        description="원문 영문 단어를 100% 그대로 보존한 상태에서 슬래시(/) 끊어읽기와 [절]·(수식어구) 괄호 기호를 삽입한 구문독해용 영문",
+        default="",
+        description="원문 영문 문장 (v5부터 original_english와 동일)",
     )
     korean_translation: str = Field(
-        ...,
-        description="구문 기호(/, [], ())나 직독직해 끊어쓰기 없이 한국어 어순에 맞게 작성한 자연스러운 일반 한국어 해석 문장",
+        default="",
+        description="모의고사 해설지 PDF [해석] 섹션에서 추출한 한국어 해석 문장",
     )
     syntax_notes: list[str] = Field(
         default_factory=list,
-        description="해당 문장의 핵심 구문·어법 구조 해설 (현재 빈 배열 [] 유지)",
+        description="하위 호환용 빈 배열 []",
     )
     original_blank_phrase: str = Field(
         default="",
-        description="원래 빈칸 추론 문항에서 빈칸이었던 원문 구절 (이 문장에 빈칸이 있었을 때만 기재)",
+        description="하위 호환용 필드 (v5부터 미사용)",
     )
     is_inserted_sentence: bool = Field(
         default=False,
-        description="원래 문장 삽입 문항에서 정답 위치에 삽입된 주어진 문장이면 True",
+        description="하위 호환용 필드 (v5부터 미사용)",
     )
 
 
 class EnglishPassageAnalysisOutput(BaseModel):
-    """내신·수능형 영어 지문 정밀 분석지 구조화 출력 스키마 (주제 · 논리 흐름 · 시각 도식 · 문장별 구문 분석)."""
+    """영어 정밀 지문 분석지 구조화 출력 스키마 (주제 · 논리 흐름 · 시각 도식 · 문장별 원문/해설지 해석)."""
 
     title: str = Field(..., description="지문 핵심 제목 (한국어 중심 또는 영문+한국어 병기)")
     core_theme: str = Field(..., description="지문 전체의 핵심 주제 · 요지 요약 (1~2문장)")
@@ -117,25 +136,29 @@ class EnglishPassageAnalysisOutput(BaseModel):
     )
     sentence_analyses: list[EnglishSentenceAnalysisItem] = Field(
         default_factory=list,
-        description="지문 전체 문장에 대한 1번부터 끝번까지의 문장별 정밀 구문독해 리스트",
+        description="지문 전체 문장에 대한 1번부터 끝번까지의 원문·해설지 해석 리스트",
     )
     exam_point_title: str = Field(
         default="",
-        description="문항 유형에 맞는 기출 포인트 박스 제목 (예: '기출 포인트 (원문 빈칸)', '기출 포인트 (글의 순서)')",
+        description="하위 호환용 필드 (v5부터 미사용)",
     )
     exam_point_note: str = Field(
         default="",
-        description="원래 기출 유형 핵심 포인트 (빈칸 추론의 원래 빈칸 위치·정답 구절, 무관한 문장의 제거된 정답 문장, 글의 순서 정답 배열, 문장 삽입 원문·정답 위치 등)",
+        description="하위 호환용 필드 (v5부터 미사용)",
     )
     footnotes: list[str] = Field(
         default_factory=list,
         description="문제지 공식 각주 어휘 목록 (예: ['delineate: ~의 경계를 정하다'])",
     )
+    translation_source: str = Field(
+        default="",
+        description="해석 출처 ('answer_pdf' | 'direct_input' | 'none')",
+    )
     is_source_restored: bool = Field(
         default=False,
-        description="빈칸·어법·어휘·삽입·순서 등 기출 변형 원문 복원 및 교정 완료 여부",
+        description="원문 추출 완료 여부",
     )
     analysis_version: int = Field(
         default=1,
-        description="분석지 엔진 스키마·검증 버전 (v4: 빈칸 덮어쓰기 차단·하이픈 보존·각주/번호/괄호 정밀 검증·PDF 누락 zero 가드)",
+        description="분석지 엔진 스키마 버전 (v5: 기출 포인트 제거, 3번 섹션 AI 미사용 원문+해설지 PDF 순수 복붙)",
     )

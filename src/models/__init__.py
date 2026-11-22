@@ -79,6 +79,7 @@ _SUBMODULE_EXPORTS: dict[str, tuple[str, ...]] = {
         "BatchEnglishExamExtractionOutput",
         "CURRENT_ENGLISH_ANALYSIS_VERSION",
         "EnglishPassageAnalysisOutput",
+        "EnglishPassageSummaryDiagramOutput",
         "EnglishQuestionExtractionItem",
         "EnglishSentenceAnalysisItem",
         "EnglishSingleExtractionOutput",

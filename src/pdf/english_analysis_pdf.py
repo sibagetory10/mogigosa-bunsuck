@@ -3,7 +3,6 @@ from __future__ import annotations
 import base64
 import html
 import io
-import math
 import re
 from datetime import datetime
 from typing import Any
@@ -12,43 +11,32 @@ import pymupdf
 from PIL import Image
 
 from src.diagram_renderer import render_korean_diagram_png
-from src.pdf.common import _CIRCLED_NUMS, _build_korean_story_font_bundle
+from src.pdf.common import _build_korean_story_font_bundle
 from src.pdf.korean_analysis_pdf import _format_structure_flow_html
-from src.text_formatter import normalize_english_korean_translation
+from src.pdf_parser.english_source_extractor import split_english_sentences_clean
 
-def _format_chunked_english_html(chunked_text: str, blank_phrase: str = "") -> str:
-    """슬래시(/)와 대괄호([]), 소괄호(()) 구문 표기 및 기출 빈칸 원위치 하이라이트를 안전한 HTML로 변환한다."""
-    raw = (chunked_text or "").strip()
-    if not raw:
-        return ""
-    raw = re.sub(r"[{｝}｛]", "", raw)
-    bp = (blank_phrase or "").strip()
-    if bp:
-        bp_words = re.findall(r"[A-Za-z0-9]+(?:['’-][A-Za-z0-9]+)*", bp)
-        if bp_words:
-            sep = r"[\s/\[\]\(\),;:\"'‘’“”-]+"
-            pat = sep.join(re.escape(w).replace("'", "['’]") for w in bp_words)
-            m_bp = re.search(pat, raw, flags=re.IGNORECASE)
-            if m_bp:
-                raw = f"{raw[:m_bp.start()]}@@BLK_S@@{raw[m_bp.start():m_bp.end()]}@@BLK_E@@{raw[m_bp.end():]}"
+# KS X 1001 완성형 한글 폰트에서 모두 안전하게 지원되는 ①~⑮ 원문자
+_EXT_CIRCLED_NUMS: tuple[str, ...] = (
+    "①", "②", "③", "④", "⑤", "⑥", "⑦", "⑧", "⑨", "⑩",
+    "⑪", "⑫", "⑬", "⑭", "⑮",
+)
 
-    escaped = html.escape(raw)
-    escaped = escaped.replace(" / ", " <span class='eng-slash'>/</span> ")
-    escaped = re.sub(r"(\[|\])", r"<span class='eng-bracket'>\1</span>", escaped)
-    escaped = re.sub(r"(\(|\))", r"<span class='eng-paren'>\1</span>", escaped)
-    escaped = escaped.replace("@@BLK_S@@", "<span class='eng-blank-hl'>").replace("@@BLK_E@@", "</span>")
-    return escaped
+
+def _format_sentence_badge(num: int) -> str:
+    if 1 <= num <= len(_EXT_CIRCLED_NUMS):
+        return _EXT_CIRCLED_NUMS[num - 1]
+    return f"({num})"
 
 
 def _build_english_landscape_css(scale: float = 1.0, font_face_css: str = "") -> str:
-    """A4 가로(Landscape) 1페이지 1지문 영어 정밀 분석지용 스케일 가변 CSS를 생성한다."""
+    """A4 가로(Landscape) 1페이지 1지문 영어 지문 분석지용 스케일 가변 CSS를 생성한다."""
     s = max(0.58, min(1.05, float(scale)))
     return f"""
     {font_face_css}
     body {{
         font-family: "MogiKorSans", "Noto Sans CJK KR", "NanumBarunGothic", "NanumGothic", "Malgun Gothic", "Apple SD Gothic Neo", sans-serif;
         font-size: {8.6 * s:.2f}pt;
-        line-height: {1.42:.2f};
+        line-height: 1.42;
         color: #0F172A;
         margin: 0;
         padding: 0;
@@ -68,11 +56,6 @@ def _build_english_landscape_css(scale: float = 1.0, font_face_css: str = "") ->
         font-size: {12.2 * s:.2f}pt;
         font-weight: bold;
         color: #0F172A;
-        margin-top: {1.5 * s:.2f}pt;
-    }}
-    .eng-l-hdr-meta {{
-        font-size: {7.6 * s:.2f}pt;
-        color: #475569;
         margin-top: {1.5 * s:.2f}pt;
     }}
     .eng-l-sec {{
@@ -102,16 +85,6 @@ def _build_english_landscape_css(scale: float = 1.0, font_face_css: str = "") ->
         font-size: {8.1 * s:.2f}pt;
         line-height: 1.42;
     }}
-    .eng-l-point {{
-        background-color: #FAF5FF;
-        border: 0.8pt solid #C4B5FD;
-        border-radius: 3.5pt;
-        padding: {4.5 * s:.2f}pt {7 * s:.2f}pt;
-        margin-bottom: {4 * s:.2f}pt;
-        font-size: {7.6 * s:.2f}pt;
-        line-height: 1.38;
-        color: #3B0764;
-    }}
     .eng-l-footnote {{
         background-color: #F8FAFC;
         border: 0.6pt solid #CBD5E1;
@@ -130,25 +103,6 @@ def _build_english_landscape_css(scale: float = 1.0, font_face_css: str = "") ->
         max-width: 100%;
         height: auto;
     }}
-    .sec-keep-tbl {{
-        width: 100%;
-        border-collapse: collapse;
-        border: none;
-        margin: 0;
-        padding: 0;
-        break-inside: avoid;
-        page-break-inside: avoid;
-    }}
-    .sec-keep-tr {{
-        break-inside: avoid;
-        page-break-inside: avoid;
-    }}
-    .sec-keep-td {{
-        padding: 0;
-        margin: 0;
-        border: none;
-        vertical-align: top;
-    }}
     .eng-sent-card {{
         border: 0.7pt solid #CBD5E1;
         border-radius: 3.5pt;
@@ -158,82 +112,18 @@ def _build_english_landscape_css(scale: float = 1.0, font_face_css: str = "") ->
         break-inside: avoid;
         page-break-inside: avoid;
     }}
-    .eng-sent-card-topic {{
-        border: 1.0pt solid #F59E0B;
-        border-left: 3pt solid #D97706;
-        border-radius: 3.5pt;
-        background-color: #FFFBEB;
-        padding: {4.5 * s:.2f}pt {7 * s:.2f}pt;
-        margin-bottom: {4 * s:.2f}pt;
-        break-inside: avoid;
-        page-break-inside: avoid;
-    }}
-    .eng-sent-hdr {{
-        margin-bottom: {2 * s:.2f}pt;
-        line-height: 1.35;
-    }}
     .eng-sent-num {{
         font-weight: bold;
         color: #1E3A8A;
         font-size: {8.5 * s:.2f}pt;
+        margin-right: 2.5pt;
     }}
-    .eng-topic-badge {{
-        display: inline-block;
-        background-color: #FEF3C7;
-        color: #B45309;
-        border: 0.5pt solid #F59E0B;
-        font-weight: bold;
-        font-size: {7.0 * s:.2f}pt;
-        padding: 0.8pt 3.5pt;
-        margin-left: 3pt;
-        border-radius: 2.5pt;
-    }}
-    .eng-blank-badge {{
-        display: inline-block;
-        background-color: #EEF2FF;
-        color: #3730A3;
-        border: 0.5pt solid #818CF8;
-        font-weight: bold;
-        font-size: {7.0 * s:.2f}pt;
-        padding: 0.8pt 3.5pt;
-        margin-left: 3pt;
-        border-radius: 2.5pt;
-    }}
-    .eng-insert-badge {{
-        display: inline-block;
-        background-color: #ECFDF5;
-        color: #065F46;
-        border: 0.5pt solid #34D399;
-        font-weight: bold;
-        font-size: {7.0 * s:.2f}pt;
-        padding: 0.8pt 3.5pt;
-        margin-left: 3pt;
-        border-radius: 2.5pt;
-    }}
-    .eng-blank-hl {{
-        background-color: #E0E7FF;
-        border-bottom: 1.1pt solid #4F46E5;
-        padding: 0 1.5pt;
-        border-radius: 2pt;
-    }}
-    .eng-sent-chunk {{
+    .eng-sent-eng {{
         font-size: {8.3 * s:.2f}pt;
         font-weight: bold;
         color: #0F172A;
         line-height: 1.4;
-        margin-bottom: {1.5 * s:.2f}pt;
-    }}
-    .eng-slash {{
-        color: #DC2626;
-        font-weight: bold;
-    }}
-    .eng-bracket {{
-        color: #1D4ED8;
-        font-weight: bold;
-    }}
-    .eng-paren {{
-        color: #0F766E;
-        font-weight: bold;
+        margin-bottom: {1.8 * s:.2f}pt;
     }}
     .eng-sent-kor {{
         font-size: {7.9 * s:.2f}pt;
@@ -244,6 +134,25 @@ def _build_english_landscape_css(scale: float = 1.0, font_face_css: str = "") ->
     """
 
 
+def _choose_balanced_split_index(weights: list[float]) -> int:
+    """우측 2열 서브컬럼의 누적 텍스트 높이가 균등하도록 분할 인덱스를 결정한다."""
+    n = len(weights)
+    if n <= 1:
+        return 1
+    total = sum(weights)
+    half = total / 2.0
+    acc = 0.0
+    best_idx = 1
+    best_diff = float("inf")
+    for idx in range(1, n):
+        acc += weights[idx - 1]
+        diff = abs(acc - half)
+        if diff < best_diff:
+            best_diff = diff
+            best_idx = idx
+    return best_idx
+
+
 def _render_single_english_landscape_page(
     item: dict[str, Any],
     doc_title: str,
@@ -251,23 +160,10 @@ def _render_single_english_landscape_page(
     include_diagrams: bool,
 ) -> bytes:
     """영어 지문 1개를 A4 가로(842x595pt) 정확히 1페이지 안에 좌·우 분할 레이아웃으로 렌더링한다."""
-    from src.gemini.english_validators import (
-        _enforce_english_analysis_token_guard,
-        _resolve_english_exam_point_title,
-        _split_english_sentences,
-    )
-
     an = item["analysis"]
     q_label = str(item.get("q_label") or item.get("exam_name") or "영어 독해").strip()
     orig_type = str(item.get("orig_type") or "영어 독해").strip()
     src_passage = str(item.get("passage_text") or "").strip()
-
-    # 렌더링 직전 최종 토큰 일치 & 괄호 균형 가드 강제 적용
-    src_sents = _split_english_sentences(src_passage) if src_passage else None
-    if src_sents and len(src_sents) == len(getattr(an, "sentence_analyses", None) or []):
-        an = _enforce_english_analysis_token_guard(an, src_sents)
-    else:
-        an = _enforce_english_analysis_token_guard(an, None)
 
     font_archive, font_face_css = _build_korean_story_font_bundle()
 
@@ -285,9 +181,9 @@ def _render_single_english_landscape_page(
     margin_bottom = 26.0
     col_gap = 12.0
 
-    # 시각 도식 PNG 사전 생성 (좁은 좌측 컬럼 전용 세로 고가독성 레이아웃)
+    # 시각 도식 PNG 사전 생성
     diag_b64 = ""
-    diag_aspect = 1.0  # w / h
+    diag_aspect = 1.0
     v_diag = getattr(an, "visual_diagram", None)
     if include_diagrams and v_diag is not None and (
         getattr(v_diag, "nodes", None)
@@ -318,19 +214,6 @@ def _render_single_english_landscape_page(
     """
 
     flow_html_inner = _format_structure_flow_html(an.structure_flow)
-    exam_point_txt = (getattr(an, "exam_point_note", "") or "").strip()
-    exam_point_html = ""
-    if exam_point_txt:
-        ep_title = (getattr(an, "exam_point_title", "") or "").strip() or _resolve_english_exam_point_title(
-            orig_type, exam_point_txt
-        )
-        ep_lines = "<br/>".join(html.escape(ln.strip()) for ln in exam_point_txt.splitlines() if ln.strip())
-        exam_point_html = (
-            "<div class='eng-l-point'>"
-            f"<div><b>{html.escape(ep_title)}</b></div>"
-            f"<div>{ep_lines}</div>"
-            "</div>"
-        )
     fn_list = [str(f).strip() for f in (getattr(an, "footnotes", None) or []) if str(f).strip()]
     fn_html = ""
     if fn_list:
@@ -348,56 +231,50 @@ def _render_single_english_landscape_page(
         <div><b>논리 전개 흐름</b></div>
         <div>{flow_html_inner}</div>
       </div>
-      {exam_point_html}
       {fn_html}
     </body></html>
     """
 
-    is_non_blank_type = any(
-        k in orig_type
-        for k in ("삽입", "순서", "무관", "어법", "어휘", "요약", "주제", "제목", "요지", "주장", "목적", "심경", "함축")
-    )
     sent_sec_num = "3" if diag_b64 else "2"
+    raw_sent_list = list(getattr(an, "sentence_analyses", None) or [])
+    sent_pairs: list[tuple[int, str, str]] = []
+    if raw_sent_list:
+        for s_idx, sa in enumerate(raw_sent_list):
+            s_num = int(getattr(sa, "sentence_num", s_idx + 1) or (s_idx + 1))
+            orig_eng = (
+                getattr(sa, "original_english", "")
+                or getattr(sa, "chunked_english", "")
+                or ""
+            ).strip()
+            kor_txt = (getattr(sa, "korean_translation", "") or "").strip()
+            if orig_eng or kor_txt:
+                sent_pairs.append((s_num, orig_eng, kor_txt))
+    elif src_passage:
+        for s_idx, s_txt in enumerate(split_english_sentences_clean(src_passage), start=1):
+            sent_pairs.append((s_idx, s_txt, ""))
+
     sent_cards_html: list[str] = []
+    card_weights: list[float] = []
     expected_badges: list[str] = []
     last_sent_check_words: list[str] = []
-    sent_list = list(getattr(an, "sentence_analyses", None) or [])
-    for s_idx, sa in enumerate(sent_list):
-        s_num = int(getattr(sa, "sentence_num", s_idx + 1) or (s_idx + 1))
-        num_badge = _CIRCLED_NUMS[s_num - 1] if 1 <= s_num <= len(_CIRCLED_NUMS) else f"({s_num})"
+
+    for p_idx, (s_num, orig_eng, kor_txt) in enumerate(sent_pairs):
+        num_badge = _format_sentence_badge(s_num)
         expected_badges.append(num_badge)
-        is_topic = bool(getattr(sa, "is_topic_sentence", False))
-        raw_blank_phrase = (getattr(sa, "original_blank_phrase", "") or "").strip()
-        blank_phrase = "" if is_non_blank_type else raw_blank_phrase
-        is_inserted = bool(getattr(sa, "is_inserted_sentence", False)) and ("삽입" in orig_type or not orig_type)
-        card_cls = "eng-sent-card-topic" if is_topic else "eng-sent-card"
-        badges: list[str] = []
-        if is_topic:
-            badges.append("<span class='eng-topic-badge'>★ 주제문 (Topic Sentence)</span>")
-        if blank_phrase:
-            badges.append("<span class='eng-blank-badge'>기출 빈칸 원위치</span>")
-        if is_inserted:
-            badges.append("<span class='eng-insert-badge'>기출 삽입 문장</span>")
-        badges_html = (" " + " ".join(badges)) if badges else ""
-        chk_eng = getattr(sa, "chunked_english", "") or ""
-        if s_idx == len(sent_list) - 1:
-            last_words = re.findall(r"[A-Za-z]{3,}", chk_eng)
+        if p_idx == len(sent_pairs) - 1:
+            last_words = re.findall(r"[A-Za-z]{3,}", orig_eng)
             if last_words:
                 last_sent_check_words = [last_words[0].lower(), last_words[-1].lower()]
-        chunk_html = _format_chunked_english_html(
-            chk_eng,
-            blank_phrase=blank_phrase,
-        )
-        kor_html = html.escape(normalize_english_korean_translation(getattr(sa, "korean_translation", "") or ""))
 
+        kor_div = f"<div class='eng-sent-kor'>{html.escape(kor_txt)}</div>" if kor_txt else ""
         card_inner = (
-            f"<div class='{card_cls}'>"
-            f"<div class='eng-sent-hdr'><span class='eng-sent-num'>{num_badge}</span>{badges_html}</div>"
-            f"<div class='eng-sent-chunk'>{chunk_html}</div>"
-            f"<div class='eng-sent-kor'>{kor_html}</div>"
+            "<div class='eng-sent-card'>"
+            f"<div class='eng-sent-eng'><span class='eng-sent-num'>{num_badge}</span>{html.escape(orig_eng)}</div>"
+            f"{kor_div}"
             "</div>"
         )
         sent_cards_html.append(card_inner)
+        card_weights.append(len(orig_eng) * 1.15 + len(kor_txt) * 1.30 + 45.0)
 
     right_html = f"""
     <html><body>
@@ -405,7 +282,7 @@ def _render_single_english_landscape_page(
       {''.join(sent_cards_html)}
     </body></html>
     """
-    mid_idx = max(1, (len(sent_cards_html) + 1) // 2)
+    mid_idx = _choose_balanced_split_index(card_weights)
     right_html_col1 = f"""
     <html><body>
       <div class="eng-l-sec">{sent_sec_num}. 문장별 정밀 구문 분석</div>
@@ -555,19 +432,18 @@ def _render_single_english_landscape_page(
                 src_doc.close()
                 dst_doc.close()
 
-    # 최악의 폴백
     return _try_render_1page(0.60, two_col_right=True, canvas_h=1600.0) or b""
 
 
 def generate_english_passage_analysis_pdf(
     analyses: list[dict[str, Any]],
-    doc_title: str = "수능·모의고사 영어 정밀 지문 분석지",
+    doc_title: str = "수능·모의고사 영어 지문 분석지",
     include_diagrams: bool = True,
 ) -> bytes:
     """
     영어 지문 분석 결과(EnglishPassageAnalysisOutput + 출처 메타) 리스트를
     A4 가로(Landscape) 1페이지당 1지문 레이아웃 PDF로 렌더링한다.
-    구성: [1] 핵심 주제 & 논리 전개 흐름, [2] 이해용 시각 도식, [3] 문장별 정밀 구문 분석.
+    구성: [1] 핵심 주제 & 논리 전개 흐름, [2] 이해용 시각 도식, [3] 문장별 정밀 구문 분석 (원문·해설지 해석).
     """
     if not analyses:
         raise ValueError("생성할 영어 지문 분석 데이터가 없습니다.")

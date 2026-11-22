@@ -66,6 +66,16 @@ _SUBMODULE_EXPORTS: dict[str, tuple[str, ...]] = {
         "_stitch_vertical_pngs",
         "parse_exam_pdf",
     ),
+    "src.pdf_parser.english_source_extractor": (
+        "align_english_korean_sentences",
+        "build_english_sentence_items",
+        "extract_all_english_translations_from_answer_pdf",
+        "extract_english_passage_from_problem_source",
+        "extract_english_question_translation_from_pdf",
+        "extract_problem_question_text_from_pdf",
+        "split_english_sentences_clean",
+        "split_korean_sentences_clean",
+    ),
 }
 
 _SYMBOL_TO_MODULE: dict[str, str] = {

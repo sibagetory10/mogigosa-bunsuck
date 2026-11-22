@@ -24,7 +24,7 @@
 - **서비스명**: 2022 개정 교육과정 맞춤형 기출 추출 & 상위 문제 개조 플랫폼 (`mogigosa-bunsuck`)
 - **핵심 도메인 로직**:
   - **수학 · 사회 · 과학 · 한국사**: 개념서·교과서 PDF(또는 공용 개념서 DB)에 실제로 등장한 핵심 원리(`core_principles`)와 용어(`required_terms` / `basic_terms`)만 허용하고, 원리는 같지만 상위 학년·선택과목 전문 용어(`advanced_terms`)가 포함된 기출문제를 학생의 개념서 언어로 자동 개조(`RewrittenQuestion`)한다.
-  - **영어**: 수능/모의고사 영어 독해 지문을 기반으로 11종 수능 유형(`ENGLISH_TRANSFORM_TYPES`)으로 변형 문제를 생성하고, `english_validators.py`의 결정론적 후처리 검증을 거쳐 고품질 문제·해설·영단어장 PDF를 제공한다. 또한 **영어 정밀 지문 분석지**(주제 · 논리 전개 흐름 · 유형별 동적 기출 포인트[빈칸 원위치·무관한 문장·글의 순서·문장 삽입] · 공식 각주 · 이해용 시각 도식 · 최종 토큰 일치 가드 및 외국어 혼입 차단 검증 문장별 `/`·`[절]`·`(수식어)` 구문독해 · 주제문 `★` 표시, `analysis_version=4` / PDF `v6`)를 생성·캐싱·PDF 출력할 수 있다.
+  - **영어**: 수능/모의고사 영어 독해 지문을 기반으로 11종 수능 유형(`ENGLISH_TRANSFORM_TYPES`)으로 변형 문제를 생성하고, `english_validators.py`의 결정론적 후처리 검증을 거쳐 고품질 문제·해설·영단어장 PDF를 제공한다. 또한 **영어 지문 분석지**(주제 · 논리 전개 흐름 · 공식 각주 · 이해용 시각 도식 · AI 미사용 문제지/해설지 PDF 순수 복붙 문장별 원문+해설 매칭, `analysis_version=5` / PDF `v7`, 기출 포인트 제거)를 생성·캐싱·PDF 출력할 수 있다.
   - **국어**: 독서·문학·화법과 작문·언어와 매체 세트 지문을 분석하고, 자유 유형 세트 문항 재구성, Pillow 기반 시각 구조도(`diagram_renderer.py`), 2단/분석본 PDF(`korean_pdf_generator.py`)를 생성한다.
 - **기술 스택**: Python, Streamlit (`>=1.50.0`), PyMuPDF (`pymupdf`), Google GenAI SDK (`google-genai`), Pydantic v2 (`pydantic`), Pillow (`pillow`), Requests, BeautifulSoup4.
 
@@ -85,7 +85,7 @@
 - **`src/auth/` (`tokens.py`, `oauth.py`, `accounts.py`, `quota.py`, `__init__.py`)**: PBKDF2 인증, 서명 세션 토큰, Google OAuth 2.0, 등급·월간 토큰 쿼터 관리.
 - **`src/storage/` (`base.py`, `exam_store.py`, `user_exams_store.py`, `english_pool_store.py`, `analysis_pool_store.py`, `vocab_store.py`, `__init__.py`)**: `StorageManager` — `threading.RLock` + 원자적 파일 교체(`_atomic_write_text`/`_bytes`), `mtime_ns`/`size` 캐시, 읽기 전용 `load_db_readonly()` & O(1) `get_db_summary_counts()`.
 - **`src/curriculum_2022/` (`catalog.py`, `importers.py`, `grounding.py`, `__init__.py`)**: 2022 개정 교육과정 편제표·NCIC 성취기준 로드·파싱·검증.
-- **`src/pdf_parser/` (`common.py`, `metadata_and_pairing.py`, `concept_slicer.py`, `exam_cropper.py`, `__init__.py`)**: PyMuPDF 기반 문항 영역 크롭, 2단 레이아웃 파싱, 개념서 슬라이싱, 해설지 매칭.
+- **`src/pdf_parser/` (`common.py`, `metadata_and_pairing.py`, `concept_slicer.py`, `exam_cropper.py`, `english_source_extractor.py`, `__init__.py`)**: PyMuPDF 기반 문항 영역 크롭, 2단 레이아웃 파싱, 개념서 슬라이싱, 해설지 매칭, 영어 문제지/해설지 `[해석]` 무손실 추출 및 문장별 1:1 DP 정렬(AI 미사용).
 - **`src/pdf/` (`styles.py`, `common.py`, `poetry_renderer.py`, `korean_analysis_pdf.py`, `english_analysis_pdf.py`, `exam_pdf.py`, `vocab_pdf.py`, `__init__.py`)**: 맞춤형 2단 시험지, 국어·영어 지문 분석지, 영단어장 PDF 렌더링.
 - **`src/diagram_renderer/` (`primitives.py`, `academic_charts.py`, `literature_charts.py`, `card_layouts.py`, `__init__.py`)**: Pillow 기반 국어·영어 지문 시각 구조도 PNG 렌더링.
 - **`src/text_formatter.py`, `src/ui_styles.py`, `src/exporters.py`, `src/ebsi_fetcher.py`**: 화학/수식 첨자 및 영어/국어 블록 포매팅, 반응형 CSS, JSONL/HTML/MD 내보내기, EBSi 연동.

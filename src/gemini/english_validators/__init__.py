@@ -86,6 +86,7 @@ _SUBMODULE_EXPORTS: dict[str, tuple[str, ...]] = {
         "_sanitize_disallowed_syntax_braces",
         "_strip_spurious_quotes_against_source",
         "_validate_english_analysis_output",
+        "_validate_english_summary_diagram_output",
     ),
 }
 

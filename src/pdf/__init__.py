@@ -38,7 +38,6 @@ _SUBMODULE_EXPORTS: dict[str, tuple[str, ...]] = {
     ),
     "src.pdf.english_analysis_pdf": (
         "_build_english_landscape_css",
-        "_format_chunked_english_html",
         "_render_single_english_landscape_page",
         "generate_english_passage_analysis_pdf",
     ),

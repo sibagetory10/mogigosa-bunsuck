@@ -262,10 +262,13 @@ class AnalysisPoolStoreMixin:
     def build_english_analysis_key(
         passage_text: str,
         q_label: str = "",
+        extra_key: str = "",
     ) -> str:
-        """영어 지문 원문 정규화 텍스트로 분석지 캐시 키를 생성한다."""
+        """영어 지문 원문 정규화 텍스트(및 선택적 해석 키)로 분석지 캐시 키를 생성한다."""
         norm_p = re.sub(r"\s+", " ", (passage_text or "").strip())
-        return hashlib.sha256(f"eng_an||{norm_p}".encode("utf-8")).hexdigest()[:24]
+        norm_extra = re.sub(r"\s+", " ", (extra_key or "").strip())
+        raw = f"eng_an||{norm_p}||{norm_extra}" if norm_extra else f"eng_an||{norm_p}"
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
 
     def _load_english_analysis_pool_unlocked(self) -> dict[str, dict[str, Any]]:
         if not self.english_analysis_pool_path.exists():
@@ -351,14 +354,15 @@ class AnalysisPoolStoreMixin:
             self._save_english_analysis_pool_unlocked(pool)
 
     def get_english_analysis_pdf_path(self, cache_key: str) -> Path:
-        """지문별 영어 분석지 PDF 파일 경로를 반환한다 (v6: PDF 문장 잘림 zero 검증·유형별 배지 격리·하이픈/괄호 완전 보정)."""
-        return self.english_analysis_pdfs_root / f"{self._safe_kor_cache_key(cache_key)}_eng_analysis_v6.pdf"
+        """지문별 영어 분석지 PDF 파일 경로를 반환한다 (v7: 기출 포인트 제거 · 3번 섹션 AI 미사용 원문+해설지 PDF 순수 복붙)."""
+        return self.english_analysis_pdfs_root / f"{self._safe_kor_cache_key(cache_key)}_eng_analysis_v7.pdf"
 
     def _unlink_eng_pdfs_for_key(self, cache_key: str) -> bool:
         safe_key = self._safe_kor_cache_key(cache_key)
         removed_any = False
         for pdf_p in (
             self.get_english_analysis_pdf_path(cache_key),
+            self.english_analysis_pdfs_root / f"{safe_key}_eng_analysis_v6.pdf",
             self.english_analysis_pdfs_root / f"{safe_key}_eng_analysis_v5.pdf",
             self.english_analysis_pdfs_root / f"{safe_key}_eng_analysis_v4.pdf",
             self.english_analysis_pdfs_root / f"{safe_key}_eng_analysis_v3.pdf",
@@ -388,7 +392,7 @@ class AnalysisPoolStoreMixin:
             self.english_analysis_pdfs_root.mkdir(parents=True, exist_ok=True)
             _atomic_write_bytes(self.get_english_analysis_pdf_path(cache_key), pdf_bytes)
             safe_key = self._safe_kor_cache_key(cache_key)
-            for legacy_ver in ("v1", "v2", "v3", "v4", "v5"):
+            for legacy_ver in ("v1", "v2", "v3", "v4", "v5", "v6"):
                 legacy_p = self.english_analysis_pdfs_root / f"{safe_key}_eng_analysis_{legacy_ver}.pdf"
                 if legacy_p.exists():
                     legacy_p.unlink(missing_ok=True)

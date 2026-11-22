@@ -14,7 +14,11 @@ from src.gemini.english_validators.transform_helpers import (
     _sentence_has_english_verb,
     _split_english_sentences,
 )
-from src.models import EnglishPassageAnalysisOutput, EnglishSentenceAnalysisItem
+from src.models import (
+    EnglishPassageAnalysisOutput,
+    EnglishPassageSummaryDiagramOutput,
+    EnglishSentenceAnalysisItem,
+)
 from src.text_formatter import normalize_english_exam_text, normalize_english_korean_translation
 
 # 영어 정밀 지문 분석지(EnglishPassageAnalysisOutput) 결정론적 검증·자동 교정기
@@ -738,5 +742,70 @@ def _repair_english_analysis_output(
     # 5. 최종 토큰 일치 & 괄호 균형 가드 강제 적용
     out = _enforce_english_analysis_token_guard(out, sents)
     return out
+
+
+def _validate_english_summary_diagram_output(
+    out: EnglishPassageSummaryDiagramOutput,
+    *,
+    require_diagram: bool = True,
+) -> list[str]:
+    """
+    AI가 생성한 영어 지문 제목 · 핵심 주제 · 논리 전개 흐름 · 구조 도식 스펙을 검증한다.
+    (문장별 원문/해석은 AI가 생성하지 않으므로 검증 대상에서 제외)
+    """
+    issues: list[str] = []
+    if not (out.title or "").strip():
+        issues.append("`title`(지문 핵심 제목)이 비어 있습니다.")
+    if not (out.core_theme or "").strip():
+        issues.append("`core_theme`(핵심 주제)이 비어 있습니다.")
+    if not (out.structure_flow or "").strip():
+        issues.append("`structure_flow`(논리 전개 흐름)이 비어 있습니다.")
+
+    vd = out.visual_diagram
+    if require_diagram:
+        has_diag = vd is not None and bool(
+            getattr(vd, "nodes", None)
+            or getattr(vd, "graph_spec", None)
+            or getattr(vd, "emotion_points", None)
+        )
+        if not has_diag:
+            issues.append("`visual_diagram`(이해용 구조 도식)이 비어 있습니다. nodes 또는 graph_spec을 채워 주세요.")
+
+    text_parts: list[str] = [
+        out.title or "",
+        out.core_theme or "",
+        out.structure_flow or "",
+    ]
+    if vd is not None:
+        text_parts.extend(
+            [
+                vd.title or "",
+                vd.center_label or "",
+                vd.quadrant_x_label or "",
+                vd.quadrant_y_label or "",
+                vd.takeaway or "",
+                *(vd.relation_labels or []),
+            ]
+        )
+        for nd in vd.nodes or []:
+            text_parts.append(nd.title or "")
+            text_parts.append(nd.subtitle or "")
+            text_parts.extend(nd.details or [])
+        for mr in vd.matrix_rows or []:
+            text_parts.append(mr.criterion or "")
+            text_parts.extend(mr.values or [])
+        gs = vd.graph_spec
+        if gs is not None:
+            text_parts.extend([gs.x_label or "", gs.y_label or "", gs.highlight_point or ""])
+            for cv in gs.curves or []:
+                text_parts.extend([cv.label or "", cv.annotation or ""])
+
+    foreign_hits = _detect_foreign_script_contamination("\n".join(text_parts))
+    if foreign_hits:
+        issues.append(
+            f"한국어 출력 영역에 비한글 외국 문자({', '.join(foreign_hits)})가 혼입되었습니다. "
+            "모든 제목·주제·논리 흐름·도식은 순수 한국어(필요 시 원문 영어 용어만 병기)로 작성하세요."
+        )
+    return issues
 
 
