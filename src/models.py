@@ -866,7 +866,7 @@ class KoreanPassageAnalysisOutput(BaseModel):
     )
 
 
-CURRENT_ENGLISH_ANALYSIS_VERSION: int = 2
+CURRENT_ENGLISH_ANALYSIS_VERSION: int = 3
 
 
 class EnglishSentenceAnalysisItem(BaseModel):
@@ -893,6 +893,10 @@ class EnglishSentenceAnalysisItem(BaseModel):
         default="",
         description="원래 빈칸 추론 문항에서 빈칸이었던 원문 구절 (이 문장에 빈칸이 있었을 때만 기재)",
     )
+    is_inserted_sentence: bool = Field(
+        default=False,
+        description="원래 문장 삽입 문항에서 정답 위치에 삽입된 주어진 문장이면 True",
+    )
 
 
 class EnglishPassageAnalysisOutput(BaseModel):
@@ -912,9 +916,13 @@ class EnglishPassageAnalysisOutput(BaseModel):
         default_factory=list,
         description="지문 전체 문장에 대한 1번부터 끝번까지의 문장별 정밀 구문독해 리스트",
     )
+    exam_point_title: str = Field(
+        default="",
+        description="문항 유형에 맞는 기출 포인트 박스 제목 (예: '기출 포인트 (원문 빈칸)', '기출 포인트 (글의 순서)')",
+    )
     exam_point_note: str = Field(
         default="",
-        description="원래 기출 유형 핵심 포인트 (빈칸 추론의 원래 빈칸 위치·정답 구절, 무관한 문장의 제거된 정답 문장 및 이탈 이유 등)",
+        description="원래 기출 유형 핵심 포인트 (빈칸 추론의 원래 빈칸 위치·정답 구절, 무관한 문장의 제거된 정답 문장, 글의 순서 정답 배열, 문장 삽입 원문·정답 위치 등)",
     )
     footnotes: list[str] = Field(
         default_factory=list,
@@ -926,7 +934,7 @@ class EnglishPassageAnalysisOutput(BaseModel):
     )
     analysis_version: int = Field(
         default=1,
-        description="분석지 엔진 스키마·검증 버전 (v2: 원문 100% 무손실 검증·기출 포인트·각주·용어 일관성 강화)",
+        description="분석지 엔진 스키마·검증 버전 (v3: 최종 토큰 일치 가드·외국어 오염 차단·유형별 동적 기출 포인트·재시도 최적화)",
     )
 
 

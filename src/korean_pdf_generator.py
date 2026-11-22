@@ -480,7 +480,7 @@ def _is_korean_poetry_item(
 
 
 def _pick_korean_font_paths() -> tuple[str | None, str | None, str | None]:
-    """시스템(Linux/Windows/macOS)에서 명조(시 본문) · 고딕(주석) · 고딕 볼드 폰트 경로를 찾는다."""
+    """시스템(Linux/Windows/macOS)에서 명조(시 본문) · 고딕(주석) · 고딕 볼드 폰트 경로를 찾는다 (11,172자 완성형 지원 폰트 우선)."""
     serif_candidates = [
         "/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc",
         "/usr/share/fonts/truetype/noto/NotoSerifCJK-Regular.ttc",
@@ -490,15 +490,21 @@ def _pick_korean_font_paths() -> tuple[str | None, str | None, str | None]:
     ]
     sans_candidates = [
         "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/nanum/NanumBarunGothic.ttf",
         "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
         "C:/Windows/Fonts/malgun.ttf",
+        "C:/Windows/Fonts/NanumBarunGothic.ttf",
         "C:/Windows/Fonts/NanumGothic.ttf",
         "/System/Library/Fonts/AppleSDGothicNeo.ttc",
     ]
     bold_candidates = [
         "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Bold.ttc",
+        "/usr/share/fonts/truetype/nanum/NanumBarunGothicBold.ttf",
         "/usr/share/fonts/truetype/nanum/NanumGothicBold.ttf",
         "C:/Windows/Fonts/malgunbd.ttf",
+        "C:/Windows/Fonts/NanumBarunGothicBold.ttf",
         "C:/Windows/Fonts/NanumGothicBold.ttf",
         "/System/Library/Fonts/AppleSDGothicNeo.ttc",
     ]
@@ -506,6 +512,45 @@ def _pick_korean_font_paths() -> tuple[str | None, str | None, str | None]:
     sans_p = next((p for p in sans_candidates if os.path.exists(p)), None)
     bold_p = next((p for p in bold_candidates if os.path.exists(p)), None) or sans_p
     return serif_p, sans_p, bold_p
+
+
+def _build_korean_story_font_bundle() -> tuple[Any | None, str]:
+    """
+    PyMuPDF Story에서 희귀 한글 음절까지 누락 없이 렌더링되도록
+    시스템 한글 폰트 디렉터리를 Archive로 묶고 @font-face CSS를 생성한다.
+    """
+    _, sans_p, bold_p = _pick_korean_font_paths()
+    font_dirs: list[str] = []
+    face_rules: list[str] = []
+
+    if sans_p and os.path.isfile(sans_p):
+        d = os.path.dirname(sans_p)
+        if d and d not in font_dirs:
+            font_dirs.append(d)
+        fname = os.path.basename(sans_p)
+        face_rules.append(
+            f"@font-face {{ font-family: 'MogiKorSans'; src: url('{fname}'); font-weight: normal; font-style: normal; }}"
+        )
+    if bold_p and os.path.isfile(bold_p):
+        d = os.path.dirname(bold_p)
+        if d and d not in font_dirs:
+            font_dirs.append(d)
+        fname = os.path.basename(bold_p)
+        face_rules.append(
+            f"@font-face {{ font-family: 'MogiKorSans'; src: url('{fname}'); font-weight: bold; font-style: normal; }}"
+        )
+
+    archive = None
+    if font_dirs and hasattr(pymupdf, "Archive"):
+        try:
+            archive = pymupdf.Archive(font_dirs[0])
+            for extra_d in font_dirs[1:]:
+                archive.add(extra_d)
+        except Exception:
+            archive = None
+            face_rules = []
+
+    return archive, "\n".join(face_rules)
 
 
 def _measure_rendered_line_chars(
@@ -1108,7 +1153,12 @@ def _build_korean_passage_html_block(
 
 def _render_story_pdf(full_html: str, css_text: str) -> bytes:
     """HTML + CSS를 PyMuPDF Story로 A4 PDF 바이트로 렌더링한다."""
-    story = pymupdf.Story(html=full_html, user_css=css_text)
+    font_archive, font_face_css = _build_korean_story_font_bundle()
+    eff_css = f"{font_face_css}\n{css_text}" if font_face_css else css_text
+    story_kwargs: dict[str, Any] = {"html": full_html, "user_css": eff_css}
+    if font_archive is not None:
+        story_kwargs["archive"] = font_archive
+    story = pymupdf.Story(**story_kwargs)
     writer_buf = io.BytesIO()
     mediabox = pymupdf.paper_rect("a4")
     where = mediabox + (36, 40, -36, -42)
@@ -1396,12 +1446,13 @@ def _format_chunked_english_html(chunked_text: str, blank_phrase: str = "") -> s
     return escaped
 
 
-def _build_english_landscape_css(scale: float = 1.0) -> str:
+def _build_english_landscape_css(scale: float = 1.0, font_face_css: str = "") -> str:
     """A4 가로(Landscape) 1페이지 1지문 영어 정밀 분석지용 스케일 가변 CSS를 생성한다."""
     s = max(0.58, min(1.05, float(scale)))
     return f"""
+    {font_face_css}
     body {{
-        font-family: "NanumGothic", "Malgun Gothic", sans-serif;
+        font-family: "MogiKorSans", "Noto Sans CJK KR", "NanumBarunGothic", "NanumGothic", "Malgun Gothic", "Apple SD Gothic Neo", sans-serif;
         font-size: {8.6 * s:.2f}pt;
         line-height: {1.42:.2f};
         color: #0F172A;
@@ -1524,7 +1575,8 @@ def _build_english_landscape_css(scale: float = 1.0) -> str:
         page-break-inside: avoid;
     }}
     .eng-sent-hdr {{
-        margin-bottom: {1.5 * s:.2f}pt;
+        margin-bottom: {2 * s:.2f}pt;
+        line-height: 1.35;
     }}
     .eng-sent-num {{
         font-weight: bold;
@@ -1532,23 +1584,36 @@ def _build_english_landscape_css(scale: float = 1.0) -> str:
         font-size: {8.5 * s:.2f}pt;
     }}
     .eng-topic-badge {{
-        display: inline;
+        display: inline-block;
         background-color: #FEF3C7;
         color: #B45309;
         border: 0.5pt solid #F59E0B;
         font-weight: bold;
-        font-size: {7.1 * s:.2f}pt;
+        font-size: {7.0 * s:.2f}pt;
         padding: 0.8pt 3.5pt;
+        margin-left: 3pt;
         border-radius: 2.5pt;
     }}
     .eng-blank-badge {{
-        display: inline;
+        display: inline-block;
         background-color: #EEF2FF;
         color: #3730A3;
         border: 0.5pt solid #818CF8;
         font-weight: bold;
-        font-size: {7.1 * s:.2f}pt;
+        font-size: {7.0 * s:.2f}pt;
         padding: 0.8pt 3.5pt;
+        margin-left: 3pt;
+        border-radius: 2.5pt;
+    }}
+    .eng-insert-badge {{
+        display: inline-block;
+        background-color: #ECFDF5;
+        color: #065F46;
+        border: 0.5pt solid #34D399;
+        font-weight: bold;
+        font-size: {7.0 * s:.2f}pt;
+        padding: 0.8pt 3.5pt;
+        margin-left: 3pt;
         border-radius: 2.5pt;
     }}
     .eng-blank-hl {{
@@ -1592,9 +1657,31 @@ def _render_single_english_landscape_page(
     include_diagrams: bool,
 ) -> bytes:
     """영어 지문 1개를 A4 가로(842x595pt) 정확히 1페이지 안에 좌·우 분할 레이아웃으로 렌더링한다."""
+    from src.gemini.english_validators import (
+        _enforce_english_analysis_token_guard,
+        _resolve_english_exam_point_title,
+        _split_english_sentences,
+    )
+
     an = item["analysis"]
     q_label = str(item.get("q_label") or item.get("exam_name") or "영어 독해").strip()
     orig_type = str(item.get("orig_type") or "영어 독해").strip()
+    src_passage = str(item.get("passage_text") or "").strip()
+
+    # 렌더링 직전 최종 토큰 일치 & 괄호 균형 가드 강제 적용
+    src_sents = _split_english_sentences(src_passage) if src_passage else None
+    if src_sents and len(src_sents) == len(getattr(an, "sentence_analyses", None) or []):
+        an = _enforce_english_analysis_token_guard(an, src_sents)
+    else:
+        an = _enforce_english_analysis_token_guard(an, None)
+
+    font_archive, font_face_css = _build_korean_story_font_bundle()
+
+    def _make_story(html_str: str, css_str: str) -> Any:
+        kw: dict[str, Any] = {"html": html_str, "user_css": css_str}
+        if font_archive is not None:
+            kw["archive"] = font_archive
+        return pymupdf.Story(**kw)
 
     mediabox = pymupdf.paper_rect("a4-l")  # 842 x 595 pt
     page_w = mediabox.width
@@ -1640,10 +1727,13 @@ def _render_single_english_landscape_page(
     exam_point_txt = (getattr(an, "exam_point_note", "") or "").strip()
     exam_point_html = ""
     if exam_point_txt:
+        ep_title = (getattr(an, "exam_point_title", "") or "").strip() or _resolve_english_exam_point_title(
+            orig_type, exam_point_txt
+        )
         ep_lines = "<br/>".join(html.escape(ln.strip()) for ln in exam_point_txt.splitlines() if ln.strip())
         exam_point_html = (
             "<div class='eng-l-point'>"
-            "<div><b>기출 포인트 (원문 빈칸·무관한 문장)</b></div>"
+            f"<div><b>{html.escape(ep_title)}</b></div>"
             f"<div>{ep_lines}</div>"
             "</div>"
         )
@@ -1677,17 +1767,16 @@ def _render_single_english_landscape_page(
         num_badge = _CIRCLED_NUMS[s_num - 1] if 1 <= s_num <= len(_CIRCLED_NUMS) else f"({s_num})"
         is_topic = bool(getattr(sa, "is_topic_sentence", False))
         blank_phrase = (getattr(sa, "original_blank_phrase", "") or "").strip()
+        is_inserted = bool(getattr(sa, "is_inserted_sentence", False))
         card_cls = "eng-sent-card-topic" if is_topic else "eng-sent-card"
-        topic_badge = (
-            " &nbsp;<span class='eng-topic-badge'>★ 주제문 (Topic Sentence)</span>"
-            if is_topic
-            else ""
-        )
-        blank_badge = (
-            " &nbsp;<span class='eng-blank-badge'>기출 빈칸 원위치</span>"
-            if blank_phrase
-            else ""
-        )
+        badges: list[str] = []
+        if is_topic:
+            badges.append("<span class='eng-topic-badge'>★ 주제문 (Topic Sentence)</span>")
+        if blank_phrase:
+            badges.append("<span class='eng-blank-badge'>기출 빈칸 원위치</span>")
+        if is_inserted:
+            badges.append("<span class='eng-insert-badge'>기출 삽입 문장</span>")
+        badges_html = (" " + " ".join(badges)) if badges else ""
         chunk_html = _format_chunked_english_html(
             getattr(sa, "chunked_english", ""),
             blank_phrase=blank_phrase,
@@ -1696,7 +1785,7 @@ def _render_single_english_landscape_page(
 
         card_inner = (
             f"<div class='{card_cls}'>"
-            f"<div class='eng-sent-hdr'><span class='eng-sent-num'>{num_badge}</span>{topic_badge}{blank_badge}</div>"
+            f"<div class='eng-sent-hdr'><span class='eng-sent-num'>{num_badge}</span>{badges_html}</div>"
             f"<div class='eng-sent-chunk'>{chunk_html}</div>"
             f"<div class='eng-sent-kor'>{kor_html}</div>"
             "</div>"
@@ -1728,9 +1817,9 @@ def _render_single_english_landscape_page(
     """
 
     def _try_render_1page(scale: float, two_col_right: bool = False, canvas_h: float = page_h) -> bytes | None:
-        css_txt = _build_english_landscape_css(scale)
-        hdr_story = pymupdf.Story(html=header_html, user_css=css_txt)
-        l_top_story = pymupdf.Story(html=left_top_html, user_css=css_txt)
+        css_txt = _build_english_landscape_css(scale, font_face_css=font_face_css)
+        hdr_story = _make_story(header_html, css_txt)
+        l_top_story = _make_story(left_top_html, css_txt)
 
         buf = io.BytesIO()
         c_rect = pymupdf.Rect(0, 0, page_w, canvas_h)
@@ -1763,7 +1852,6 @@ def _render_single_english_landscape_page(
                 writer.end_page()
                 writer.close()
                 return None
-            # 섹션 제목 높이(~18pt)를 제외한 가용 영역에 도식을 최대 크기로 맞춤
             max_img_h = max(60.0, avail_h - 20.0)
             fit_w = min(left_w - 4.0, max_img_h * diag_aspect)
             diag_img_w = max(140, int(fit_w))
@@ -1773,11 +1861,10 @@ def _render_single_english_landscape_page(
                 f"<div class='eng-l-diag-wrap'><img class='eng-l-diag-img' width='{diag_img_w}' src='data:image/png;base64,{diag_b64}'/></div>"
                 "</body></html>"
             )
-            diag_story = pymupdf.Story(html=diag_only_html, user_css=css_txt)
+            diag_story = _make_story(diag_only_html, css_txt)
             diag_rect = pymupdf.Rect(margin_x, diag_top, margin_x + left_w, body_bottom)
             more_d, _ = diag_story.place(diag_rect)
             if more_d:
-                # 1~2pt 여유 오차 보정 후 재시도
                 diag_img_w = max(120, int(fit_w * 0.92))
                 diag_only_html = (
                     "<html><body>"
@@ -1785,7 +1872,7 @@ def _render_single_english_landscape_page(
                     f"<div class='eng-l-diag-wrap'><img class='eng-l-diag-img' width='{diag_img_w}' src='data:image/png;base64,{diag_b64}'/></div>"
                     "</body></html>"
                 )
-                diag_story = pymupdf.Story(html=diag_only_html, user_css=css_txt)
+                diag_story = _make_story(diag_only_html, css_txt)
                 more_d, _ = diag_story.place(diag_rect)
                 if more_d:
                     writer.end_page()
@@ -1795,7 +1882,7 @@ def _render_single_english_landscape_page(
 
         r_start_x = margin_x + left_w + col_gap
         if not two_col_right:
-            r_story = pymupdf.Story(html=right_html, user_css=css_txt)
+            r_story = _make_story(right_html, css_txt)
             r_rect = pymupdf.Rect(r_start_x, body_top, page_w - margin_x, body_bottom)
             more_r, _ = r_story.place(r_rect)
             if more_r:
@@ -1808,7 +1895,7 @@ def _render_single_english_landscape_page(
             sub_w = (right_w - sub_gap) / 2.0
             r_rect1 = pymupdf.Rect(r_start_x, body_top, r_start_x + sub_w, body_bottom)
             r_rect2 = pymupdf.Rect(r_start_x + sub_w + sub_gap, body_top, page_w - margin_x, body_bottom)
-            r_story1 = pymupdf.Story(html=right_html_col1, user_css=css_txt)
+            r_story1 = _make_story(right_html_col1, css_txt)
             more_r1, _ = r_story1.place(r_rect1)
             if more_r1:
                 writer.end_page()
@@ -1816,7 +1903,7 @@ def _render_single_english_landscape_page(
                 return None
             r_story1.draw(dev, None)
             if sent_cards_html[mid_idx:]:
-                r_story2 = pymupdf.Story(html=right_html_col2, user_css=css_txt)
+                r_story2 = _make_story(right_html_col2, css_txt)
                 more_r2, _ = r_story2.place(r_rect2)
                 if more_r2:
                     writer.end_page()

@@ -1337,6 +1337,108 @@ def _extract_english_word_tokens(text: str) -> list[str]:
     return re.findall(r"[A-Za-z0-9]+(?:['-][A-Za-z0-9]+)*", s)
 
 
+def _resolve_english_exam_point_title(orig_question_type: str = "", exam_point_note: str = "") -> str:
+    """문항 유형(및 노트 내용)에 맞는 기출 포인트 박스 동적 제목을 반환한다."""
+    qt = (orig_question_type or "").strip()
+    note = (exam_point_note or "").strip()
+    if "빈칸" in qt or "[기출 빈칸" in note:
+        return "기출 포인트 (원문 빈칸)"
+    if "무관" in qt or ("흐름" in qt and "관계" in qt) or "[제거된 무관한 문장" in note:
+        return "기출 포인트 (제거된 무관한 문장)"
+    if "순서" in qt or "[정답 순서" in note:
+        return "기출 포인트 (글의 순서)"
+    if "삽입" in qt or "[삽입 문장" in note:
+        return "기출 포인트 (문장 삽입)"
+    if "어법" in qt:
+        return "기출 포인트 (어법)"
+    if "어휘" in qt or "낱말" in qt:
+        return "기출 포인트 (어휘)"
+    if "함축" in qt:
+        return "기출 포인트 (함축 의미)"
+    if "요약" in qt:
+        return "기출 포인트 (요약문)"
+    return "기출 포인트"
+
+
+def _infer_blank_phrase_by_diff(raw_body_with_blank: str, completed_passage: str) -> str:
+    """
+    PDF 텍스트 추출 과정에서 ①~⑤ 선지 분할이 깨졌을 때,
+    원본 빈칸 문장(`____`)과 복원된 완성 지문(`completed_passage`)의 토큰 diff로
+    원래 빈칸 구절(`original_blank_phrase`)을 결정론적으로 역추출한다.
+    """
+    raw_b = (raw_body_with_blank or "").strip()
+    comp_p = (completed_passage or "").strip()
+    if not raw_b or not comp_p or not re.search(r"_{3,}", raw_b):
+        return ""
+
+    # 빈칸이 포함된 원문 문장 추출
+    raw_masked = re.sub(r"_{3,}", " __BLANK_SENTINEL__ ", raw_b)
+    raw_sents = _split_english_sentences(raw_masked)
+    blank_sent = next((s for s in raw_sents if "__BLANK_SENTINEL__" in s), "")
+    if not blank_sent:
+        return ""
+
+    left_part, right_part = blank_sent.split("__BLANK_SENTINEL__", 1)
+    left_toks = [t.lower() for t in _extract_english_word_tokens(left_part)]
+    right_toks = [t.lower() for t in _extract_english_word_tokens(right_part)]
+    anchor_set = set(left_toks + right_toks)
+    if not anchor_set:
+        return ""
+
+    # 완성 지문에서 빈칸 문장과 가장 일치하는 문장 탐색
+    comp_sents = _split_english_sentences(comp_p)
+    best_sent = ""
+    best_score = 0.0
+    for cs in comp_sents:
+        cs_toks = [t.lower() for t in _extract_english_word_tokens(cs)]
+        if not cs_toks:
+            continue
+        cs_set = set(cs_toks)
+        overlap = len(anchor_set & cs_set) / max(1, len(anchor_set))
+        if overlap > best_score:
+            best_score = overlap
+            best_sent = cs
+    if not best_sent or best_score < 0.55:
+        return ""
+
+    # 완성 문장에서 left_toks 끝 ~ right_toks 시작 사이 원문 슬라이스 추출
+    word_re = re.compile(r"[A-Za-z0-9]+(?:['’-][A-Za-z0-9]+)*")
+    cs_matches = list(word_re.finditer(best_sent))
+    cs_low = [m.group(0).lower().replace("’", "'") for m in cs_matches]
+    if not cs_matches:
+        return ""
+
+    start_tok_idx = 0
+    if left_toks:
+        for k in range(min(4, len(left_toks)), 0, -1):
+            pat = left_toks[-k:]
+            for idx in range(len(cs_low) - k + 1):
+                if cs_low[idx : idx + k] == pat:
+                    start_tok_idx = idx + k
+                    break
+            if start_tok_idx > 0:
+                break
+
+    end_tok_idx = len(cs_matches)
+    if right_toks:
+        for k in range(min(4, len(right_toks)), 0, -1):
+            pat = right_toks[:k]
+            for idx in range(start_tok_idx, len(cs_low) - k + 1):
+                if cs_low[idx : idx + k] == pat:
+                    end_tok_idx = idx
+                    break
+            if end_tok_idx < len(cs_matches):
+                break
+
+    if 0 <= start_tok_idx < end_tok_idx <= len(cs_matches):
+        span_len = end_tok_idx - start_tok_idx
+        # 문장 전체가 아니라 합리적 빈칸 길이(1~22단어)일 때만 채택
+        if 1 <= span_len <= 22 and span_len < len(cs_matches):
+            phrase = best_sent[cs_matches[start_tok_idx].start() : cs_matches[end_tok_idx - 1].end()].strip()
+            return phrase
+    return ""
+
+
 def _extract_english_exam_context(
     question_text: str,
     orig_question_type: str = "",
@@ -1346,6 +1448,7 @@ def _extract_english_exam_context(
     """
     원본 PDF 텍스트(question_text)와 정답(answer)을 대조해
     각주(footnotes), 원래 빈칸 구절(original_blank_phrase), 제거된 무관한 문장(irrelevant_sentence),
+    글의 순서 정답 배열(order_answer_seq), 문장 삽입 원문/위치(inserted_sentence),
     그리고 원문 변조·누락 시 복구 가능한 무손실 기준 지문(reconstructed_clean_passage)을 결정론적으로 추출한다.
     """
     ctx: dict[str, Any] = {
@@ -1353,6 +1456,9 @@ def _extract_english_exam_context(
         "original_blank_phrase": "",
         "irrelevant_sentence": "",
         "irrelevant_answer_sym": "",
+        "order_answer_seq": "",
+        "inserted_sentence": "",
+        "inserted_answer_sym": "",
         "reconstructed_clean_passage": "",
         "choices": {},
     }
@@ -1371,6 +1477,7 @@ def _extract_english_exam_context(
     # 1) 빈칸 추론 (31~34번)
     is_blank = ("빈칸" in q_type) or bool(re.search(r"_{3,}", body_and_choices))
     if is_blank:
+        raw_body = body_and_choices
         split_res = _split_numbered_five_markers(body_and_choices)
         if split_res is not None:
             raw_body, segs = split_res
@@ -1378,7 +1485,6 @@ def _extract_english_exam_context(
             ctx["choices"] = choices_map
             if ans_int and str(ans_int) in choices_map:
                 ans_phrase = choices_map[str(ans_int)].strip()
-                # 선지 끝에 페이지 번호 등이 붙었으면 제거
                 ans_phrase = re.sub(r"(?:\s+\d{1,2}){1,2}\s*$", "", ans_phrase).strip()
                 ctx["original_blank_phrase"] = ans_phrase
                 if re.search(r"_{3,}", raw_body) and ans_phrase:
@@ -1387,6 +1493,11 @@ def _extract_english_exam_context(
                     filled = re.sub(r"\s+", " ", filled).strip()
                     if _is_clean_english_reconstruction(filled, passage_text):
                         ctx["reconstructed_clean_passage"] = filled
+        # 폴백: ①~⑤ 선지 추출이 깨졌더라도 빈칸 문장(____)과 완성 지문의 diff로 정답 구절 역추출
+        if not ctx["original_blank_phrase"] and passage_text:
+            inferred_bp = _infer_blank_phrase_by_diff(raw_body, passage_text)
+            if inferred_bp:
+                ctx["original_blank_phrase"] = inferred_bp
         return ctx
 
     # 2) 무관한 문장 (35번)
@@ -1423,15 +1534,30 @@ def _extract_english_exam_context(
     # 3) 글의 순서 (36~37번)
     is_order = "순서" in q_type
     if is_order:
+        default_order_choices = {
+            "1": "(A) - (C) - (B)",
+            "2": "(B) - (A) - (C)",
+            "3": "(B) - (C) - (A)",
+            "4": "(C) - (A) - (B)",
+            "5": "(C) - (B) - (A)",
+        }
+        order_body = body_and_choices
+        m_seq = None
         split_res = _split_numbered_five_markers(body_and_choices)
         if split_res is not None:
             order_body, segs = split_res
             choices_map = {str(k): v for k, v in segs.items() if v}
             ctx["choices"] = choices_map
             m_seq = _ORDER_SEQ_RE.search(choices_map.get(str(ans_int), "")) if ans_int else None
+        if m_seq is None and ans_int and str(ans_int) in default_order_choices:
+            m_seq = _ORDER_SEQ_RE.search(default_order_choices[str(ans_int)])
+
+        if m_seq is not None:
+            seq = (m_seq.group(1), m_seq.group(2), m_seq.group(3))
+            ctx["order_answer_seq"] = f"({seq[0]}) - ({seq[1]}) - ({seq[2]})"
             # (A), (B), (C) 단락 분할
             parts = re.split(r"(?:^|\s)\(([ABC])\)\s+", order_body)
-            if m_seq and len(parts) >= 7:
+            if len(parts) >= 7:
                 given_txt = parts[0].strip()
                 blocks: dict[str, str] = {}
                 for i_p in range(1, len(parts) - 1, 2):
@@ -1439,13 +1565,55 @@ def _extract_english_exam_context(
                     txt = parts[i_p + 1].strip()
                     if lbl in ("A", "B", "C") and txt:
                         blocks[lbl] = txt
-                seq = (m_seq.group(1), m_seq.group(2), m_seq.group(3))
                 if given_txt and set(blocks.keys()) == {"A", "B", "C"} and set(seq) == {"A", "B", "C"}:
                     rebuilt = re.sub(
                         r"\s+",
                         " ",
                         " ".join([given_txt, blocks[seq[0]], blocks[seq[1]], blocks[seq[2]]]),
                     ).strip()
+                    if _is_clean_english_reconstruction(rebuilt, passage_text):
+                        ctx["reconstructed_clean_passage"] = rebuilt
+        return ctx
+
+    # 4) 문장 삽입 (38~39번)
+    is_insertion = "삽입" in q_type
+    if is_insertion:
+        # ( ① ) ~ ( ⑤ ) 또는 ① ~ ⑤ 위치 마커 분할
+        norm_ins = re.sub(r"\(\s*([①②③④⑤])\s*\)", r"\1", body_and_choices)
+        split_res = _split_numbered_five_markers(norm_ins)
+        if split_res is not None:
+            prefix_raw, segs = split_res
+            prefix_clean = re.sub(r"\[주어진\s*문장\]", "", prefix_raw).strip()
+            pref_sents = _split_english_sentences(prefix_clean)
+            if pref_sents:
+                # 주어진 문장은 보통 박스 안의 첫 1문장(또는 완성 지문에서 뒤쪽 위치에 등장하는 앞 문장)
+                given_sent = pref_sents[0]
+                body_intro = " ".join(pref_sents[1:]).strip()
+                # 완성 지문과 대조해 주어진 문장 경계 확인 (주어진 문장이 2문장인 드문 케이스 대비)
+                if passage_text and len(pref_sents) >= 2:
+                    p_sents = _split_english_sentences(passage_text)
+                    if p_sents:
+                        first_p_toks = set(t.lower() for t in _extract_english_word_tokens(p_sents[0]))
+                        for cand_i, ps in enumerate(pref_sents):
+                            if cand_i == 0:
+                                continue
+                            ps_toks = set(t.lower() for t in _extract_english_word_tokens(ps))
+                            if ps_toks and len(first_p_toks & ps_toks) / max(1, len(first_p_toks | ps_toks)) >= 0.65:
+                                given_sent = " ".join(pref_sents[:cand_i]).strip()
+                                body_intro = " ".join(pref_sents[cand_i:]).strip()
+                                break
+                ctx["inserted_sentence"] = given_sent
+                if ans_int:
+                    ctx["inserted_answer_sym"] = _NUM_TO_CIRCLED_MAP.get(str(ans_int), "")
+                    rebuilt_parts: list[str] = []
+                    if body_intro:
+                        rebuilt_parts.append(body_intro)
+                    for k in range(1, 6):
+                        if k == ans_int:
+                            rebuilt_parts.append(given_sent)
+                        if segs.get(k):
+                            rebuilt_parts.append(segs[k])
+                    rebuilt = re.sub(r"\s+", " ", " ".join(rebuilt_parts)).strip()
                     if _is_clean_english_reconstruction(rebuilt, passage_text):
                         ctx["reconstructed_clean_passage"] = rebuilt
         return ctx
@@ -1462,6 +1630,7 @@ def _reconcile_english_passage_with_question_text(
     """
     저장된 passage_text를 원본 question_text(+정답)와 결정론적으로 대조하여,
     원문 단어 변조·구절 누락·정상 문장 통누락이 감지되면 무손실 원본으로 자동 복구한다.
+    원문 자체에 소괄호 `( ... )`가 포함된 경우에도 괄호와 전후 단어를 100% 보존한다.
     """
     raw_p = (passage_text or "").strip()
     exam_ctx = _extract_english_exam_context(
@@ -1482,12 +1651,12 @@ def _reconcile_english_passage_with_question_text(
     if not p_toks or not r_toks:
         return raw_p, exam_ctx
 
-    # 원문과 토큰 시퀀스가 다르면(정상 문장 누락, 괄호 구절 삭제, 단어 변조 등) 무손실 PDF 기준본으로 복구
-    if p_toks != r_toks:
+    # 원문과 토큰 시퀀스가 다르거나 원문 자체 괄호 구절이 유실된 경우 무손실 PDF 기준본으로 복구
+    paren_lost = rebuilt.count("(") > raw_p.count("(") or rebuilt.count(")") > raw_p.count(")")
+    if p_toks != r_toks or paren_lost:
         p_sents = _split_english_sentences(raw_p)
         r_sents = _split_english_sentences(rebuilt)
         sm = difflib.SequenceMatcher(None, p_toks, r_toks)
-        # 지나치게 다른 텍스트(오매칭)는 제외하고, 동일 지문 내 누락·변조만 안전하게 교정
         if sm.ratio() >= 0.78 or (len(r_sents) == len(p_sents) + 1 and sm.ratio() >= 0.70):
             return rebuilt, exam_ctx
 
@@ -1511,9 +1680,15 @@ _WEAK_TOPIC_SENT_RE = re.compile(
     r"However,|Yet,|Still,|For\s+example,|For\s+instance,|In\s+contrast,|On\s+the\s+other\s+hand,)",
     re.IGNORECASE,
 )
+# 일본어(히라가나/가타카나/반각가타카나), 키릴, 아랍, 태국, 데바나가리 및 한국어 문맥 내 의도치 않은 비한글 외국 문자 감지
+_FOREIGN_SCRIPT_RE = re.compile(
+    r"[\u3040-\u309f\u30a0-\u30ff\uff65-\uff9f\u0400-\u04ff\u0600-\u06ff\u0e00-\u0e7f\u0900-\u097f]"
+)
+_UNEXPECTED_CJK_HANJA_RE = re.compile(r"[\u4e00-\u9fff]{2,}")
 
 
 def _has_balanced_syntax_brackets(text: str) -> bool:
+    """대괄호 []와 소괄호 ()의 열림/닫힘 짝과 중첩 순서가 정확히 맞는지 검사한다."""
     stack: list[str] = []
     pairs = {"]": "[", ")": "("}
     for ch in text:
@@ -1526,8 +1701,262 @@ def _has_balanced_syntax_brackets(text: str) -> bool:
     return not stack
 
 
+def _strip_spurious_quotes_against_source(source_sent: str, chunked_sent: str) -> str:
+    """
+    원문 영어 문장(`source_sent`)에 없는 임의 큰따옴표(`"`, `“`, `”`)가
+    빈칸·강조 표기 목적으로 `chunked_sent`에 추가된 경우 결정론적으로 제거한다.
+    """
+    src = (source_sent or "").strip()
+    chk = (chunked_sent or "").strip()
+    if not chk:
+        return chk
+    src_q_cnt = sum(src.count(q) for q in ('"', "“", "”"))
+    chk_q_cnt = sum(chk.count(q) for q in ('"', "“", "”"))
+    if chk_q_cnt <= src_q_cnt:
+        return chk
+    if src_q_cnt == 0:
+        cleaned = re.sub(r'["“”]', "", chk)
+        cleaned = re.sub(r"[ \t]{2,}", " ", cleaned).strip()
+        cleaned = re.sub(r"\s+([.,?!;:])", r"\1", cleaned)
+        return cleaned
+    # 원문에 따옴표가 일부 있는 경우, 원문에 없는 위치의 쌍따옴표 쌍만 제거
+    src_quoted = {
+        re.sub(r"\s+", " ", m.group(1)).strip().lower()
+        for m in re.finditer(r'["“]([^"”]+)["”]', src)
+    }
+
+    def _drop_if_spurious(m: re.Match[str]) -> str:
+        inner = m.group(1)
+        norm_inner = re.sub(r"[/\[\]\(\)]", " ", inner)
+        norm_inner = re.sub(r"\s+", " ", norm_inner).strip().lower()
+        if any(norm_inner in sq or sq in norm_inner for sq in src_quoted if sq):
+            return m.group(0)
+        return inner
+
+    cleaned = re.sub(r'["“]([^"”]+)["”]', _drop_if_spurious, chk)
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned).strip()
+    return cleaned
+
+
+def _balance_added_markup_chars(text: str) -> str:
+    """
+    임시 센티넬(⟨⟩)로 보호된 원문 괄호는 유지하고,
+    새로 추가된 []/() 중 짝이 맞지 않거나 교차 중첩(`[... ( ... ] ...)`)된 기호만 제거한다.
+    """
+    chars = list(text)
+    remove_idx: set[int] = set()
+    stack: list[tuple[str, int]] = []
+    match_open = {"]": "[", ")": "("}
+    for idx, ch in enumerate(chars):
+        if ch in ("[", "("):
+            stack.append((ch, idx))
+        elif ch in ("]", ")"):
+            want = match_open[ch]
+            # 스택 맨 위와 일치하면 정상 팝
+            if stack and stack[-1][0] == want:
+                stack.pop()
+            else:
+                # 교차 중첩 검사: 스택 안쪽에 want가 있으면 그 사이의 미닫힘 괄호들을 제거하고 want를 닫음
+                found_pos = -1
+                for k in range(len(stack) - 1, -1, -1):
+                    if stack[k][0] == want:
+                        found_pos = k
+                        break
+                if found_pos != -1:
+                    while len(stack) - 1 > found_pos:
+                        _, bad_i = stack.pop()
+                        remove_idx.add(bad_i)
+                    stack.pop()
+                else:
+                    remove_idx.add(idx)
+    for _, unmatched_i in stack:
+        remove_idx.add(unmatched_i)
+
+    cleaned = "".join(ch for i, ch in enumerate(chars) if i not in remove_idx)
+    cleaned = re.sub(r"\[\s*\]|\(\s*\)", "", cleaned)
+    cleaned = re.sub(r"(?:\s*/\s*){2,}", " / ", cleaned)
+    cleaned = re.sub(r"^\s*/\s*|\s*/\s*$", "", cleaned)
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned).strip()
+    cleaned = re.sub(r"\s+([.,?!;:])", r"\1", cleaned)
+    return cleaned
+
+
+def _normalize_syntax_bracket_consistency(source_sent: str, chunked_sent: str) -> str:
+    """
+    병렬 동사구 주어 묶음(`[they accept ...] and [move on]`) 및
+    원문 자체 괄호가 아닌 간접의문문 소괄호(`(why ... V ...)`)를 결정론적으로 교정해
+    명사절/관계절/부사절=`[ ]`, 구 수식어=`( )` 표기 일관성을 맞춘다.
+    """
+    src = (source_sent or "").strip()
+    chk = (chunked_sent or "").strip()
+    if not chk:
+        return chk
+
+    # 1) 주어 공유 동사구 병렬에서 주어까지 앞 대괄호에 묶은 오류 자동 교정
+    def _fix_parallel(m: re.Match[str]) -> str:
+        left_inner = m.group(1).strip()
+        conj = m.group(2)
+        right_inner = m.group(3).strip()
+        right_words = _extract_english_word_tokens(right_inner)
+        if right_words and right_words[0].lower() not in (
+            "they", "we", "he", "she", "it", "you", "i", "that", "which", "who", "what", "when", "if", "because", "although"
+        ):
+            return f"{left_inner} / {conj} / {right_inner}"
+        return m.group(0)
+
+    chk = _PARALLEL_SUBJ_BRACKET_RE.sub(_fix_parallel, chk)
+
+    # 2) 원문 자체 괄호가 아닌 간접의문문(주어+동사 포함 wh-절)을 소괄호 () → 대괄호 []로 교정
+    src_parens = {m.group(0).lower() for m in re.finditer(r"\([^()]+\)", src)}
+
+    def _fix_wh_paren(m: re.Match[str]) -> str:
+        if m.group(0).lower() in src_parens:
+            return m.group(0)
+        inner = f"{m.group(1)} {m.group(2)}"
+        if len(_extract_english_word_tokens(inner)) >= 4 and _sentence_has_english_verb(inner):
+            return f"[{m.group(1)} {m.group(2).strip()}]"
+        return m.group(0)
+
+    chk = _WH_PAREN_CLAUSE_RE.sub(_fix_wh_paren, chk)
+    chk = re.sub(r"(?:\s*/\s*){2,}", " / ", chk)
+    chk = re.sub(r"[ \t]{2,}", " ", chk).strip()
+    return chk
+
+
+def _project_chunk_markup_onto_source(source_sent: str, chunked_sent: str) -> str:
+    """
+    AI의 chunked_english에 단어 변조·누락·괄호 깨짐이 있더라도,
+    100% 정확한 source_sent 단어·원문 괄호·구두점 위에 유효한 구문 표기(/, [], ())만 안전하게 투영한다.
+    """
+    src = (source_sent or "").strip()
+    chk = _strip_spurious_quotes_against_source(src, (chunked_sent or "").strip())
+    if not src:
+        return chk
+    if not chk:
+        return src
+
+    chk = _normalize_syntax_bracket_consistency(src, chk)
+
+    # 이미 원문과 단어 100% 일치 + 괄호 균형 + 원문 자체 괄호 보존이면 정리 후 반환
+    src_toks = _extract_english_word_tokens(src)
+    chk_toks = _extract_english_word_tokens(chk)
+    if (
+        [t.lower() for t in src_toks] == [t.lower() for t in chk_toks]
+        and _has_balanced_syntax_brackets(chk)
+        and not re.search(r"\[\s*\]|\(\s*\)|/\s*/", chk)
+        and src.count("(") <= chk.count("(")
+        and src.count(")") <= chk.count(")")
+    ):
+        return chk
+
+    word_re = re.compile(r"[A-Za-z0-9]+(?:['’-][A-Za-z0-9]+)*")
+    src_matches = list(word_re.finditer(src))
+    chk_matches = list(word_re.finditer(chk))
+    if not src_matches or not chk_matches:
+        return src
+
+    src_low = [m.group(0).lower().replace("’", "'") for m in src_matches]
+    chk_low = [m.group(0).lower().replace("’", "'") for m in chk_matches]
+    sm = difflib.SequenceMatcher(None, src_low, chk_low)
+    if sm.ratio() < 0.55:
+        return src
+
+    # 원문 자체 괄호 ( )를 센티넬 ⟨ ⟩ 로 보호
+    src_gaps: list[str] = []
+    prev_end = 0
+    for m in src_matches:
+        g = src[prev_end : m.start()].replace("(", "⟨").replace(")", "⟩")
+        src_gaps.append(g)
+        prev_end = m.end()
+    src_gaps.append(src[prev_end:].replace("(", "⟨").replace(")", "⟩"))
+
+    chk_gaps: list[str] = []
+    c_prev = 0
+    for m in chk_matches:
+        chk_gaps.append(chk[c_prev : m.start()])
+        c_prev = m.end()
+    chk_gaps.append(chk[c_prev:])
+
+    n_src = len(src_matches)
+    gap_close: list[str] = [""] * (n_src + 1)
+    gap_slash: list[bool] = [False] * (n_src + 1)
+    gap_open: list[str] = [""] * (n_src + 1)
+
+    def _split_gap_markup(g_txt: str) -> tuple[str, bool, str]:
+        if "/" in g_txt:
+            left_s, right_s = g_txt.split("/", 1)
+            closes = "".join(re.findall(r"[\]\)]", left_s))
+            opens = "".join(re.findall(r"[\[\(]", right_s))
+            return closes, True, opens
+        closes = "".join(re.findall(r"[\]\)]", g_txt))
+        opens = "".join(re.findall(r"[\[\(]", g_txt))
+        return closes, False, opens
+
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag != "equal":
+            continue
+        block_len = i2 - i1
+        _, has_sl0, op0 = _split_gap_markup(chk_gaps[j1])
+        if op0 and "⟨" not in src_gaps[i1]:
+            gap_open[i1] = op0
+        if has_sl0 and i1 > 0:
+            gap_slash[i1] = True
+        for offset in range(1, block_len):
+            si = i1 + offset
+            cj = j1 + offset
+            cl, has_sl, op = _split_gap_markup(chk_gaps[cj])
+            if cl and "⟩" not in src_gaps[si]:
+                gap_close[si] = cl
+            if has_sl:
+                gap_slash[si] = True
+            if op and "⟨" not in src_gaps[si]:
+                gap_open[si] = op
+        cl_end, has_sl_end, _ = _split_gap_markup(chk_gaps[j2])
+        if cl_end and "⟩" not in src_gaps[i2]:
+            gap_close[i2] = cl_end
+        if has_sl_end and i2 < n_src:
+            gap_slash[i2] = True
+
+    pieces: list[str] = []
+    for idx_w, m in enumerate(src_matches):
+        g = src_gaps[idx_w]
+        if idx_w == 0:
+            pieces.append(g + gap_open[0])
+        else:
+            m_punc = re.match(r"^([,.;:?!\"'”’⟩]*)(.*)$", g, flags=re.S)
+            pre_p = m_punc.group(1) if m_punc else ""
+            post_p = m_punc.group(2) if m_punc else g
+            if gap_slash[idx_w]:
+                # 원문 괄호(⟨), 따옴표(“), 대시(—) 등 post_p의 비공백 문자를 절대 유실하지 않고 슬래시 뒤에 보존
+                post_nonspace = post_p.lstrip()
+                mid = f" / {post_nonspace}" if post_nonspace else " / "
+            else:
+                mid = post_p if post_p else " "
+            pieces.append(f"{gap_close[idx_w]}{pre_p}{mid}{gap_open[idx_w]}")
+        pieces.append(m.group(0))
+
+    last_g = src_gaps[n_src]
+    m_end = re.match(r"^([⟩\"'”’]*)([.?!,;:]?)(.*)$", last_g, flags=re.S)
+    if m_end:
+        pieces.append(f"{m_end.group(1)}{gap_close[n_src]}{m_end.group(2)}{m_end.group(3)}")
+    else:
+        pieces.append(f"{gap_close[n_src]}{last_g}")
+
+    balanced = _balance_added_markup_chars("".join(pieces))
+    restored = balanced.replace("⟨", "(").replace("⟩", ")")
+    restored = _normalize_syntax_bracket_consistency(src, restored)
+    if (
+        [t.lower() for t in _extract_english_word_tokens(restored)] == src_low
+        and _has_balanced_syntax_brackets(restored)
+        and src.count("(") <= restored.count("(")
+        and src.count(")") <= restored.count(")")
+    ):
+        return restored
+    return src
+
+
 def _check_chunked_english_fidelity(source_sent: str, chunked_sent: str) -> list[str]:
-    """chunked_english가 source_sent의 모든 영어 단어를 100% 그대로 보존하고 구문 괄호 규칙을 지키는지 검증한다."""
+    """chunked_english가 source_sent의 모든 영어 단어를 100% 그대로 보존하고 괄호 짝이 맞는지 검사한다."""
     issues: list[str] = []
     src = (source_sent or "").strip()
     chk = (chunked_sent or "").strip()
@@ -1557,191 +1986,16 @@ def _check_chunked_english_fidelity(source_sent: str, chunked_sent: str) -> list
     if re.search(r"\[\s*\]|\(\s*\)|/\s*/", chk):
         issues.append("빈 괄호 `[]`/`()` 또는 중복 슬래시 `/ /`가 포함되어 있습니다.")
 
-    # 병렬 동사구에 주어까지 앞 대괄호로 묶는 구문 오류 감지
-    for m_par in _PARALLEL_SUBJ_BRACKET_RE.finditer(chk):
-        right_inner = m_par.group(3).strip()
-        right_words = _extract_english_word_tokens(right_inner)
-        if right_words and right_words[0].lower() not in (
-            "they", "we", "he", "she", "it", "you", "i", "that", "which", "who", "what", "when", "if", "because", "although"
-        ):
-            issues.append(
-                f"병렬 구조 괄호 오류 (`[{m_par.group(1)}] {m_par.group(2)} [{right_inner}]`): "
-                "주어를 공유하는 동사구 병렬은 주어까지 앞 대괄호에 묶지 말고 슬래시(/)로만 구분하세요."
-            )
-            break
-
-    # 간접의문문 명사절을 소괄호 (...)로 잘못 묶은 오류 감지 (원문 자체 괄호 삽입구는 제외)
-    src_parens = {m.group(0).lower() for m in re.finditer(r"\([^()]+\)", src)}
-    for m_wh in _WH_PAREN_CLAUSE_RE.finditer(chk):
-        if m_wh.group(0).lower() in src_parens:
-            continue
-        inner = f"{m_wh.group(1)} {m_wh.group(2)}"
-        if len(_extract_english_word_tokens(inner)) >= 4 and _sentence_has_english_verb(inner):
-            issues.append(
-                f"명사절/간접의문문 괄호 기준 오류 (`{m_wh.group(0)}`): "
-                "절(주어+동사 포함)은 소괄호 `( )`가 아니라 대괄호 `[ ]`로 묶으세요."
-            )
-            break
-
     return issues
 
 
-def _balance_added_markup_chars(text: str) -> str:
-    """임시 센티넬(⟨⟩)로 보호된 원문 괄호는 유지하고, 새로 추가된 []/() 중 짝이 안 맞는 기호만 제거한다."""
-    chars = list(text)
-    remove_idx: set[int] = set()
-    for open_c, close_c in (("[", "]"), ("(", ")")):
-        stack: list[int] = []
-        for idx, ch in enumerate(chars):
-            if ch == open_c:
-                stack.append(idx)
-            elif ch == close_c:
-                if stack:
-                    stack.pop()
-                else:
-                    remove_idx.add(idx)
-        for unmatched in stack:
-            remove_idx.add(unmatched)
-    cleaned = "".join(ch for i, ch in enumerate(chars) if i not in remove_idx)
-    # 빈 괄호 및 중복 슬래시 정리
-    cleaned = re.sub(r"\[\s*\]|\(\s*\)", "", cleaned)
-    cleaned = re.sub(r"(?:\s*/\s*){2,}", " / ", cleaned)
-    cleaned = re.sub(r"^\s*/\s*|\s*/\s*$", "", cleaned)
-    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned).strip()
-    cleaned = re.sub(r"\s+([.,?!;:])", r"\1", cleaned)
-    return cleaned
-
-
-def _project_chunk_markup_onto_source(source_sent: str, chunked_sent: str) -> str:
-    """
-    AI의 chunked_english에 단어 변조·누락이 있더라도,
-    100% 정확한 source_sent 단어·원문 괄호·구두점 위에 유효한 구문 표기(/, [], ())만 안전하게 투영한다.
-    """
-    src = (source_sent or "").strip()
-    chk = (chunked_sent or "").strip()
-    if not src:
-        return chk
-    if not chk:
-        return src
-
-    # 이미 원문과 단어 100% 일치 + 괄호 균형이면 가볍게 공백만 정리해 반환
-    src_toks = _extract_english_word_tokens(src)
-    chk_toks = _extract_english_word_tokens(chk)
-    if (
-        [t.lower() for t in src_toks] == [t.lower() for t in chk_toks]
-        and _has_balanced_syntax_brackets(chk)
-        and not re.search(r"\[\s*\]|\(\s*\)|/\s*/", chk)
-    ):
-        # 혹시 원문 자체 괄호 (as commonly supposed)가 있는데 AI가 빠뜨렸는지 검사
-        if src.count("(") <= chk.count("(") and src.count(")") <= chk.count(")"):
-            return chk
-
-    word_re = re.compile(r"[A-Za-z0-9]+(?:['’-][A-Za-z0-9]+)*")
-    src_matches = list(word_re.finditer(src))
-    chk_matches = list(word_re.finditer(chk))
-    if not src_matches or not chk_matches:
-        return src
-
-    src_low = [m.group(0).lower().replace("’", "'") for m in src_matches]
-    chk_low = [m.group(0).lower().replace("’", "'") for m in chk_matches]
-    sm = difflib.SequenceMatcher(None, src_low, chk_low)
-    if sm.ratio() < 0.55:
-        return src
-
-    # 원문 괄호 ( )를 센티넬 ⟨ ⟩ 로 보호
-    src_gaps: list[str] = []
-    prev_end = 0
-    for m in src_matches:
-        g = src[prev_end : m.start()].replace("(", "⟨").replace(")", "⟩")
-        src_gaps.append(g)
-        prev_end = m.end()
-    src_gaps.append(src[prev_end:].replace("(", "⟨").replace(")", "⟩"))
-
-    chk_gaps: list[str] = []
-    c_prev = 0
-    for m in chk_matches:
-        chk_gaps.append(chk[c_prev : m.start()])
-        c_prev = m.end()
-    chk_gaps.append(chk[c_prev:])
-
-    # 매칭된 단어 경계의 구문 기호만 추출해 주입
-    n_src = len(src_matches)
-    gap_close: list[str] = [""] * (n_src + 1)
-    gap_slash: list[bool] = [False] * (n_src + 1)
-    gap_open: list[str] = [""] * (n_src + 1)
-
-    def _split_gap_markup(g_txt: str) -> tuple[str, bool, str]:
-        closes = "".join(re.findall(r"[\]\)]", g_txt.split("/")[0])) if "/" in g_txt else "".join(re.findall(r"[\]\)]", g_txt))
-        has_sl = "/" in g_txt
-        opens = "".join(re.findall(r"[\[\(]", g_txt.split("/")[-1])) if "/" in g_txt else "".join(re.findall(r"[\[\(]", g_txt))
-        return closes, has_sl, opens
-
-    for tag, i1, i2, j1, j2 in sm.get_opcodes():
-        if tag != "equal":
-            continue
-        block_len = i2 - i1
-        # 블록 시작 앞 열기 괄호
-        _, has_sl0, op0 = _split_gap_markup(chk_gaps[j1])
-        if op0 and "⟨" not in src_gaps[i1]:
-            gap_open[i1] = op0
-        if has_sl0 and i1 > 0:
-            gap_slash[i1] = True
-        # 블록 내부 경계
-        for offset in range(1, block_len):
-            si = i1 + offset
-            cj = j1 + offset
-            cl, has_sl, op = _split_gap_markup(chk_gaps[cj])
-            if cl and "⟩" not in src_gaps[si]:
-                gap_close[si] = cl
-            if has_sl:
-                gap_slash[si] = True
-            if op and "⟨" not in src_gaps[si]:
-                gap_open[si] = op
-        # 블록 끝 뒤 닫기 괄호
-        cl_end, has_sl_end, _ = _split_gap_markup(chk_gaps[j2])
-        if cl_end and "⟩" not in src_gaps[i2]:
-            gap_close[i2] = cl_end
-        if has_sl_end and i2 < n_src:
-            gap_slash[i2] = True
-
-    pieces: list[str] = []
-    for idx_w, m in enumerate(src_matches):
-        g = src_gaps[idx_w]
-        if idx_w == 0:
-            pieces.append(g + gap_open[0])
-        else:
-            # 기존 구두점(쉼표·세미콜론 등) 뒤에 닫기 괄호, 슬래시, 열기 괄호 배치
-            stripped_g = g
-            # 닫기 괄호는 앞 단어 바로 뒤, 구두점 앞/뒤 자연 위치에 배치
-            m_punc = re.match(r"^([,.;:?!\"'”’⟩]*)(.*)$", stripped_g, flags=re.S)
-            pre_p = m_punc.group(1) if m_punc else ""
-            post_p = m_punc.group(2) if m_punc else stripped_g
-            mid = " / " if gap_slash[idx_w] else (post_p if post_p else " ")
-            if gap_slash[idx_w] and "⟨" in post_p:
-                mid = " / " + post_p.lstrip()
-            pieces.append(f"{gap_close[idx_w]}{pre_p}{mid}{gap_open[idx_w]}")
-        pieces.append(m.group(0))
-    # 마지막 갭
-    last_g = src_gaps[n_src]
-    m_end = re.match(r"^([⟩\"'”’]*)([.?!,;:]?)(.*)$", last_g, flags=re.S)
-    if m_end:
-        pieces.append(f"{m_end.group(1)}{gap_close[n_src]}{m_end.group(2)}{m_end.group(3)}")
-    else:
-        pieces.append(f"{gap_close[n_src]}{last_g}")
-
-    balanced = _balance_added_markup_chars("".join(pieces))
-    restored = balanced.replace("⟨", "(").replace("⟩", ")")
-    if [t.lower() for t in _extract_english_word_tokens(restored)] == src_low and _has_balanced_syntax_brackets(restored):
-        return restored
-    return src
-
-
 def _collect_all_analysis_korean_blobs(out: EnglishPassageAnalysisOutput) -> str:
-    """분석지의 한국어 텍스트 영역(주제·흐름·도식·해석)을 모두 합쳐 교차 용어 검사용 문자열을 만든다."""
+    """분석지의 한국어 텍스트 영역(주제·흐름·도식·해석)을 모두 합쳐 교차 검사용 문자열을 만든다."""
     parts: list[str] = [
         out.title or "",
         out.core_theme or "",
         out.structure_flow or "",
+        out.exam_point_title or "",
         out.exam_point_note or "",
     ]
     vd = out.visual_diagram
@@ -1772,6 +2026,22 @@ def _collect_all_analysis_korean_blobs(out: EnglishPassageAnalysisOutput) -> str
     return "\n".join(parts)
 
 
+def _detect_foreign_script_contamination(text: str) -> list[str]:
+    """한국어 출력 필드에 일본어(히라가나·가타카나), 키릴, 아랍, 태국, 의도치 않은 한자 등 외국 문자 혼입을 감지한다."""
+    if not text:
+        return []
+    found: list[str] = []
+    m_for = _FOREIGN_SCRIPT_RE.search(text)
+    if m_for:
+        st_i = max(0, m_for.start() - 6)
+        en_i = min(len(text), m_for.end() + 6)
+        found.append(f"외국 문자({text[st_i:en_i].strip()!r})")
+    m_cjk = _UNEXPECTED_CJK_HANJA_RE.search(text)
+    if m_cjk:
+        found.append(f"한자/중국어({m_cjk.group(0)!r})")
+    return found
+
+
 def _validate_english_analysis_output(
     out: EnglishPassageAnalysisOutput,
     source_sents: Sequence[str],
@@ -1779,72 +2049,50 @@ def _validate_english_analysis_output(
     clean_passage: str = "",
     exam_context: dict[str, Any] | None = None,
 ) -> list[str]:
-    """생성된 영어 정밀 지문 분석지의 원문 보존·문장 수·구문 괄호·용어 환각·각주 반영 여부를 결정론적으로 검증한다."""
-    issues: list[str] = []
+    """
+    LLM 재시도가 반드시 필요한 **치명적 오류(critical issues)**만 선별해 반환한다.
+    (미세 단어 변조, 괄호 짝 어긋남, 원문 따옴표 삽입, 약한 주제문 플래그 등 파이썬 후처리로
+    0.01초 만에 100% 교정 가능한 항목은 재시도 트리거에서 제외해 로딩 시간과 토큰 소모를 최소화한다.)
+    """
+    _ = clean_passage
+    critical_issues: list[str] = []
     ctx = exam_context or {}
     sents = list(source_sents or [])
     analyses = sorted(list(out.sentence_analyses or []), key=lambda x: x.sentence_num)
 
-    # 1. 문장 수 누락/초과 검증
+    # 1. [치명] 문장 수 불일치 (정상 문장 누락·병합·초과)
     if sents and len(analyses) != len(sents):
-        issues.append(
+        critical_issues.append(
             f"문장 수 불일치: 원문은 총 {len(sents)}문장이나 분석 결과는 {len(analyses)}문장입니다. "
             "1번부터 마지막 문장까지 단 한 문장도 누락·병합·추가하지 말고 정확히 1:1로 분석하세요."
         )
 
-    # 2. 문장별 원문 100% 무손실 보존 및 구문 괄호 일관성 검증
+    # 2. [치명] 토큰 투영으로 복구 불가능한 수준의 심각한 문장 변조/환각 (유사도 < 0.55) 또는 해석 누락
     compare_n = min(len(sents), len(analyses))
-    fidelity_err_cnt = 0
     for idx in range(compare_n):
-        src_s = sents[idx]
-        sa = analyses[idx]
-        s_errs = _check_chunked_english_fidelity(src_s, sa.chunked_english)
-        for err in s_errs:
-            issues.append(f"{idx + 1}번 문장: {err}")
-            fidelity_err_cnt += 1
-        if fidelity_err_cnt >= 6:
+        src_toks = [t.lower() for t in _extract_english_word_tokens(sents[idx])]
+        chk_toks = [t.lower() for t in _extract_english_word_tokens(analyses[idx].chunked_english)]
+        if src_toks:
+            ratio = difflib.SequenceMatcher(None, src_toks, chk_toks).ratio()
+            if ratio < 0.55:
+                critical_issues.append(
+                    f"{idx + 1}번 문장이 원문과 심각하게 다릅니다(유사도 {ratio:.2f}). 원문 그대로 1:1 분석하세요."
+                )
+                break
+        if not (analyses[idx].korean_translation or "").strip():
+            critical_issues.append(f"{idx + 1}번 문장의 한국어 해석이 비어 있습니다.")
             break
 
-    # 3. 단순 연결/전환 단문에 ★ 주제문(is_topic_sentence) 남발 방지
-    topic_items = [sa for sa in analyses if getattr(sa, "is_topic_sentence", False)]
-    for sa in topic_items:
-        idx_s = sa.sentence_num - 1
-        ref_s = sents[idx_s] if 0 <= idx_s < len(sents) else sa.chunked_english
-        w_cnt = len(_extract_english_word_tokens(ref_s))
-        if w_cnt <= 6 or (_WEAK_TOPIC_SENT_RE.search(ref_s.strip()) and w_cnt <= 9):
-            issues.append(
-                f"{sa.sentence_num}번 문장(`{ref_s[:60]}`)은 짧은 연결/전환 문장이므로 `is_topic_sentence`를 `false`로 바꾸고, "
-                "글의 핵심 주장·결론이 완결적으로 담긴 문장에만 `true`를 부여하세요."
-            )
-
-    # 4. 해부학·과학·고유명사·과잉해석 용어 환각 교차 검증
-    p_low = (clean_passage or "").lower()
+    # 3. [치명] 한국어 출력 필드 외국어(일본어 가나·키릴·아랍·의도치 않은 중국어 한자 등) 혼입 차단
     kor_blob = _collect_all_analysis_korean_blobs(out)
-    if re.search(r"\beardrums?\b", p_low) and "귓바퀴" in kor_blob:
-        issues.append(
-            "해부학적 용어 환각: 원문의 `eardrum(s)`은 '고막'입니다. 논리 흐름·도식·해석 전체에서 '귓바퀴'를 '고막'으로 수정하세요."
-        )
-    if re.search(r"\bwallace\b", p_low) and "윌리스" in kor_blob:
-        issues.append(
-            "인명 오표기: 원문의 `Wallace`는 '윌리스'가 아니라 '월리스'로 통일해 표기하세요."
-        )
-    if (
-        re.search(r"\batomic\s+bonds?\b", p_low)
-        and not re.search(r"\batomic\s+structures?\b", p_low)
-        and "원자 구조" in kor_blob
-    ):
-        issues.append(
-            "원문 용어 변형: 원문의 `atomic bonds`는 '원자 결합'입니다. 도식·흐름의 '원자 구조'를 '원자 결합'으로 수정하세요."
-        )
-    if (
-        "생물학적" in kor_blob
-        and not re.search(r"\b(?:biological|biologically|biology)\b", p_low)
-    ):
-        issues.append(
-            "원문에 없는 과잉 해석: 지문에 `biological` 표현이 없으므로 도식·요약에서 '생물학적' 표현을 제거하고 원문 표현(예: 심리적·뇌의 산물)만 사용하세요."
+    foreign_hits = _detect_foreign_script_contamination(kor_blob)
+    if foreign_hits:
+        critical_issues.append(
+            f"한국어 출력 영역에 비한글 외국 문자({', '.join(foreign_hits)})가 혼입되었습니다. "
+            "모든 해석·주제·논리 흐름·도식은 순수 한국어(필요 시 원문 영어 용어만 병기)로 작성하세요."
         )
 
-    # 5. 문제지 공식 각주 뜻 반영 여부 검증
+    # 4. [범용] 문제지 공식 각주(* word: 뜻) 뜻 반영 여부 검증
     footnotes = list(ctx.get("footnotes") or [])
     for fn in footnotes:
         if ":" not in fn:
@@ -1853,7 +2101,6 @@ def _validate_english_analysis_output(
         eng_stem = re.sub(r"(?:e|s|es|ed|ing)$", "", eng_term.split()[0].lower())
         if len(eng_stem) < 4:
             eng_stem = eng_term.split()[0].lower()
-        # 각주 핵심 명사/어근 추출 (예: '~의 경계를 정하다' -> '경계', '측정기' -> '측정기')
         kor_tokens = [
             tok for tok in re.findall(r"[가-힣]{2,}", kor_mean)
             if tok not in ("하다", "되다", "이다", "있는", "없는", "것을", "으로", "에서")
@@ -1864,52 +2111,51 @@ def _validate_english_analysis_output(
         for idx in range(compare_n):
             if eng_stem in sents[idx].lower():
                 if primary_kor not in (analyses[idx].korean_translation or ""):
-                    issues.append(
+                    critical_issues.append(
                         f"각주 뜻 미반영 ({idx + 1}번 문장): 문제지 각주 `{eng_term}: {kor_mean}`의 뜻('{primary_kor}')을 "
                         f"{idx + 1}번 문장 해석에 정확히 반영하세요."
                     )
                 break
 
-    return issues
+    return critical_issues
 
 
-def _replace_hallucinated_term_in_analysis(
+def _enforce_english_analysis_token_guard(
     out: EnglishPassageAnalysisOutput,
-    bad: str,
-    good: str,
-) -> None:
-    """분석지 전체(제목·주제·흐름·도식·기출포인트·문장별 해석)에서 확정 오역/오표기를 일괄 치환한다."""
-    if not bad or bad == good:
-        return
-    out.title = (out.title or "").replace(bad, good)
-    out.core_theme = (out.core_theme or "").replace(bad, good)
-    out.structure_flow = (out.structure_flow or "").replace(bad, good)
-    out.exam_point_note = (out.exam_point_note or "").replace(bad, good)
-    vd = out.visual_diagram
-    if vd is not None:
-        vd.title = (vd.title or "").replace(bad, good)
-        vd.center_label = (vd.center_label or "").replace(bad, good)
-        vd.quadrant_x_label = (vd.quadrant_x_label or "").replace(bad, good)
-        vd.quadrant_y_label = (vd.quadrant_y_label or "").replace(bad, good)
-        vd.takeaway = (vd.takeaway or "").replace(bad, good)
-        vd.relation_labels = [(r or "").replace(bad, good) for r in (vd.relation_labels or [])]
-        for nd in vd.nodes or []:
-            nd.title = (nd.title or "").replace(bad, good)
-            nd.subtitle = (nd.subtitle or "").replace(bad, good)
-            nd.details = [(d or "").replace(bad, good) for d in (nd.details or [])]
-        for mr in vd.matrix_rows or []:
-            mr.criterion = (mr.criterion or "").replace(bad, good)
-            mr.values = [(v or "").replace(bad, good) for v in (mr.values or [])]
-        gs = vd.graph_spec
-        if gs is not None:
-            gs.x_label = (gs.x_label or "").replace(bad, good)
-            gs.y_label = (gs.y_label or "").replace(bad, good)
-            gs.highlight_point = (gs.highlight_point or "").replace(bad, good)
-            for cv in gs.curves or []:
-                cv.label = (cv.label or "").replace(bad, good)
-                cv.annotation = (cv.annotation or "").replace(bad, good)
-    for sa in out.sentence_analyses or []:
-        sa.korean_translation = (sa.korean_translation or "").replace(bad, good)
+    source_sents: Sequence[str] | None = None,
+) -> EnglishPassageAnalysisOutput:
+    """
+    최종 저장·렌더링 직전 모든 출력 경로에서 호출하는 최종 토큰 일치 & 괄호 균형 가드.
+    chunked_english에서 구문 기호(/, [], ())를 제거한 토큰 시퀀스가 원문 문장과 단 1단어라도 다르거나
+    괄호 짝이 맞지 않으면 강제로 원문 무손실 투영/폴백하여 변조된 문장이 절대 통과하지 못하게 한다.
+    """
+    sents = list(source_sents or [])
+    for idx, sa in enumerate(out.sentence_analyses or []):
+        chk = (sa.chunked_english or "").strip()
+        if idx < len(sents) and sents[idx].strip():
+            src_s = sents[idx].strip()
+            src_low = [t.lower() for t in _extract_english_word_tokens(src_s)]
+            chk_clean = _strip_spurious_quotes_against_source(src_s, chk)
+            chk_low = [t.lower() for t in _extract_english_word_tokens(chk_clean)]
+            if (
+                chk_low != src_low
+                or not _has_balanced_syntax_brackets(chk_clean)
+                or src_s.count("(") > chk_clean.count("(")
+                or src_s.count(")") > chk_clean.count(")")
+            ):
+                chk_clean = _project_chunk_markup_onto_source(src_s, chk_clean)
+            # 최종 2차 확인: 그래도 1단어라도 다르거나 괄호 불균형이면 원문 그대로 강제 폴백
+            if (
+                [t.lower() for t in _extract_english_word_tokens(chk_clean)] != src_low
+                or not _has_balanced_syntax_brackets(chk_clean)
+            ):
+                chk_clean = src_s
+            sa.chunked_english = chk_clean
+        else:
+            # 원문 문장 리스트가 없는 렌더링 폴백 경로에서도 최소한 괄호 짝 무결성은 보장
+            if chk and not _has_balanced_syntax_brackets(chk):
+                sa.chunked_english = _balance_added_markup_chars(chk)
+    return out
 
 
 def _repair_english_analysis_output(
@@ -1917,12 +2163,17 @@ def _repair_english_analysis_output(
     source_sents: Sequence[str],
     *,
     clean_passage: str = "",
+    orig_question_type: str = "",
     exam_context: dict[str, Any] | None = None,
 ) -> EnglishPassageAnalysisOutput:
     """
-    재시도 후에도 잔존할 수 있는 원문 변조·문장 누락·각주/기출포인트 누락·확정 오표기를
-    결정론적으로 최종 보정하여 내신 대비 시 100% 원문 무손실을 보장한다.
+    결정론적 파이썬 후처리 파이프라인:
+    1) 문장 1..N 정확 매칭 + 원문 따옴표 제거 + 구문 괄호 일관성/짝 복구 + 토큰 일치 최종 가드
+    2) 단순 전환 단문에 붙은 약한 ★ 주제문 자동 해제
+    3) 문항 유형별 기출 포인트(빈칸 원위치·무관한 문장·글의 순서·문장 삽입) 및 동적 제목 보강
+    4) 공식 각주 목록 보강
     """
+    _ = clean_passage
     ctx = exam_context or {}
     sents = list(source_sents or [])
     raw_list = sorted(list(out.sentence_analyses or []), key=lambda x: x.sentence_num)
@@ -1934,14 +2185,12 @@ def _repair_english_analysis_output(
         for idx_s, src_s in enumerate(sents):
             src_tok_set = set(t.lower() for t in _extract_english_word_tokens(src_s))
             matched_sa: EnglishSentenceAnalysisItem | None = None
-            # 우선 같은 위치(idx_s) 후보가 유사하면 그대로 사용
             if idx_s < len(raw_list) and idx_s not in used_indices:
                 cand_tok_set = set(t.lower() for t in _extract_english_word_tokens(raw_list[idx_s].chunked_english))
                 jac = len(src_tok_set & cand_tok_set) / max(1, len(src_tok_set | cand_tok_set))
                 if jac >= 0.45:
                     matched_sa = raw_list[idx_s]
                     used_indices.add(idx_s)
-            # 위치가 밀렸다면 가장 유사한 분석 항목 탐색
             if matched_sa is None:
                 best_j = -1
                 best_jac = 0.0
@@ -1967,6 +2216,7 @@ def _repair_english_analysis_output(
                         korean_translation=normalize_english_korean_translation(matched_sa.korean_translation),
                         syntax_notes=[],
                         original_blank_phrase=(matched_sa.original_blank_phrase or "").strip(),
+                        is_inserted_sentence=bool(getattr(matched_sa, "is_inserted_sentence", False)),
                     )
                 )
             else:
@@ -1978,6 +2228,7 @@ def _repair_english_analysis_output(
                         korean_translation="",
                         syntax_notes=[],
                         original_blank_phrase="",
+                        is_inserted_sentence=False,
                     )
                 )
     else:
@@ -2004,16 +2255,7 @@ def _repair_english_analysis_output(
 
     out.sentence_analyses = repaired_sents
 
-    # 3. 확정 오역·오표기 최종 안전 치환
-    p_low = (clean_passage or "").lower()
-    if re.search(r"\beardrums?\b", p_low):
-        _replace_hallucinated_term_in_analysis(out, "귓바퀴", "고막")
-    if re.search(r"\bwallace\b", p_low):
-        _replace_hallucinated_term_in_analysis(out, "윌리스", "월리스")
-    if re.search(r"\batomic\s+bonds?\b", p_low) and not re.search(r"\batomic\s+structures?\b", p_low):
-        _replace_hallucinated_term_in_analysis(out, "원자 구조", "원자 결합")
-
-    # 4. 기출 빈칸 원위치 및 무관한 문장 정답 포인트 결정론적 보강
+    # 3. 문항 유형별 기출 포인트 결정론적 보강 (빈칸·무관한 문장·글의 순서·문장 삽입)
     blank_phrase = (ctx.get("original_blank_phrase") or "").strip()
     if blank_phrase:
         bp_toks = [t.lower() for t in _extract_english_word_tokens(blank_phrase)]
@@ -2033,20 +2275,50 @@ def _repair_english_analysis_output(
                 break
         if blank_sent_num and blank_phrase.lower() not in (out.exam_point_note or "").lower():
             c_badge = _CIRCLED_NUM_LIST[blank_sent_num - 1] if 1 <= blank_sent_num <= 5 else f"{blank_sent_num}번"
-            prefix = f"[기출 빈칸 원위치 ({c_badge} 문장)] \"{blank_phrase}\""
+            prefix = f"[기출 빈칸 원위치 ({c_badge} 문장)] {blank_phrase}"
             out.exam_point_note = f"{prefix}\n{out.exam_point_note}".strip() if out.exam_point_note else prefix
 
     irrel_sent = (ctx.get("irrelevant_sentence") or "").strip()
     irrel_sym = (ctx.get("irrelevant_answer_sym") or "").strip()
     if irrel_sent:
         if irrel_sent[:35].lower() not in (out.exam_point_note or "").lower():
-            prefix = f"[제거된 무관한 문장 (정답 {irrel_sym or '해당 문항'})] \"{irrel_sent}\""
+            prefix = f"[제거된 무관한 문장 (정답 {irrel_sym or '해당 문항'})] {irrel_sent}"
             out.exam_point_note = f"{prefix}\n{out.exam_point_note}".strip() if out.exam_point_note else prefix
 
-    # 5. 공식 각주 어휘 보강
+    order_seq = (ctx.get("order_answer_seq") or "").strip()
+    if order_seq:
+        if order_seq not in (out.exam_point_note or ""):
+            prefix = f"[정답 순서] {order_seq}"
+            out.exam_point_note = f"{prefix}\n{out.exam_point_note}".strip() if out.exam_point_note else prefix
+
+    ins_sent = (ctx.get("inserted_sentence") or "").strip()
+    ins_sym = (ctx.get("inserted_answer_sym") or "").strip()
+    if ins_sent:
+        ins_toks = set(t.lower() for t in _extract_english_word_tokens(ins_sent))
+        for idx_s, sa in enumerate(out.sentence_analyses):
+            s_ref = sents[idx_s] if idx_s < len(sents) else sa.chunked_english
+            s_toks = set(t.lower() for t in _extract_english_word_tokens(s_ref))
+            if ins_toks and s_toks and len(ins_toks & s_toks) / max(1, len(ins_toks | s_toks)) >= 0.72:
+                sa.is_inserted_sentence = True
+                break
+        if ins_sent[:35].lower() not in (out.exam_point_note or "").lower():
+            pos_txt = f"정답 {ins_sym}번 위치" if ins_sym else "정답 위치"
+            prefix = f"[삽입 문장 ({pos_txt})] {ins_sent}"
+            out.exam_point_note = f"{prefix}\n{out.exam_point_note}".strip() if out.exam_point_note else prefix
+
+    # 동적 기출 포인트 제목 확정
+    if (out.exam_point_note or "").strip():
+        out.exam_point_title = _resolve_english_exam_point_title(orig_question_type, out.exam_point_note)
+    else:
+        out.exam_point_title = ""
+
+    # 4. 공식 각주 어휘 보강
     extracted_fn = list(ctx.get("footnotes") or [])
     if extracted_fn:
         out.footnotes = extracted_fn
 
+    # 5. 최종 토큰 일치 & 괄호 균형 가드 강제 적용
+    out = _enforce_english_analysis_token_guard(out, sents)
     return out
+
 

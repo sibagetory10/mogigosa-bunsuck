@@ -1441,14 +1441,15 @@ class StorageManager:
             self._save_english_analysis_pool_unlocked(pool)
 
     def get_english_analysis_pdf_path(self, cache_key: str) -> Path:
-        """지문별 영어 분석지 PDF 파일 경로를 반환한다 (v4: 원문 100% 무손실 검증 + 기출 포인트·각주 반영)."""
-        return self.english_analysis_pdfs_root / f"{self._safe_kor_cache_key(cache_key)}_eng_analysis_v4.pdf"
+        """지문별 영어 분석지 PDF 파일 경로를 반환한다 (v5: 최종 토큰 가드·동적 기출 포인트·폰트 폴백·도식 잘림 방지)."""
+        return self.english_analysis_pdfs_root / f"{self._safe_kor_cache_key(cache_key)}_eng_analysis_v5.pdf"
 
     def _unlink_eng_pdfs_for_key(self, cache_key: str) -> bool:
         safe_key = self._safe_kor_cache_key(cache_key)
         removed_any = False
         for pdf_p in (
             self.get_english_analysis_pdf_path(cache_key),
+            self.english_analysis_pdfs_root / f"{safe_key}_eng_analysis_v4.pdf",
             self.english_analysis_pdfs_root / f"{safe_key}_eng_analysis_v3.pdf",
             self.english_analysis_pdfs_root / f"{safe_key}_eng_analysis_v2.pdf",
             self.english_analysis_pdfs_root / f"{safe_key}_eng_analysis_v1.pdf",
@@ -1476,7 +1477,7 @@ class StorageManager:
             self.english_analysis_pdfs_root.mkdir(parents=True, exist_ok=True)
             _atomic_write_bytes(self.get_english_analysis_pdf_path(cache_key), pdf_bytes)
             safe_key = self._safe_kor_cache_key(cache_key)
-            for legacy_ver in ("v1", "v2", "v3"):
+            for legacy_ver in ("v1", "v2", "v3", "v4"):
                 legacy_p = self.english_analysis_pdfs_root / f"{safe_key}_eng_analysis_{legacy_ver}.pdf"
                 if legacy_p.exists():
                     legacy_p.unlink(missing_ok=True)

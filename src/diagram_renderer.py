@@ -51,18 +51,22 @@ _PALETTES: dict[str, dict[str, tuple[int, int, int]]] = {
 _COLOR_CYCLE = ("blue", "green", "amber", "purple", "slate")
 
 _REGULAR_FONT_CANDIDATES = (
-    "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
-    "/usr/share/fonts/truetype/nanum/NanumBarunGothic.ttf",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
     "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/truetype/nanum/NanumBarunGothic.ttf",
+    "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
     "C:/Windows/Fonts/malgun.ttf",
+    "C:/Windows/Fonts/NanumBarunGothic.ttf",
     "C:/Windows/Fonts/NanumGothic.ttf",
 )
 
 _BOLD_FONT_CANDIDATES = (
-    "/usr/share/fonts/truetype/nanum/NanumGothicBold.ttf",
-    "/usr/share/fonts/truetype/nanum/NanumBarunGothicBold.ttf",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
     "/usr/share/fonts/truetype/noto/NotoSansCJK-Bold.ttc",
+    "/usr/share/fonts/truetype/nanum/NanumBarunGothicBold.ttf",
+    "/usr/share/fonts/truetype/nanum/NanumGothicBold.ttf",
     "C:/Windows/Fonts/malgunbd.ttf",
+    "C:/Windows/Fonts/NanumBarunGothicBold.ttf",
     "C:/Windows/Fonts/NanumGothicBold.ttf",
     "C:/Windows/Fonts/malgun.ttf",
 )
@@ -84,6 +88,19 @@ def _load_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont | ImageF
             except Exception:
                 continue
     return ImageFont.load_default()
+
+
+def _measure_line_height(
+    font: ImageFont.FreeTypeFont | ImageFont.ImageFont,
+    min_lh: int,
+) -> int:
+    """폰트의 실제 한글/영문 글리프 높이를 측정해 줄 겹침·하단 잘림이 없는 안전한 줄 높이를 반환한다."""
+    try:
+        bb = font.getbbox("가나다Agjy()")
+        glyph_h = int(bb[3] - bb[1])
+        return max(min_lh, glyph_h + 7)
+    except Exception:
+        return min_lh
 
 
 def _wrap_text(
@@ -1419,7 +1436,7 @@ def _render_compact_vertical_layout(
     """좁은 컬럼(영어 분석지 좌측 등)에서 글씨가 큼직하게 읽히도록 세로 중심 고가독성 레이아웃을 계산한다."""
     probe = ImageDraw.Draw(Image.new("RGB", (W, 100)))
     inner_full_w = W - PAD_X * 2
-    nodes = list(diagram.nodes or [])[:5]
+    nodes = list(diagram.nodes or [])[:6]
     rel_labels = list(diagram.relation_labels or [])
 
     # 1) 비교 매트릭스표 (760px 폭 + 큰 폰트)
@@ -1541,14 +1558,16 @@ def _render_compact_vertical_layout(
     banner_h = 46 if show_center_banner else 0
     arrow_gap = 38
     card_w = inner_full_w
+    eff_title_lh = _measure_line_height(fonts["title"], 30)
+    eff_body_lh = _measure_line_height(fonts["body"], 27)
     card_hs = [
         _measure_card_height(
             probe, nd, card_w, fonts["sub"], fonts["title"], fonts["body"],
-            sub_h=30, title_lh=30, body_lh=27, min_h=88,
-        )
+            sub_h=30, title_lh=eff_title_lh, body_lh=eff_body_lh, min_h=88,
+        ) + 6
         for nd in nodes
     ]
-    total_h = (banner_h + 14 if show_center_banner else 0) + sum(card_hs) + arrow_gap * max(0, len(nodes) - 1)
+    total_h = (banner_h + 14 if show_center_banner else 0) + sum(card_hs) + arrow_gap * max(0, len(nodes) - 1) + 8
 
     def _draw_compact_stack(draw: ImageDraw.ImageDraw) -> None:
         cur_y = body_top
@@ -1570,7 +1589,7 @@ def _render_compact_vertical_layout(
             _draw_node_card(
                 draw, nd, PAD_X, cur_y, card_w, ch,
                 fonts["sub"], fonts["title"], fonts["body"],
-                sub_h=30, title_lh=30, body_lh=27,
+                sub_h=30, title_lh=eff_title_lh, body_lh=eff_body_lh,
             )
             if i < len(nodes) - 1:
                 y1 = cur_y + ch + 3
@@ -1617,8 +1636,8 @@ def render_korean_diagram_png(
             "lbl": _load_font(17, bold=True),
             "take": _load_font(20, bold=True),
         }
-        title_lh = 34
-        take_lh = 28
+        title_lh = _measure_line_height(fonts["hdr_title"], 34)
+        take_lh = _measure_line_height(fonts["take"], 30)
     else:
         W = 1400
         PAD_X = 36
@@ -1631,12 +1650,12 @@ def render_korean_diagram_png(
             "lbl": _load_font(14, bold=True),
             "take": _load_font(19, bold=True),
         }
-        title_lh = 34
-        take_lh = 28
+        title_lh = _measure_line_height(fonts["hdr_title"], 34)
+        take_lh = _measure_line_height(fonts["take"], 30)
 
     probe = ImageDraw.Draw(Image.new("RGB", (W, 200), (255, 255, 255)))
     title_lines = _wrap_text(probe, diagram.title or "핵심 원리 도식", fonts["hdr_title"], W - PAD_X * 2 - 20)
-    header_h = 24 + 28 + max(1, len(title_lines)) * title_lh + 14
+    header_h = 24 + 28 + max(1, len(title_lines)) * title_lh + 16
     body_top = header_h + 16
 
     takeaway_lines = (
@@ -1644,7 +1663,8 @@ def render_korean_diagram_png(
         if (diagram.takeaway or "").strip()
         else []
     )
-    takeaway_h = (len(takeaway_lines) * take_lh + 24) if takeaway_lines else 0
+    takeaway_pad_v = 14
+    takeaway_h = (len(takeaway_lines) * take_lh + takeaway_pad_v * 2 + 4) if takeaway_lines else 0
 
     if compact_vertical and dtype not in ("graph", "emotion_arc"):
         body_h, draw_fns = _render_compact_vertical_layout(diagram, dtype, W, PAD_X, body_top, fonts)
@@ -1679,7 +1699,9 @@ def render_korean_diagram_png(
     else:
         body_h, draw_fns = _render_card_layout(diagram, dtype, W, PAD_X, body_top, fonts)
 
-    total_h = body_top + body_h + 22 + (takeaway_h + 16 if takeaway_h else 0)
+    ty_box = body_top + body_h + 18
+    bottom_margin = 26
+    total_h = (ty_box + takeaway_h + bottom_margin) if takeaway_lines else (body_top + body_h + bottom_margin + 4)
     img = Image.new("RGB", (W, total_h), (255, 255, 255))
     draw = ImageDraw.Draw(img)
 
@@ -1722,7 +1744,6 @@ def render_korean_diagram_png(
         fn(draw)
 
     if takeaway_lines:
-        ty_box = body_top + body_h + 18
         draw.rounded_rectangle(
             [PAD_X, ty_box, W - PAD_X, ty_box + takeaway_h],
             radius=12,
@@ -1730,7 +1751,7 @@ def render_korean_diagram_png(
             outline=(245, 158, 11),
             width=2,
         )
-        cur_ty = ty_box + 12
+        cur_ty = ty_box + takeaway_pad_v
         for tl in takeaway_lines:
             draw.text((PAD_X + 18, cur_ty), tl, font=fonts["take"], fill=(146, 64, 14))
             cur_ty += take_lh

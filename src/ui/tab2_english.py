@@ -22,7 +22,10 @@ from src.auth import (
 from src.config import EXAM_TAGGING_MODEL, FLASH_LITE_MODEL, MODEL_LABELS
 from src.diagram_renderer import render_korean_diagram_png
 from src.gemini import (
+    _enforce_english_analysis_token_guard,
     _needs_english_passage_restoration,
+    _resolve_english_exam_point_title,
+    _split_english_sentences,
     generate_english_passage_analysis,
     generate_english_transformed_question,
     generate_english_visual_diagram,
@@ -458,6 +461,13 @@ def _render_english_analysis_results_section() -> None:
             an = an_item["analysis"]
             q_lbl = an_item.get("q_label") or an_item.get("exam_name") or "영어 지문"
             orig_t = an_item.get("orig_type") or "독해"
+            src_p = str(an_item.get("passage_text") or "").strip()
+            src_s = _split_english_sentences(src_p) if src_p else None
+            if src_s and len(src_s) == len(getattr(an, "sentence_analyses", None) or []):
+                an = _enforce_english_analysis_token_guard(an, src_s)
+            else:
+                an = _enforce_english_analysis_token_guard(an, None)
+
             with st.expander(
                 f"{idx_a}. [{q_lbl}] {an.title} ({orig_t})",
                 expanded=(idx_a == 1),
@@ -466,7 +476,10 @@ def _render_english_analysis_results_section() -> None:
                 st.success(f"**🧭 논리 전개 흐름:**\n\n{an.structure_flow}")
                 _ep_note = (getattr(an, "exam_point_note", "") or "").strip()
                 if _ep_note:
-                    st.warning(f"**🎯 기출 포인트 (빈칸 원위치 · 무관한 문장):**\n\n{_ep_note}")
+                    _ep_title = (getattr(an, "exam_point_title", "") or "").strip() or _resolve_english_exam_point_title(
+                        orig_t, _ep_note
+                    )
+                    st.warning(f"**🎯 {_ep_title}:**\n\n{_ep_note}")
                 _fn_list = [str(f).strip() for f in (getattr(an, "footnotes", None) or []) if str(f).strip()]
                 if _fn_list:
                     st.caption("📝 **문제지 공식 각주:** " + " · ".join(_fn_list))
@@ -487,7 +500,7 @@ def _render_english_analysis_results_section() -> None:
 
                 sent_list = list(getattr(an, "sentence_analyses", None) or [])
                 if sent_list:
-                    st.markdown("**🔍 문장별 정밀 구문 분석** (`/` 끊어읽기 · `[절]` · `(수식어구)` · `★ 주제문` · `기출 빈칸`)")
+                    st.markdown("**🔍 문장별 정밀 구문 분석** (`/` 끊어읽기 · `[절]` · `(수식어구)` · `★ 주제문` · `기출 포인트`)")
                     st.markdown(
                         "<style>"
                         ".eng-slash{color:#DC2626;font-weight:700;}"
@@ -502,20 +515,27 @@ def _render_english_analysis_results_section() -> None:
                         n_badge = _ENG_CIRCLED_NUMS[s_num - 1] if 1 <= s_num <= len(_ENG_CIRCLED_NUMS) else f"({s_num})"
                         is_topic = bool(getattr(sa, "is_topic_sentence", False))
                         blank_phrase = (getattr(sa, "original_blank_phrase", "") or "").strip()
-                        topic_html = (
-                            " <span style='background:#FEF3C7;color:#B45309;border:1px solid #F59E0B;"
-                            "padding:1px 6px;border-radius:4px;font-size:0.8em;font-weight:700;'>"
-                            "★ 주제문 (Topic Sentence)</span>"
-                            if is_topic
-                            else ""
-                        )
-                        blank_html = (
-                            " <span style='background:#EEF2FF;color:#3730A3;border:1px solid #818CF8;"
-                            "padding:1px 6px;border-radius:4px;font-size:0.8em;font-weight:700;'>"
-                            "📌 기출 빈칸 원위치</span>"
-                            if blank_phrase
-                            else ""
-                        )
+                        is_inserted = bool(getattr(sa, "is_inserted_sentence", False))
+                        badges: list[str] = []
+                        if is_topic:
+                            badges.append(
+                                "<span style='background:#FEF3C7;color:#B45309;border:1px solid #F59E0B;"
+                                "padding:1px 6px;border-radius:4px;font-size:0.8em;font-weight:700;'>"
+                                "★ 주제문 (Topic Sentence)</span>"
+                            )
+                        if blank_phrase:
+                            badges.append(
+                                "<span style='background:#EEF2FF;color:#3730A3;border:1px solid #818CF8;"
+                                "padding:1px 6px;border-radius:4px;font-size:0.8em;font-weight:700;'>"
+                                "📌 기출 빈칸 원위치</span>"
+                            )
+                        if is_inserted:
+                            badges.append(
+                                "<span style='background:#ECFDF5;color:#065F46;border:1px solid #34D399;"
+                                "padding:1px 6px;border-radius:4px;font-size:0.8em;font-weight:700;'>"
+                                "📥 기출 삽입 문장</span>"
+                            )
+                        badges_html = "".join(badges)
                         border_style = (
                             "border:1.5px solid #F59E0B;border-left:4px solid #D97706;background:#FFFBEB;"
                             if is_topic
@@ -528,7 +548,8 @@ def _render_english_analysis_results_section() -> None:
                         kor_txt = _html.escape(normalize_english_korean_translation(getattr(sa, "korean_translation", "") or ""))
                         st.markdown(
                             f"<div style='{border_style}border-radius:6px;padding:10px 12px;margin-bottom:8px;'>"
-                            f"<div style='margin-bottom:4px;'><strong style='color:#1E3A8A;'>{n_badge}</strong>{topic_html}{blank_html}</div>"
+                            f"<div style='display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-bottom:4px;'>"
+                            f"<strong style='color:#1E3A8A;'>{n_badge}</strong>{badges_html}</div>"
                             f"<div style='font-weight:600;color:#0F172A;line-height:1.6;margin-bottom:4px;'>{chunk_html}</div>"
                             f"<div style='color:#334155;font-size:0.95em;line-height:1.5;'>{kor_txt}</div>"
                             "</div>",

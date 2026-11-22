@@ -27,6 +27,7 @@ from src.gemini.english_validators import (
     _DANGLING_TO_END_RE,
     _assemble_english_slim_stem,
     _build_english_transform_rule,
+    _detect_foreign_script_contamination,
     _ensure_korean_instruction_prefix,
     _has_exam_structure_markers,
     _has_incomplete_english_blank,
@@ -142,12 +143,12 @@ def _verify_and_fix_english_tagged_passage(
     if q_num == 40:
         p = re.split(r"\n\s*(?:\[요약문\]|￫|->)\s*", p, maxsplit=1)[0].strip()
 
-    # 31~34(빈칸), 35(무관한 문장), 36~37(글의 순서): PyMuPDF 원본 텍스트와 대조해 원문 변조·문장 누락 즉시 복구
-    if local_question_text and q_num in (31, 32, 33, 34, 35, 36, 37):
+    # 31~34(빈칸), 35(무관한 문장), 36~37(글의 순서), 38~39(문장 삽입): PyMuPDF 원본 텍스트와 대조해 원문 변조·문장 누락 즉시 복구
+    if local_question_text and q_num in (31, 32, 33, 34, 35, 36, 37, 38, 39):
         inferred_type = (
             "빈칸 추론"
             if q_num in (31, 32, 33, 34)
-            else ("무관한 문장" if q_num == 35 else "글의 순서")
+            else ("무관한 문장" if q_num == 35 else ("글의 순서" if q_num in (36, 37) else "문장 삽입"))
         )
         reconciled, _ = _reconcile_english_passage_with_question_text(
             passage_text=p,
@@ -826,8 +827,8 @@ _ENGLISH_DIAGRAM_GUIDE = (
     "  ⑪ `pyramid` (위계·계층 피라미드): 상하 위계나 단계별 중요도가 쌓이는 구조(`nodes` 최상위→최하위 3~4개)에 사용.\n"
     "  ⑫ `flow` (원리·논리 흐름도): 통념 제시 → 반박 → 실험/근거 → 결론처럼 순차적 인과·논증 흐름에 사용 (`nodes` 2~4개, 짧은 `relation_labels` 6자 이내).\n"
     "공통 규칙: 각 카드 `details`는 1~3개의 짧은 한국어 핵심 구절(26자 이내), `takeaway`는 1줄 한국어 핵심 정리.\n"
-    "⚠️ **도식 근거 엄수(환각 금지)**: 지문 원문에 실제로 등장하는 개념·예시·용어만 그대로 사용하세요. "
-    "원문에 없는 해부학·과학 용어나 상위 범주(예: `eardrums`를 `귓바퀴`로 바꾸기, `atomic bonds`를 `원자 구조`로 바꾸기, 원문에 `biological`이 없는데 `생물학적` 덧붙이기)를 절대 임의로 추가·변형하지 마세요."
+    "⚠️ **도식 근거 엄수(환각·외국어 혼입 금지)**: 지문 원문에 실제로 등장하는 개념·예시·용어만 그대로 사용하세요. "
+    "원문에 없는 해부학·과학·학술 개념이나 상위 범주를 임의로 창작·변형하지 말고, 일본어·중국어 등 비한글 외국 문자 혼입 없이 순수 한국어로만 작성하세요."
 )
 
 
@@ -845,14 +846,14 @@ def generate_english_passage_analysis(
 ) -> EnglishPassageAnalysisOutput:
     """
     영어 독해 지문을 내신·수능형 정밀 지문 분석지(핵심 주제, 논리 전개 흐름, 이해용 시각 도식,
-    기출 원문 포인트·공식 각주, 문장별 원문 100% 무손실 슬래시(/) 끊어읽기 + [절]/(수식어) 구문독해 + 주제문 ★ 표시 + 해석)로
-    구조화 분석하고, 결정론적 무손실 검증·재시도·최종 보정을 수행한다.
+    유형별 기출 포인트·공식 각주, 문장별 원문 100% 무손실 슬래시(/) 끊어읽기 + [절]/(수식어) 구문독해 + 주제문 ★ 표시 + 해석)로
+    구조화 분석하고, 치명적 오류 전용 재시도 및 결정론적 최종 토큰 일치·괄호 보정을 수행한다.
     """
     raw_passage = (passage_text or "").strip()
     if not raw_passage:
         raise ValueError("분석할 영어 지문 원문(passage_text)이 비어 있습니다.")
 
-    # 1) 원본 PyMuPDF question_text(+정답)와 대조해 각주·빈칸 원위치·무관한 문장 추출 및 기존 DB 원문 변조·문장 누락 자동 복구
+    # 1) 원본 PyMuPDF question_text(+정답)와 대조해 각주·빈칸·무관한 문장·순서·삽입 추출 및 원문 무손실 복구
     reconciled_raw, exam_ctx = _reconcile_english_passage_with_question_text(
         passage_text=raw_passage,
         question_text=question_text,
@@ -893,39 +894,44 @@ def generate_english_passage_analysis(
     orig_blank_phrase = (exam_ctx.get("original_blank_phrase") or "").strip()
     irrel_sent = (exam_ctx.get("irrelevant_sentence") or "").strip()
     irrel_sym = (exam_ctx.get("irrelevant_answer_sym") or "").strip()
+    order_seq = (exam_ctx.get("order_answer_seq") or "").strip()
+    ins_sent = (exam_ctx.get("inserted_sentence") or "").strip()
+    ins_sym = (exam_ctx.get("inserted_answer_sym") or "").strip()
 
     client = _build_client(api_key, timeout_seconds=90)
     system_inst = (
         "당신은 대한민국 대치동·수능·내신 영어 1등급 전문 구문독해 일타 강사입니다.\n"
         "주어진 영어 독해 지문을 바탕으로, 학생이 내신 서술형·어법·변형 대비까지 단 하나의 오류 없이 학습할 수 있는 "
         "**초정밀 지문 분석지**를 JSON(`EnglishPassageAnalysisOutput`)으로 작성하세요.\n\n"
-        "[절대 준수 규칙 — 원문 변조·누락·용어 환각 0%]\n"
-        "1. `title`: 지문의 핵심 소재와 주제를 담은 간결한 제목 (한국어 제목 또는 영문 핵심구(한국어)).\n"
+        "[절대 준수 규칙 — 원문 무손실 · 괄호 일관성 · 외국어 혼입 0%]\n"
+        "1. `title`: 지문의 핵심 소재와 주제를 담은 간결한 제목 (순수 한국어 중심 또는 영문 핵심구(한국어)).\n"
         "2. `core_theme`: 지문 전체의 핵심 주제·요지를 한국어 1~2문장으로 명쾌하게 요약.\n"
         "3. `structure_flow`: 글 전체의 논리 전개 흐름을 `도입 : ...\\n전개 : ...\\n심화/반전 : ...\\n결론 : ...` 형식의 단계별 줄바꿈으로 작성. "
-        "지문 본문의 모든 핵심 전개(예: 실무 적용·협력 단계 포함)를 빠뜨리지 말고, 문장 해석·도식과 **100% 동일한 용어**를 사용하세요.\n"
-        "4. `visual_diagram`: 지문의 논리·비교·인과·순환 구조를 한눈에 파악할 수 있는 도식 그림(`KoreanVisualDiagram`)을 반드시 한국어로 작성.\n"
+        "지문 본문의 모든 핵심 전개를 빠뜨리지 말고, 문장 해석·도식과 **100% 동일한 한국어 용어**를 사용하세요.\n"
+        "4. `visual_diagram`: 지문의 논리·비교·인과·순환 구조를 한눈에 파악할 수 있는 도식 그림(`KoreanVisualDiagram`)을 반드시 순수 한국어로 작성.\n"
         f"{_ENGLISH_DIAGRAM_GUIDE}\n"
         "5. `exam_point_note`: 기출 원문 참고 정보가 주어진 경우에만 1~2줄로 간결히 작성(없으면 빈 문자열 `\"\"`).\n"
-        "   - 빈칸 추론(`[원래 기출 빈칸 구절]` 제공 시): 빈칸 원위치 문장 번호와 해당 원문 구절, 정답 논리 근거를 1~2줄로 명시.\n"
-        "   - 무관한 문장(`[원래 기출 무관한 문장]` 제공 시): 제거된 정답 번호·원문 문장을 그대로 인용하고 전체 흐름에서 벗어나는 이유를 1~2줄로 명시.\n"
+        "   - 빈칸 추론: 빈칸 원위치 문장 번호·원문 구절과 정답 논리 근거를 1~2줄로 명시.\n"
+        "   - 무관한 문장: 제거된 정답 번호·원문 문장과 전체 흐름에서 벗어나는 이유를 1~2줄로 명시.\n"
+        "   - 글의 순서: 정답 배열 순서(예: `(B) - (A) - (C)`)와 단락 연결 단서를 1~2줄로 명시.\n"
+        "   - 문장 삽입: 주어진 삽입 문장과 정답 위치, 앞뒤 논리 연결 근거를 1~2줄로 명시.\n"
         "6. `footnotes`: `[문제지 공식 각주]`가 주어졌으면 그대로 리스트로 담아 반환하고, 없으면 빈 배열 `[]`.\n"
         "7. `sentence_analyses`: 지문의 1번 문장부터 마지막 문장까지 단 한 문장도 빠뜨리거나 합치지 말고 순서대로(`sentence_num` 1..N) 1:1 분석하세요.\n"
-        "   - **원문 100% 무손실 보존(최우선 절대 규칙)**: `chunked_english`에는 원문의 모든 단어·철자·관사·대명사·원래 괄호 구절(예: `(as commonly supposed)`)·구두점을 **단 한 글자도 바꾸거나 빼거나 추가하지 마세요.**\n"
-        "     * **사전지식 덮어쓰기 엄금**: 유명한 격언·관용표현처럼 보이더라도 원문이 `does it make it sound?`이면 절대 `a sound`로 고치지 말고 원문 그대로 유지·번역하세요. `at one and the same time`을 `at once`로 변조하지 마세요.\n"
-        "   - **구문 괄호·슬래시 정밀 기준**:\n"
-        "     * **대괄호 `[ ... ]`**: 반드시 **절(명사절·간접의문문·관계사절·부사절)**에만 사용하세요. 특히 `why/how/what/whether` 간접의문문 명사절(예: `[why electrons have their particular mass and charge]`, `[how variation generation and inheritance worked]`)은 반드시 대괄호 `[ ... ]`로 통일하고 소괄호 `( ... )`로 묶지 마세요.\n"
-        "     * **소괄호 `( ... )`**: **구 수식어(전치사구·분사구·to부정사 형용사/부사적 수식구·삽입구)**에만 사용하세요. 원문 자체에 이미 들어있는 괄호 삽입구(예: `(as commonly supposed)`)는 절대 삭제하지 말고 원문 그대로 보존하세요.\n"
-        "     * **병렬 구조 주의**: `they just accept the measured values and move on`처럼 주어를 공유하는 동사구 병렬에서 `[they just accept ...]`처럼 주어까지 앞 대괄호에 묶지 마세요. `they / just accept the measured values / and / move on.`처럼 슬래시로 깔끔히 구분하세요.\n"
-        "     * **의미 단위 끊어읽기 ` / `**: 주어부·동사부·목적어·핵심 구문 경계에만 과도하지 않게 삽입하세요.\n"
-        "   - **`is_topic_sentence` 엄격 기준**: 글 전체의 핵심 주장·결론이 **구체적으로 완결 서술된 문장(1~2문장)**에만 `true`를 부여하세요. `The same is true of sound.` 같은 짧은 전환·연결 단문에는 절대 `true`를 달지 마세요.\n"
+        "   - **원문 100% 무손실 보존(최우선 절대 규칙)**: `chunked_english`에는 원문의 모든 단어·철자·관사·대명사·원래 괄호 구절·구두점을 **단 한 글자도 바꾸거나 빼거나 추가하지 마세요.**\n"
+        "     * **사전지식 덮어쓰기 엄금**: 유명한 격언·관용표현처럼 보이더라도 원문의 특이한 어휘·관사를 사전지식으로 임의 수정하지 말고 원문 철자 그대로 유지·번역하세요.\n"
+        "     * **원문 따옴표 임의 삽입 금지**: 빈칸 구절이나 강조 표현을 표시하기 위해 영어 원문 텍스트 자체에 큰따옴표(`\"...\"`)를 임의로 넣지 마세요. (강조는 시스템이 스타일로 하이라이트합니다.)\n"
+        "   - **구문 괄호·슬래시 일관성 기준**:\n"
+        "     * **대괄호 `[ ... ]`**: 반드시 **절(명사절·간접의문문·관계사절·부사절)**에만 사용하세요. `why/how/what/whether` 간접의문문 명사절도 반드시 대괄호 `[ ... ]`로 통일하고 소괄호 `( ... )`로 묶지 마세요.\n"
+        "     * **소괄호 `( ... )`**: **구 수식어(전치사구·분사구·to부정사 형용사/부사적 수식구·삽입구)**에만 사용하세요. 원문 자체에 이미 들어있는 괄호 삽입구는 절대 삭제하지 말고 원문 그대로 보존하세요.\n"
+        "     * **병렬 구조 주의**: 주어를 공유하는 동사구 병렬에서 주어까지 앞 대괄호에 묶지 말고 슬래시(`/`)로만 구분하세요.\n"
+        "     * **괄호 짝 엄수**: 모든 `[ ]`와 `( )`는 교차 중첩 없이 열림/닫힘 짝이 정확히 맞아야 합니다.\n"
+        "   - **`is_topic_sentence` 엄격 기준**: 글 전체의 핵심 주장·결론이 **구체적으로 완결 서술된 문장(1~2문장)**에만 `true`를 부여하고, 짧은 전환·연결 단문에는 `false`를 유지하세요.\n"
         "   - **`original_blank_phrase`**: `[원래 기출 빈칸 구절]`이 이 문장에 포함되어 있으면 해당 구절을 원문 철자 그대로 기재하고, 나머지 문장은 빈 문자열 `\"\"`.\n"
-        "   - **`korean_translation` 정밀 번역 & 용어 일관성 규칙**:\n"
+        "   - **`korean_translation` 정밀 번역 & 언어 순수성 규칙**:\n"
         "     * `/`, `[ ]`, `( )` 구문 기호나 직독직해 끊어쓰기 없이 자연스러운 일반 한국어 문장으로 작성하세요.\n"
-        "     * **동일 핵심어 번역 통일**: 지문 내 반복 단어(예: `Beings`, `eardrums`, `designation`)는 모든 문장 해석·논리 흐름·도식에서 동일한 한국어 용어로 일관되게 번역하세요.\n"
-        "     * **해부학·과학·고유명사 정확성**: `eardrums`는 모든 영역에서 `고막`(절대 `귓바퀴` 금지), `atomic bonds`는 `원자 결합`(절대 `원자 구조` 금지), `Wallace`는 `월리스`(절대 `윌리스` 금지), `biological`이 원문에 없으면 `생물학적` 추가 금지.\n"
-        "     * **공식 해설·각주 존중**: `[공식 해설 참고]`와 `[문제지 공식 각주]`가 제공되면 각주 단어의 한국어 뜻(예: `delineate`→`~의 경계를 정하다`, `gauge`→`측정기`)과 문맥·논지에 부합하는 정확한 용어(예: "
-        "'소리가 없다'는 논지에서 `make a mess`는 소리를 연상시키는 '소란' 대신 '혼란/난장판')를 반영하세요.\n"
+        "     * **외국어 혼입 절대 금지**: 일본어(히라가나·가타카나), 중국어 한자, 기타 비한글 외국 문자를 한국어 출력 필드 어디에도 절대 섞지 마세요.\n"
+        "     * **동일 핵심어·고유명사 일관성**: 지문 내 반복 핵심어, 인명(표준 외래어 표기), 과학·해부학 전문 용어는 모든 문장 해석·논리 흐름·도식에서 100% 동일한 정확한 한국어로 통일하세요.\n"
+        "     * **공식 해설·각주 존중**: `[공식 해설 참고]`와 `[문제지 공식 각주]`가 제공되면 각주 단어의 한국어 뜻과 공식 해설의 맥락적 번역을 최우선으로 반영하세요.\n"
         "   - `syntax_notes`: 문장별 문법 설명은 출력하지 않으므로 반드시 빈 배열 `[]`로 두세요."
     )
 
@@ -939,13 +945,23 @@ def generate_english_passage_analysis(
         )
     if orig_blank_phrase:
         extra_blocks.append(
-            f"[원래 기출 빈칸 구절 (정답 {answer or '-'})]\n\"{orig_blank_phrase}\"\n"
-            "→ 이 구절이 포함된 문장의 `original_blank_phrase`에 그대로 기록하고, `exam_point_note`에 빈칸 원위치와 정답 근거를 명시하세요."
+            f"[원래 기출 빈칸 구절 (정답 {answer or '-'})]\n{orig_blank_phrase}\n"
+            "→ 이 구절이 포함된 문장의 `original_blank_phrase`에 그대로 기록하고(영문 본문에 따옴표 추가 금지), `exam_point_note`에 빈칸 원위치와 정답 근거를 명시하세요."
         )
     if irrel_sent:
         extra_blocks.append(
-            f"[원래 기출 무관한 문장 (제거된 정답 {irrel_sym or answer or '-'})]\n\"{irrel_sent}\"\n"
+            f"[원래 기출 무관한 문장 (제거된 정답 {irrel_sym or answer or '-'})]\n{irrel_sent}\n"
             "→ 본문 `sentence_analyses`에는 넣지 말고, `exam_point_note`에 이 제거된 문장 원문과 전체 흐름에서 벗어나는 이유를 반드시 명시하세요."
+        )
+    if order_seq:
+        extra_blocks.append(
+            f"[원래 기출 글의 순서 (정답 배열)]\n{order_seq}\n"
+            "→ `exam_point_note`에 정답 배열 순서와 단락 간 연결 단서를 1~2줄로 명시하세요."
+        )
+    if ins_sent:
+        extra_blocks.append(
+            f"[원래 기출 문장 삽입 (정답 {ins_sym or answer or '-'}번 위치)]\n{ins_sent}\n"
+            "→ `exam_point_note`에 주어진 삽입 문장과 정답 위치, 앞뒤 연결 근거를 1~2줄로 명시하세요."
         )
     extra_section = ("\n\n" + "\n\n".join(extra_blocks)) if extra_blocks else ""
 
@@ -980,26 +996,29 @@ def generate_english_passage_analysis(
             fast_mode=True,
         )
         out = _parse_structured(resp, EnglishPassageAnalysisOutput)
-        issues = _validate_english_analysis_output(
+        # 치명적 오류(문장 누락, 외국어 혼입, 심각한 문장 변조, 각주 미반영)에만 LLM 재시도 발동
+        critical_issues = _validate_english_analysis_output(
             out,
             sents,
             clean_passage=clean_passage,
             exam_context=exam_ctx,
         )
-        if not issues:
+        if not critical_issues:
             break
         if attempt == 0:
             prompt = (
                 base_prompt
                 + "\n\n[⚠️ 직전 분석 결과에서 치명적 오류가 감지되었습니다 — 아래 항목을 100% 수정하여 다시 생성하세요]\n"
-                + "\n".join(f"- {iss}" for iss in issues)
+                + "\n".join(f"- {iss}" for iss in critical_issues)
             )
 
     assert out is not None
+    # 파이썬 결정론적 후처리(토큰 투영·최종 토큰 일치 가드·괄호 짝/일관성·따옴표 제거·유형별 기출 포인트·각주 보강)
     out = _repair_english_analysis_output(
         out,
         sents,
         clean_passage=clean_passage,
+        orig_question_type=orig_question_type,
         exam_context=exam_ctx,
     )
     out.is_source_restored = True
@@ -1024,30 +1043,53 @@ def generate_english_visual_diagram(
     client = _build_client(api_key, timeout_seconds=60)
     system_inst = (
         "당신은 수능 영어 일타 강사입니다. 주어진 영어 지문 원문만을 100% 근거로, "
-        "학생이 핵심 논리·비교·인과·구조를 그림으로 한눈에 이해할 수 있는 도식 명세(`KoreanVisualDiagram`) JSON을 한국어로 작성하세요.\n"
-        "원문에 없는 해부학·과학 개념이나 상위 범주(예: eardrums→귓바퀴, atomic bonds→원자 구조, biological 미언급 시 생물학적 추가)를 절대 창작하지 마세요.\n"
+        "학생이 핵심 논리·비교·인과·구조를 그림으로 한눈에 이해할 수 있는 도식 명세(`KoreanVisualDiagram`) JSON을 순수 한국어로 작성하세요.\n"
+        "원문에 없는 해부학·과학·학술 개념을 창작하지 말고, 일본어·중국어 등 비한글 외국 문자를 절대 혼입하지 마세요.\n"
         + _ENGLISH_DIAGRAM_GUIDE
     )
-    prompt = (
+    base_prompt = (
         f"[제목/주제] {title or '-'} / {core_theme or '-'}\n\n"
         f"[영어 지문 원문]\n{clean_passage[:4500]}\n\n"
         "위 영어 지문의 핵심 논리 구조를 시각화한 한국어 도식 JSON을 작성하세요."
     )
-    resp = _generate_content_with_fallback(
-        client=client,
-        model_name=eff_model,
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            system_instruction=system_inst,
-            response_mime_type="application/json",
-            response_schema=KoreanVisualDiagram,
-            temperature=0.05,
-            max_output_tokens=2048,
-            thinking_config=types.ThinkingConfig(
-                thinking_level=types.ThinkingLevel.MINIMAL,
-                include_thoughts=False,
+    prompt = base_prompt
+    diag: KoreanVisualDiagram | None = None
+    for attempt in range(2):
+        resp = _generate_content_with_fallback(
+            client=client,
+            model_name=eff_model,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                system_instruction=system_inst,
+                response_mime_type="application/json",
+                response_schema=KoreanVisualDiagram,
+                temperature=0.05 if attempt == 0 else 0.0,
+                max_output_tokens=2048,
+                thinking_config=types.ThinkingConfig(
+                    thinking_level=types.ThinkingLevel.MINIMAL,
+                    include_thoughts=False,
+                ),
             ),
-        ),
-        fast_mode=True,
-    )
-    return _parse_structured(resp, KoreanVisualDiagram)
+            fast_mode=True,
+        )
+        diag = _parse_structured(resp, KoreanVisualDiagram)
+        diag_blob = "\n".join(
+            [
+                diag.title or "",
+                diag.center_label or "",
+                diag.takeaway or "",
+                *(diag.relation_labels or []),
+                *[nd.title or "" for nd in (diag.nodes or [])],
+                *[d for nd in (diag.nodes or []) for d in (nd.details or [])],
+            ]
+        )
+        foreign_hits = _detect_foreign_script_contamination(diag_blob)
+        if not foreign_hits:
+            break
+        if attempt == 0:
+            prompt = (
+                base_prompt
+                + f"\n\n[⚠️ 비한글 외국 문자({', '.join(foreign_hits)})가 감지되었습니다. 순수 한국어로만 다시 작성하세요.]"
+            )
+    assert diag is not None
+    return diag
