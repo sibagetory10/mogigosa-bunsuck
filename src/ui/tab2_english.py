@@ -22,6 +22,7 @@ from src.auth import (
 from src.config import EXAM_TAGGING_MODEL, FLASH_LITE_MODEL, MODEL_LABELS
 from src.diagram_renderer import render_korean_diagram_png
 from src.gemini import (
+    _needs_english_passage_restoration,
     generate_english_passage_analysis,
     generate_english_transformed_question,
     generate_english_visual_diagram,
@@ -221,6 +222,14 @@ def _execute_english_analysis_jobs(
         c_key = ctx.storage.build_english_analysis_key(p_txt, q_lbl)
         cached_an = ctx.storage.get_cached_english_analysis(c_key)
         cached_pdf = ctx.storage.get_english_analysis_pdf_bytes(c_key) if include_diagrams else None
+        if (
+            cached_an is not None
+            and not getattr(cached_an, "is_source_restored", False)
+            and _needs_english_passage_restoration(p_txt, str(it.get("orig_type", "") or ""))
+        ):
+            # 빈칸·어법·어휘·삽입·순서 등 원문 복원이 필요한 구버전 미복원 캐시는 1회 자동 재분석
+            cached_an = None
+            cached_pdf = None
         if cached_an is not None and getattr(cached_an, "sentence_analyses", None):
             _dirty_kor = False
             for _sa in cached_an.sentence_analyses:
@@ -285,6 +294,9 @@ def _execute_english_analysis_jobs(
                             source_label=it["q_label"],
                             orig_question_type=it.get("orig_type", ""),
                             passage_topic=it.get("passage_topic", ""),
+                            answer=it.get("answer", ""),
+                            choices=it.get("choices", []),
+                            explanation=it.get("explanation", ""),
                         )
                         return slot_i, an_out
 
@@ -983,6 +995,9 @@ def _render_english_analysis_submode(ctx: AppContext) -> None:
                                 "orig_type": (getattr(rec_p, "english_question_type", "") or rec_p.unit_name).strip(),
                                 "passage_topic": (getattr(rec_p, "passage_topic", "") or "").strip(),
                                 "passage_text": rec_p.passage_text,
+                                "answer": (getattr(rec_p, "answer", "") or "").strip(),
+                                "choices": list(getattr(rec_p, "choices", None) or []),
+                                "explanation": (getattr(rec_p, "explanation", "") or "").strip(),
                             }
                             for rec_p, q_label in checked_an_rows
                         ]

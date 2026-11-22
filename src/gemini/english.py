@@ -30,6 +30,7 @@ from src.gemini.english_validators import (
     _ensure_korean_instruction_prefix,
     _has_incomplete_english_blank,
     _is_irrelevant_answer_from_source,
+    _needs_english_passage_restoration,
     _preprocess_english_source_passage,
     _rebuild_insertion_stem_from_source,
     _reconcile_english_insertion_answer,
@@ -282,23 +283,50 @@ def _restore_incomplete_source_passage(
     api_key: str,
     model_name: str,
     passage: str,
+    orig_question_type: str = "",
+    answer: str = "",
+    choices: Sequence[str] | None = None,
+    explanation: str = "",
 ) -> str:
-    """빈칸 기출 원문에서 빠진 구절만 문맥에 맞게 복원해 완전한 영어 지문을 만든다 (해시 캐싱)."""
-    if not api_key or not _has_incomplete_english_blank(passage):
+    """빈칸·어법·어휘·무관한 문장·삽입·순서 등 기출 변형 지문을 원래의 완전하고 문법적으로 올바른 영어 지문으로 복원한다 (해시 캐싱)."""
+    if not api_key or not _needs_english_passage_restoration(passage, orig_question_type):
         return passage
-    p_hash = hashlib.sha256(passage.encode("utf-8")).hexdigest()[:24]
+    choices_str = " | ".join(str(c).strip() for c in (choices or []) if str(c).strip())
+    hash_src = f"{passage}\n||{orig_question_type}||{answer}||{choices_str}"
+    p_hash = hashlib.sha256(hash_src.encode("utf-8")).hexdigest()[:24]
     with _RESTORED_PASSAGE_LOCK:
         cached = _RESTORED_PASSAGE_CACHE.get(p_hash)
         if cached:
             return cached
     try:
         client = _build_client(api_key, timeout_seconds=45)
+        meta_lines: list[str] = []
+        if (orig_question_type or "").strip():
+            meta_lines.append(f"- Original Question Type: {orig_question_type.strip()}")
+        if (answer or "").strip():
+            meta_lines.append(f"- Official Correct Answer: {answer.strip()}")
+        if choices_str:
+            meta_lines.append(f"- Original Choices: {choices_str[:700]}")
+        if (explanation or "").strip():
+            meta_lines.append(f"- Official Explanation (reference): {explanation.strip()[:800]}")
+        meta_block = ("\n[Exam Metadata]\n" + "\n".join(meta_lines) + "\n") if meta_lines else ""
+
         prompt = (
-            "Below is an English reading passage extracted from a blank-filling exam question, "
-            "so one phrase or clause is missing (e.g., 'there isn't much .', 'has to .', '____', or a noun phrase without a verb).\n"
-            "Restore ONLY the missing word/phrase/clause naturally so every sentence is grammatically complete. "
-            "Keep ALL other words 100% identical. Output ONLY the restored English passage with no commentary.\n\n"
-            f"{passage}"
+            "Below is an English reading passage extracted from a Korean CSAT/mock exam question. "
+            "Because it was used as an exam question, it may contain one of the following intentional modifications or extraction artifacts:\n"
+            "1) Blank-filling: a missing phrase/clause (e.g. '____', '[   ]', an abrupt gap, or an incomplete sentence).\n"
+            "2) Grammar (어법): ONE grammatically incorrect word/expression (e.g. 'making' instead of 'makes', wrong verb/relative pronoun/tense) OR an '(A)/(B)/(C)' bracketed choice.\n"
+            "3) Vocabulary (어휘): ONE contextually inappropriate/antonym word OR an '(A)/(B)/(C)' bracketed choice.\n"
+            "4) Irrelevant sentence (무관한 문장): ONE off-topic sentence marked with ①~⑤.\n"
+            "5) Sentence insertion / Ordering (문장 삽입 / 글의 순서): insertion markers ①~⑤ or shuffled paragraph markers (A)/(B)/(C).\n\n"
+            "Your task: Restore ONLY the defective/missing/incorrect/misplaced part using the exam metadata (answer/choices/explanation) and context so the passage is a 100% grammatically sound, logically coherent original English text.\n"
+            "- Remove exam markers like ①, ②, ③, ④, ⑤ or (A)/(B)/(C) labels if they are question markers.\n"
+            "- For grammar/vocabulary questions, fix ONLY the single erroneous/antonym expression to the correct form/word.\n"
+            "- For irrelevant-sentence questions, remove ONLY the off-topic sentence.\n"
+            "- Keep ALL other words, punctuation, and sentence structures 100% identical.\n"
+            "- Output ONLY the restored English passage with no commentary or markdown.\n"
+            f"{meta_block}\n"
+            f"[Passage]\n{passage}"
         )
         resp = _generate_content_with_fallback(
             client=client,
@@ -315,7 +343,7 @@ def _restore_incomplete_source_passage(
             fast_mode=True,
         )
         restored = _preprocess_english_source_passage((resp.text or "").strip())
-        if restored and len(restored) >= int(len(passage) * 0.8) and not _has_incomplete_english_blank(restored):
+        if restored and len(restored) >= int(len(passage) * 0.65) and not _has_incomplete_english_blank(restored):
             with _RESTORED_PASSAGE_LOCK:
                 if len(_RESTORED_PASSAGE_CACHE) > 512:
                     _RESTORED_PASSAGE_CACHE.clear()
@@ -646,6 +674,9 @@ def generate_english_passage_analysis(
     source_label: str = "",
     orig_question_type: str = "",
     passage_topic: str = "",
+    answer: str = "",
+    choices: Sequence[str] | None = None,
+    explanation: str = "",
 ) -> EnglishPassageAnalysisOutput:
     """
     영어 독해 지문을 내신·수능형 정밀 지문 분석지(핵심 주제, 논리 전개 흐름, 이해용 시각 도식,
@@ -656,8 +687,16 @@ def generate_english_passage_analysis(
         raise ValueError("분석할 영어 지문 원문(passage_text)이 비어 있습니다.")
 
     eff_model = (model_name or "").strip() or EXAM_TAGGING_MODEL
-    if _has_incomplete_english_blank(clean_passage):
-        clean_passage = _restore_incomplete_source_passage(api_key, eff_model, clean_passage)
+    if _needs_english_passage_restoration(clean_passage, orig_question_type):
+        clean_passage = _restore_incomplete_source_passage(
+            api_key,
+            eff_model,
+            clean_passage,
+            orig_question_type=orig_question_type,
+            answer=answer,
+            choices=choices,
+            explanation=explanation,
+        )
 
     sents = _split_english_sentences(clean_passage)
     numbered_sents_block = (
@@ -717,6 +756,7 @@ def generate_english_passage_analysis(
         fast_mode=True,
     )
     out = _parse_structured(resp, EnglishPassageAnalysisOutput)
+    out.is_source_restored = True
     if out.sentence_analyses:
         for sa in out.sentence_analyses:
             sa.korean_translation = normalize_english_korean_translation(sa.korean_translation)

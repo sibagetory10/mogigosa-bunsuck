@@ -1155,6 +1155,8 @@ def _assemble_english_slim_stem(
 
 _INCOMPLETE_BLANK_RE = re.compile(
     r"_{2,}|"
+    r"\[\s+\]|\(\s+\)|"
+    r"\(\s*[A-C]\s*\)\s*(?:\[[^\]]+/[^\]]+\]|[A-Za-z-]+/[A-Za-z-]+)|"
     r"[A-Za-z][ \t]+[.?!](?=\s|$|[\"'”’\)])|"
     r"\b(?:isn't\s+much|aren't\s+many|has\s+to|have\s+to|had\s+to|want\s+to|need\s+to|"
     r"able\s+to|going\s+to|ought\s+to|used\s+to|the|a|an|of|in|on|at|for|with|from|into|by|that|which)\s*[.?!]"
@@ -1162,9 +1164,20 @@ _INCOMPLETE_BLANK_RE = re.compile(
     re.IGNORECASE,
 )
 
+_RESTORE_TARGET_TYPE_KEYWORDS = (
+    "어법",
+    "어휘",
+    "빈칸",
+    "무관",
+    "흐름",
+    "삽입",
+    "순서",
+    "낱말",
+)
+
 
 def _has_incomplete_english_blank(passage: str) -> bool:
-    """원문 영어 지문 자체가 빈칸 기출이어서 비문/누락 문장이 있는지 판별한다."""
+    """원문 영어 지문 자체가 빈칸·선택형 기출이어서 비문/누락 문장이 있는지 판별한다."""
     if not passage:
         return False
     if _INCOMPLETE_BLANK_RE.search(passage):
@@ -1173,4 +1186,14 @@ def _has_incomplete_english_blank(passage: str) -> bool:
         words = re.findall(r"[A-Za-z]+", sent)
         if len(words) >= 4 and not _sentence_has_english_verb(sent):
             return True
+    return False
+
+
+def _needs_english_passage_restoration(passage: str, orig_question_type: str = "") -> bool:
+    """기출 지문이 빈칸·어법·어휘·삽입·순서·무관한 문장 등으로 원문 복원/교정이 필요한지 판별한다."""
+    if _has_incomplete_english_blank(passage):
+        return True
+    q_type = (orig_question_type or "").strip()
+    if q_type and any(kw in q_type for kw in _RESTORE_TARGET_TYPE_KEYWORDS):
+        return True
     return False

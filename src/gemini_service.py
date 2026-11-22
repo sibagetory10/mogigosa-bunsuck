@@ -94,6 +94,7 @@ from src.gemini.english_validators import (  # noqa: F401
     _has_order_scrambled_sentences,
     _is_irrelevant_answer_from_source,
     _is_order_abc_canonical,
+    _needs_english_passage_restoration,
     _preprocess_english_source_passage,
     _rebuild_insertion_stem_from_source,
     _reconcile_english_insertion_answer,

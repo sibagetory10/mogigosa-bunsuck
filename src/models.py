@@ -905,6 +905,10 @@ class EnglishPassageAnalysisOutput(BaseModel):
         default_factory=list,
         description="지문 전체 문장에 대한 1번부터 끝번까지의 문장별 정밀 구문독해 리스트",
     )
+    is_source_restored: bool = Field(
+        default=False,
+        description="빈칸·어법·어휘·삽입·순서 등 기출 변형 원문 복원 및 교정 완료 여부",
+    )
 
 
 class ExamHeaderMetadata(BaseModel):
