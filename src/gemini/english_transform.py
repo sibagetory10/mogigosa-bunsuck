@@ -13,6 +13,7 @@ from src.gemini.core import (
     _CIRCLED_DIGIT_TO_NUM,
     _build_client,
     _generate_content_with_fallback,
+    _generate_structured_with_fallback,
     _is_flash_lite_model,
     _normalize_extracted_answer,
     _parse_structured,
@@ -244,25 +245,26 @@ def generate_english_transformed_question(
     base_out_tokens = min(8192, max(3072, int(len(clean_passage) / 2.0) + 1800))
     for attempt in range(3):
         out_tokens = base_out_tokens if attempt == 0 else min(12288, int(base_out_tokens * 1.6))
-        resp = _generate_content_with_fallback(
-            client=client,
-            model_name=eff_model,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                system_instruction=system_inst,
-                response_mime_type="application/json",
-                response_schema=RewrittenQuestion,
-                temperature=0.35 if previous_attempt is not None else 0.25,
-                max_output_tokens=out_tokens,
-                thinking_config=types.ThinkingConfig(
-                    thinking_level=target_thinking_level,
-                    include_thoughts=False,
-                ),
-            ),
-            fast_mode=not use_precision_mode,
-        )
         try:
-            parsed_rw = _parse_structured(resp, RewrittenQuestion)
+            parsed_rw = _generate_structured_with_fallback(
+                client=client,
+                model_name=eff_model,
+                contents=prompt,
+                schema_cls=RewrittenQuestion,
+                config=types.GenerateContentConfig(
+                    system_instruction=system_inst,
+                    response_mime_type="application/json",
+                    response_schema=RewrittenQuestion,
+                    temperature=0.35 if previous_attempt is not None else 0.25,
+                    max_output_tokens=out_tokens,
+                    thinking_config=types.ThinkingConfig(
+                        thinking_level=target_thinking_level,
+                        include_thoughts=False,
+                    ),
+                ),
+                fast_mode=not use_precision_mode,
+                max_parse_retries=2,
+            )
         except Exception:
             if attempt == 0:
                 continue
@@ -572,7 +574,8 @@ def generate_english_passage_analysis(
         "     * **외국어 혼입 절대 금지**: 일본어(히라가나·가타카나), 중국어 한자, 기타 비한글 외국 문자를 한국어 출력 필드 어디에도 절대 섞지 마세요.\n"
         "     * **동일 핵심어·고유명사 일관성**: 지문 내 반복 핵심어, 인명(표준 외래어 표기), 과학·해부학 전문 용어는 모든 문장 해석·논리 흐름·도식에서 100% 동일한 정확한 한국어로 통일하세요.\n"
         "     * **공식 해설·각주 존중**: `[공식 해설 참고]`와 `[문제지 공식 각주]`가 제공되면 각주 단어의 한국어 뜻과 공식 해설의 맥락적 번역을 최우선으로 반영하세요.\n"
-        "   - `syntax_notes`: 문장별 문법 설명은 출력하지 않으므로 반드시 빈 배열 `[]`로 두세요."
+        "   - `syntax_notes`: 문장별 문법 설명은 출력하지 않으므로 반드시 빈 배열 `[]`로 두세요.\n"
+        "   - **정수 필드 안정성**: `analysis_version`은 정수 `4`, `sentence_num`은 `1`부터 문장 수까지의 작은 정수로만 출력하고 숫자 `0`을 반복하지 마세요."
     )
 
     extra_blocks: list[str] = []
@@ -658,24 +661,25 @@ def generate_english_passage_analysis(
     prompt = base_prompt
     out: EnglishPassageAnalysisOutput | None = None
     for attempt in range(2):
-        resp = _generate_content_with_fallback(
+        out = _generate_structured_with_fallback(
             client=client,
             model_name=eff_model,
             contents=prompt,
+            schema_cls=EnglishPassageAnalysisOutput,
             config=types.GenerateContentConfig(
                 system_instruction=system_inst,
                 response_mime_type="application/json",
                 response_schema=EnglishPassageAnalysisOutput,
-                temperature=0.05 if attempt == 0 else 0.0,
-                max_output_tokens=10240,
+                temperature=0.15 if attempt == 0 else 0.25,
+                max_output_tokens=8192,
                 thinking_config=types.ThinkingConfig(
                     thinking_level=types.ThinkingLevel.MINIMAL,
                     include_thoughts=False,
                 ),
             ),
             fast_mode=True,
+            max_parse_retries=2,
         )
-        out = _parse_structured(resp, EnglishPassageAnalysisOutput)
         # 치명적 오류(문장 누락, 외국어 혼입, 심각한 문장 변조, 각주 미반영)에만 LLM 재시도 발동
         critical_issues = _validate_english_analysis_output(
             out,
@@ -735,15 +739,16 @@ def generate_english_visual_diagram(
     prompt = base_prompt
     diag: KoreanVisualDiagram | None = None
     for attempt in range(2):
-        resp = _generate_content_with_fallback(
+        diag = _generate_structured_with_fallback(
             client=client,
             model_name=eff_model,
             contents=prompt,
+            schema_cls=KoreanVisualDiagram,
             config=types.GenerateContentConfig(
                 system_instruction=system_inst,
                 response_mime_type="application/json",
                 response_schema=KoreanVisualDiagram,
-                temperature=0.05 if attempt == 0 else 0.0,
+                temperature=0.15 if attempt == 0 else 0.3,
                 max_output_tokens=2048,
                 thinking_config=types.ThinkingConfig(
                     thinking_level=types.ThinkingLevel.MINIMAL,
@@ -751,8 +756,8 @@ def generate_english_visual_diagram(
                 ),
             ),
             fast_mode=True,
+            max_parse_retries=2,
         )
-        diag = _parse_structured(resp, KoreanVisualDiagram)
         diag_blob = "\n".join(
             [
                 diag.title or "",

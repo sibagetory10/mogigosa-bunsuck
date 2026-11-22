@@ -7,6 +7,7 @@ from google.genai import types
 from src.gemini.core import (
     _build_client,
     _generate_content_with_fallback,
+    _generate_structured_with_fallback,
     _parse_structured,
 )
 from src.models import EnglishDictEntry, normalize_english_dict_key
@@ -55,7 +56,7 @@ def lookup_english_word_with_gemini(
 
     prompt = f"조회 대상: `{clean_query}`{ctx_block}\n\n위 어휘의 수능·고교 맞춤형 정밀 사전 데이터를 JSON으로 생성하세요."
 
-    resp = _generate_content_with_fallback(
+    entry = _generate_structured_with_fallback(
         client=client,
         model_name=model_name,
         contents=prompt,
@@ -70,8 +71,9 @@ def lookup_english_word_with_gemini(
             ),
         ),
         fast_mode=True,
+        schema_cls=EnglishDictEntry,
+        max_parse_retries=2,
     )
-    entry = _parse_structured(resp, EnglishDictEntry)
     head = (entry.headword or clean_query).strip()
     return entry.model_copy(
         update={

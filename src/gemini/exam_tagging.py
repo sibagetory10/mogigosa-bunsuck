@@ -20,6 +20,7 @@ from src.gemini.core import (
     _generate_content_with_fallback,
     _is_flash_lite_model,
     _normalize_extracted_answer,
+    _generate_structured_with_fallback,
     _parse_structured,
     optimize_image_for_vision,
     prepare_pdf_part,
@@ -52,7 +53,7 @@ def detect_scanned_question_boxes(
     )
     opt_png = optimize_image_for_vision(page_png_bytes)
     img_part = types.Part.from_bytes(data=opt_png, mime_type="image/png")
-    resp = _generate_content_with_fallback(
+    result = _generate_structured_with_fallback(
         client=client,
         model_name=model_name,
         contents=[img_part, prompt],
@@ -62,8 +63,9 @@ def detect_scanned_question_boxes(
             temperature=0.0,
         ),
         fast_mode=True,
+        schema_cls=ScannedPageBoxes,
+        max_parse_retries=2,
     )
-    result = _parse_structured(resp, ScannedPageBoxes)
     return result.boxes
 
 
@@ -186,17 +188,18 @@ def analyze_question_with_gemini(
         )
         use_fast_mode = not is_self_solve
 
-    resp = _generate_content_with_fallback(
+    parsed = _generate_structured_with_fallback(
         client=client,
         model_name=model_name,
         contents=contents,
+        schema_cls=QuestionExtractionOutput,
         config=gen_config,
         fast_mode=use_fast_mode,
         status_callback=status_callback,
+        max_parse_retries=2,
     )
     if status_callback is not None:
         status_callback(f"{q_num}번 응답 파싱 및 2022 기준 검증 중...")
-    parsed = _parse_structured(resp, QuestionExtractionOutput)
     parsed.answer = _normalize_extracted_answer(parsed.answer)
     return validate_and_normalize_extracted_tag(
         parsed,
@@ -318,15 +321,16 @@ def analyze_exam_pdf_batch_with_gemini(
             max_output_tokens=32768,
         )
 
-    resp = _generate_content_with_fallback(
+    parsed = _generate_structured_with_fallback(
         client=client,
         model_name=model_name,
         contents=contents,
         config=batch_config,
         fast_mode=has_answer_ref,
         status_callback=status_callback,
+        schema_cls=BatchExamExtractionOutput,
+        max_parse_retries=2,
     )
-    parsed = _parse_structured(resp, BatchExamExtractionOutput)
     out: dict[int, BatchQuestionTagItem] = {}
     for item in parsed.questions:
         if item.q_num in ordered_q and item.q_num not in out:
@@ -378,7 +382,7 @@ def extract_exam_header_metadata(
         contents.append(types.Part.from_bytes(data=opt_png, mime_type="image/png"))
     contents.append(prompt)
 
-    resp = _generate_content_with_fallback(
+    meta = _generate_structured_with_fallback(
         client=client,
         model_name=model_name,
         contents=contents,
@@ -389,8 +393,9 @@ def extract_exam_header_metadata(
             temperature=0.0,
         ),
         fast_mode=True,
+        schema_cls=ExamHeaderMetadata,
+        max_parse_retries=2,
     )
-    meta = _parse_structured(resp, ExamHeaderMetadata)
 
     year = meta.year.strip()
     month = meta.month.strip()
@@ -502,7 +507,7 @@ def match_problem_and_answer_pdfs_with_ai(
     _append_pairing_vision_parts(contents, answer_items, "A", remaining_imgs)
     contents.append(prompt)
 
-    resp = _generate_content_with_fallback(
+    parsed = _generate_structured_with_fallback(
         client=client,
         model_name=model_name,
         contents=contents,
@@ -513,8 +518,9 @@ def match_problem_and_answer_pdfs_with_ai(
             temperature=0.0,
         ),
         fast_mode=True,
+        schema_cls=BatchFilePairingOutput,
+        max_parse_retries=2,
     )
-    parsed = _parse_structured(resp, BatchFilePairingOutput)
 
     matches: list[int | None] = [None] * n_prob
     reasons: dict[int, str] = {}
@@ -586,7 +592,7 @@ def classify_mixed_exam_pdfs_with_ai(
     _append_pairing_vision_parts(contents, pdf_items, "F", MAX_PAIRING_VISION_IMAGES)
     contents.append(prompt)
 
-    resp = _generate_content_with_fallback(
+    parsed = _generate_structured_with_fallback(
         client=client,
         model_name=model_name,
         contents=contents,
@@ -597,8 +603,9 @@ def classify_mixed_exam_pdfs_with_ai(
             temperature=0.0,
         ),
         fast_mode=True,
+        schema_cls=MixedPdfClassificationOutput,
+        max_parse_retries=2,
     )
-    parsed = _parse_structured(resp, MixedPdfClassificationOutput)
 
     roles: list[str] = ["problem"] * n_files
     for item in parsed.items:

@@ -9,6 +9,7 @@ from src.gemini.core import (
     ForbiddenTermRemainingError,
     _build_client,
     _generate_content_with_fallback,
+    _generate_structured_with_fallback,
     _parse_structured,
     optimize_image_for_vision,
 )
@@ -93,7 +94,7 @@ def rewrite_question_for_pdf(
             contents.append(types.Part.from_bytes(data=optimize_image_for_vision(crop_png_bytes), mime_type="image/png"))
         contents.append(prompt)
 
-        resp = _generate_content_with_fallback(
+        rw = _generate_structured_with_fallback(
             client=client,
             model_name=model_name,
             contents=contents,
@@ -104,8 +105,9 @@ def rewrite_question_for_pdf(
                 temperature=0.2,
             ),
             fast_mode=True,
+            schema_cls=RewrittenQuestion,
+            max_parse_retries=2,
         )
-        rw = _parse_structured(resp, RewrittenQuestion)
         rw.preserved_answer = question.answer
         rw.rewritten_stem = normalize_exam_layout_text(rw.rewritten_stem)
         rw.rewritten_choices = [format_chemical_scripts(c.strip()) for c in (rw.rewritten_choices or []) if c.strip()]

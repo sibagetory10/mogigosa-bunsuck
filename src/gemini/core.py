@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import io
 import random
+import re
 import time
 from typing import Any, Callable
 
 from google import genai
 from google.genai import types
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from src.config import (
     DEFAULT_MODEL,
@@ -418,6 +419,25 @@ def _generate_content_with_fallback(
     raise last_err
 
 
+_JSON_STR_SPLIT_RE = re.compile(r'("(?:\\.|[^"\\])*")')
+_JSON_FRAC_LOOP_RE = re.compile(r"(-?\d+)\.(\d{8})\d+")
+_JSON_ZERO_LOOP_RE = re.compile(r"(?<![.\d])0{2,}(?=[,}\]\s]|$)")
+
+
+def _sanitize_corrupted_json_numbers(raw_text: str) -> str:
+    """JSON 문자열 리터럴 밖의 폭주한 숫자(0000... / 긴 소수부)만 안전하게 정리한다."""
+    if not raw_text:
+        return raw_text
+    parts = _JSON_STR_SPLIT_RE.split(raw_text)
+    for i in range(0, len(parts), 2):
+        seg = parts[i]
+        if seg:
+            seg = _JSON_FRAC_LOOP_RE.sub(r"\1.\2", seg)
+            seg = _JSON_ZERO_LOOP_RE.sub("0", seg)
+            parts[i] = seg
+    return "".join(parts)
+
+
 def _parse_structured(response: Any, schema_cls: type[T]) -> T:
     parsed = getattr(response, "parsed", None)
     if isinstance(parsed, schema_cls):
@@ -425,7 +445,73 @@ def _parse_structured(response: Any, schema_cls: type[T]) -> T:
     text = getattr(response, "text", None) or ""
     if not text.strip():
         raise RuntimeError("Gemini 응답이 비어 있습니다. 모델 이름 또는 입력 데이터를 확인해 주세요.")
-    return schema_cls.model_validate_json(text)
+    try:
+        return schema_cls.model_validate_json(text)
+    except ValidationError as orig_err:
+        sanitized = _sanitize_corrupted_json_numbers(text)
+        if sanitized != text:
+            try:
+                return schema_cls.model_validate_json(sanitized)
+            except ValidationError:
+                pass
+        raise orig_err
+
+
+def _generate_structured_with_fallback(
+    client: genai.Client,
+    model_name: str,
+    contents: Any,
+    schema_cls: type[T],
+    config: types.GenerateContentConfig | None = None,
+    fast_mode: bool = False,
+    status_callback: Callable[[str], None] | None = None,
+    max_parse_retries: int = 2,
+) -> T:
+    """
+    구조화 JSON 생성 + 파싱 전용 래퍼.
+    Flash-Lite가 temperature=0.0/0.05에서 숫자 반복 루프(`0000...`) 또는 잘린 JSON을 낼 때
+    온도를 단계적으로 올려(최대 0.7) 최대 max_parse_retries회 자동 재시도한다.
+    API 호출 자체의 400/401/403/429/503 오류는 _generate_content_with_fallback이 처리/전파한다.
+    """
+    total_attempts = 1 + max(0, int(max_parse_retries))
+    orig_temp = getattr(config, "temperature", None) if config is not None else None
+    base_temp = float(orig_temp) if isinstance(orig_temp, (int, float)) else 0.1
+    last_parse_err: Exception | None = None
+
+    for attempt in range(total_attempts):
+        attempt_cfg = config
+        if attempt > 0:
+            if attempt == 1:
+                new_temp = min(0.7, max(base_temp + 0.2, 0.25))
+            else:
+                new_temp = min(0.7, max(base_temp + 0.35, 0.45))
+            if config is not None:
+                attempt_cfg = config.model_copy(update={"temperature": new_temp})
+            else:
+                attempt_cfg = types.GenerateContentConfig(temperature=new_temp)
+            if status_callback is not None:
+                status_callback(
+                    f"⚠️ 구조화 JSON 파싱 오류 감지 → temperature={new_temp:.2f}로 자동 재시도 ({attempt}/{total_attempts - 1})..."
+                )
+            time.sleep(0.3)
+
+        resp = _generate_content_with_fallback(
+            client=client,
+            model_name=model_name,
+            contents=contents,
+            config=attempt_cfg,
+            fast_mode=fast_mode,
+            status_callback=status_callback,
+        )
+        try:
+            return _parse_structured(resp, schema_cls)
+        except (ValidationError, ValueError, RuntimeError) as exc:
+            last_parse_err = exc
+            if attempt + 1 >= total_attempts:
+                raise
+
+    assert last_parse_err is not None
+    raise last_parse_err
 
 
 def prepare_pdf_part(client: genai.Client, pdf_bytes: bytes, display_name: str = "document.pdf") -> Any:

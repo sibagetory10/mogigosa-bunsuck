@@ -17,6 +17,7 @@ from src.gemini.core import (
     _is_fatal_config_or_auth_error,
     _is_rate_limit_error,
     _is_server_overload_error,
+    _generate_structured_with_fallback,
     _parse_structured,
     optimize_image_for_vision,
     prepare_pdf_part,
@@ -104,7 +105,7 @@ def _extract_concept_toc_with_ai(
             )
             contents = [pdf_part, prompt]
 
-        resp = _generate_content_with_fallback(
+        parsed = _generate_structured_with_fallback(
             client=client,
             model_name=model_name,
             contents=contents,
@@ -115,8 +116,9 @@ def _extract_concept_toc_with_ai(
                 temperature=0.0,
             ),
             status_callback=status_callback,
+            schema_cls=TocExtractionOutput,
+            max_parse_retries=2,
         )
-        parsed = _parse_structured(resp, TocExtractionOutput)
         parsed.toc_units = [u for u in parsed.toc_units if u.unit_name.strip()]
         return parsed
     except Exception:
@@ -349,7 +351,7 @@ def detect_concept_pages_with_ai(
                     "아래 페이지별 `[ACTUAL_PDF_PAGE: 번호]`를 기준으로 개념 구간(`detected_ranges`)을 JSON으로 반환하세요.\n\n"
                     + "\n".join(lines)
                 )
-                resp = _generate_content_with_fallback(
+                return _generate_structured_with_fallback(
                     client=local_client,
                     model_name=model_name,
                     contents=prompt,
@@ -361,8 +363,9 @@ def detect_concept_pages_with_ai(
                     ),
                     fast_mode=True,
                     status_callback=None,
+                    schema_cls=AutoConceptPageDetectionOutput,
+                    max_parse_retries=2,
                 )
-                return _parse_structured(resp, AutoConceptPageDetectionOutput)
 
             out_parsed = _run_chunk_with_backoff(_call, b_label, max_retries=2, status_callback=status_callback)
             return b_pages, out_parsed
@@ -419,7 +422,7 @@ def detect_concept_pages_with_ai(
                     "각 페이지 상단 여백에 각인된 빨간색 라벨 **`[ACTUAL_PDF_PAGE: 번호]`** 를 보고, "
                     "반드시 그 `ACTUAL_PDF_PAGE` 번호 기준으로 `start_page`와 `end_page`를 반환하세요."
                 )
-                resp = _generate_content_with_fallback(
+                return _generate_structured_with_fallback(
                     client=local_client,
                     model_name=model_name,
                     contents=[pdf_part, prompt],
@@ -431,8 +434,9 @@ def detect_concept_pages_with_ai(
                     ),
                     fast_mode=True,
                     status_callback=None,
+                    schema_cls=AutoConceptPageDetectionOutput,
+                    max_parse_retries=2,
                 )
-                return _parse_structured(resp, AutoConceptPageDetectionOutput)
 
             return _run_chunk_with_backoff(_call, b_label, max_retries=2, status_callback=status_callback)
 
@@ -592,7 +596,7 @@ def extract_concept_book_units(
             pdf_part = prepare_pdf_part(local_client, chunk_pdf, display_name="concept_book_slice.pdf")
             contents = [pdf_part, prompt]
 
-        resp = _generate_content_with_fallback(
+        return _generate_structured_with_fallback(
             client=local_client,
             model_name=model_name,
             contents=contents,
@@ -604,8 +608,9 @@ def extract_concept_book_units(
             ),
             fast_mode=True,
             status_callback=None,
+            schema_cls=ConceptBookExtractionOutput,
+            max_parse_retries=2,
         )
-        return _parse_structured(resp, ConceptBookExtractionOutput)
 
     total_kept = len(kept_pages) if kept_pages else 1
     is_text_rich_book = _has_rich_extracted_text(mapped_concept_text, total_kept)
@@ -703,7 +708,7 @@ def extract_concept_whitelist(
         pdf_part = prepare_pdf_part(client, sliced_pdf_bytes, display_name="concept_slice.pdf")
         contents = [pdf_part, prompt]
 
-    resp = _generate_content_with_fallback(
+    wl = _generate_structured_with_fallback(
         client=client,
         model_name=model_name,
         contents=contents,
@@ -714,8 +719,9 @@ def extract_concept_whitelist(
             temperature=0.0,
         ),
         fast_mode=True,
+        schema_cls=ConceptWhitelist,
+        max_parse_retries=2,
     )
-    wl = _parse_structured(resp, ConceptWhitelist)
     if book_title.strip():
         wl.book_title = book_title.strip()
     if not wl.units:
@@ -799,7 +805,7 @@ def match_questions_to_whitelist(
             "[평가할 기출 문항 목록 (JSONL)]\n" + "\n".join(cand_lines)
         )
 
-        resp = _generate_content_with_fallback(
+        batch_res = _generate_structured_with_fallback(
             client=client,
             model_name=model_name,
             contents=prompt,
@@ -809,8 +815,9 @@ def match_questions_to_whitelist(
                 response_schema=BatchMatchResult,
                 temperature=0.0,
             ),
+            schema_cls=BatchMatchResult,
+            max_parse_retries=2,
         )
-        batch_res = _parse_structured(resp, BatchMatchResult)
         all_judgments.extend(batch_res.judgments)
 
     return all_judgments
@@ -848,7 +855,7 @@ def extract_concept_book_cover_metadata(
         contents.append(types.Part.from_bytes(data=opt_png, mime_type="image/png"))
     contents.append(prompt)
 
-    resp = _generate_content_with_fallback(
+    meta = _generate_structured_with_fallback(
         client=client,
         model_name=model_name,
         contents=contents,
@@ -859,8 +866,9 @@ def extract_concept_book_cover_metadata(
             temperature=0.0,
         ),
         fast_mode=True,
+        schema_cls=ConceptBookCoverMetadata,
+        max_parse_retries=2,
     )
-    meta = _parse_structured(resp, ConceptBookCoverMetadata)
     return ConceptBookCoverMetadata(
         book_title=meta.book_title.strip(),
         subject_and_grade=meta.subject_and_grade.strip(),

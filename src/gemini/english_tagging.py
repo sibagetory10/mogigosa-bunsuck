@@ -14,6 +14,7 @@ from src.gemini.core import (
     _generate_content_with_fallback,
     _is_flash_lite_model,
     _normalize_extracted_answer,
+    _generate_structured_with_fallback,
     _parse_structured,
     optimize_image_for_vision,
     prepare_pdf_part,
@@ -241,7 +242,7 @@ def analyze_english_exam_pdf_batch_with_gemini(
     if status_callback is not None:
         status_callback(f"⚡ {model_name} 모델로 영어 PDF({len(ordered_q)}문항) 일괄 분석 중...")
 
-    resp = _generate_content_with_fallback(
+    parsed = _generate_structured_with_fallback(
         client=client,
         model_name=model_name,
         contents=contents,
@@ -254,8 +255,9 @@ def analyze_english_exam_pdf_batch_with_gemini(
         ),
         fast_mode=True,
         status_callback=status_callback,
+        schema_cls=BatchEnglishExamExtractionOutput,
+        max_parse_retries=2,
     )
-    parsed = _parse_structured(resp, BatchEnglishExamExtractionOutput)
 
     out: dict[int, EnglishQuestionExtractionItem] = {}
     for item in parsed.questions:
@@ -354,7 +356,7 @@ def analyze_english_question_with_gemini(
         contents.append(answer_pdf_part)
     contents.append(prompt)
 
-    resp = _generate_content_with_fallback(
+    single = _generate_structured_with_fallback(
         client=client,
         model_name=model_name,
         contents=contents,
@@ -365,8 +367,9 @@ def analyze_english_question_with_gemini(
             temperature=0.0,
         ),
         fast_mode=True,
+        schema_cls=EnglishSingleExtractionOutput,
+        max_parse_retries=2,
     )
-    single = _parse_structured(resp, EnglishSingleExtractionOutput)
     sec: Any = "듣기" if is_listening else "독해"
     grp_id = _infer_english_group_id(q_num, single.passage_group_id)
     ans_norm = _normalize_extracted_answer(single.answer)

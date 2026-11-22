@@ -12,6 +12,7 @@ from src.gemini.core import (
     _build_lang_ncic_grounding_section,
     _generate_content_with_fallback,
     _normalize_extracted_answer,
+    _generate_structured_with_fallback,
     _parse_structured,
     optimize_image_for_vision,
     prepare_pdf_part,
@@ -203,7 +204,7 @@ def analyze_korean_exam_pdf_batch_with_gemini(
     if status_callback is not None:
         status_callback(f"⚡ {model_name} 모델로 국어 전 문항({len(ordered_q)}문항 · 독서/문학/화작/언매) 일괄 분석 중...")
 
-    resp = _generate_content_with_fallback(
+    parsed = _generate_structured_with_fallback(
         client=client,
         model_name=model_name,
         contents=contents,
@@ -220,8 +221,9 @@ def analyze_korean_exam_pdf_batch_with_gemini(
         ),
         fast_mode=True,
         status_callback=status_callback,
+        schema_cls=BatchKoreanExamExtractionOutput,
+        max_parse_retries=2,
     )
-    parsed = _parse_structured(resp, BatchKoreanExamExtractionOutput)
 
     items_list: list[KoreanQuestionExtractionItem] = []
     seen_q: set[int] = set()
@@ -284,7 +286,7 @@ def analyze_korean_question_with_gemini(
         contents.append(answer_pdf_part)
     contents.append("\n\n".join(hint_parts))
 
-    resp = _generate_content_with_fallback(
+    out = _generate_structured_with_fallback(
         client=client,
         model_name=model_name,
         contents=contents,
@@ -299,8 +301,9 @@ def analyze_korean_question_with_gemini(
             ),
         ),
         fast_mode=True,
+        schema_cls=KoreanSingleExtractionOutput,
+        max_parse_retries=2,
     )
-    out = _parse_structured(resp, KoreanSingleExtractionOutput)
     out.answer = _normalize_extracted_answer(out.answer)
     out.passage_group_id = normalize_korean_group_id(out.passage_group_id, q_num)
     if not (out.passage_text or "").strip():
@@ -390,7 +393,7 @@ def generate_korean_set_reconstruction(
         f"위 지문을 바탕으로 정확히 {n_questions}개의 새로운 수능형 국어 세트 문항을 JSON(set_intro, questions)으로 생성하세요."
     )
 
-    resp = _generate_content_with_fallback(
+    parsed = _generate_structured_with_fallback(
         client=client,
         model_name=model_name,
         contents=prompt,
@@ -406,8 +409,9 @@ def generate_korean_set_reconstruction(
             ),
         ),
         fast_mode=True,
+        schema_cls=KoreanSetReconstructionOutput,
+        max_parse_retries=2,
     )
-    parsed = _parse_structured(resp, KoreanSetReconstructionOutput)
     gen_qs = sorted(parsed.questions or [], key=lambda x: x.slot_index)[:n_questions]
     if not gen_qs:
         raise ValueError("AI가 국어 세트 문항을 생성하지 못했습니다. 다시 시도해 주세요.")
@@ -564,7 +568,7 @@ def proofread_korean_passage_analysis(
         "위 초안을 검토·교정한 최종 `KoreanPassageAnalysisOutput` JSON을 출력하세요."
     )
     try:
-        resp = _generate_content_with_fallback(
+        reviewed = _generate_structured_with_fallback(
             client=client,
             model_name=model_name,
             contents=prompt,
@@ -580,8 +584,9 @@ def proofread_korean_passage_analysis(
                 ),
             ),
             fast_mode=True,
+            schema_cls=KoreanPassageAnalysisOutput,
+            max_parse_retries=2,
         )
-        reviewed = _parse_structured(resp, KoreanPassageAnalysisOutput)
         return _sanitize_korean_analysis_output(reviewed)
     except Exception:
         return _sanitize_korean_analysis_output(draft)
@@ -784,7 +789,7 @@ def generate_korean_passage_analysis(
         "위 자료를 바탕으로 정밀 지문 분석지 JSON을 작성하세요."
     )
 
-    resp = _generate_content_with_fallback(
+    draft_out = _generate_structured_with_fallback(
         client=client,
         model_name=model_name,
         contents=prompt,
@@ -800,8 +805,9 @@ def generate_korean_passage_analysis(
             ),
         ),
         fast_mode=True,
+        schema_cls=KoreanPassageAnalysisOutput,
+        max_parse_retries=2,
     )
-    draft_out = _parse_structured(resp, KoreanPassageAnalysisOutput)
     if enable_proofread:
         return proofread_korean_passage_analysis(
             api_key=api_key,
@@ -840,7 +846,7 @@ def generate_korean_visual_diagram(
         f"[지문 원문]\n{clean_passage[:4500]}\n\n"
         "위 지문의 핵심을 시각화한 도식 JSON을 작성하세요."
     )
-    resp = _generate_content_with_fallback(
+    return _generate_structured_with_fallback(
         client=client,
         model_name=model_name,
         contents=prompt,
@@ -856,5 +862,6 @@ def generate_korean_visual_diagram(
             ),
         ),
         fast_mode=True,
+        schema_cls=KoreanVisualDiagram,
+        max_parse_retries=2,
     )
-    return _parse_structured(resp, KoreanVisualDiagram)
