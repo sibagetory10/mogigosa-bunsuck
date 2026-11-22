@@ -734,38 +734,30 @@ def extract_english_passage_from_problem_source(
     answer: str = "",
 ) -> tuple[str, list[str]]:
     """
-    저장된 문제지 PDF(`source_pdf_bytes`) 또는 DB 스크랩 텍스트(`question_text`, `passage_text`)에서
-    AI 없이 순수 Python으로 영어 원문 지문과 공식 각주 목록을 추출한다.
+    DB에 저장된 영어 지문 원문(`passage_text`)을 최우선으로 사용하고,
+    없거나 불완전할 때만 문제지 PDF(`source_pdf_bytes`) / `question_text`에서 보완 추출한다.
+    공식 각주(`* word: 뜻`)는 문제지 PDF / `question_text`에서 함께 추출한다. (AI 미사용)
     """
-    pdf_q_text = ""
+    raw_q_src = (question_text or "").strip()
     if source_pdf_bytes and q_num > 0:
         try:
             pdf_q_text = extract_problem_question_text_from_pdf(
                 source_pdf_bytes, q_num=q_num, passage_group_id=passage_group_id
             )
+            if pdf_q_text:
+                raw_q_src = pdf_q_text
         except Exception:
-            pdf_q_text = ""
+            pass
 
-    raw_q_src = pdf_q_text or (question_text or "").strip()
     footnotes = _extract_footnotes_local(raw_q_src)
-    if not footnotes and question_text and pdf_q_text:
+    if not footnotes and question_text and raw_q_src != question_text.strip():
         footnotes = _extract_footnotes_local(question_text)
 
-    fallback_passage = _clean_passage_surface(passage_text)
+    db_passage = _clean_passage_surface(passage_text)
+    if _is_valid_english_candidate(db_passage, ""):
+        return db_passage, footnotes
+
     is_irrel = q_num == 35 or "무관" in (orig_question_type or "")
-
-    # Q29(어법)/Q30(어휘)/Q42는 해설지 기반 정답 단어 교정이 DB passage_text에 이미 반영되어 있으므로
-    # DB passage_text가 깨끗하면 우선 사용 (단어 치환 유지), 비어있을 때만 raw_q_src 사용
-    is_error_fix_q = q_num in (29, 30, 41, 42) or any(
-        k in (orig_question_type or "") for k in ("어법", "어휘", "낱말")
-    )
-    if is_error_fix_q and _is_valid_english_candidate(fallback_passage, ""):
-        return fallback_passage, footnotes
-
-    # Q44/45는 Q43의 순서가 DB passage_text에 반영되어 있으므로 DB passage_text 우선
-    if q_num in (44, 45) and _is_valid_english_candidate(fallback_passage, ""):
-        return fallback_passage, footnotes
-
     if raw_q_src:
         cand = _reconstruct_english_from_raw_qtext(
             raw_q_src,
@@ -774,10 +766,10 @@ def extract_english_passage_from_problem_source(
             orig_question_type=orig_question_type,
             answer=answer,
         )
-        if _is_valid_english_candidate(cand, fallback_passage, allow_shorter=is_irrel):
+        if _is_valid_english_candidate(cand, db_passage, allow_shorter=is_irrel):
             return cand, footnotes
 
-    return fallback_passage, footnotes
+    return db_passage, footnotes
 
 
 # ---------------------------------------------------------------------------
