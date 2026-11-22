@@ -782,7 +782,9 @@ _ANS_SUBJECT_OTHER_RE = re.compile(
     r"제\s*1\s*교시|제\s*2\s*교시|제\s*4\s*교시)"
 )
 
-_ANS_RANGE_HDR_RE = re.compile(r"^\[\s*(\d{1,2})\s*[~\-～–—]\s*(\d{1,2})\s*\](?:\s*(.*))?$")
+_ANS_RANGE_HDR_RE = re.compile(
+    r"^(?:[•▶▷◈■◆●★]?\s*)?(?:\[\s*(\d{1,2})\s*[~\-～–—]\s*(\d{1,2})\s*\]|(\d{1,2})\s*[~\-～–—]\s*(\d{1,2})\s*[.)번]?)(?:\s+(.*)|\s*$)"
+)
 _ANS_Q_HDR_RE = re.compile(
     r"^(?:[•▶▷◈■◆●★]?\s*)?(?:\[\s*(\d{1,2})\s*\]|(\d{1,2})\s*[.)번])(?:\s+(.*)|\s*$)"
 )
@@ -906,6 +908,14 @@ def _extract_interp_from_block(block_lines: list[str], q_key: str) -> tuple[str,
 
         # 세트(41~42, 43~45) 블록 내부에서 개별 문항 '41.', '42.', '43.'이 나오면 해석 종료
         if q_key in ("41~42", "43~45") and re.match(r"^(?:4[1-5])\s*[.)]", ln):
+            in_interp = False
+            continue
+
+        # 비-세트 문항 블록 내부에 41~42 / 43~45 범위 헤더가 섞여 들어온 경우 즉시 해석 종료
+        if q_key not in ("41~42", "43~45") and re.match(
+            r"^(?:[•▶▷◈■◆●★]?\s*)?(?:\[\s*4[13]\s*[~\-～–—]\s*4[25]\s*\]|4[13]\s*[~\-～–—]\s*4[25]\s*[.)번]?)(?:\s|$)",
+            ln,
+        ):
             in_interp = False
             continue
 
@@ -1046,19 +1056,23 @@ def extract_all_english_translations_from_answer_pdf(answer_pdf_bytes: bytes) ->
             continue
 
         rm = _ANS_RANGE_HDR_RE.match(txt)
-        if rm and ln["x0"] <= ln["col_x0"] + 0.50 * max(1.0, ln["col_w"]):
-            qs, qe = int(rm.group(1)), int(rm.group(2))
-            if (qs, qe) in ((41, 42), (43, 45)):
-                _flush_block()
-                cur_key = f"{qs}~{qe}"
-                last_q_num = qs
-                rest = (rm.group(3) or "").strip()
-                if rest:
-                    cur_buf.append(rest)
-                continue
-            # [31~34], [36~37], [38~39] 공통 발문 배너는 무시
-            if 18 <= qs <= qe <= 45:
-                continue
+        if rm:
+            s_str = rm.group(1) or rm.group(3)
+            e_str = rm.group(2) or rm.group(4)
+            if s_str and e_str:
+                qs, qe = int(s_str), int(e_str)
+                if (qs, qe) in ((41, 42), (43, 45)):
+                    _flush_block()
+                    cur_key = f"{qs}~{qe}"
+                    last_q_num = qs
+                    rest = (rm.group(5) or "").strip()
+                    if rest:
+                        cur_buf.append(rest)
+                    continue
+                if ln["x0"] <= ln["col_x0"] + 0.50 * max(1.0, ln["col_w"]):
+                    # [31~34], [36~37], [38~39] 공통 발문 배너는 무시
+                    if 18 <= qs <= qe <= 45:
+                        continue
 
         qm = _ANS_Q_HDR_RE.match(txt)
         if qm and ln["x0"] <= ln["col_x0"] + 0.45 * max(1.0, ln["col_w"]):
@@ -1126,8 +1140,12 @@ def _normalize_extracted_translation_by_type(
             ans_kor = choices_map[str(ans_int)].strip()
             txt = re.sub(r"\s*_{2,}\s*", f" {ans_kor} ", txt, count=1)
 
-    # 35번 무관한 문장: ①~⑤가 모두 있으면 정답 번호 문장 제외 후 ①~⑤ 제거
+    # 35번 무관한 문장: 괄호 쳐진 무관한 문장 해석((③ ...), (완결 해석 문장.)) 제거 및 정답 번호 문장 제외
     if q_num == 35 or "무관" in qt or ("흐름" in qt and "관계" in qt):
+        # 1) 괄호 안에 ①~⑤가 포함된 해석 또는 괄호 쳐진 완결 한국어 해석 문장 제거
+        txt = re.sub(r"\(\s*[^()]*?[①②③④⑤][^()]*?\s*\)", " ", txt)
+        txt = re.sub(r"\(\s*[^()]*?(?:[.?!]|다\.|요\.|[가-힣]{8,})[^()]*?\s*\)", " ", txt)
+        txt = re.sub(r"[ \t]{2,}", " ", txt).strip()
         intro, segs = _split_circled_five(txt)
         if len(segs) == 5 and ans_int in segs:
             kept = [intro] if intro else []
