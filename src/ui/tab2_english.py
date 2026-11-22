@@ -510,12 +510,17 @@ def _render_english_analysis_results_section() -> None:
                         "</style>",
                         unsafe_allow_html=True,
                     )
+                    is_non_blank_t = any(
+                        k in orig_t
+                        for k in ("삽입", "순서", "무관", "어법", "어휘", "요약", "주제", "제목", "요지", "주장", "목적", "심경", "함축")
+                    )
                     for s_i, sa in enumerate(sent_list):
                         s_num = int(getattr(sa, "sentence_num", s_i + 1) or (s_i + 1))
                         n_badge = _ENG_CIRCLED_NUMS[s_num - 1] if 1 <= s_num <= len(_ENG_CIRCLED_NUMS) else f"({s_num})"
                         is_topic = bool(getattr(sa, "is_topic_sentence", False))
-                        blank_phrase = (getattr(sa, "original_blank_phrase", "") or "").strip()
-                        is_inserted = bool(getattr(sa, "is_inserted_sentence", False))
+                        raw_bp = (getattr(sa, "original_blank_phrase", "") or "").strip()
+                        blank_phrase = "" if is_non_blank_t else raw_bp
+                        is_inserted = bool(getattr(sa, "is_inserted_sentence", False)) and ("삽입" in orig_t or not orig_t)
                         badges: list[str] = []
                         if is_topic:
                             badges.append(

@@ -1428,6 +1428,7 @@ def _format_chunked_english_html(chunked_text: str, blank_phrase: str = "") -> s
     raw = (chunked_text or "").strip()
     if not raw:
         return ""
+    raw = re.sub(r"[{｝}｛]", "", raw)
     bp = (blank_phrase or "").strip()
     if bp:
         bp_words = re.findall(r"[A-Za-z0-9]+(?:['’-][A-Za-z0-9]+)*", bp)
@@ -1759,15 +1760,23 @@ def _render_single_english_landscape_page(
     </body></html>
     """
 
+    is_non_blank_type = any(
+        k in orig_type
+        for k in ("삽입", "순서", "무관", "어법", "어휘", "요약", "주제", "제목", "요지", "주장", "목적", "심경", "함축")
+    )
     sent_sec_num = "3" if diag_b64 else "2"
     sent_cards_html: list[str] = []
+    expected_badges: list[str] = []
+    last_sent_check_words: list[str] = []
     sent_list = list(getattr(an, "sentence_analyses", None) or [])
     for s_idx, sa in enumerate(sent_list):
         s_num = int(getattr(sa, "sentence_num", s_idx + 1) or (s_idx + 1))
         num_badge = _CIRCLED_NUMS[s_num - 1] if 1 <= s_num <= len(_CIRCLED_NUMS) else f"({s_num})"
+        expected_badges.append(num_badge)
         is_topic = bool(getattr(sa, "is_topic_sentence", False))
-        blank_phrase = (getattr(sa, "original_blank_phrase", "") or "").strip()
-        is_inserted = bool(getattr(sa, "is_inserted_sentence", False))
+        raw_blank_phrase = (getattr(sa, "original_blank_phrase", "") or "").strip()
+        blank_phrase = "" if is_non_blank_type else raw_blank_phrase
+        is_inserted = bool(getattr(sa, "is_inserted_sentence", False)) and ("삽입" in orig_type or not orig_type)
         card_cls = "eng-sent-card-topic" if is_topic else "eng-sent-card"
         badges: list[str] = []
         if is_topic:
@@ -1777,8 +1786,13 @@ def _render_single_english_landscape_page(
         if is_inserted:
             badges.append("<span class='eng-insert-badge'>기출 삽입 문장</span>")
         badges_html = (" " + " ".join(badges)) if badges else ""
+        chk_eng = getattr(sa, "chunked_english", "") or ""
+        if s_idx == len(sent_list) - 1:
+            last_words = re.findall(r"[A-Za-z]{3,}", chk_eng)
+            if last_words:
+                last_sent_check_words = [last_words[0].lower(), last_words[-1].lower()]
         chunk_html = _format_chunked_english_html(
-            getattr(sa, "chunked_english", ""),
+            chk_eng,
             blank_phrase=blank_phrase,
         )
         kor_html = html.escape(normalize_english_korean_translation(getattr(sa, "korean_translation", "") or ""))
@@ -1790,11 +1804,7 @@ def _render_single_english_landscape_page(
             f"<div class='eng-sent-kor'>{kor_html}</div>"
             "</div>"
         )
-        sent_cards_html.append(
-            "<table class='sec-keep-tbl'><tr class='sec-keep-tr'>"
-            f"<td class='sec-keep-td'>{card_inner}</td>"
-            "</tr></table>"
-        )
+        sent_cards_html.append(card_inner)
 
     right_html = f"""
     <html><body>
@@ -1839,7 +1849,7 @@ def _render_single_english_landscape_page(
 
         l_top_rect = pymupdf.Rect(margin_x, body_top, margin_x + left_w, body_bottom)
         more_lt, filled_lt = l_top_story.place(l_top_rect)
-        if more_lt:
+        if more_lt or float(filled_lt[3]) > body_bottom + 1.0:
             writer.end_page()
             writer.close()
             return None
@@ -1884,8 +1894,8 @@ def _render_single_english_landscape_page(
         if not two_col_right:
             r_story = _make_story(right_html, css_txt)
             r_rect = pymupdf.Rect(r_start_x, body_top, page_w - margin_x, body_bottom)
-            more_r, _ = r_story.place(r_rect)
-            if more_r:
+            more_r, filled_r = r_story.place(r_rect)
+            if more_r or float(filled_r[3]) > body_bottom + 1.0:
                 writer.end_page()
                 writer.close()
                 return None
@@ -1896,16 +1906,16 @@ def _render_single_english_landscape_page(
             r_rect1 = pymupdf.Rect(r_start_x, body_top, r_start_x + sub_w, body_bottom)
             r_rect2 = pymupdf.Rect(r_start_x + sub_w + sub_gap, body_top, page_w - margin_x, body_bottom)
             r_story1 = _make_story(right_html_col1, css_txt)
-            more_r1, _ = r_story1.place(r_rect1)
-            if more_r1:
+            more_r1, filled_r1 = r_story1.place(r_rect1)
+            if more_r1 or float(filled_r1[3]) > body_bottom + 1.0:
                 writer.end_page()
                 writer.close()
                 return None
             r_story1.draw(dev, None)
             if sent_cards_html[mid_idx:]:
                 r_story2 = _make_story(right_html_col2, css_txt)
-                more_r2, _ = r_story2.place(r_rect2)
-                if more_r2:
+                more_r2, filled_r2 = r_story2.place(r_rect2)
+                if more_r2 or float(filled_r2[3]) > body_bottom + 1.0:
                     writer.end_page()
                     writer.close()
                     return None
@@ -1913,7 +1923,17 @@ def _render_single_english_landscape_page(
 
         writer.end_page()
         writer.close()
-        return buf.getvalue()
+        pdf_out = buf.getvalue()
+        if expected_badges:
+            with pymupdf.open("pdf", pdf_out) as chk_doc:
+                rendered_txt = chk_doc[0].get_text("text") if chk_doc.page_count else ""
+            if any(b not in rendered_txt for b in expected_badges):
+                return None
+            if last_sent_check_words:
+                low_rendered = rendered_txt.lower()
+                if any(w not in low_rendered for w in last_sent_check_words):
+                    return None
+        return pdf_out
 
     # 1) 우측 1컬럼으로 들어가는 최대 스케일 탐색
     for sc in (1.0, 0.92, 0.85, 0.78, 0.72, 0.66):
@@ -1928,8 +1948,8 @@ def _render_single_english_landscape_page(
             return out_b
 
     # 3) 초장문 지문 최종 폴백: 세로로 넉넉한 가상 캔버스에 그린 뒤 A4 가로 1페이지에 비율 유지 축소
-    for virt_h in (760.0, 960.0, 1280.0):
-        tall_b = _try_render_1page(0.75, two_col_right=True, canvas_h=virt_h)
+    for virt_h in (760.0, 960.0, 1280.0, 1600.0):
+        tall_b = _try_render_1page(0.75 if virt_h < 1600.0 else 0.62, two_col_right=True, canvas_h=virt_h)
         if tall_b is not None:
             src_doc = pymupdf.open("pdf", tall_b)
             dst_doc = pymupdf.open()
@@ -1942,7 +1962,7 @@ def _render_single_english_landscape_page(
                 src_doc.close()
                 dst_doc.close()
 
-    # 최악의 폴백 (도달 가능성 극히 낮음)
+    # 최악의 폴백
     return _try_render_1page(0.60, two_col_right=True, canvas_h=1600.0) or b""
 
 

@@ -143,12 +143,20 @@ def _verify_and_fix_english_tagged_passage(
     if q_num == 40:
         p = re.split(r"\n\s*(?:\[요약문\]|￫|->)\s*", p, maxsplit=1)[0].strip()
 
-    # 31~34(빈칸), 35(무관한 문장), 36~37(글의 순서), 38~39(문장 삽입): PyMuPDF 원본 텍스트와 대조해 원문 변조·문장 누락 즉시 복구
-    if local_question_text and q_num in (31, 32, 33, 34, 35, 36, 37, 38, 39):
+    # 29~30(어법·어휘 본동사 누락 복구), 31~34(빈칸), 35(무관한 문장), 36~37(글의 순서), 38~39(문장 삽입): PyMuPDF 원본 텍스트와 대조해 원문 변조·문장 누락 즉시 복구
+    if local_question_text and q_num in (29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39):
         inferred_type = (
-            "빈칸 추론"
-            if q_num in (31, 32, 33, 34)
-            else ("무관한 문장" if q_num == 35 else ("글의 순서" if q_num in (36, 37) else "문장 삽입"))
+            "어법"
+            if q_num == 29
+            else (
+                "어휘"
+                if q_num == 30
+                else (
+                    "빈칸 추론"
+                    if q_num in (31, 32, 33, 34)
+                    else ("무관한 문장" if q_num == 35 else ("글의 순서" if q_num in (36, 37) else "문장 삽입"))
+                )
+            )
         )
         reconciled, _ = _reconcile_english_passage_with_question_text(
             passage_text=p,
@@ -859,6 +867,7 @@ def generate_english_passage_analysis(
         question_text=question_text,
         orig_question_type=orig_question_type,
         answer=answer,
+        explanation=explanation,
     )
     eff_choices: list[str] = [str(c).strip() for c in (choices or []) if str(c).strip()]
     if not eff_choices and isinstance(exam_ctx.get("choices"), dict):
@@ -866,8 +875,12 @@ def generate_english_passage_analysis(
         eff_choices = [c_dict[str(k)] for k in range(1, 6) if str(k) in c_dict]
 
     eff_model = (model_name or "").strip() or EXAM_TAGGING_MODEL
+    orig_blank_phrase = (exam_ctx.get("original_blank_phrase") or "").strip()
     # 2) 마커 제거 전에 실제 미복원 흔적(____ / ①~⑤ / (A)(B)(C) / <u> / 불완전 문장)이 있을 때만 제한적으로 복원
     if _needs_english_passage_restoration(reconciled_raw, orig_question_type):
+        restore_exp_hint = explanation
+        if orig_blank_phrase and orig_blank_phrase.lower() not in reconciled_raw.lower():
+            restore_exp_hint = f"[정확한 빈칸 정답 원문 구절: {orig_blank_phrase}]\n{explanation or ''}".strip()
         clean_passage = _restore_incomplete_source_passage(
             api_key,
             eff_model,
@@ -875,7 +888,7 @@ def generate_english_passage_analysis(
             orig_question_type=orig_question_type,
             answer=answer,
             choices=eff_choices,
-            explanation=explanation,
+            explanation=restore_exp_hint,
         )
     else:
         clean_passage = _preprocess_english_source_passage(reconciled_raw)
@@ -891,10 +904,11 @@ def generate_english_passage_analysis(
     )
 
     footnotes = list(exam_ctx.get("footnotes") or [])
-    orig_blank_phrase = (exam_ctx.get("original_blank_phrase") or "").strip()
     irrel_sent = (exam_ctx.get("irrelevant_sentence") or "").strip()
     irrel_sym = (exam_ctx.get("irrelevant_answer_sym") or "").strip()
     order_seq = (exam_ctx.get("order_answer_seq") or "").strip()
+    order_given = (exam_ctx.get("order_given_text") or "").strip()
+    order_blocks = dict(exam_ctx.get("order_blocks") or {})
     ins_sent = (exam_ctx.get("inserted_sentence") or "").strip()
     ins_sym = (exam_ctx.get("inserted_answer_sym") or "").strip()
 
@@ -924,11 +938,13 @@ def generate_english_passage_analysis(
         "     * **대괄호 `[ ... ]`**: 반드시 **절(명사절·간접의문문·관계사절·부사절)**에만 사용하세요. `why/how/what/whether` 간접의문문 명사절도 반드시 대괄호 `[ ... ]`로 통일하고 소괄호 `( ... )`로 묶지 마세요.\n"
         "     * **소괄호 `( ... )`**: **구 수식어(전치사구·분사구·to부정사 형용사/부사적 수식구·삽입구)**에만 사용하세요. 원문 자체에 이미 들어있는 괄호 삽입구는 절대 삭제하지 말고 원문 그대로 보존하세요.\n"
         "     * **병렬 구조 주의**: 주어를 공유하는 동사구 병렬에서 주어까지 앞 대괄호에 묶지 말고 슬래시(`/`)로만 구분하세요.\n"
-        "     * **괄호 짝 엄수**: 모든 `[ ]`와 `( )`는 교차 중첩 없이 열림/닫힘 짝이 정확히 맞아야 합니다.\n"
+        "     * **괄호 짝 & 기호 제한 엄수**: 구문 표기는 오직 `/`, `[ ]`, `( )`만 사용하세요. **중괄호 `{ }`는 절대 사용하지 마세요.** 모든 `[ ]`와 `( )`는 교차 중첩 없이 열림/닫힘 짝이 정확히 맞아야 합니다.\n"
         "   - **`is_topic_sentence` 엄격 기준**: 글 전체의 핵심 주장·결론이 **구체적으로 완결 서술된 문장(1~2문장)**에만 `true`를 부여하고, 짧은 전환·연결 단문에는 `false`를 유지하세요.\n"
-        "   - **`original_blank_phrase`**: `[원래 기출 빈칸 구절]`이 이 문장에 포함되어 있으면 해당 구절을 원문 철자 그대로 기재하고, 나머지 문장은 빈 문자열 `\"\"`.\n"
+        "   - **`original_blank_phrase`**: 오직 빈칸 추론 문항에서 `[원래 기출 빈칸 구절]`이 포함된 문장에만 원문 철자 그대로 기재하고, 빈칸 문항이 아니거나 나머지 문장은 반드시 빈 문자열 `\"\"`로 두세요.\n"
         "   - **`korean_translation` 정밀 번역 & 언어 순수성 규칙**:\n"
         "     * `/`, `[ ]`, `( )` 구문 기호나 직독직해 끊어쓰기 없이 자연스러운 일반 한국어 문장으로 작성하세요.\n"
+        "     * **단독 부정(`not merely / not simply / not just`) 번역 엄수**: 같은 문장에 `but`이 없는 `not merely A`는 절대 `~일 뿐만 아니라`로 번역하지 말고 `단순히 A인 것이 아니다 / A에 불과한 것이 아니다`로 정확히 번역하세요.\n"
+        "     * **임의 비유·단어 추가 금지**: 원문에 없는 명사·비유(예: '용기', '그릇' 등)를 임의로 덧붙이지 마세요.\n"
         "     * **외국어 혼입 절대 금지**: 일본어(히라가나·가타카나), 중국어 한자, 기타 비한글 외국 문자를 한국어 출력 필드 어디에도 절대 섞지 마세요.\n"
         "     * **동일 핵심어·고유명사 일관성**: 지문 내 반복 핵심어, 인명(표준 외래어 표기), 과학·해부학 전문 용어는 모든 문장 해석·논리 흐름·도식에서 100% 동일한 정확한 한국어로 통일하세요.\n"
         "     * **공식 해설·각주 존중**: `[공식 해설 참고]`와 `[문제지 공식 각주]`가 제공되면 각주 단어의 한국어 뜻과 공식 해설의 맥락적 번역을 최우선으로 반영하세요.\n"
@@ -954,9 +970,49 @@ def generate_english_passage_analysis(
             "→ 본문 `sentence_analyses`에는 넣지 말고, `exam_point_note`에 이 제거된 문장 원문과 전체 흐름에서 벗어나는 이유를 반드시 명시하세요."
         )
     if order_seq:
+        order_boundary_lines: list[str] = []
+        if order_given and order_blocks and sents:
+            def _find_sent_span(block_txt: str) -> str:
+                b_sents = _split_english_sentences(block_txt)
+                if not b_sents:
+                    return ""
+                matched_nums: list[int] = []
+                for bs in b_sents:
+                    bs_set = set(re.findall(r"[a-z0-9]+", bs.lower()))
+                    if not bs_set:
+                        continue
+                    best_i, best_sc = -1, 0.0
+                    for si, ss in enumerate(sents):
+                        ss_set = set(re.findall(r"[a-z0-9]+", ss.lower()))
+                        if not ss_set:
+                            continue
+                        sc = len(bs_set & ss_set) / max(1, len(bs_set | ss_set))
+                        if sc > best_sc:
+                            best_sc, best_i = sc, si + 1
+                    if best_i != -1 and best_sc >= 0.55:
+                        matched_nums.append(best_i)
+                if not matched_nums:
+                    return ""
+                if len(matched_nums) == 1:
+                    return f"{matched_nums[0]}번 문장"
+                return f"{min(matched_nums)}~{max(matched_nums)}번 문장"
+
+            g_span = _find_sent_span(order_given)
+            order_boundary_lines.append(
+                f"  - [주어진 글]{f' ({g_span})' if g_span else ''}: {order_given[:140]}"
+            )
+            seq_labels = re.findall(r"\(([ABC])\)", order_seq)
+            for lbl in (seq_labels or ["A", "B", "C"]):
+                b_txt = order_blocks.get(lbl, "")
+                if b_txt:
+                    b_span = _find_sent_span(b_txt)
+                    order_boundary_lines.append(
+                        f"  - ({lbl}) 단락{f' ({b_span})' if b_span else ''}: {b_txt[:140]}"
+                    )
+        boundary_block = ("\n" + "\n".join(order_boundary_lines)) if order_boundary_lines else ""
         extra_blocks.append(
-            f"[원래 기출 글의 순서 (정답 배열)]\n{order_seq}\n"
-            "→ `exam_point_note`에 정답 배열 순서와 단락 간 연결 단서를 1~2줄로 명시하세요."
+            f"[원래 기출 글의 순서 (정답 배열: {order_seq})]{boundary_block}\n"
+            "→ `exam_point_note`에 정답 배열 순서와 위 실제 단락 경계·내용에 맞춘 `(A)/(B)/(C)` 단락별 연결 단서를 1~2줄로 정확히 명시하세요 (단락 라벨과 내용을 절대 뒤바꾸지 마세요)."
         )
     if ins_sent:
         extra_blocks.append(

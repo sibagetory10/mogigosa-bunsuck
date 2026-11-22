@@ -866,7 +866,7 @@ class KoreanPassageAnalysisOutput(BaseModel):
     )
 
 
-CURRENT_ENGLISH_ANALYSIS_VERSION: int = 3
+CURRENT_ENGLISH_ANALYSIS_VERSION: int = 4
 
 
 class EnglishSentenceAnalysisItem(BaseModel):
@@ -934,7 +934,7 @@ class EnglishPassageAnalysisOutput(BaseModel):
     )
     analysis_version: int = Field(
         default=1,
-        description="분석지 엔진 스키마·검증 버전 (v3: 최종 토큰 일치 가드·외국어 오염 차단·유형별 동적 기출 포인트·재시도 최적화)",
+        description="분석지 엔진 스키마·검증 버전 (v4: 빈칸 덮어쓰기 차단·하이픈 보존·각주/번호/괄호 정밀 검증·PDF 누락 zero 가드)",
     )
 
 

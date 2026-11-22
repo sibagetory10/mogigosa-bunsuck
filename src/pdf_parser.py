@@ -601,12 +601,55 @@ def _detect_columns(page: pymupdf.Page) -> list[tuple[float, float]]:
     return [(0.0, mid_x), (mid_x, w)]
 
 
+_PDF_HYPHEN_CHARS_RE = re.compile(r"[\u00ad\u2010\u2011\u2012\u2212\uf02d]")
+_PDF_ENDASH_ALNUM_RE = re.compile(r"(?<=[A-Za-z0-9])\u2013(?=[A-Za-z0-9])")
+
+
+def _normalize_pdf_hyphens(text: str) -> str:
+    """PDF 추출 텍스트의 소프트 하이픈·PUA 하이픈·유니코드 대시를 ASCII '-'로 정규화한다."""
+    if not text:
+        return ""
+    out = _PDF_HYPHEN_CHARS_RE.sub("-", text)
+    out = _PDF_ENDASH_ALNUM_RE.sub("-", out)
+    return out
+
+
+def _has_vector_hyphen_between(
+    x_gap_start: float,
+    x_gap_end: float,
+    line_y0: float,
+    line_y1: float,
+    drawings: list[dict] | None,
+) -> bool:
+    """두 span 사이 간격 안에 벡터 선분으로 그려진 짧은 수평 하이픈이 있는지 판별한다."""
+    if not drawings:
+        return False
+    line_h = max(4.0, line_y1 - line_y0)
+    y_lo = line_y0 + 0.15 * line_h
+    y_hi = line_y1 - 0.15 * line_h
+    x_lo = x_gap_start - 1.5
+    x_hi = x_gap_end + 1.5
+    for d in drawings:
+        rect = d.get("rect")
+        if not rect:
+            continue
+        rw = float(rect.x1 - rect.x0)
+        rh = float(rect.y1 - rect.y0)
+        if 1.5 <= rw <= 11.0 and rh <= 2.2:
+            rcx = (rect.x0 + rect.x1) / 2.0
+            rcy = (rect.y0 + rect.y1) / 2.0
+            if x_lo <= rcx <= x_hi and y_lo <= rcy <= y_hi:
+                return True
+    return False
+
+
 def _extract_lines_in_column(
     page_dict: dict,
     col_x0: float,
     col_x1: float,
     page_h: float,
     page_w: float,
+    page_drawings: list[dict] | None = None,
 ) -> list[dict]:
     """
     블록 경계가 2단을 가로지르더라도 span 단위로 칼럼 소속을 분리해
@@ -642,7 +685,33 @@ def _extract_lines_in_column(
             if not col_spans:
                 continue
 
-            text = "".join(sp.get("text", "") for sp in col_spans).strip()
+            parts: list[str] = []
+            for idx_sp, sp in enumerate(col_spans):
+                st = _normalize_pdf_hyphens(sp.get("text", ""))
+                if idx_sp > 0 and parts:
+                    prev_sp = col_spans[idx_sp - 1]
+                    prev_txt = parts[-1]
+                    prev_bbox = prev_sp.get("bbox", (lx0, ly0, lx1, ly1))
+                    curr_bbox = sp.get("bbox", (lx0, ly0, lx1, ly1))
+                    gap = float(curr_bbox[0]) - float(prev_bbox[2])
+                    if (
+                        0.5 <= gap <= 14.0
+                        and prev_txt
+                        and st
+                        and prev_txt[-1].isalnum()
+                        and st[0].isalnum()
+                        and _has_vector_hyphen_between(
+                            float(prev_bbox[2]),
+                            float(curr_bbox[0]),
+                            float(ly0),
+                            float(ly1),
+                            page_drawings,
+                        )
+                    ):
+                        parts.append("-")
+                parts.append(st)
+
+            text = "".join(parts).strip()
             if not text:
                 continue
 
@@ -683,6 +752,9 @@ def _is_footer_or_header_noise(text: str, y0: float, page_h: float) -> bool:
     if any(p in t for p in always_noise):
         return True
     if re.match(r"^(?:국어|수학|영어|한국사|사회탐구|과학탐구|직업탐구|제2외국어)\s*영역$", t):
+        return True
+    # 단독 1~2자리 쪽번호('7', '[10]' 등)는 약간 더 넓은 상·하단 여백까지 필터링 (마침표 붙은 문항번호 '39.'는 제외)
+    if (y0 < 0.115 * page_h or y0 > 0.885 * page_h) and re.match(r"^\[?\s*\d{1,2}\s*\]?$", t):
         return True
     if not in_margin:
         return False
@@ -833,13 +905,21 @@ def parse_exam_pdf(
             page_h = page.rect.height
             page_w = page.rect.width
             page_dict = page.get_text("dict")
+            page_drawings = page.get_drawings()
             total_text_chars += len(re.sub(r"\s+", "", page.get_text("text") or ""))
 
             columns = _detect_columns(page)
 
             for col_x0, col_x1 in columns:
                 col_w = col_x1 - col_x0
-                lines = _extract_lines_in_column(page_dict, col_x0, col_x1, page_h, page_w)
+                lines = _extract_lines_in_column(
+                    page_dict,
+                    col_x0,
+                    col_x1,
+                    page_h,
+                    page_w,
+                    page_drawings=page_drawings,
+                )
                 if not lines:
                     continue
 
