@@ -6,7 +6,7 @@ import html as _html
 import json
 import re
 import threading
-from typing import Any
+from typing import Any, Sequence
 
 import streamlit as st
 
@@ -553,3 +553,25 @@ def _auto_save_current_exam(
 
 
 auto_save_current_exam = _auto_save_current_exam
+
+
+def create_lazy_tabs(labels: Sequence[str], *, key: str) -> Any:
+    """지원되는 Streamlit 버전에서 활성 탭만 지연 렌더링하도록 on_change='rerun'으로 탭을 생성한다."""
+    try:
+        return st.tabs(labels, on_change="rerun", key=key)
+    except TypeError:
+        return st.tabs(labels)
+
+
+def create_lazy_expander(label: str, *, expanded: bool = False, key: str) -> Any:
+    """지원되는 Streamlit 버전에서 펼쳐진 expander만 내부 위젯을 렌더링하도록 생성한다."""
+    try:
+        return st.expander(label, expanded=expanded, on_change="rerun", key=key)
+    except TypeError:
+        return st.expander(label, expanded=expanded)
+
+
+def is_container_open(container: Any) -> bool:
+    """탭/익스팬더가 현재 열려 있는지(혹은 open 속성이 없는 구버전인지) 판별한다."""
+    is_open = getattr(container, "open", None)
+    return True if is_open is None else bool(is_open)

@@ -18,7 +18,14 @@ from src.models import (
     UserVocabItem,
     normalize_english_dict_key,
 )
-from src.ui.common import ensure_token_quota, sanitize_id_part, usage_scope
+from src.ui.common import (
+    create_lazy_expander,
+    create_lazy_tabs,
+    ensure_token_quota,
+    is_container_open,
+    sanitize_id_part,
+    usage_scope,
+)
 from src.ui.context import AppContext
 from src.ui_styles import render_chips
 from src.vocab_pdf_generator import generate_vocab_wordbook_pdf
@@ -532,8 +539,15 @@ def _render_dict_search_subtab(ctx: AppContext) -> None:
             pass
 
     cached_total = ctx.storage.count_cached_english_dict_entries()
-    with st.expander(f"📚 공용 사전 DB 빠른 찾아보기 (누적 {cached_total}개 · 클릭 시 토큰 0)", expanded=False):
-        if cached_total == 0:
+    cache_exp = create_lazy_expander(
+        f"📚 공용 사전 DB 빠른 찾아보기 (누적 {cached_total}개 · 클릭 시 토큰 0)",
+        expanded=False,
+        key="tab4_dict_cache_exp",
+    )
+    with cache_exp:
+        if not is_container_open(cache_exp):
+            pass
+        elif cached_total == 0:
             st.info("아직 공용 사전 DB에 캐싱된 단어가 없습니다. 위 검색창에서 첫 단어를 검색해 보세요!")
         else:
             cache_filter = st.text_input(
@@ -628,9 +642,22 @@ def _render_exam_vocab_subtab(ctx: AppContext) -> None:
     username = ctx.current_user.username if ctx.current_user else ""
     existing_keys = {v.normalized_key for v in ctx.storage.load_user_vocab(username)} if username else set()
 
-    ac1, ac2 = st.columns([2.2, 1.3])
+    ev_page_size = 20
+    ev_total_pages = max(1, (len(vocab_rows) + ev_page_size - 1) // ev_page_size)
+    ac1, ac_pg, ac2 = st.columns([1.8, 0.9, 1.4])
     with ac1:
-        st.caption(f"조회된 기출 핵심 어휘: 총 **{len(vocab_rows)}개** (상위 80개 표시)")
+        st.caption(f"조회된 기출 핵심 어휘: 총 **{len(vocab_rows)}개** ({ev_page_size}개씩 페이지 표시)")
+    with ac_pg:
+        ev_page = int(
+            st.number_input(
+                "페이지",
+                min_value=1,
+                max_value=ev_total_pages,
+                value=1,
+                step=1,
+                key="tab4_ev_page",
+            )
+        )
     with ac2:
         if st.button(
             f"⭐ 필터된 어휘 전체 내 단어장에 담기 ({len(vocab_rows)}개 · 토큰 0)",
@@ -656,7 +683,10 @@ def _render_exam_vocab_subtab(ctx: AppContext) -> None:
         st.info("표시할 기출 어휘가 없습니다.")
         return
 
-    for idx, vr in enumerate(vocab_rows[:80]):
+    ev_start = (ev_page - 1) * ev_page_size
+    ev_slice = vocab_rows[ev_start : ev_start + ev_page_size]
+    for offset, vr in enumerate(ev_slice):
+        idx = ev_start + offset
         is_saved = vr["normalized_key"] in existing_keys
         rc1, rc2, rc3, rc4 = st.columns([1.6, 2.3, 0.75, 0.85])
         with rc1:
@@ -666,7 +696,8 @@ def _render_exam_vocab_subtab(ctx: AppContext) -> None:
         with rc3:
             if st.button("🔍 사전", key=f"tab4_ev_lookup_{idx}_{vr['normalized_key']}", width="stretch"):
                 st.session_state["tab4_dict_pending_query"] = vr["headword"]
-                st.toast(f"'{vr['headword']}' 검색이 준비되었습니다. [🔍 단어·숙어 검색] 탭을 확인해 주세요.")
+                st.session_state["tab4_switch_to_search"] = True
+                st.rerun()
         with rc4:
             if is_saved:
                 st.caption("✅ 저장됨")
@@ -794,9 +825,26 @@ def _render_user_wordbook_subtab(ctx: AppContext) -> None:
                 continue
         filtered.append(it)
 
-    st.caption(f"표시 중: **{len(filtered)} / {total_cnt}개** (최대 100개 표시)")
+    wb_page_size = 25
+    wb_total_pages = max(1, (len(filtered) + wb_page_size - 1) // wb_page_size)
+    wb_c1, wb_c2 = st.columns([2.6, 0.9])
+    with wb_c1:
+        st.caption(f"표시 중: **{len(filtered)} / {total_cnt}개** ({wb_page_size}개씩 페이지 표시)")
+    with wb_c2:
+        wb_page = int(
+            st.number_input(
+                "단어장 페이지",
+                min_value=1,
+                max_value=wb_total_pages,
+                value=1,
+                step=1,
+                key="tab4_wb_page",
+            )
+        )
 
-    for idx, it in enumerate(filtered[:100]):
+    wb_start = (wb_page - 1) * wb_page_size
+    for offset, it in enumerate(filtered[wb_start : wb_start + wb_page_size]):
+        idx = wb_start + offset
         with st.container(border=True):
             c_chk, c_word, c_mean, c_act = st.columns([0.55, 1.5, 2.35, 1.1])
             with c_chk:
@@ -831,7 +879,8 @@ def _render_user_wordbook_subtab(ctx: AppContext) -> None:
                 with b1:
                     if st.button("🔍", key=f"tab4_wb_go_{it.normalized_key}_{idx}", help="사전에서 상세 보기"):
                         st.session_state["tab4_dict_pending_query"] = it.headword
-                        st.toast(f"'{it.headword}' 검색이 준비되었습니다. [🔍 단어·숙어 검색] 탭을 확인하세요.")
+                        st.session_state["tab4_switch_to_search"] = True
+                        st.rerun()
                 with b2:
                     if st.button("🗑️", key=f"tab4_wb_del_{it.normalized_key}_{idx}", help="단어장에서 삭제"):
                         ctx.storage.delete_user_vocab_item(username, it.normalized_key)
@@ -1197,23 +1246,31 @@ def _render_vocab_quiz_fragment(ctx: AppContext) -> None:
 
 def render_tab4(ctx: AppContext) -> None:
     """[탭 4] 올인원 수능 영단어 사전 · 기출 어휘 연동 · 개인 단어장 & PDF · 암기 퀴즈 UI."""
-    sub_search, sub_exam_vocab, sub_wordbook, sub_quiz = st.tabs(
+    if st.session_state.pop("tab4_switch_to_search", False):
+        st.session_state["tab4_dict_subtabs"] = "🔍 단어 · 숙어 검색"
+
+    sub_search, sub_exam_vocab, sub_wordbook, sub_quiz = create_lazy_tabs(
         [
             "🔍 단어 · 숙어 검색",
             "📝 기출 어휘 모아보기",
             "⭐ 나만의 단어장 & PDF",
             "🎯 영단어 암기 퀴즈",
-        ]
+        ],
+        key="tab4_dict_subtabs",
     )
 
     with sub_search:
-        _render_dict_search_subtab(ctx)
+        if is_container_open(sub_search):
+            _render_dict_search_subtab(ctx)
 
     with sub_exam_vocab:
-        _render_exam_vocab_subtab(ctx)
+        if is_container_open(sub_exam_vocab):
+            _render_exam_vocab_subtab(ctx)
 
     with sub_wordbook:
-        _render_user_wordbook_subtab(ctx)
+        if is_container_open(sub_wordbook):
+            _render_user_wordbook_subtab(ctx)
 
     with sub_quiz:
-        _render_vocab_quiz_fragment(ctx)
+        if is_container_open(sub_quiz):
+            _render_vocab_quiz_fragment(ctx)

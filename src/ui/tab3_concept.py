@@ -31,14 +31,27 @@ from src.pdf_parser import (
     parse_page_ranges_spec,
     render_pdf_page_png,
 )
-from src.ui.common import _ensure_token_quota, _usage_scope, sanitize_id_part
+from src.ui.common import (
+    _ensure_token_quota,
+    _usage_scope,
+    create_lazy_expander,
+    is_container_open,
+    sanitize_id_part,
+)
 from src.ui.context import AppContext
 from src.ui_styles import render_chips
 
 
 def _render_ncic_curriculum_manager(key_prefix: str = "ncic") -> None:
     """2022 개정 교육과정(NCIC 고시 별책 5·7·8·9·14 PDF) 기준표 현황 조회 및 성취기준 누적 등록 UI."""
-    with st.expander("🧭 2022 개정 교육과정 공식 기준표(NCIC 고시 PDF) 관리 · 성취기준 보강", expanded=False):
+    ncic_exp = create_lazy_expander(
+        "🧭 2022 개정 교육과정 공식 기준표(NCIC 고시 PDF) 관리 · 성취기준 보강",
+        expanded=False,
+        key=f"{key_prefix}_ncic_mgr_exp",
+    )
+    with ncic_exp:
+        if not is_container_open(ncic_exp):
+            return
         stats = get_catalog_summary_stats()
         st.caption(
             "기본적으로 2022 교육부 고시(제2022-33호) 공식 과목 편제표가 내장되어 있으며, "
@@ -568,17 +581,23 @@ def _render_concept_book_builder_section(ctx: AppContext, key_prefix: str = "tab
                             st.warning(del_err)
                         st.rerun()
 
-                with st.expander(f"📋 `{book.book_title}` 단원별 개념 및 허용 용어 상세 보기 ({len(book.units)}개 단원)", expanded=False):
-                    for u_idx, unit in enumerate(book.units, start=1):
-                        st.markdown(f"**{u_idx}. {unit.unit_name}** (`{unit.page_range}`)")
-                        uc1, uc2 = st.columns(2)
-                        with uc1:
-                            st.caption("핵심 원리 및 정의 요약 (`core_concepts`)")
-                            render_chips(unit.core_concepts, variant="blue", limit=60)
-                        with uc2:
-                            st.caption("허용 용어·공식·단위 (`allowed_terms_and_units`)")
-                            render_chips(unit.allowed_terms_and_units, variant="green", limit=80)
-                        st.markdown("---")
+                unit_exp = create_lazy_expander(
+                    f"📋 `{book.book_title}` 단원별 개념 및 허용 용어 상세 보기 ({len(book.units)}개 단원)",
+                    expanded=False,
+                    key=f"{key_prefix}_cb_units_exp_{b_idx}_{book.id}",
+                )
+                with unit_exp:
+                    if is_container_open(unit_exp):
+                        for u_idx, unit in enumerate(book.units, start=1):
+                            st.markdown(f"**{u_idx}. {unit.unit_name}** (`{unit.page_range}`)")
+                            uc1, uc2 = st.columns(2)
+                            with uc1:
+                                st.caption("핵심 원리 및 정의 요약 (`core_concepts`)")
+                                render_chips(unit.core_concepts, variant="blue", limit=60)
+                            with uc2:
+                                st.caption("허용 용어·공식·단위 (`allowed_terms_and_units`)")
+                                render_chips(unit.allowed_terms_and_units, variant="green", limit=80)
+                            st.markdown("---")
 
 
 

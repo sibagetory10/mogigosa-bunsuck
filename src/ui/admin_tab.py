@@ -32,6 +32,7 @@ from src.config import (
     resolve_billing_api_key,
 )
 from src.fx_rate import get_daily_gemini_fx_rate
+from src.ui.common import create_lazy_expander, is_container_open
 from src.ui.context import AppContext
 
 
@@ -431,7 +432,7 @@ def _get_cached_git_status_snapshot(repo_dir_str: str) -> dict[str, Any]:
 
 def _render_server_git_update_admin_section() -> None:
     st.divider()
-    repo_dir = Path(__file__).resolve().parent
+    repo_dir = Path(__file__).resolve().parents[2]
     hdr_c1, hdr_c2 = st.columns([3.5, 1])
     with hdr_c1:
         st.subheader("🔄 서버 Git 상태 확인 · 원클릭 동기화")
@@ -575,7 +576,14 @@ def _render_english_pool_admin_section(ctx: AppContext) -> None:
             st.success(f"🧹 영어 변형 캐시 {removed_cnt}문항을 모두 비웠습니다.")
             st.rerun()
 
-    with st.expander(f"📋 저장된 영어 변형 캐시 상세 조회 / 개별 삭제 ({total_items}문항)", expanded=False):
+    eng_pool_exp = create_lazy_expander(
+        f"📋 저장된 영어 변형 캐시 상세 조회 / 개별 삭제 ({total_items}문항)",
+        expanded=False,
+        key="admin_eng_pool_detail_exp",
+    )
+    with eng_pool_exp:
+        if not is_container_open(eng_pool_exp):
+            return
         f_col1, f_col2 = st.columns([1, 2])
         with f_col1:
             type_options = ["전체"] + sorted(type_counts.keys())
@@ -599,8 +607,8 @@ def _render_english_pool_admin_section(ctx: AppContext) -> None:
             )
         ]
 
-        st.caption(f"검색 결과: {len(filtered_entries)}문항 (최대 50건 표시)")
-        for ck, idx, it in filtered_entries[:50]:
+        st.caption(f"검색 결과: {len(filtered_entries)}문항 (최대 25건 표시)")
+        for ck, idx, it in filtered_entries[:25]:
             t_label = str(it.get("target_type") or "기타")
             ans_label = str(it.get("answer") or "-")
             stem_preview = " ".join(str(it.get("rewritten_stem") or "").split())[:130]
@@ -672,7 +680,14 @@ def _render_korean_analysis_pool_admin_section(ctx: AppContext) -> None:
             st.success(f"🧹 국어 지문 분석지 캐시 {removed_cnt}세트를 모두 비웠습니다.")
             st.rerun()
 
-    with st.expander(f"📋 저장된 국어 지문 분석지 상세 조회 / 개별 삭제 ({total_cnt}세트)", expanded=False):
+    kor_pool_exp = create_lazy_expander(
+        f"📋 저장된 국어 지문 분석지 상세 조회 / 개별 삭제 ({total_cnt}세트)",
+        expanded=False,
+        key="admin_kor_pool_detail_exp",
+    )
+    with kor_pool_exp:
+        if not is_container_open(kor_pool_exp):
+            return
         f_col1, f_col2, f_col3 = st.columns([1.2, 1.0, 1.5])
         with f_col1:
             sel_exam = st.selectbox(
@@ -719,8 +734,8 @@ def _render_korean_analysis_pool_admin_section(ctx: AppContext) -> None:
                 continue
             filtered_entries.append((ck, ent, an_dict))
 
-        st.caption(f"검색 결과: {len(filtered_entries)}세트 (최대 50건 표시)")
-        for ck, ent, an_dict in filtered_entries[:50]:
+        st.caption(f"검색 결과: {len(filtered_entries)}세트 (최대 25건 표시)")
+        for ck, ent, an_dict in filtered_entries[:25]:
             ex_n = str(ent.get("exam_name") or "미분류 회차")
             gid_n = str(ent.get("group_id") or "-")
             sec_n = str(ent.get("section") or "기타")

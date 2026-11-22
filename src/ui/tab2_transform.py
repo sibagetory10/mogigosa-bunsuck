@@ -53,6 +53,9 @@ from src.ui.common import (
     _record_english_seen_for_user,
     _render_rewritten_card_html,
     _usage_scope,
+    create_lazy_expander,
+    create_lazy_tabs,
+    is_container_open,
     sanitize_id_part,
 )
 from src.ui.context import AppContext
@@ -66,14 +69,24 @@ from src.ui_styles import render_chips
 def _render_tab2_concept_source_tabs(ctx: AppContext) -> None:
     st.subheader("1️⃣ 기준 개념서 범위 설정 (공용 개념서 DB 선택 또는 PDF 직접 업로드)")
 
-    source_tab_db, source_tab_pdf = st.tabs(
+    source_tab_db, source_tab_pdf = create_lazy_tabs(
         [
             "📚 공용 개념서·교과서 DB에서 단원 선택 (Pro · ADMIN 전용)",
             "📄 개념서·교과서 PDF 1회성 직접 업로드",
-        ]
+        ],
+        key="tab2_concept_src_tabs",
     )
 
     with source_tab_db:
+        if is_container_open(source_tab_db):
+            _render_tab2_shared_concept_db_panel(ctx)
+
+    with source_tab_pdf:
+        if is_container_open(source_tab_pdf):
+            _render_tab2_direct_pdf_panel(ctx)
+
+
+def _render_tab2_shared_concept_db_panel(ctx: AppContext) -> None:
         has_concept_db_access = can_access_shared_concept_db(ctx.current_user)
         shared_books = ctx.storage.load_concept_books()
 
@@ -192,110 +205,117 @@ def _render_tab2_concept_source_tabs(ctx: AppContext) -> None:
                             f"✅ 공용 개념서 `{chosen_book.book_title}`의 {len(effective_units)}개 단원이 출제·개조 기준으로 적용되었습니다!"
                         )
 
-            with st.expander("➕ 새 개념서·교과서 PDF를 공용 DB에 바로 추가하기", expanded=not bool(shared_books)):
-                render_concept_book_builder_section(ctx, key_prefix="tab2_inline")
+            cb_inline_exp = create_lazy_expander(
+                "➕ 새 개념서·교과서 PDF를 공용 DB에 바로 추가하기",
+                expanded=not bool(shared_books),
+                key="tab2_inline_cb_exp",
+            )
+            with cb_inline_exp:
+                if is_container_open(cb_inline_exp):
+                    render_concept_book_builder_section(ctx, key_prefix="tab2_inline")
 
-    with source_tab_pdf:
-        concept_file = st.file_uploader(
-            "통합과학·통합사회·한국사·공통수학 등 개념서/교과서 PDF 업로드",
-            type=["pdf"],
-            key="tab2_concept_pdf",
-        )
 
-        concept_pdf_bytes: bytes | None = concept_file.getvalue() if concept_file is not None else None
-        if concept_pdf_bytes is not None:
-            cur_pdf_hash = hashlib.sha256(concept_pdf_bytes).hexdigest()[:16]
-            if st.session_state["concept_pdf_hash"] and st.session_state["concept_pdf_hash"] != cur_pdf_hash:
-                st.session_state["concept_whitelist"] = None
-                st.session_state["matched_items"] = []
-                st.session_state["generated_exam_pdf"] = None
-            st.session_state["concept_pdf_hash"] = cur_pdf_hash
+def _render_tab2_direct_pdf_panel(ctx: AppContext) -> None:
+    concept_file = st.file_uploader(
+        "통합과학·통합사회·한국사·공통수학 등 개념서/교과서 PDF 업로드",
+        type=["pdf"],
+        key="tab2_concept_pdf",
+    )
 
-            total_pages = get_pdf_page_count(concept_pdf_bytes)
-            default_book_name = re.sub(r"\.pdf$", "", concept_file.name, flags=re.IGNORECASE)
-            up_meta_c1, up_meta_c2 = st.columns([1, 1.4])
-            with up_meta_c1:
-                direct_book_title = st.text_input(
-                    "교재명 (결과 출처 표기용)",
-                    value=default_book_name,
-                    placeholder="예: 완자 통합과학",
-                    key="tab2_direct_book_title",
-                )
-            with up_meta_c2:
-                multi_range_str = st.text_input(
-                    "개념 페이지 범위 입력 (예: 12-25, 34-48 처럼 여러 구간 지정 가능)",
-                    value=f"1-{min(total_pages, 5)}",
-                    placeholder="예: 12-25, 34-48, 60-75",
-                    key="tab2_direct_page_ranges",
-                )
+    concept_pdf_bytes: bytes | None = concept_file.getvalue() if concept_file is not None else None
+    if concept_pdf_bytes is not None:
+        cur_pdf_hash = hashlib.sha256(concept_pdf_bytes).hexdigest()[:16]
+        if st.session_state["concept_pdf_hash"] and st.session_state["concept_pdf_hash"] != cur_pdf_hash:
+            st.session_state["concept_whitelist"] = None
+            st.session_state["matched_items"] = []
+            st.session_state["generated_exam_pdf"] = None
+        st.session_state["concept_pdf_hash"] = cur_pdf_hash
 
-            parsed_direct_ranges: list[tuple[int, int]] = []
-            try:
-                parsed_direct_ranges = parse_page_ranges_spec(multi_range_str, total_pages)
-                range_disp = ", ".join(
-                    f"p.{s}~p.{e}" if s != e else f"p.{s}" for s, e in parsed_direct_ranges
-                )
-                sel_cnt = sum(e - s + 1 for s, e in parsed_direct_ranges)
-                st.info(f"전체 {total_pages}쪽 중 **{range_disp}** (총 {sel_cnt}쪽) 선택됨")
-            except ValueError as ve:
-                st.error(str(ve))
+        total_pages = get_pdf_page_count(concept_pdf_bytes)
+        default_book_name = re.sub(r"\.pdf$", "", concept_file.name, flags=re.IGNORECASE)
+        up_meta_c1, up_meta_c2 = st.columns([1, 1.4])
+        with up_meta_c1:
+            direct_book_title = st.text_input(
+                "교재명 (결과 출처 표기용)",
+                value=default_book_name,
+                placeholder="예: 완자 통합과학",
+                key="tab2_direct_book_title",
+            )
+        with up_meta_c2:
+            multi_range_str = st.text_input(
+                "개념 페이지 범위 입력 (예: 12-25, 34-48 처럼 여러 구간 지정 가능)",
+                value=f"1-{min(total_pages, 5)}",
+                placeholder="예: 12-25, 34-48, 60-75",
+                key="tab2_direct_page_ranges",
+            )
 
-            if parsed_direct_ranges:
-                first_page_num = parsed_direct_ranges[0][0]
-                last_page_num = parsed_direct_ranges[-1][1]
-                with st.expander("👀 선택한 범위 첫 페이지(및 끝 페이지) 미리보기", expanded=True):
-                    prev_c1, prev_c2 = st.columns(2)
-                    with prev_c1:
+        parsed_direct_ranges: list[tuple[int, int]] = []
+        try:
+            parsed_direct_ranges = parse_page_ranges_spec(multi_range_str, total_pages)
+            range_disp = ", ".join(
+                f"p.{s}~p.{e}" if s != e else f"p.{s}" for s, e in parsed_direct_ranges
+            )
+            sel_cnt = sum(e - s + 1 for s, e in parsed_direct_ranges)
+            st.info(f"전체 {total_pages}쪽 중 **{range_disp}** (총 {sel_cnt}쪽) 선택됨")
+        except ValueError as ve:
+            st.error(str(ve))
+
+        if parsed_direct_ranges:
+            first_page_num = parsed_direct_ranges[0][0]
+            last_page_num = parsed_direct_ranges[-1][1]
+            with st.expander("👀 선택한 범위 첫 페이지(및 끝 페이지) 미리보기", expanded=True):
+                prev_c1, prev_c2 = st.columns(2)
+                with prev_c1:
+                    st.image(
+                        render_pdf_page_png(concept_pdf_bytes, first_page_num, dpi=140),
+                        caption=f"시작 페이지 ({first_page_num}쪽)",
+                        width="stretch",
+                    )
+                with prev_c2:
+                    if last_page_num != first_page_num:
                         st.image(
-                            render_pdf_page_png(concept_pdf_bytes, first_page_num, dpi=140),
-                            caption=f"시작 페이지 ({first_page_num}쪽)",
+                            render_pdf_page_png(concept_pdf_bytes, last_page_num, dpi=140),
+                            caption=f"끝 페이지 ({last_page_num}쪽)",
                             width="stretch",
                         )
-                    with prev_c2:
-                        if last_page_num != first_page_num:
-                            st.image(
-                                render_pdf_page_png(concept_pdf_bytes, last_page_num, dpi=140),
-                                caption=f"끝 페이지 ({last_page_num}쪽)",
-                                width="stretch",
-                            )
-                        else:
-                            st.caption("단일 페이지가 선택되었습니다.")
-
-                if st.button("🔍 1단계: 업로드된 PDF 지식 화이트리스트 추출", type="primary"):
-                    scope_api_key, scope_key_label = resolve_active_gemini_api_key(
-                        ctx.current_user, ctx.creds.gemini_api_key, model_name=CONCEPT_SCOPE_MODEL
-                    )
-                    if not scope_api_key:
-                        st.error(f"사용 가능한 Gemini API 키({scope_key_label})가 설정되지 않았습니다.")
-                    elif not _ensure_token_quota(ctx):
-                        pass
                     else:
-                        with st.spinner(f"PDF ({range_disp})의 순수 개념 본문·도표·용어를 정독해 화이트리스트를 구축 중..."):
-                            sliced_bytes, sliced_text, slice_stats = extract_concept_pages_by_ranges(
-                                concept_pdf_bytes, parsed_direct_ranges
-                            )
-                            try:
-                                with _usage_scope(ctx):
-                                    wl = extract_concept_whitelist(
-                                        api_key=scope_api_key,
-                                        model_name=CONCEPT_SCOPE_MODEL,
-                                        sliced_pdf_bytes=sliced_bytes,
-                                        sliced_text=sliced_text,
-                                        start_page=first_page_num,
-                                        end_page=last_page_num,
-                                        book_title=direct_book_title.strip() or default_book_name,
-                                        range_display=slice_stats["ranges_display"],
-                                    )
-                                st.session_state["concept_whitelist"] = wl
-                                st.session_state["concept_sliced_text"] = sliced_text
-                                st.session_state["concept_source_label"] = (
-                                    f"{direct_book_title.strip() or concept_file.name} ({slice_stats['ranges_display']})"
+                        st.caption("단일 페이지가 선택되었습니다.")
+
+            if st.button("🔍 1단계: 업로드된 PDF 지식 화이트리스트 추출", type="primary"):
+                scope_api_key, scope_key_label = resolve_active_gemini_api_key(
+                    ctx.current_user, ctx.creds.gemini_api_key, model_name=CONCEPT_SCOPE_MODEL
+                )
+                if not scope_api_key:
+                    st.error(f"사용 가능한 Gemini API 키({scope_key_label})가 설정되지 않았습니다.")
+                elif not _ensure_token_quota(ctx):
+                    pass
+                else:
+                    with st.spinner(f"PDF ({range_disp})의 순수 개념 본문·도표·용어를 정독해 화이트리스트를 구축 중..."):
+                        sliced_bytes, sliced_text, slice_stats = extract_concept_pages_by_ranges(
+                            concept_pdf_bytes, parsed_direct_ranges
+                        )
+                        try:
+                            with _usage_scope(ctx):
+                                wl = extract_concept_whitelist(
+                                    api_key=scope_api_key,
+                                    model_name=CONCEPT_SCOPE_MODEL,
+                                    sliced_pdf_bytes=sliced_bytes,
+                                    sliced_text=sliced_text,
+                                    start_page=first_page_num,
+                                    end_page=last_page_num,
+                                    book_title=direct_book_title.strip() or default_book_name,
+                                    range_display=slice_stats["ranges_display"],
                                 )
-                                st.session_state["matched_items"] = []
-                                st.session_state["generated_exam_pdf"] = None
-                                st.success("✅ PDF 지식 화이트리스트 추출이 완료되었습니다!")
-                            except Exception as exc:
-                                st.error(f"화이트리스트 추출 실패: {exc}")
+                            st.session_state["concept_whitelist"] = wl
+                            st.session_state["concept_sliced_text"] = sliced_text
+                            st.session_state["concept_source_label"] = (
+                                f"{direct_book_title.strip() or concept_file.name} ({slice_stats['ranges_display']})"
+                            )
+                            st.session_state["matched_items"] = []
+                            st.session_state["generated_exam_pdf"] = None
+                            st.success("✅ PDF 지식 화이트리스트 추출이 완료되었습니다!")
+                        except Exception as exc:
+                            st.error(f"화이트리스트 추출 실패: {exc}")
 
 
 
