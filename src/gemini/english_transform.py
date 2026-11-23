@@ -191,6 +191,11 @@ def prepare_clean_english_source_passage(
 
     candidate = raw_passage
 
+    # Fast-path: 이미 80자 이상이고 미복원 빈칸/선택형/기출 마커가 전혀 없는 깨끗한 지문이면
+    # 무거운 PDF 파싱(PyMuPDF)을 건너뛰어 워커 스레드 병목·데드락을 원천 방지한다.
+    if len(candidate) >= 80 and not _needs_english_passage_restoration(candidate, eff_orig_type):
+        return _preprocess_english_source_passage(candidate)
+
     # 1. question_text가 있거나 원문에 기출 구조 마커/빈칸이 남아 있으면 결정론적 복원기 우선 실행
     if raw_q_text:
         try:
@@ -347,7 +352,7 @@ def generate_english_transformed_question(
         else types.ThinkingLevel.MINIMAL
     )
 
-    client = _build_client(api_key, timeout_seconds=90)
+    client = _build_client(api_key, timeout_seconds=25)
     system_inst = (
         "대한민국 수능·평가원 영어 출제위원으로서 지정된 **[목표 유형 1개]**의 전용 JSON 스키마를 정확히 생성하세요.\n\n"
         f"[유형: {canonical_type} | 난이도: {difficulty} | 총 문장 수: {n_sents}문장 (S0 ~ S{max(0, n_sents - 1)})]\n"
@@ -381,10 +386,10 @@ def generate_english_transformed_question(
     rw: RewrittenQuestion | None = None
     issues: list[str] = []
     last_error_msg = ""
-    base_out_tokens = 3072
+    base_out_tokens = 900
 
-    for attempt in range(3):
-        out_tokens = base_out_tokens if attempt == 0 else 4096
+    for attempt in range(2):
+        out_tokens = base_out_tokens if attempt == 0 else 1200
         try:
             parsed_spec = _generate_structured_with_fallback(
                 client=client,
@@ -403,11 +408,11 @@ def generate_english_transformed_question(
                     ),
                 ),
                 fast_mode=not use_precision_mode,
-                max_parse_retries=2,
+                max_parse_retries=1,
             )
         except Exception as api_exc:
             last_error_msg = str(api_exc)
-            if attempt < 2:
+            if attempt < 1:
                 continue
             raise
 
@@ -449,7 +454,7 @@ def generate_english_transformed_question(
         except Exception as asm_exc:
             last_error_msg = str(asm_exc)
             issues = [f"조립 오류: {last_error_msg}"]
-            if attempt < 2:
+            if attempt < 1:
                 prompt = (
                     base_prompt
                     + "\n\n[⚠️ 직전 출력 조립 오류 — 아래 사항을 반드시 수정하여 다시 생성하세요]\n"
@@ -483,7 +488,7 @@ def generate_english_transformed_question(
         )
         if not issues:
             break
-        if attempt < 2:
+        if attempt < 1:
             prompt = (
                 base_prompt
                 + "\n\n[⚠️ 직전 출력 검증 오류 — 반드시 아래 누락/오류 사항을 모두 수정하여 다시 생성하세요]\n"
@@ -692,7 +697,7 @@ def generate_english_passage_analysis(
 
     # 2단계 (AI): 제목, 핵심 주제, 논리 전개 흐름, 구조 도식만 생성 (문장별 구문/번역 생성 금지)
     eff_model = (model_name or "").strip() or EXAM_TAGGING_MODEL
-    client = _build_client(api_key, timeout_seconds=90)
+    client = _build_client(api_key, timeout_seconds=25)
 
     diagram_inst = (
         "4. `visual_diagram`: 지문의 논리·비교·인과·순환 구조를 한눈에 파악할 수 있는 도식 그림(`KoreanVisualDiagram`)을 반드시 순수 한국어로 작성.\n"

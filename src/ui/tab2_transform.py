@@ -785,28 +785,37 @@ def render_tab2(ctx: AppContext) -> None:
                         ).encode("utf-8")
                     ).hexdigest()[:16]
 
-                    if build_pdf_btn:
+                    need_auto_build_pdf = (
+                        not st.session_state.get("generated_exam_pdf")
+                        or st.session_state.get("generated_exam_pdf_sig", "") != items_sig
+                    )
+                    if build_pdf_btn or need_auto_build_pdf:
                         with st.spinner("PDF 조판 및 뒷장 정답·해설 페이지 생성 중..."):
-                            from src.pdf.exam_pdf import generate_custom_exam_pdf
+                            try:
+                                from src.pdf.exam_pdf import generate_custom_exam_pdf
 
-                            pdf_bytes = generate_custom_exam_pdf(
-                                items=matched_items,
-                                exam_title=pdf_title.strip() or "맞춤형 기출 모의고사",
-                                source_label=st.session_state.get("concept_source_label", "업로드 개념서 PDF"),
-                                whitelist=whitelist,
-                                two_column=(layout_choice == "2단 모의고사 스타일"),
-                                include_original_for_rewritten=include_orig_fig,
-                            )
-                            st.session_state["generated_exam_pdf"] = pdf_bytes
-                            st.session_state["generated_exam_pdf_sig"] = items_sig
-                            _record_english_seen_for_user(ctx, matched_items)
-                            _auto_save_current_exam(ctx, 
-                                matched_items,
-                                title=pdf_title.strip() or "맞춤형 기출 모의고사",
-                                pdf_bytes=pdf_bytes,
-                                sig=_build_exam_sig(matched_items),
-                            )
-                        st.success("✅ 시험지 PDF(뒷장 정답·개념서 맞춤 해설 포함)가 생성되고 '나의 시험지'에 자동 저장되었습니다!")
+                                pdf_bytes = generate_custom_exam_pdf(
+                                    items=matched_items,
+                                    exam_title=pdf_title.strip() or "맞춤형 기출 모의고사",
+                                    source_label=st.session_state.get("concept_source_label", "업로드 개념서 PDF"),
+                                    whitelist=whitelist,
+                                    two_column=(layout_choice == "2단 모의고사 스타일"),
+                                    include_original_for_rewritten=include_orig_fig,
+                                )
+                                st.session_state["generated_exam_pdf"] = pdf_bytes
+                                st.session_state["generated_exam_pdf_sig"] = items_sig
+                                _record_english_seen_for_user(ctx, matched_items)
+                                _auto_save_current_exam(
+                                    ctx,
+                                    matched_items,
+                                    title=pdf_title.strip() or "맞춤형 기출 모의고사",
+                                    pdf_bytes=pdf_bytes,
+                                    sig=_build_exam_sig(matched_items),
+                                )
+                                if build_pdf_btn:
+                                    st.success("✅ 시험지 PDF(뒷장 정답·개념서 맞춤 해설 포함)가 생성되고 '나의 시험지'에 자동 저장되었습니다!")
+                            except Exception as pdf_exc:
+                                st.error(f"PDF 생성 중 오류가 발생했습니다: {pdf_exc}")
 
                     if (
                         st.session_state.get("generated_exam_pdf")

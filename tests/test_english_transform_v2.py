@@ -485,7 +485,7 @@ class TestEnglishTransformV2(unittest.TestCase):
                         target_type="어법상 틀린 것 (밑줄 ①~⑤)",
                         storage=storage,
                     )
-                self.assertEqual(mock_gen.call_count, 3)
+                self.assertEqual(mock_gen.call_count, 2)
                 self.assertEqual(storage.load_english_pool(), {})
 
 

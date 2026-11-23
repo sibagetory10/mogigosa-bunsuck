@@ -11,6 +11,7 @@ import streamlit as st
 
 from src.auth import (
     TIER_LABELS,
+    can_use_premium_features,
     consume_extraction_quota,
     format_token_count,
     get_max_batch_questions,
@@ -27,7 +28,13 @@ from src.models import (
     RewrittenQuestion,
     normalize_english_group_id,
 )
-from src.ui.common import _ensure_token_quota, _usage_scope
+from src.ui.common import (
+    _auto_save_current_exam,
+    _build_exam_sig,
+    _ensure_token_quota,
+    _record_english_seen_for_user,
+    _usage_scope,
+)
 from src.ui.context import AppContext
 from src.ui_styles import render_chips
 
@@ -73,12 +80,17 @@ def _execute_english_transform_jobs(
         st.error(f"영어 지문 변형용 Gemini API 키({rewrite_key_label})가 설정되지 않았습니다.")
         return
 
-    from src.gemini import generate_english_transformed_question, submit_with_usage_context
+    from src.gemini import (
+        generate_english_transformed_question,
+        prepare_clean_english_source_passage,
+        submit_with_usage_context,
+    )
+    from src.gemini.english_validators import _needs_english_passage_restoration
 
     total_jobs = len(jobs)
     prog = st.progress(0.0)
     stat = st.empty()
-    n_workers = max(1, min(total_jobs, 8))
+    n_workers = max(1, min(total_jobs, 4))
     stat.info(f"🔤 영어 지문 수능형 변형 {total_jobs}문항 병렬 출제 중 (최대 {n_workers}스레드)...")
 
     results_by_idx: dict[int, RewrittenQuestion] = {}
@@ -101,17 +113,39 @@ def _execute_english_transform_jobs(
             )
         return pdf_bytes_cache[key]
 
-    job_pdf_bytes = [_get_job_source_pdf_bytes(job.get("base_question")) for job in jobs]
-
+    # PyMuPDF 멀티스레드 경합/데드락 방지: 메인 스레드에서 1회만 원문 정화·복원 후 워커 스레드에는 정화된 텍스트만 전달
+    cleaned_passages_cache: dict[str, str] = {}
+    prepared_passages: list[str] = []
     with _usage_scope(ctx):
-        with concurrent.futures.ThreadPoolExecutor(max_workers=n_workers) as executor:
+        for job in jobs:
+            raw_p = str(job.get("passage_text") or "").strip()
+            base_q = job.get("base_question")
+            cache_k = f"{getattr(base_q, 'id', '')}||{hashlib.sha256(raw_p.encode('utf-8')).hexdigest()[:16]}"
+            if cache_k not in cleaned_passages_cache:
+                orig_t = (
+                    (getattr(base_q, "english_question_type", "") if base_q is not None else "")
+                    or (getattr(base_q, "unit_name", "") if base_q is not None else "")
+                )
+                needs_pdf = len(raw_p) < 80 or _needs_english_passage_restoration(raw_p, orig_t)
+                src_pdf_b = _get_job_source_pdf_bytes(base_q) if needs_pdf else None
+                cleaned_passages_cache[cache_k] = prepare_clean_english_source_passage(
+                    api_key=rewrite_api_key,
+                    model_name=rewrite_model,
+                    source_passage=raw_p,
+                    base_question=base_q,
+                    source_pdf_bytes=src_pdf_b,
+                ) or raw_p
+            prepared_passages.append(cleaned_passages_cache[cache_k])
+
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=n_workers)
+        try:
             future_map = {
                 submit_with_usage_context(
                     executor,
                     generate_english_transformed_question,
                     api_key=rewrite_api_key,
                     model_name=rewrite_model,
-                    source_passage=job["passage_text"],
+                    source_passage=prepared_passages[idx],
                     target_type=job["target_type"],
                     difficulty=job["difficulty"],
                     blank_unit=job["blank_unit"],
@@ -121,21 +155,30 @@ def _execute_english_transform_jobs(
                     storage=ctx.storage,
                     use_cache=True,
                     username=ctx.current_user.username if ctx.current_user is not None else "",
-                    base_question=job.get("base_question"),
-                    source_pdf_bytes=job_pdf_bytes[idx],
+                    base_question=None,
+                    source_pdf_bytes=None,
                 ): idx
                 for idx, job in enumerate(jobs)
             }
             done_cnt = 0
-            for fut in concurrent.futures.as_completed(future_map):
-                idx = future_map[fut]
-                done_cnt += 1
-                try:
-                    results_by_idx[idx] = fut.result()
-                except Exception as exc:
-                    errors_by_idx[idx] = str(exc)
-                prog.progress(done_cnt / total_jobs)
-                stat.info(f"🔤 영어 지문 수능형 변형 출제 중 ({done_cnt}/{total_jobs})...")
+            batch_timeout_s = max(65.0, float(total_jobs) * 20.0)
+            try:
+                for fut in concurrent.futures.as_completed(future_map, timeout=batch_timeout_s):
+                    idx = future_map[fut]
+                    done_cnt += 1
+                    try:
+                        results_by_idx[idx] = fut.result(timeout=5)
+                    except Exception as exc:
+                        errors_by_idx[idx] = str(exc)
+                    prog.progress(done_cnt / total_jobs)
+                    stat.info(f"🔤 영어 지문 수능형 변형 출제 중 ({done_cnt}/{total_jobs})...")
+            except concurrent.futures.TimeoutError:
+                for fut, idx in future_map.items():
+                    if idx not in results_by_idx and idx not in errors_by_idx:
+                        fut.cancel()
+                        errors_by_idx[idx] = "응답 시간 초과로 중단되었습니다. 해당 문항만 다시 시도해 주세요."
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
 
     prog.progress(1.0)
     stat.empty()
@@ -188,10 +231,55 @@ def _execute_english_transform_jobs(
     st.session_state["match_diagnostics"] = []
     st.session_state["concept_source_label"] = source_summary_label
     st.session_state["generated_exam_pdf"] = None
+    st.session_state["generated_exam_pdf_sig"] = ""
     st.session_state["user_answers"] = {}
     st.session_state["graded"] = False
     st.session_state["ai_explanations"] = {}
     st.session_state["ai_chats"] = {}
+
+    if can_use_premium_features(ctx.current_user):
+        try:
+            import json
+            from src.pdf.exam_pdf import generate_custom_exam_pdf
+
+            default_title = "수능·모의고사 영어 지문 맞춤형 변형 모의고사"
+            default_layout = "2단 모의고사 스타일"
+            items_sig = hashlib.sha256(
+                json.dumps(
+                    [
+                        (
+                            it["question"].id,
+                            getattr(it.get("rewritten"), "rewritten_stem", ""),
+                            getattr(it.get("rewritten"), "rewritten_choices", []),
+                            default_title,
+                            default_layout,
+                            False,
+                        )
+                        for it in assembled
+                    ],
+                    ensure_ascii=False,
+                ).encode("utf-8")
+            ).hexdigest()[:16]
+            pre_pdf_bytes = generate_custom_exam_pdf(
+                items=assembled,
+                exam_title=default_title,
+                source_label=source_summary_label or "영어 기출 지문",
+                whitelist=None,
+                two_column=True,
+                include_original_for_rewritten=False,
+            )
+            st.session_state["generated_exam_pdf"] = pre_pdf_bytes
+            st.session_state["generated_exam_pdf_sig"] = items_sig
+            _record_english_seen_for_user(ctx, assembled)
+            _auto_save_current_exam(
+                ctx,
+                assembled,
+                title=default_title,
+                pdf_bytes=pre_pdf_bytes,
+                sig=_build_exam_sig(assembled),
+            )
+        except Exception:
+            pass
 
     rem_msg = ""
     fresh_u = get_user_by_username(ctx.storage, ctx.current_user.username)
