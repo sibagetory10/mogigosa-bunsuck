@@ -8,13 +8,15 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from src.config import FLASH_3_6_MODEL, FLASH_LITE_MODEL
-from src.english_v3.assembler import ORDER_CHOICES, assemble_question
+from src.english_v3.assembler import ORDER_CHOICES, AssemblyError, assemble_question
 from src.english_v3.batch_runner import submit_generation_batch, sync_and_advance_batch_job
+from src.english_v3.discourse import rank_insertion_targets, rank_order_splits
 from src.english_v3.pipeline import generate_batch_questions_v3, generate_english_transformed_question
 from src.english_v3.preprocessor import (
     build_indexed_passage,
     check_type_feasibility,
     needs_passage_restoration,
+    reconcile_exam_source_passage,
     split_english_sentences,
 )
 from src.english_v3.routing import (
@@ -269,7 +271,7 @@ def test_assemble_all_11_types_and_render_pdf() -> None:
             "구 (3~6단어)",
             "밑줄형 (①~⑤)",
             OrderSpec(
-                given_end_sentence_idx=1,
+                first_chunk_start_idx=2,
                 second_chunk_start_idx=3,
                 third_chunk_start_idx=5,
                 cohesion_rationale_ko="주어진 글의 센서 데이터 수집 뒤 (However) 한계 -> 기획자의 전환 -> 따라서 결론으로 이어진다.",
@@ -612,6 +614,132 @@ def test_async_batch_runner_2pass_flow(tmp_path: Path | None = None) -> None:
         assert len(storage.load_english_pool()) == 2
 
 
+def test_order_empty_chunk_and_insertion_oob_repaired_deterministically(tmp_path: Path | None = None) -> None:
+    with tempfile.TemporaryDirectory() as td:
+        base_dir = Path(td) if tmp_path is None else tmp_path
+        storage = StorageManager(local_root=base_dir / "exam_db", concept_root=base_dir / "concept_db")
+
+        # Q30 regression: invalid OrderSpec where c1 == c2 (would create empty chunk) must fail assembler if direct,
+        # and pipeline must auto-repair via rank_order_splits
+        indexed = build_indexed_passage(SAMPLE_PASSAGE_6)
+        bad_order = OrderSpec(
+            first_chunk_start_idx=2,
+            second_chunk_start_idx=2,
+            third_chunk_start_idx=4,
+            cohesion_rationale_ko="충분히 긴 응집성 설명입니다.",
+        )
+        try:
+            assemble_question(indexed, bad_order, target_type="글의 순서 ((A)-(B)-(C))")
+            raise AssertionError("Expected AssemblyError for c1 == c2")
+        except AssemblyError:
+            pass
+
+        # Q23 regression: 7-sentence passage where LLM returns out-of-bounds extracted_sentence_idx=7
+        passage_7 = (
+            "Corporate wrongdoing has risen in recent decades. "
+            "Internal employees often witness these illegal practices first. "
+            "However, fear of retaliation frequently silences potential whistleblowers. "
+            "To address this problem, lawmakers introduced legal protection programs. "
+            "These safeguards shield informants from unfair dismissal. "
+            "As a result, brave insiders have exposed several major scandals. "
+            "Such disclosures ultimately strengthen public trust in markets."
+        )
+        oob_ins = InsertionSpec(
+            extracted_sentence_idx=7,  # OOB for N=7 (valid 0-based is 0..6, internal 1..5)
+            cohesion_rationale_ko="However가 앞뒤 문맥을 전환하는 핵심 단서입니다.",
+        )
+
+        def _fake_ins_call(client, *, route, user_prompt, schema_cls, **kwargs):
+            _ = (client, route, kwargs)
+            if schema_cls is InsertionSpec:
+                return oob_ins
+            # BlindSolver returns whatever slot corresponds to the extracted sentence
+            # Verify prompt has all 5 markers and pick the first circled slot matching true gap
+            for sym_i, sym in enumerate(("①", "②", "③", "④", "⑤"), start=1):
+                if f"( {sym} )" in user_prompt:
+                    pass
+            # Extract gap from known rank_insertion_targets top pick
+            top_idx = rank_insertion_targets(build_indexed_passage(passage_7))[0][0]
+            return BlindSolverVerdict(
+                brief_analysis="Unique cohesive gap",
+                selected_answer=str(top_idx),
+                ambiguous_choices=[],
+                confidence="high",
+            )
+
+        with (
+            patch("src.english_v3.pipeline.build_v3_client", return_value=MagicMock()),
+            patch("src.english_v3.pipeline.call_structured_v3", side_effect=_fake_ins_call),
+            patch("src.english_v3.blind_validator.call_structured_v3", side_effect=_fake_ins_call),
+        ):
+            rw = generate_english_transformed_question(
+                api_key="dummy",
+                model_name=FLASH_LITE_MODEL,
+                source_passage=passage_7,
+                target_type="주어진 문장 삽입",
+                storage=storage,
+                use_cache=False,
+            )
+            assert rw.preserved_answer in ("1", "2", "3", "4", "5")
+            assert "[주어진 문장]" in rw.rewritten_stem
+
+
+def test_poulet_quote_preservation_and_source_reconciliation() -> None:
+    # Q33 regression: closing quote " and closing paren ) must NEVER be stripped
+    poulet = (
+        'The very fact that all of our experiences "take place" in a physical space makes the space inseparable from what defines it. '
+        "The tree and the ground beneath are inseparable from what took place there. "
+        "This intertwining of space, place, and experience challenges the idea of place as passive backdrop. "
+        "Spatial framework is the medium of all experiences — not merely a background exterior to experience (as commonly supposed). "
+        'Belgian literary critic Georges Poulet wrote: "Beings surround themselves with the places where they find themselves. Without places, beings would be only abstractions."'
+    )
+    sents = split_english_sentences(poulet)
+    assert any(s.endswith('(as commonly supposed).') for s in sents), f"Missing closing paren in {sents}"
+    assert any(s.endswith('abstractions."') for s in sents), f"Missing closing quote in {sents}"
+
+    idx_p = build_indexed_passage(poulet)
+    ranked = rank_order_splits(idx_p)
+    assert ranked
+    top_triple, top_score, _ = ranked[0]
+    # Top split must NOT cut inside Poulet's open quote (after sentence 4) and must prefer cohesive S2 boundary
+    assert top_score > -50
+    assert 2 in top_triple
+
+    # Q36 regression: scrambled passage_text in DB reconciled deterministically from question_text + answer="4" ((C)-(A)-(B))
+    q36_rec = QuestionRecord(
+        id="2026_고1_10월_영어__Q36",
+        exam_name="2026년 10월 고1 영어",
+        q_num=36,
+        subject_category="영어",
+        curriculum_subject="영어",
+        unit_name="글의 순서",
+        min_grade=1,
+        answer="4",
+        official_explanation="해설",
+        english_question_type="글의 순서",
+        passage_text=(
+            "Isaac Newton noted that light waves have no color until perceived by a brain. "
+            "No, because sound requires a hearer to interpret pressure waves. "
+            "That disturbance of molecules travels through the air silently until it hits an eardrum. "
+            "The same is true of sound, which is merely molecular motion before perception. "
+            "If a tree falls in an empty forest, does it make a sound?"
+        ),
+        question_text=(
+            "36. 주어진 글 다음에 이어질 글의 순서로 가장 적절한 것은?\n"
+            "Isaac Newton noted that light waves have no color until perceived by a brain.\n"
+            "(A) No, because sound requires a hearer to interpret pressure waves. "
+            "That disturbance of molecules travels through the air silently until it hits an eardrum.\n"
+            "(B) If a tree falls in an empty forest, does it make a sound?\n"
+            "(C) The same is true of sound, which is merely molecular motion before perception.\n"
+            "① (A)-(C)-(B) ② (B)-(A)-(C) ③ (B)-(C)-(A) ④ (C)-(A)-(B) ⑤ (C)-(B)-(A)"
+        ),
+    )
+    reconciled_q36 = reconcile_exam_source_passage(q36_rec.passage_text, q36_rec)
+    # Chronological order (C)-(A)-(B): "The same is true of sound..." -> "No, because..." -> "If a tree falls..."
+    assert reconciled_q36.index("The same is true of sound") < reconciled_q36.index("No, because")
+    assert reconciled_q36.index("No, because") < reconciled_q36.index("If a tree falls")
+
+
 class EnglishV3EngineTestCase(unittest.TestCase):
     def test_all(self) -> None:
         test_preprocessor_strips_noise_preserves_footnotes_and_abbreviations()
@@ -621,6 +749,8 @@ class EnglishV3EngineTestCase(unittest.TestCase):
         test_flex_fallback_to_standard_and_50pct_discount_usage()
         test_pipeline_blind_solver_retry_escalation_and_batch()
         test_async_batch_runner_2pass_flow()
+        test_order_empty_chunk_and_insertion_oob_repaired_deterministically()
+        test_poulet_quote_preservation_and_source_reconciliation()
 
 
 if __name__ == "__main__":

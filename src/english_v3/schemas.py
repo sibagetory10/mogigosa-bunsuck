@@ -143,22 +143,22 @@ class IrrelevantSpec(BaseModel):
 
 
 class OrderSpec(BaseModel):
-    """Family E-1: 글의 순서 ((A)-(B)-(C)) — split boundaries only."""
+    """Family E-1: 글의 순서 ((A)-(B)-(C)) — strict 3-chunk start boundaries."""
 
-    given_end_sentence_idx: int = Field(
+    first_chunk_start_idx: int = Field(
         ...,
-        ge=0,
-        description="[주어진 글]의 마지막 문장 인덱스 (보통 0 또는 1)",
+        ge=1,
+        description="[주어진 글] 직후 이어질 첫 번째 단락의 시작 문장 인덱스 (1 이상, [주어진 글]은 S0 ~ S[first_chunk_start_idx-1])",
     )
     second_chunk_start_idx: int = Field(
         ...,
         ge=2,
-        description="원래 논리 순서상 두 번째 단락의 시작 문장 인덱스",
+        description="원래 논리 순서상 두 번째 단락의 시작 문장 인덱스 (반드시 first_chunk_start_idx < second_chunk_start_idx)",
     )
     third_chunk_start_idx: int = Field(
         ...,
         ge=3,
-        description="원래 논리 순서상 세 번째 단락의 시작 문장 인덱스",
+        description="원래 논리 순서상 세 번째(마지막) 단락의 시작 문장 인덱스 (반드시 second_chunk_start_idx < third_chunk_start_idx <= N-1)",
     )
     cohesion_rationale_ko: str = Field(
         ...,

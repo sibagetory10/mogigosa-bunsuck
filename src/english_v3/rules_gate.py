@@ -10,6 +10,7 @@ from src.english_v3.assembler import AssemblyMetadata
 from src.english_v3.preprocessor import IndexedPassage
 from src.models.concept import RewrittenQuestion
 from src.storage.english_pool_store import _is_valid_cached_english_question
+from src.text_formatter import split_english_stem_blocks
 
 _FUNCTION_WORDS: frozenset[str] = frozenset({
     "a", "an", "the", "and", "or", "but", "nor", "so", "yet", "for",
@@ -181,4 +182,13 @@ def validate_assembled_question(
     violations.extend(_verify_blank_paraphrase(rw, meta))
     violations.extend(_verify_choice_symmetry(rw, meta))
     violations.extend(_verify_mutations(meta))
+    if meta.family == "order":
+        blocks = split_english_stem_blocks(rw.rewritten_stem or "")
+        order_blocks = [cnt for kind, cnt in blocks if kind == "order_chunks"]
+        if not order_blocks or len(order_blocks[0]) != 3:
+            violations.append("글의 순서 구조 오류: (A), (B), (C) 3개 단락이 모두 존재해야 합니다.")
+        else:
+            for mk, body_txt in order_blocks[0]:
+                if len(re.findall(r"[A-Za-z]+", str(body_txt))) < 3:
+                    violations.append(f"글의 순서 {mk} 단락이 비어 있거나 너무 짧습니다.")
     return violations

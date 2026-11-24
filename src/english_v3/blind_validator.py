@@ -17,11 +17,29 @@ def build_blind_solver_prompt(rw: RewrittenQuestion) -> str:
     choices_lines = "\n".join(
         f"{CIRCLED_NUMS[i]} {c}" for i, c in enumerate(rw.rewritten_choices[:5])
     )
+    t = (rw.target_question_type or "").strip()
+    discourse_hint = ""
+    if "순서" in t:
+        discourse_hint = (
+            "\nCRITICAL ORDERING RULE:\n"
+            "- Check exact boundary-level anaphora linking END of [주어진 글] -> START of 1st block, "
+            "END of 1st -> START of 2nd, and END of 2nd -> START of 3rd.\n"
+            "- Prioritize explicit grammatical/lexical referents (this/these/such/the same + noun, "
+            "'this last part', 'that disturbance', direct '?' -> 'No/Yes, because...', "
+            "however/instead/therefore, definite 'the + noun') over loose thematic ordering.\n"
+        )
+    elif "삽입" in t:
+        discourse_hint = (
+            "\nCRITICAL INSERTION RULE:\n"
+            "- Identify the exact anaphoric/contrastive hook inside [주어진 문장], and locate the gap ①~⑤ "
+            "where BOTH its backward referent is satisfied AND a logical/referential break occurs without it.\n"
+        )
     return (
         "You are an independent Korean CSAT (수능) English test-taker and KICE quality auditor.\n"
         "Solve the question below strictly based on the given passage, logic, cohesion, and grammar.\n"
         "Do NOT assume any pre-selected answer. Check whether EXACTLY ONE choice is uniquely correct.\n"
-        "If another choice can also be reasonably defended, list it in `ambiguous_choices` and explain why in `defect_reason`.\n\n"
+        "If another choice can also be reasonably defended, list it in `ambiguous_choices` and explain why in `defect_reason`.\n"
+        f"{discourse_hint}\n"
         f"[Question Type]: {rw.target_question_type}\n\n"
         f"{rw.rewritten_stem}\n\n"
         f"[Choices]\n{choices_lines}\n"

@@ -39,7 +39,17 @@ _ABBREV_RE = re.compile(
 )
 _DECIMAL_RE = re.compile(r"(\d)\.(\d)")
 _INITIAL_RE = re.compile(r"\b([A-Z])\.(?=\s+[A-Z])")
-_SENT_SPLIT_RE = re.compile(r"(?<=[.?!])(?:[\"”’'\)\]]+)?\s+(?=[A-Z\"“‘'\(\[])")
+_SENT_SPAN_RE = re.compile(
+    r'.+?(?:[.?!]+(?:["”’\'\)\]]+)?(?=\s+[A-Z"“‘\'\(\[]|$)|$)'
+)
+_STD_ORDER_MAP: dict[str, tuple[str, str, str]] = {
+    "1": ("A", "C", "B"),
+    "2": ("B", "A", "C"),
+    "3": ("B", "C", "A"),
+    "4": ("C", "A", "B"),
+    "5": ("C", "B", "A"),
+}
+_CIRCLED_LIST: tuple[str, ...] = ("①", "②", "③", "④", "⑤")
 
 
 @dataclass(frozen=True)
@@ -110,7 +120,7 @@ def sanitize_english_passage_deterministically(raw_text: str) -> tuple[str, list
 
 
 def split_english_sentences(text: str) -> list[str]:
-    """Deterministically split an English paragraph into sentences while protecting abbreviations and decimals."""
+    """Losslessly split an English paragraph into sentences while preserving quotes, parens, and abbreviations."""
     clean = re.sub(r"\s+", " ", (text or "").strip())
     if not clean:
         return []
@@ -119,13 +129,13 @@ def split_english_sentences(text: str) -> list[str]:
     protected = _ABBREV_RE.sub(lambda m: m.group(0).replace(".", _ABBREV_PLACEHOLDER), protected)
     protected = _INITIAL_RE.sub(rf"\1{_ABBREV_PLACEHOLDER}", protected)
 
-    raw_parts = _SENT_SPLIT_RE.split(protected)
+    raw_parts = [m.group(0).strip() for m in _SENT_SPAN_RE.finditer(protected) if m.group(0).strip()]
     restored = [p.replace(_ABBREV_PLACEHOLDER, ".").strip() for p in raw_parts if p.strip()]
 
     merged: list[str] = []
     for seg in restored:
         word_count = len(re.findall(r"[A-Za-z]+", seg))
-        if merged and (word_count < 3 or not re.search(r"[A-Za-z]", seg)):
+        if merged and (word_count < 2 or not re.search(r"[A-Za-z]", seg)):
             merged[-1] = f"{merged[-1]} {seg}".strip()
         else:
             merged.append(seg)
@@ -164,6 +174,107 @@ class _RestoredPassageSchema(BaseModel):
     restored_passage: str = Field(..., min_length=60)
 
 
+def _alpha_len(s: str) -> int:
+    return len(re.findall(r"[A-Za-z]", s or ""))
+
+
+def reconcile_exam_source_passage(raw_passage: str, base_question: Any) -> str:
+    """Deterministically reconcile scrambled/uncleaned Q35/Q36-37/Q38-39 DB passages using question_text & answer (0원)."""
+    raw = (raw_passage or "").strip()
+    if base_question is None:
+        return raw
+
+    q_num = int(getattr(base_question, "q_num", 0) or 0)
+    q_text = str(getattr(base_question, "question_text", "") or "").replace("\r\n", "\n").strip()
+    ans = str(getattr(base_question, "answer", "") or "").strip()
+    orig_type = str(getattr(base_question, "english_question_type", "") or "").strip()
+    if not q_text or ans not in ("1", "2", "3", "4", "5"):
+        return raw
+
+    _, raw_footnotes = sanitize_english_passage_deterministically(raw)
+
+    # 1) Original Order (36, 37)
+    if q_num in (36, 37) or "순서" in orig_type:
+        if all(mk in q_text for mk in ("(A)", "(B)", "(C)")):
+            # Parse choice sequence if present in q_text, else fallback to standard KICE map
+            seq = _STD_ORDER_MAP[ans]
+            ans_sym = _CIRCLED_LIST[int(ans) - 1]
+            cm = re.search(
+                rf"(?:^|\s){re.escape(ans_sym)}\s*\(?([ABC])\)?\s*[-–—]\s*\(?([ABC])\)?\s*[-–—]\s*\(?([ABC])\)?",
+                q_text,
+            )
+            if cm:
+                seq = (cm.group(1), cm.group(2), cm.group(3))
+
+            body_q, q_footnotes = sanitize_english_passage_deterministically(q_text)
+            m_abc = re.search(r"^(.*?)\(A\)\s+(.*?)\(B\)\s+(.*?)\(C\)\s+(.*)$", body_q, re.DOTALL)
+            if m_abc:
+                given_part = m_abc.group(1).strip()
+                # Strip trailing [주어진 글] or similar if present
+                given_part = re.sub(r"^\[주어진\s*글\]\s*", "", given_part).strip()
+                chunk_map = {
+                    "A": m_abc.group(2).strip(),
+                    "B": m_abc.group(3).strip(),
+                    "C": m_abc.group(4).strip(),
+                }
+                if len(given_part) >= 15 and all(len(chunk_map[k]) >= 15 for k in ("A", "B", "C")):
+                    rebuilt = f"{given_part} {chunk_map[seq[0]]} {chunk_map[seq[1]]} {chunk_map[seq[2]]}"
+                    rebuilt = re.sub(r"\s+", " ", rebuilt).strip()
+                    raw_alpha = _alpha_len(raw)
+                    reb_alpha = _alpha_len(rebuilt)
+                    if raw_alpha == 0 or (0.80 * raw_alpha <= reb_alpha <= 1.25 * raw_alpha):
+                        fns = q_footnotes or raw_footnotes
+                        return (rebuilt + ("\n" + "\n".join(fns) if fns else "")).strip()
+
+    # 2) Original Irrelevant Sentence (35)
+    if q_num == 35 or "무관" in orig_type:
+        if all(sym in q_text for sym in _CIRCLED_LIST):
+            ans_idx = int(ans) - 1
+            cur_sym = _CIRCLED_LIST[ans_idx]
+            next_pat = re.escape(_CIRCLED_LIST[ans_idx + 1]) if ans_idx < 4 else r"(?:\n|$)"
+            m_irr = re.search(rf"{re.escape(cur_sym)}\s*(.+?)(?={next_pat})", q_text, re.DOTALL)
+            if m_irr:
+                intruder_cand = re.sub(r"\s+", " ", m_irr.group(1)).strip()
+                # Strip trailing footnote if ans == 5
+                intruder_cand = re.split(r"\s+\*{1,2}\s*[A-Za-z-]+:", intruder_cand, maxsplit=1)[0].strip()
+                if len(intruder_cand) >= 25:
+                    body_raw, raw_fns = sanitize_english_passage_deterministically(raw)
+                    if intruder_cand in body_raw:
+                        cleaned_body = re.sub(r"\s+", " ", body_raw.replace(intruder_cand, " ")).strip()
+                        return (cleaned_body + ("\n" + "\n".join(raw_fns) if raw_fns else "")).strip()
+
+    # 3) Original Sentence Insertion (38, 39)
+    if q_num in (38, 39) or "삽입" in orig_type:
+        if all(sym in q_text for sym in _CIRCLED_LIST):
+            body_q, q_footnotes = sanitize_english_passage_deterministically(q_text)
+            # Detect [주어진 문장] box or first block before ①
+            m_ins = re.search(r"^(.*?)\(\s*①\s*\)|^(.*?)①", q_text, re.DOTALL)
+            if m_ins:
+                # Look for explicit box or first paragraph before main passage
+                q_clean_lines = [
+                    ln.strip()
+                    for ln in _KOR_INST_HEAD_RE.sub("", q_text, count=1).strip().splitlines()
+                    if ln.strip() and not _FOOTNOTE_RE.match(ln.strip()) and not _CHOICE_LINE_RE.match(ln.strip())
+                ]
+                if len(q_clean_lines) >= 2 and "①" not in q_clean_lines[0]:
+                    given_sent = re.sub(r"^\[주어진\s*문장\]\s*", "", q_clean_lines[0]).strip()
+                    rest_text = " ".join(q_clean_lines[1:])
+                    target_sym = _CIRCLED_LIST[int(ans) - 1]
+                    pat_marker = rf"\(\s*{re.escape(target_sym)}\s*\)|{re.escape(target_sym)}"
+                    if given_sent and len(given_sent) >= 15 and re.search(pat_marker, rest_text):
+                        spliced = re.sub(pat_marker, f" {given_sent} ", rest_text, count=1)
+                        spliced = _CIRCLED_WITH_PARENS_RE.sub(" ", spliced)
+                        spliced = _CIRCLED_MARKER_RE.sub("", spliced)
+                        spliced = re.sub(r"\s+", " ", spliced).strip()
+                        raw_alpha = _alpha_len(raw)
+                        spl_alpha = _alpha_len(spliced)
+                        if raw_alpha == 0 or (0.80 * raw_alpha <= spl_alpha <= 1.25 * raw_alpha):
+                            fns = q_footnotes or raw_footnotes
+                            return (spliced + ("\n" + "\n".join(fns) if fns else "")).strip()
+
+    return raw
+
+
 def restore_passage_if_needed(
     api_key: str,
     model_name: str,
@@ -173,7 +284,7 @@ def restore_passage_if_needed(
 ) -> str:
     """Restore an incomplete exam passage (blank/order/choice brackets) into clean coherent prose."""
     _ = source_pdf_bytes
-    raw = (raw_passage or "").strip()
+    raw = reconcile_exam_source_passage((raw_passage or "").strip(), base_question)
     if not raw:
         return ""
     orig_type = (

@@ -457,20 +457,20 @@ def assemble_question(
         return rw, meta
 
     if isinstance(spec, OrderSpec):
-        g_end = int(spec.given_end_sentence_idx)
-        s2 = int(spec.second_chunk_start_idx)
-        s3 = int(spec.third_chunk_start_idx)
-        if not (0 <= g_end < s2 - 1 and s2 < s3 < n_sent):
-            # Allow s2 == g_end + 1 (valid 1-sentence chunk1)
-            if not (0 <= g_end < s2 < s3 < n_sent):
-                raise AssemblyError(
-                    f"글의 순서 분할 경계가 유효하지 않습니다: given_end={g_end}, s2={s2}, s3={s3}, n={n_sent}"
-                )
+        c1 = int(spec.first_chunk_start_idx)
+        c2 = int(spec.second_chunk_start_idx)
+        c3 = int(spec.third_chunk_start_idx)
+        if not (1 <= c1 < c2 < c3 < n_sent):
+            raise AssemblyError(
+                f"글의 순서 분할 경계가 유효하지 않습니다: c1={c1}, c2={c2}, c3={c3}, n={n_sent}"
+            )
 
-        given_text = " ".join(sentences[: g_end + 1])
-        chunk1 = " ".join(sentences[g_end + 1 : s2])
-        chunk2 = " ".join(sentences[s2:s3])
-        chunk3 = " ".join(sentences[s3:])
+        given_text = " ".join(sentences[:c1]).strip()
+        chunk1 = " ".join(sentences[c1:c2]).strip()
+        chunk2 = " ".join(sentences[c2:c3]).strip()
+        chunk3 = " ".join(sentences[c3:]).strip()
+        if not all((given_text, chunk1, chunk2, chunk3)):
+            raise AssemblyError("글의 순서 조립 중 빈 단락이 발생했습니다.")
         chunks = [chunk1, chunk2, chunk3]
 
         # Non-canonical permutations: perm[label_idx] = original_chunk_idx (never (0, 1, 2))

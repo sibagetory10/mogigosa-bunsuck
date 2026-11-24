@@ -123,17 +123,17 @@ def _build_cost_saver_rules() -> dict[str, TypeRoutingRule]:
         ),
         "order": TypeRoutingRule(
             family="order",
-            generate=StageRoute(FLASH_LITE_MODEL, "medium", 0.20),
-            retry_2_generate=StageRoute(FLASH_LITE_MODEL, "high", 0.25),
+            generate=StageRoute(FLASH_LITE_MODEL, "medium", 0.25),
+            retry_2_generate=StageRoute(FLASH_LITE_MODEL, "high", 0.35),
             require_blind_solver=True,
-            blind_solver=StageRoute(FLASH_LITE_MODEL, "medium", 0.10),
+            blind_solver=StageRoute(FLASH_LITE_MODEL, "high", 0.10),
         ),
         "insertion": TypeRoutingRule(
             family="insertion",
-            generate=StageRoute(FLASH_LITE_MODEL, "medium", 0.20),
-            retry_2_generate=StageRoute(FLASH_LITE_MODEL, "high", 0.25),
+            generate=StageRoute(FLASH_LITE_MODEL, "medium", 0.25),
+            retry_2_generate=StageRoute(FLASH_LITE_MODEL, "high", 0.35),
             require_blind_solver=True,
-            blind_solver=StageRoute(FLASH_LITE_MODEL, "medium", 0.10),
+            blind_solver=StageRoute(FLASH_LITE_MODEL, "high", 0.10),
         ),
         "summary": TypeRoutingRule(
             family="summary",

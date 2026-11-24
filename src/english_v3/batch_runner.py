@@ -13,15 +13,16 @@ from google.genai import types
 from src.config import FLASH_LITE_MODEL
 from src.english_v3.assembler import AssemblyError, assemble_question
 from src.english_v3.blind_validator import build_blind_solver_prompt, evaluate_blind_verdict
+from src.english_v3.discourse import rank_insertion_targets, rank_order_splits
 from src.english_v3.pipeline import build_generation_prompt, resolve_schema_for_type
-from src.english_v3.preprocessor import build_indexed_passage, check_type_feasibility
+from src.english_v3.preprocessor import IndexedPassage, build_indexed_passage, check_type_feasibility
 from src.english_v3.routing import (
     classify_target_family,
     get_type_routing_rule,
     resolve_active_routing_profile,
 )
 from src.english_v3.rules_gate import validate_assembled_question
-from src.english_v3.schemas import BlindSolverVerdict
+from src.english_v3.schemas import BlindSolverVerdict, InsertionSpec, OrderSpec
 from src.english_v3.transport import build_inlined_request_dict, build_v3_client
 from src.models.concept import RewrittenQuestion
 from src.storage.base import _atomic_write_text
@@ -258,6 +259,22 @@ def sync_and_advance_batch_job(
                         sentences=tuple(m_entry["sentences"]),
                         footnotes=tuple(m_entry.get("footnotes") or []),
                     )
+                    n_s = len(indexed.sentences)
+                    if isinstance(spec, OrderSpec):
+                        t3 = (spec.first_chunk_start_idx, spec.second_chunk_start_idx, spec.third_chunk_start_idx)
+                        if not (1 <= t3[0] < t3[1] < t3[2] < n_s):
+                            cands = rank_order_splits(indexed)
+                            if cands:
+                                b3 = cands[0][0]
+                                spec = spec.model_copy(
+                                    update={"first_chunk_start_idx": b3[0], "second_chunk_start_idx": b3[1], "third_chunk_start_idx": b3[2]}
+                                )
+                    elif isinstance(spec, InsertionSpec):
+                        ei = int(spec.extracted_sentence_idx)
+                        if not (1 <= ei < n_s):
+                            cands_i = rank_insertion_targets(indexed)
+                            if cands_i:
+                                spec = spec.model_copy(update={"extracted_sentence_idx": cands_i[0][0]})
                     rw, a_meta = assemble_question(
                         indexed,
                         spec,
