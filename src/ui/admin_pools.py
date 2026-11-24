@@ -223,12 +223,124 @@ def _render_server_git_update_admin_section() -> None:
                     st.error(f"❌ git pull 실패: {pull_out}")
 
 
+def _render_english_batch_builder_expander(ctx: AppContext) -> None:
+    """관리자 전용: Gemini Batch API(50% 할인)로 영어 v3 변형 문제 풀을 비동기 대량 구축한다."""
+    batch_exp = create_lazy_expander(
+        "📦 영어 v3 비동기 Batch API 대량 풀 구축 (50% 할인)",
+        expanded=False,
+        key="admin_eng_v3_batch_exp",
+    )
+    with batch_exp:
+        if not is_container_open(batch_exp):
+            return
+        from src.auth import resolve_active_gemini_api_key
+        from src.english_v3.batch_runner import (
+            load_batch_jobs,
+            submit_generation_batch,
+            sync_and_advance_batch_job,
+        )
+        from src.english_v3.routing import ROUTING_PROFILES
+        from src.models import ENGLISH_DEFAULT_EXCLUDED_Q_NUMS, ENGLISH_TRANSFORM_TYPES
+
+        api_key, key_lbl = resolve_active_gemini_api_key(ctx.current_user, ctx.creds.gemini_api_key)
+        all_db = ctx.storage.load_db_readonly()
+        eng_recs = [
+            r
+            for r in all_db
+            if r.subject_category == "영어"
+            and r.q_num not in ENGLISH_DEFAULT_EXCLUDED_Q_NUMS
+            and bool((getattr(r, "passage_text", "") or "").strip())
+        ]
+        avail_exams = sorted({r.exam_name for r in eng_recs}, reverse=True)
+
+        if not avail_exams:
+            st.info("Batch API에 투입할 영어 독해 기출 지문이 DB에 없습니다.")
+        else:
+            b_c1, b_c2 = st.columns([1.4, 1.0])
+            with b_c1:
+                sel_exam = st.selectbox("대상 영어 모의고사 회차", options=avail_exams, key="admin_v3_batch_exam")
+            with b_c2:
+                sel_profile = st.selectbox(
+                    "라우팅 프로필",
+                    options=list(ROUTING_PROFILES.keys()),
+                    index=0,
+                    key="admin_v3_batch_profile",
+                )
+            sel_types = st.multiselect(
+                "사전 적재할 변형 유형",
+                options=list(ENGLISH_TRANSFORM_TYPES),
+                default=["주제 파악", "빈칸 추론", "어법상 틀린 것 (밑줄 ①~⑤)", "글의 순서 ((A)-(B)-(C))"],
+                key="admin_v3_batch_types",
+            )
+            if st.button("🚀 비동기 Batch 작업 제출 (50% 할인)", key="admin_v3_batch_submit_btn", type="primary"):
+                if not api_key:
+                    st.error(f"Gemini API 키({key_lbl})가 설정되지 않았습니다.")
+                elif not sel_types:
+                    st.warning("최소 1개 이상의 변형 유형을 선택하세요.")
+                else:
+                    target_recs = [r for r in eng_recs if r.exam_name == sel_exam]
+                    b_jobs = [
+                        {
+                            "passage_text": r.passage_text,
+                            "target_type": t_type,
+                            "difficulty": "고3 평가원·수능 수준",
+                            "blank_unit": "구 (3~6단어)",
+                            "vocab_style": "밑줄형 (①~⑤)",
+                            "source_label": f"출처: {r.exam_name} {r.q_num}번",
+                        }
+                        for r in target_recs
+                        for t_type in sel_types
+                    ]
+                    try:
+                        rec_b = submit_generation_batch(
+                            api_key=api_key,
+                            storage=ctx.storage,
+                            jobs=b_jobs,
+                            display_label=f"{sel_exam} ({len(sel_types)}유형)",
+                            routing_profile=sel_profile,
+                        )
+                        st.success(
+                            f"✅ Batch 작업 `{rec_b['job_id']}` 제출 완료! "
+                            f"(신규 {rec_b['submitted_count']}건 / 기존 캐시 스킵 {rec_b['skipped_cached']}건)"
+                        )
+                    except Exception as exc:
+                        st.error(f"Batch 제출 실패: {exc}")
+
+        tracked = load_batch_jobs(ctx.storage)
+        if tracked:
+            st.markdown("**📋 추적 중인 Batch API 작업 목록**")
+            for b_item in tracked[:10]:
+                jid = str(b_item.get("job_id") or "")
+                col_i, col_b = st.columns([4, 1.3])
+                with col_i:
+                    st.markdown(
+                        f"- `{jid}` **{b_item.get('display_label')}** · 단계 `{b_item.get('phase')}` · "
+                        f"상태 `{b_item.get('state')}` · 적재 `{b_item.get('committed_count', 0)}건` / "
+                        f"탈락 `{b_item.get('rejected_count', 0)}건`"
+                    )
+                with col_b:
+                    if b_item.get("phase") not in ("completed", "failed"):
+                        if st.button("🔄 동기화/수확", key=f"sync_v3_batch_{jid}", width="stretch"):
+                            if not api_key:
+                                st.error("API 키가 필요합니다.")
+                            else:
+                                try:
+                                    updated = sync_and_advance_batch_job(api_key, ctx.storage, jid)
+                                    st.success(
+                                        f"`{jid}` 동기화 완료 → {updated.get('phase')} "
+                                        f"(적재 {updated.get('committed_count', 0)}건)"
+                                    )
+                                    st.rerun()
+                                except Exception as exc:
+                                    st.error(f"동기화 오류: {exc}")
+
+
 def _render_english_pool_admin_section(ctx: AppContext) -> None:
     st.divider()
-    st.subheader("🔤 영어 변형 문제 풀(Pool) 캐시 관리")
+    st.subheader("🔤 영어 변형 문제 풀(Pool) 캐시 관리 (v3)")
     st.caption(
-        "파이썬 검증을 통과한 영어 변형 문항은 서버의 `./exam_db/english_question_pool.json`에 "
-        "지문·유형·옵션 해시별로 최대 3개씩 저장됩니다."
+        "파이썬 하드 규칙 + Blind Solver 검수를 통과한 영어 변형 문항은 `./exam_db/english_question_pool.json`에 "
+        "지문·유형·옵션 해시(v3)별로 최대 5개씩 저장됩니다."
     )
 
     pool = ctx.storage.load_english_pool()
@@ -237,7 +349,7 @@ def _render_english_pool_admin_section(ctx: AppContext) -> None:
     type_counts: dict[str, int] = {}
     for c_key, items in pool.items():
         for idx, item in enumerate(items):
-            t_name = str(item.get("target_type") or "기타").strip() or "기타"
+            t_name = str(item.get("target_question_type") or item.get("target_type") or "기타").strip() or "기타"
             type_counts[t_name] = type_counts.get(t_name, 0) + 1
             flat_entries.append((c_key, idx, item))
 
@@ -250,6 +362,8 @@ def _render_english_pool_admin_section(ctx: AppContext) -> None:
     if type_counts:
         summary_parts = [f"{k}({v})" for k, v in sorted(type_counts.items(), key=lambda kv: (-kv[1], kv[0]))]
         st.caption("유형별 분포: " + " · ".join(summary_parts))
+
+    _render_english_batch_builder_expander(ctx)
 
     if total_items == 0:
         st.info("현재 저장된 영어 변형 캐시 문항이 없습니다.")
@@ -305,8 +419,8 @@ def _render_english_pool_admin_section(ctx: AppContext) -> None:
 
         st.caption(f"검색 결과: {len(filtered_entries)}문항 (최대 25건 표시)")
         for ck, idx, it in filtered_entries[:25]:
-            t_label = str(it.get("target_type") or "기타")
-            ans_label = str(it.get("answer") or "-")
+            t_label = str(it.get("target_question_type") or it.get("target_type") or "기타")
+            ans_label = str(it.get("preserved_answer") or it.get("answer") or "-")
             stem_preview = " ".join(str(it.get("rewritten_stem") or "").split())[:130]
             r_col1, r_col2 = st.columns([5, 1])
             with r_col1:

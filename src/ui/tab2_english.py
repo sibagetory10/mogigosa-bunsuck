@@ -80,21 +80,18 @@ def _execute_english_transform_jobs(
         st.error(f"영어 지문 변형용 Gemini API 키({rewrite_key_label})가 설정되지 않았습니다.")
         return
 
-    from src.gemini import (
-        generate_english_transformed_question,
+    from src.english_v3.pipeline import (
+        _needs_english_passage_restoration,
+        generate_batch_questions_v3,
         prepare_clean_english_source_passage,
-        submit_with_usage_context,
     )
-    from src.gemini.english_validators import _needs_english_passage_restoration
 
     total_jobs = len(jobs)
     prog = st.progress(0.0)
     stat = st.empty()
     n_workers = max(1, min(total_jobs, 4))
-    stat.info(f"🔤 영어 지문 수능형 변형 {total_jobs}문항 병렬 출제 중 (최대 {n_workers}스레드)...")
-
-    results_by_idx: dict[int, RewrittenQuestion] = {}
-    errors_by_idx: dict[int, str] = {}
+    tier_hint = "Flex 50% 할인·캐시" if total_jobs >= 5 else "Standard 즉시 응답"
+    stat.info(f"🔤 영어 지문 수능형 변형 v3 {total_jobs}문항 출제 중 ({tier_hint}, 최대 {n_workers}스레드)...")
 
     pdf_bytes_cache: dict[tuple[str, str], bytes | None] = {}
 
@@ -115,7 +112,7 @@ def _execute_english_transform_jobs(
 
     # PyMuPDF 멀티스레드 경합/데드락 방지: 메인 스레드에서 1회만 원문 정화·복원 후 워커 스레드에는 정화된 텍스트만 전달
     cleaned_passages_cache: dict[str, str] = {}
-    prepared_passages: list[str] = []
+    prepared_jobs: list[dict[str, Any]] = []
     with _usage_scope(ctx):
         for job in jobs:
             raw_p = str(job.get("passage_text") or "").strip()
@@ -135,50 +132,23 @@ def _execute_english_transform_jobs(
                     base_question=base_q,
                     source_pdf_bytes=src_pdf_b,
                 ) or raw_p
-            prepared_passages.append(cleaned_passages_cache[cache_k])
+            p_job = dict(job)
+            p_job["passage_text"] = cleaned_passages_cache[cache_k]
+            p_job["base_question"] = None
+            prepared_jobs.append(p_job)
 
-        executor = concurrent.futures.ThreadPoolExecutor(max_workers=n_workers)
-        try:
-            future_map = {
-                submit_with_usage_context(
-                    executor,
-                    generate_english_transformed_question,
-                    api_key=rewrite_api_key,
-                    model_name=rewrite_model,
-                    source_passage=prepared_passages[idx],
-                    target_type=job["target_type"],
-                    difficulty=job["difficulty"],
-                    blank_unit=job["blank_unit"],
-                    vocab_style=job["vocab_style"],
-                    source_label=job["source_label"],
-                    use_precision_mode=use_precision_mode,
-                    storage=ctx.storage,
-                    use_cache=True,
-                    username=ctx.current_user.username if ctx.current_user is not None else "",
-                    base_question=None,
-                    source_pdf_bytes=None,
-                ): idx
-                for idx, job in enumerate(jobs)
-            }
-            done_cnt = 0
-            batch_timeout_s = max(65.0, float(total_jobs) * 20.0)
-            try:
-                for fut in concurrent.futures.as_completed(future_map, timeout=batch_timeout_s):
-                    idx = future_map[fut]
-                    done_cnt += 1
-                    try:
-                        results_by_idx[idx] = fut.result(timeout=5)
-                    except Exception as exc:
-                        errors_by_idx[idx] = str(exc)
-                    prog.progress(done_cnt / total_jobs)
-                    stat.info(f"🔤 영어 지문 수능형 변형 출제 중 ({done_cnt}/{total_jobs})...")
-            except concurrent.futures.TimeoutError:
-                for fut, idx in future_map.items():
-                    if idx not in results_by_idx and idx not in errors_by_idx:
-                        fut.cancel()
-                        errors_by_idx[idx] = "응답 시간 초과로 중단되었습니다. 해당 문항만 다시 시도해 주세요."
-        finally:
-            executor.shutdown(wait=False, cancel_futures=True)
+        def _on_v3_progress(done_cnt: int, tot_cnt: int) -> None:
+            prog.progress(min(1.0, done_cnt / max(1, tot_cnt)))
+            stat.info(f"🔤 영어 지문 수능형 변형 v3 출제·검수 중 ({done_cnt}/{tot_cnt})...")
+
+        results_by_idx, errors_by_idx = generate_batch_questions_v3(
+            api_key=rewrite_api_key,
+            jobs=prepared_jobs,
+            storage=ctx.storage,
+            username=ctx.current_user.username if ctx.current_user is not None else "",
+            max_workers=n_workers,
+            progress_callback=_on_v3_progress,
+        )
 
     prog.progress(1.0)
     stat.empty()

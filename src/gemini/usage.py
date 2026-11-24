@@ -15,7 +15,7 @@ from src.config import (
     FLASH_LITE_MODEL,
     FLASH_LITE_OUTPUT_USD_PER_1M,
     MODEL_TOKEN_PRICING_USD_PER_1M,
-    resolve_api_model_name,
+    resolve_routed_model_name,
 )
 
 
@@ -36,6 +36,7 @@ class TokenUsageRecord:
     output_tokens: int = 0  # 출력 + 사고(thoughts) 토큰
     total_tokens: int = 0
     cost_usd: float = 0.0
+    service_tier: str = "standard"
 
 
 _ACTIVE_USAGE_RECORDER: contextvars.ContextVar[Callable[[TokenUsageRecord], None] | None] = (
@@ -48,9 +49,12 @@ def calculate_token_cost_usd(
     cached_tokens: int,
     output_tokens: int,
     model_name: str = FLASH_LITE_MODEL,
+    *,
+    service_tier: str = "standard",
+    allow_routed_model: bool = False,
 ) -> float:
-    """실제 토큰 수(일반 입력 / 캐시 입력 / 출력+사고)를 모델 단가(USD)로 계산한다."""
-    resolved = resolve_api_model_name(model_name)
+    """실제 토큰 수(일반 입력 / 캐시 입력 / 출력+사고)를 모델 단가 및 서비스 티어 할인(Flex/Batch 50%)으로 계산한다."""
+    resolved = resolve_routed_model_name(model_name, allow_flash_escalation=allow_routed_model)
     rates = MODEL_TOKEN_PRICING_USD_PER_1M.get(
         resolved,
         {
@@ -67,15 +71,24 @@ def calculate_token_cost_usd(
         + (cached_in * rates["cached_input"])
         + (out_tok * rates["output"])
     ) / 1_000_000.0
+    if (service_tier or "").strip().lower() in ("flex", "batch"):
+        usd *= 0.5
     return max(0.0, usd)
 
 
-def extract_usage_from_response(response: Any, model_name: str = FLASH_LITE_MODEL) -> TokenUsageRecord:
+def extract_usage_from_response(
+    response: Any,
+    model_name: str = FLASH_LITE_MODEL,
+    *,
+    service_tier: str = "standard",
+    allow_routed_model: bool = False,
+) -> TokenUsageRecord:
     """Gemini 응답의 usage_metadata에서 실제 토큰 수와 USD 예상 비용을 추출한다."""
-    resolved = resolve_api_model_name(model_name)
+    resolved = resolve_routed_model_name(model_name, allow_flash_escalation=allow_routed_model)
+    tier_norm = (service_tier or "standard").strip().lower() or "standard"
     um = getattr(response, "usage_metadata", None)
     if um is None:
-        return TokenUsageRecord(model_name=resolved)
+        return TokenUsageRecord(model_name=resolved, service_tier=tier_norm)
 
     raw_prompt = int(getattr(um, "prompt_token_count", 0) or 0)
     cached = int(getattr(um, "cached_content_token_count", 0) or 0)
@@ -91,6 +104,8 @@ def extract_usage_from_response(response: Any, model_name: str = FLASH_LITE_MODE
         cached_tokens=cached,
         output_tokens=output_total,
         model_name=resolved,
+        service_tier=tier_norm,
+        allow_routed_model=allow_routed_model,
     )
     return TokenUsageRecord(
         model_name=resolved,
@@ -99,6 +114,7 @@ def extract_usage_from_response(response: Any, model_name: str = FLASH_LITE_MODE
         output_tokens=output_total,
         total_tokens=total_tokens,
         cost_usd=cost_usd,
+        service_tier=tier_norm,
     )
 
 
@@ -128,12 +144,23 @@ def submit_with_usage_context(
     return executor.submit(ctx.run, fn, *args, **kwargs)
 
 
-def _emit_usage_from_response(response: Any, model_name: str) -> None:
+def _emit_usage_from_response(
+    response: Any,
+    model_name: str,
+    *,
+    service_tier: str = "standard",
+    allow_routed_model: bool = False,
+) -> None:
     recorder = _ACTIVE_USAGE_RECORDER.get()
     if recorder is None:
         return
     try:
-        usage = extract_usage_from_response(response, model_name=model_name)
+        usage = extract_usage_from_response(
+            response,
+            model_name=model_name,
+            service_tier=service_tier,
+            allow_routed_model=allow_routed_model,
+        )
         if usage.total_tokens > 0 or usage.prompt_tokens > 0 or usage.output_tokens > 0:
             recorder(usage)
     except Exception:

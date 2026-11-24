@@ -16,7 +16,7 @@ from src.storage.base import (
 if TYPE_CHECKING:
     from src.models import RewrittenQuestion
 
-CURRENT_ENGLISH_POOL_VERSION = "v2"
+CURRENT_ENGLISH_POOL_VERSION = "v3"
 _DSL_REMNANT_RE = re.compile(
     r"(?:^\s*(?:SPLIT|INSERT_AT|SENTENCE)\s*:|^\s*[1-5①②③④⑤]\s*[:.)]\s*[A-Za-z\-']+(?:\s*(?:->|→)\s*[A-Za-z\-']+)?\s*$)",
     re.IGNORECASE | re.MULTILINE,

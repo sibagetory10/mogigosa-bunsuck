@@ -11,6 +11,8 @@ except ImportError:  # pragma: no cover
 
 FLASH_LITE_MODEL: str = "gemini-3.5-flash-lite"
 FLASH_LITE_LABEL: str = "Gemini 3.5 Flash-Lite"
+FLASH_3_6_MODEL: str = "gemini-3.6-flash"
+FLASH_3_8_MODEL: str = "gemini-3.8-flash"
 
 # 하위 호환용 별칭 (전 기능 gemini-3.5-flash-lite 단일 모델 통일)
 HYDROGEN_MODEL: str = FLASH_LITE_MODEL
@@ -21,6 +23,8 @@ AVAILABLE_MODELS: list[str] = [
 ]
 MODEL_LABELS: dict[str, str] = {
     FLASH_LITE_MODEL: FLASH_LITE_LABEL,
+    FLASH_3_6_MODEL: "Gemini 3.6 Flash",
+    FLASH_3_8_MODEL: "Gemini 3.8 Flash",
 }
 DEFAULT_MODEL: str = FLASH_LITE_MODEL
 EXAM_TAGGING_MODEL: str = FLASH_LITE_MODEL
@@ -39,13 +43,37 @@ MODEL_TOKEN_PRICING_USD_PER_1M: dict[str, dict[str, float]] = {
         "cached_input": FLASH_LITE_CACHED_INPUT_USD_PER_1M,
         "output": FLASH_LITE_OUTPUT_USD_PER_1M,
     },
+    FLASH_3_6_MODEL: {
+        "input": 0.75,
+        "cached_input": 0.075,
+        "output": 3.75,
+    },
+    FLASH_3_8_MODEL: {
+        "input": 0.75,
+        "cached_input": 0.075,
+        "output": 3.75,
+    },
 }
 DEFAULT_USD_TO_KRW: float = 1335.0
+
+ROUTABLE_ENGLISH_MODELS: frozenset[str] = frozenset({
+    FLASH_LITE_MODEL,
+    FLASH_3_6_MODEL,
+    FLASH_3_8_MODEL,
+})
 
 
 def resolve_api_model_name(model_choice: str | None) -> str:
     """모든 모델 요청을 단일 모델(gemini-3.5-flash-lite)로 정규화한다."""
     _ = model_choice
+    return FLASH_LITE_MODEL
+
+
+def resolve_routed_model_name(model_choice: str | None, allow_flash_escalation: bool = False) -> str:
+    """영어 v3 라우터용 모델 정규화 (허용 플래그가 켜진 경우에만 Flash 3.6/3.8 라우팅 허용)."""
+    cand = (model_choice or "").strip()
+    if allow_flash_escalation and cand in ROUTABLE_ENGLISH_MODELS:
+        return cand
     return FLASH_LITE_MODEL
 
 
