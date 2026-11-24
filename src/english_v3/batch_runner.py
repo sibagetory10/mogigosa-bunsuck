@@ -11,11 +11,16 @@ from typing import Any
 from google.genai import types
 
 from src.config import FLASH_LITE_MODEL
-from src.english_v3.assembler import AssemblyError, assemble_question
+from src.english_v3.assembler import AssemblyError, _format_explanation, assemble_question
 from src.english_v3.blind_validator import build_blind_solver_prompt, evaluate_blind_verdict
 from src.english_v3.discourse import rank_insertion_targets, rank_order_splits
 from src.english_v3.pipeline import build_generation_prompt, resolve_schema_for_type
-from src.english_v3.preprocessor import IndexedPassage, build_indexed_passage, check_type_feasibility
+from src.english_v3.preprocessor import (
+    IndexedPassage,
+    build_indexed_passage,
+    check_type_feasibility,
+    extract_passage_key_vocab,
+)
 from src.english_v3.routing import (
     classify_target_family,
     get_type_routing_rule,
@@ -23,7 +28,11 @@ from src.english_v3.routing import (
 )
 from src.english_v3.rules_gate import validate_assembled_question
 from src.english_v3.schemas import BlindSolverVerdict, InsertionSpec, OrderSpec
-from src.english_v3.transport import build_inlined_request_dict, build_v3_client
+from src.english_v3.transport import (
+    COMPACT_SOLVER_SYSTEM_PROMPT,
+    build_inlined_request_dict,
+    build_v3_client,
+)
 from src.models.concept import RewrittenQuestion
 from src.storage.base import _atomic_write_text
 from src.storage.english_pool_store import EnglishPoolStoreMixin
@@ -101,6 +110,7 @@ def submit_generation_batch(
 
     inlined_requests: list[dict[str, Any]] = []
     manifest: list[dict[str, Any]] = []
+    preassembled_pass2: list[dict[str, Any]] = []
     skipped_cached = 0
     skipped_infeasible = 0
 
@@ -129,6 +139,54 @@ def submit_generation_batch(
             continue
 
         rule = get_type_routing_rule(target_type, vocab_style=vocab_style, profile_name=eff_profile)
+        vocab_list = extract_passage_key_vocab(indexed.clean_text, hint_vocab=job.get("key_vocabulary"))
+
+        # Zero-generator-token fast path for order / insertion: pre-assemble deterministically via discourse.py
+        if family in ("order", "insertion"):
+            try:
+                if family == "order":
+                    cands = rank_order_splits(indexed)
+                    if not cands:
+                        skipped_infeasible += 1
+                        continue
+                    b3 = cands[0][0]
+                    spec_pre: Any = OrderSpec(
+                        first_chunk_start_idx=b3[0],
+                        second_chunk_start_idx=b3[1],
+                        third_chunk_start_idx=b3[2],
+                    )
+                else:
+                    cands_i = rank_insertion_targets(indexed)
+                    if not cands_i:
+                        skipped_infeasible += 1
+                        continue
+                    spec_pre = InsertionSpec(extracted_sentence_idx=cands_i[0][0])
+
+                rw_pre, meta_pre = assemble_question(
+                    indexed,
+                    spec_pre,
+                    target_type=target_type,
+                    blank_unit=blank_unit,
+                    vocab_style=vocab_style,
+                    seed_val=idx + 301,
+                    self_note=f"v3 Batch PreAssembled:0tok ({eff_profile})",
+                    key_vocab=vocab_list,
+                )
+                if validate_assembled_question(indexed, spec_pre, rw_pre, meta_pre):
+                    skipped_infeasible += 1
+                    continue
+                preassembled_pass2.append({
+                    "cache_key": ck,
+                    "target_type": target_type,
+                    "vocab_style": vocab_style,
+                    "rw_dump": rw_pre.model_dump(),
+                    "need_rationale_ko": True,
+                })
+                continue
+            except Exception:
+                skipped_infeasible += 1
+                continue
+
         schema_cls = resolve_schema_for_type(target_type, vocab_style=vocab_style)
         prompt = build_generation_prompt(
             indexed,
@@ -145,6 +203,7 @@ def submit_generation_batch(
                 schema_cls=schema_cls,
                 metadata={"req_idx": str(req_idx)},
                 allow_flash_escalation=allow_escalation,
+                max_output_tokens=600,
             )
         )
         manifest.append({
@@ -158,39 +217,88 @@ def submit_generation_batch(
             "blank_unit": blank_unit,
             "vocab_style": vocab_style,
             "source_label": str(job.get("source_label") or ""),
+            "key_vocabulary": list(job.get("key_vocabulary") or []),
         })
 
-    if not inlined_requests:
+    total_submitted = len(manifest) + len(preassembled_pass2)
+    if total_submitted == 0:
         raise ValueError(
             f"제출할 신규 작업이 없습니다 (이미 캐시 충족: {skipped_cached}건, 구조 부적합: {skipped_infeasible}건)."
         )
 
     client = build_v3_client(api_key)
     job_id = uuid.uuid4().hex[:12]
-    batch_job = client.batches.create(
-        model=FLASH_LITE_MODEL,
-        src=inlined_requests,
-        config=types.CreateBatchJobConfig(
-            display_name=display_label or f"mogigosa-eng-v3-p1-{job_id}",
-        ),
-    )
+
+    if inlined_requests:
+        batch_job = client.batches.create(
+            model=FLASH_LITE_MODEL,
+            src=inlined_requests,
+            config=types.CreateBatchJobConfig(
+                display_name=display_label or f"mogigosa-eng-v3-p1-{job_id}",
+            ),
+        )
+        phase_init = "pass1_generate"
+        p1_name = str(getattr(batch_job, "name", ""))
+        p2_name = ""
+        pending_p2_init: list[dict[str, Any]] = []
+    else:
+        pass2_direct_reqs: list[dict[str, Any]] = []
+        pending_p2_init = []
+        for p2_idx, item in enumerate(preassembled_pass2):
+            rule_p2 = get_type_routing_rule(
+                item["target_type"],
+                vocab_style=item.get("vocab_style", "밑줄형 (①~⑤)"),
+                profile_name=eff_profile,
+            )
+            solver_route = rule_p2.blind_solver or rule_p2.generate
+            rw_pre_obj = RewrittenQuestion.model_validate(item["rw_dump"])
+            pass2_direct_reqs.append(
+                build_inlined_request_dict(
+                    route=solver_route,
+                    user_prompt=build_blind_solver_prompt(rw_pre_obj, need_rationale_ko=True),
+                    schema_cls=BlindSolverVerdict,
+                    metadata={"p2_idx": str(p2_idx)},
+                    allow_flash_escalation=allow_escalation,
+                    system_instruction_override=COMPACT_SOLVER_SYSTEM_PROMPT,
+                    max_output_tokens=260,
+                )
+            )
+            pending_p2_init.append({
+                "p2_idx": p2_idx,
+                "cache_key": item["cache_key"],
+                "rw_dump": item["rw_dump"],
+                "need_rationale_ko": True,
+            })
+        batch_job = client.batches.create(
+            model=FLASH_LITE_MODEL,
+            src=pass2_direct_reqs,
+            config=types.CreateBatchJobConfig(
+                display_name=display_label or f"mogigosa-eng-v3-p2-{job_id}",
+            ),
+        )
+        phase_init = "pass2_validate"
+        p1_name = ""
+        p2_name = str(getattr(batch_job, "name", ""))
+        preassembled_pass2 = []
+
     record: dict[str, Any] = {
         "job_id": job_id,
-        "display_label": display_label or f"영어 v3 배치 ({len(manifest)}건)",
+        "display_label": display_label or f"영어 v3 배치 ({total_submitted}건)",
         "routing_profile": eff_profile,
-        "phase": "pass1_generate",
+        "phase": phase_init,
         "state": str(getattr(batch_job, "state", "JOB_STATE_PENDING")),
-        "pass1_batch_name": str(getattr(batch_job, "name", "")),
-        "pass2_batch_name": "",
+        "pass1_batch_name": p1_name,
+        "pass2_batch_name": p2_name,
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "updated_at": datetime.now().isoformat(timespec="seconds"),
-        "submitted_count": len(manifest),
+        "submitted_count": total_submitted,
         "skipped_cached": skipped_cached,
         "skipped_infeasible": skipped_infeasible,
         "committed_count": 0,
         "rejected_count": 0,
         "manifest": manifest,
-        "pending_pass2": [],
+        "preassembled_pass2": preassembled_pass2,
+        "pending_pass2": pending_p2_init,
     }
     all_jobs = load_batch_jobs(storage)
     all_jobs.insert(0, record)
@@ -275,6 +383,10 @@ def sync_and_advance_batch_job(
                             cands_i = rank_insertion_targets(indexed)
                             if cands_i:
                                 spec = spec.model_copy(update={"extracted_sentence_idx": cands_i[0][0]})
+                    vocab_list = extract_passage_key_vocab(
+                        m_entry["clean_text"],
+                        hint_vocab=m_entry.get("key_vocabulary"),
+                    )
                     rw, a_meta = assemble_question(
                         indexed,
                         spec,
@@ -283,6 +395,7 @@ def sync_and_advance_batch_job(
                         vocab_style=v_style,
                         seed_val=req_idx + 101,
                         self_note=f"v3 Batch Pass1 ({eff_profile})",
+                        key_vocab=vocab_list,
                     )
                     violations = validate_assembled_question(indexed, spec, rw, a_meta)
                     if violations:
@@ -300,18 +413,50 @@ def sync_and_advance_batch_job(
                     pass2_requests.append(
                         build_inlined_request_dict(
                             route=rule.blind_solver,
-                            user_prompt=build_blind_solver_prompt(rw),
+                            user_prompt=build_blind_solver_prompt(rw, need_rationale_ko=False),
                             schema_cls=BlindSolverVerdict,
                             metadata={"p2_idx": str(p2_idx)},
                             allow_flash_escalation=allow_escalation,
+                            system_instruction_override=COMPACT_SOLVER_SYSTEM_PROMPT,
+                            max_output_tokens=260,
                         )
                     )
                     pending_pass2.append({
                         "p2_idx": p2_idx,
                         "cache_key": m_entry["cache_key"],
                         "rw_dump": rw.model_dump(),
+                        "need_rationale_ko": False,
                     })
 
+            # Append pre-assembled 0-token items (order / insertion) into Pass 2 Blind Solver
+            for pre_item in rec.get("preassembled_pass2") or []:
+                rule_pre = get_type_routing_rule(
+                    pre_item["target_type"],
+                    vocab_style=pre_item.get("vocab_style", "밑줄형 (①~⑤)"),
+                    profile_name=eff_profile,
+                )
+                solver_route = rule_pre.blind_solver or rule_pre.generate
+                rw_pre_obj = RewrittenQuestion.model_validate(pre_item["rw_dump"])
+                p2_idx = len(pending_pass2)
+                pass2_requests.append(
+                    build_inlined_request_dict(
+                        route=solver_route,
+                        user_prompt=build_blind_solver_prompt(rw_pre_obj, need_rationale_ko=True),
+                        schema_cls=BlindSolverVerdict,
+                        metadata={"p2_idx": str(p2_idx)},
+                        allow_flash_escalation=allow_escalation,
+                        system_instruction_override=COMPACT_SOLVER_SYSTEM_PROMPT,
+                        max_output_tokens=260,
+                    )
+                )
+                pending_pass2.append({
+                    "p2_idx": p2_idx,
+                    "cache_key": pre_item["cache_key"],
+                    "rw_dump": pre_item["rw_dump"],
+                    "need_rationale_ko": True,
+                })
+
+            rec["preassembled_pass2"] = []
             rec["committed_count"] = committed
             rec["rejected_count"] = rejected
             rec["pending_pass2"] = pending_pass2
@@ -360,6 +505,10 @@ def sync_and_advance_batch_job(
                     rw_obj = RewrittenQuestion.model_validate(p2_entry["rw_dump"])
                     ok, _ = evaluate_blind_verdict(verdict, rw_obj.preserved_answer)
                     if ok:
+                        if p2_entry.get("need_rationale_ko") and (verdict.note_ko or "").strip():
+                            rw_obj = rw_obj.model_copy(
+                                update={"pdf_grounded_explanation": _format_explanation(rw_obj.preserved_answer, verdict.note_ko)}
+                            )
                         storage.save_cached_english_question(p2_entry["cache_key"], rw_obj)
                         committed += 1
                     else:

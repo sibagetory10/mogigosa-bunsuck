@@ -287,6 +287,7 @@ def _render_english_batch_builder_expander(ctx: AppContext) -> None:
                             "blank_unit": "구 (3~6단어)",
                             "vocab_style": "밑줄형 (①~⑤)",
                             "source_label": f"출처: {r.exam_name} {r.q_num}번",
+                            "key_vocabulary": list(getattr(r, "key_vocabulary", []) or []),
                         }
                         for r in target_recs
                         for t_type in sel_types

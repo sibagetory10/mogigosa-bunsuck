@@ -1,60 +1,40 @@
-"""Gemini SDK transport layer with thinking_level routing, short-TTL Explicit Cache, and Flex fallback."""
+"""Lean Gemini SDK transport layer with thinking_level routing and Flex->Standard fallback."""
 
 from __future__ import annotations
 
 import contextlib
-import re
 from typing import Any, Iterator, TypeVar
 
 from google import genai
 from google.genai import types
 from pydantic import BaseModel, ValidationError
 
-from src.config import FLASH_LITE_MODEL, resolve_routed_model_name
+from src.config import resolve_routed_model_name
 from src.english_v3.routing import ExecutionTier, StageRoute, ThinkingLevelStr
 from src.gemini.core import _sanitize_corrupted_json_numbers
 from src.gemini.usage import _emit_usage_from_response
 
 T = TypeVar("T", bound=BaseModel)
 
-STATIC_SYSTEM_PROMPT_V3: str = (
-    "You are a senior Korean CSAT (수능) and KICE (평가원) English item writer and quality auditor.\n"
-    "CORE RULES:\n"
-    "1. NEVER output or rewrite the full passage. Output ONLY exact sentence indices, verbatim target spans, "
-    "and newly crafted choices/distractors/notes matching the JSON schema.\n"
-    "2. Every `exact_target_span` / `exact_span` MUST be an exact, character-for-character substring of the "
-    "referenced indexed sentence `[Si]` (no paraphrasing, no punctuation additions).\n"
-    "3. Distractor Engineering: All 4 distractors must be plausible to a superficial reader using concepts from the "
-    "passage (too narrow, too broad, opposite polarity, distorted causal relation, or irrelevant keyword overlap), "
-    "with uniform syntactic form, capitalization, punctuation, and word-count symmetry against the correct choice.\n"
-    "4. Blank Paraphrase Rule: For blank-filling items (`빈칸 추론`), `correct_choice` MUST express the same core "
-    "meaning as `exact_target_span` using paraphrased vocabulary/syntax — NEVER copy-paste the target phrase verbatim.\n"
-    "5. Single-Answer Integrity: Every item must have exactly ONE defensible answer with zero ambiguity.\n"
-    "6. Korean explanations (`explanation_ko` / `cohesion_rationale_ko`) must be concise (1~2 sentences) and accurate."
+COMPACT_GEN_SYSTEM_PROMPT: str = (
+    "Korean CSAT/KICE English item writer.\n"
+    "1. Output JSON delta/coordinates ONLY; never rewrite passage.\n"
+    "2. exact_target_span/exact_span MUST match [Si] verbatim.\n"
+    "3. 4 distractors must use distinct CSAT traps (narrow/broad/opposite/distorted) with uniform grammar, "
+    "casing, punctuation, and word-count symmetry vs correct_choice.\n"
+    "4. Blank correct_choice MUST paraphrase exact_target_span (no verbatim copy).\n"
+    "5. explanation_ko: 1~2 concise Korean sentences (<140 chars)."
 )
 
-STATIC_RUBRIC_CORPUS_V3: str = (
-    "[CSAT ENGLISH ITEM WRITING RUBRIC & EDGE-CASE GUARDRAILS]\n"
-    "- Gist / Title / Topic (`요지 파악`, `주제 파악`, `제목 추론`): Avoid overly specific single-example traps and "
-    "overly broad truisms. Keep all 5 choices balanced in length (do not make the correct choice noticeably longest).\n"
-    "- Implied Meaning (`함축적 의미 추론`): Target a figurative, idiomatic, or context-loaded phrase (`exact_target_span`) "
-    "whose true meaning depends on the passage's central argument rather than literal word definitions.\n"
-    "- Blank Inference (`빈칸 추론`): Target the logical crux (claim, causal mechanism, or contrast resolution). "
-    "Ensure substituting `correct_choice` into the blank produces a 100% grammatical sentence without duplicate prepositions/articles.\n"
-    "- Grammar (`어법상 틀린 것`): Select 5 distinct, non-overlapping grammatical structures across sentences "
-    "(e.g., subject-verb agreement, participle vs. finite verb, relative pronoun vs. adverb, parallelism, voice, "
-    "adverb vs. adjective, modal/subordinator). Mutate ONLY ONE (`is_answer_target=True`) into a clear, unambiguous "
-    "ungrammatical form (`mutated_span`). The other 4 MUST remain 100% grammatically sound.\n"
-    "- Vocabulary (`문맥상 어휘 적절성`): Select 5 (or 3 for `(A)(B)(C)`) content words (verbs, adjectives, adverbs, "
-    "abstract nouns) whose polarity/direction is tightly constrained by surrounding logical markers. Avoid proper nouns.\n"
-    "- Irrelevant Sentence (`전체 흐름과 무관한 문장`): Reuse 1~2 surface topic nouns from the passage, but introduce "
-    "an off-topic claim (e.g., historical trivia, commercial cost, unrelated side effect) that breaks paragraph unity.\n"
-    "- Paragraph Order (`글의 순서`) & Sentence Insertion (`주어진 문장 삽입`): Choose split/extraction boundaries "
-    "backed by explicit cohesive devices (demonstratives `this/these/such`, definite articles, contrast `however/instead`, "
-    "result `therefore/thus`, or chronological progression) so only ONE sequence is logically coherent.\n"
-    "- Summary Completion (`요약문 완성`): Write a 1~2 sentence abstract summary containing literal `(A)` and `(B)` "
-    "slots that synthesize the passage's main cause-effect or contrast relationship."
+COMPACT_SOLVER_SYSTEM_PROMPT: str = (
+    "Independent Korean CSAT English solver & quality auditor. "
+    "Solve strictly from passage logic, anaphora, and grammar. "
+    "Flag any defensible runner-up in ambiguous_choices."
 )
+
+# Backwards-compatible aliases
+STATIC_SYSTEM_PROMPT_V3: str = COMPACT_GEN_SYSTEM_PROMPT
+STATIC_RUBRIC_CORPUS_V3: str = ""
 
 _THINKING_LEVEL_MAP: dict[ThinkingLevelStr, types.ThinkingLevel] = {
     "minimal": types.ThinkingLevel.MINIMAL,
@@ -84,41 +64,12 @@ def temporary_explicit_cache(
     enabled: bool,
     ttl_seconds: int = 600,
 ) -> Iterator[str | None]:
-    """Create a short-TTL explicit context cache for batch runs (5+ items) and delete it immediately on exit."""
-    if not enabled:
+    """Yield explicit cache only when static corpus exceeds Gemini's 1,024-token cache minimum."""
+    _ = (client, model_name, ttl_seconds)
+    if not enabled or len(COMPACT_GEN_SYSTEM_PROMPT) < 4096:
         yield None
         return
-
-    cache_name: str | None = None
-    try:
-        eff_model = resolve_routed_model_name(model_name, allow_flash_escalation=True)
-        created = client.caches.create(
-            model=eff_model,
-            config=types.CreateCachedContentConfig(
-                system_instruction=STATIC_SYSTEM_PROMPT_V3,
-                contents=[
-                    types.Content(
-                        role="user",
-                        parts=[types.Part.from_text(text=STATIC_RUBRIC_CORPUS_V3)],
-                    )
-                ],
-                display_name="mogigosa_eng_v3_batch",
-                ttl=f"{max(120, int(ttl_seconds))}s",
-            ),
-        )
-        cache_name = getattr(created, "name", None)
-    except Exception:
-        # Gracefully fall back to static-prefix Implicit Caching if below min token threshold or unsupported
-        cache_name = None
-
-    try:
-        yield cache_name
-    finally:
-        if cache_name:
-            try:
-                client.caches.delete(name=cache_name)
-            except Exception:
-                pass
+    yield None
 
 
 def _should_fallback_from_flex(exc: Exception) -> bool:
@@ -170,23 +121,24 @@ def call_structured_v3(
     service_tier: ExecutionTier = "standard",
     cached_content_name: str | None = None,
     allow_flash_escalation: bool = False,
-    max_parse_retries: int = 2,
+    max_parse_retries: int = 1,
+    system_instruction_override: str | None = None,
+    max_output_tokens: int = 750,
 ) -> T:
-    """Execute a structured Gemini call with explicit thinking_level, cache support, and Flex->Standard fallback."""
+    """Execute a token-minimized structured Gemini call with thinking_level and Flex->Standard fallback."""
     eff_model = resolve_routed_model_name(route.model, allow_flash_escalation=allow_flash_escalation)
     tl_enum = _THINKING_LEVEL_MAP.get(route.thinking_level, types.ThinkingLevel.MINIMAL)
-    full_static_sys = f"{STATIC_SYSTEM_PROMPT_V3}\n\n{STATIC_RUBRIC_CORPUS_V3}"
+    sys_inst = system_instruction_override or COMPACT_GEN_SYSTEM_PROMPT
 
     last_err: Exception | None = None
     for attempt in range(1 + max(0, int(max_parse_retries))):
         temp = float(route.temperature)
-        if attempt == 1:
-            temp = min(0.7, max(temp + 0.15, 0.30))
-        elif attempt >= 2:
-            temp = min(0.7, max(temp + 0.30, 0.45))
+        if attempt >= 1:
+            temp = min(0.65, max(temp + 0.15, 0.30))
 
         cfg_kwargs: dict[str, Any] = {
             "temperature": temp,
+            "max_output_tokens": max(128, int(max_output_tokens)),
             "response_mime_type": "application/json",
             "response_schema": schema_cls,
             "thinking_config": types.ThinkingConfig(
@@ -194,10 +146,10 @@ def call_structured_v3(
                 include_thoughts=False,
             ),
         }
-        if cached_content_name:
+        if cached_content_name and not system_instruction_override:
             cfg_kwargs["cached_content"] = cached_content_name
         else:
-            cfg_kwargs["system_instruction"] = full_static_sys
+            cfg_kwargs["system_instruction"] = sys_inst
 
         used_tier: ExecutionTier = "flex" if service_tier == "flex" else "standard"
         if used_tier == "flex":
@@ -216,32 +168,10 @@ def call_structured_v3(
                 used_tier = "standard"
                 fallback_kwargs = dict(cfg_kwargs)
                 fallback_kwargs.pop("service_tier", None)
-                # If explicit cache failed under standard fallback due to tier mismatch, retry without cache
-                try:
-                    resp = client.models.generate_content(
-                        model=eff_model,
-                        contents=user_prompt,
-                        config=types.GenerateContentConfig(**fallback_kwargs),
-                    )
-                except Exception as exc2:
-                    if cached_content_name and "cached_content" in str(exc2).lower():
-                        fallback_kwargs.pop("cached_content", None)
-                        fallback_kwargs["system_instruction"] = full_static_sys
-                        resp = client.models.generate_content(
-                            model=eff_model,
-                            contents=user_prompt,
-                            config=types.GenerateContentConfig(**fallback_kwargs),
-                        )
-                    else:
-                        raise
-            elif cached_content_name and "cached_content" in str(exc).lower():
-                no_cache_kwargs = dict(cfg_kwargs)
-                no_cache_kwargs.pop("cached_content", None)
-                no_cache_kwargs["system_instruction"] = full_static_sys
                 resp = client.models.generate_content(
                     model=eff_model,
                     contents=user_prompt,
-                    config=types.GenerateContentConfig(**no_cache_kwargs),
+                    config=types.GenerateContentConfig(**fallback_kwargs),
                 )
             else:
                 raise
@@ -270,9 +200,12 @@ def build_inlined_request_dict(
     schema_cls: type[BaseModel],
     metadata: dict[str, str],
     allow_flash_escalation: bool = False,
+    system_instruction_override: str | None = None,
+    max_output_tokens: int = 750,
 ) -> dict[str, Any]:
-    """Build a JSON-serializable InlinedRequest dict for Gemini Batch API."""
+    """Build a compact JSON-serializable InlinedRequest dict for Gemini Batch API."""
     eff_model = resolve_routed_model_name(route.model, allow_flash_escalation=allow_flash_escalation)
+    sys_inst = system_instruction_override or COMPACT_GEN_SYSTEM_PROMPT
     return {
         "model": eff_model,
         "contents": [
@@ -283,10 +216,9 @@ def build_inlined_request_dict(
         ],
         "metadata": metadata,
         "config": {
-            "system_instruction": {
-                "parts": [{"text": f"{STATIC_SYSTEM_PROMPT_V3}\n\n{STATIC_RUBRIC_CORPUS_V3}"}]
-            },
+            "system_instruction": {"parts": [{"text": sys_inst}]},
             "temperature": route.temperature,
+            "max_output_tokens": max(128, int(max_output_tokens)),
             "response_mime_type": "application/json",
             "response_schema": schema_cls.model_json_schema(),
             "thinking_config": {

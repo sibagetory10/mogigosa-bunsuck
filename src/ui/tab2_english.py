@@ -90,7 +90,7 @@ def _execute_english_transform_jobs(
     prog = st.progress(0.0)
     stat = st.empty()
     n_workers = max(1, min(total_jobs, 4))
-    tier_hint = "Flex 50% 할인·캐시" if total_jobs >= 5 else "Standard 즉시 응답"
+    tier_hint = "Flex 50% 할인" if total_jobs >= 3 else "Standard 즉시 응답"
     stat.info(f"🔤 영어 지문 수능형 변형 v3 {total_jobs}문항 출제 중 ({tier_hint}, 최대 {n_workers}스레드)...")
 
     pdf_bytes_cache: dict[tuple[str, str], bytes | None] = {}
@@ -134,6 +134,7 @@ def _execute_english_transform_jobs(
                 ) or raw_p
             p_job = dict(job)
             p_job["passage_text"] = cleaned_passages_cache[cache_k]
+            p_job["key_vocabulary"] = list(getattr(base_q, "key_vocabulary", []) or []) if base_q is not None else []
             p_job["base_question"] = None
             prepared_jobs.append(p_job)
 

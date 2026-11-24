@@ -5,10 +5,11 @@ from __future__ import annotations
 import itertools
 import random
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
-from src.english_v3.preprocessor import IndexedPassage
+from src.english_v3.preprocessor import IndexedPassage, extract_passage_key_vocab
 from src.english_v3.schemas import (
     ChoiceAbcSpec,
     GistSpec,
@@ -189,25 +190,27 @@ def assemble_question(
     vocab_style: str = "밑줄형 (①~⑤)",
     seed_val: int = 42,
     self_note: str = "",
+    key_vocab: Sequence[str] | None = None,
 ) -> tuple[RewrittenQuestion, AssemblyMetadata]:
     """Assemble IndexedPassage + LLM delta Spec into a renderer-ready RewrittenQuestion."""
     inst = _resolve_instruction(target_type, vocab_style=vocab_style)
     eff_type = _effective_target_label(target_type, blank_unit=blank_unit, vocab_style=vocab_style)
     sentences = list(indexed.sentences)
     n_sent = len(sentences)
+    vocab_out = list(key_vocab)[:6] if key_vocab is not None else extract_passage_key_vocab(indexed.clean_text, limit=5)
 
     if isinstance(spec, GistSpec):
         choices, ans = _seeded_shuffle_choices(
             spec.correct_choice,
-            [d.text for d in spec.distractors],
+            list(spec.distractors),
             seed_val,
-            normalize_symmetry=(spec.choice_language == "en"),
+            normalize_symmetry=("요지" not in target_type),
         )
         stem = _join_with_footnotes(f"{inst}\n\n{indexed.clean_text}", indexed.footnotes)
         rw = RewrittenQuestion(
             rewritten_stem=stem,
             rewritten_choices=choices,
-            replaced_terms_map=list(spec.key_vocab[:6]),
+            replaced_terms_map=vocab_out,
             pdf_grounded_explanation=_format_explanation(ans, spec.explanation_ko),
             preserved_answer=ans,
             self_verification_note=self_note or "English v3 Gate 1 Passed",
@@ -245,14 +248,14 @@ def assemble_question(
         stem = _join_with_footnotes(f"{inst}\n\n{body}", indexed.footnotes)
         choices, ans = _seeded_shuffle_choices(
             spec.correct_choice,
-            [d.text for d in spec.distractors],
+            list(spec.distractors),
             seed_val,
             normalize_symmetry=True,
         )
         rw = RewrittenQuestion(
             rewritten_stem=stem,
             rewritten_choices=choices,
-            replaced_terms_map=list(spec.key_vocab[:6]),
+            replaced_terms_map=vocab_out,
             pdf_grounded_explanation=_format_explanation(ans, spec.explanation_ko),
             preserved_answer=ans,
             self_verification_note=self_note or "English v3 Gate 1 + Blind Solver Passed",
@@ -271,9 +274,12 @@ def assemble_question(
         return rw, meta
 
     if isinstance(spec, Underline5Spec):
-        ans_targets = [it for it in spec.items if it.is_answer_target]
-        if len(ans_targets) != 1:
-            raise AssemblyError(f"is_answer_target=True 항목은 정확히 1개여야 합니다 (현재 {len(ans_targets)}개).")
+        wrong_idx = int(spec.wrong_item_index)
+        if not (0 <= wrong_idx < 5):
+            raise AssemblyError(f"wrong_item_index 범위 초과: {wrong_idx}")
+        mut_txt = (spec.mutated_span or "").strip()
+        if not mut_txt:
+            raise AssemblyError("정답 타깃의 mutated_span이 비어 있습니다.")
 
         located: list[tuple[int, int, int, int, str, str, bool]] = []
         for orig_i, it in enumerate(spec.items):
@@ -283,13 +289,11 @@ def assemble_question(
                 sentences[it.sentence_idx], it.exact_span, occurrence=it.occurrence
             )
             matched_orig = sentences[it.sentence_idx][st_pos:en_pos]
-            disp_span = (it.mutated_span or "").strip() if it.is_answer_target else matched_orig
-            if not disp_span:
-                raise AssemblyError("정답 타깃의 mutated_span이 비어 있습니다.")
-            located.append((it.sentence_idx, st_pos, en_pos, orig_i, matched_orig, disp_span, it.is_answer_target))
+            is_ans = orig_i == wrong_idx
+            disp_span = mut_txt if is_ans else matched_orig
+            located.append((it.sentence_idx, st_pos, en_pos, orig_i, matched_orig, disp_span, is_ans))
 
         located.sort(key=lambda x: (x[0], x[1]))
-        # Check non-overlap within same sentence
         for k in range(1, len(located)):
             if located[k][0] == located[k - 1][0] and located[k][1] < located[k - 1][2]:
                 raise AssemblyError("동일 문장 내 밑줄 타깃 구간이 서로 겹칩니다.")
@@ -315,7 +319,7 @@ def assemble_question(
         rw = RewrittenQuestion(
             rewritten_stem=stem,
             rewritten_choices=list(CIRCLED_NUMS),
-            replaced_terms_map=list(spec.key_vocab[:6]),
+            replaced_terms_map=vocab_out,
             pdf_grounded_explanation=_format_explanation(ans_num, spec.explanation_ko),
             preserved_answer=ans_num,
             self_verification_note=self_note or "English v3 Gate 1 + Blind Solver Passed",
@@ -397,7 +401,7 @@ def assemble_question(
         rw = RewrittenQuestion(
             rewritten_stem=stem,
             rewritten_choices=choices,
-            replaced_terms_map=list(spec.key_vocab[:6]),
+            replaced_terms_map=vocab_out,
             pdf_grounded_explanation=_format_explanation(ans, spec.explanation_ko),
             preserved_answer=ans,
             self_verification_note=self_note or "English v3 Gate 1 + Blind Solver Passed",
@@ -442,7 +446,7 @@ def assemble_question(
         rw = RewrittenQuestion(
             rewritten_stem=stem,
             rewritten_choices=list(CIRCLED_NUMS),
-            replaced_terms_map=list(spec.key_vocab[:6]),
+            replaced_terms_map=vocab_out,
             pdf_grounded_explanation=_format_explanation(ans, spec.explanation_ko),
             preserved_answer=ans,
             self_verification_note=self_note or "English v3 Gate 1 + Blind Solver Passed",
@@ -501,7 +505,7 @@ def assemble_question(
         rw = RewrittenQuestion(
             rewritten_stem=stem,
             rewritten_choices=list(ORDER_CHOICES),
-            replaced_terms_map=list(spec.key_vocab[:6]),
+            replaced_terms_map=vocab_out,
             pdf_grounded_explanation=_format_explanation(ans, spec.cohesion_rationale_ko),
             preserved_answer=ans,
             self_verification_note=self_note or "English v3 Gate 1 + Blind Solver Passed",
@@ -553,7 +557,7 @@ def assemble_question(
         rw = RewrittenQuestion(
             rewritten_stem=stem,
             rewritten_choices=list(CIRCLED_NUMS),
-            replaced_terms_map=list(spec.key_vocab[:6]),
+            replaced_terms_map=vocab_out,
             pdf_grounded_explanation=_format_explanation(ans, spec.cohesion_rationale_ko),
             preserved_answer=ans,
             self_verification_note=self_note or "English v3 Gate 1 + Blind Solver Passed",
@@ -593,7 +597,7 @@ def assemble_question(
         rw = RewrittenQuestion(
             rewritten_stem=stem,
             rewritten_choices=choices,
-            replaced_terms_map=list(spec.key_vocab[:6]),
+            replaced_terms_map=vocab_out,
             pdf_grounded_explanation=_format_explanation(ans, spec.explanation_ko),
             preserved_answer=ans,
             self_verification_note=self_note or "English v3 Gate 1 + Blind Solver Passed",

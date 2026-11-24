@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import threading
+from collections.abc import Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from google.genai import types
@@ -339,3 +342,88 @@ def restore_passage_if_needed(
         with _RESTORE_CACHE_LOCK:
             _RESTORE_CACHE[cache_k] = cleaned
     return cleaned or raw
+
+
+_SEED_VOCAB_LOCK = threading.RLock()
+_SEED_VOCAB_CACHE: dict[str, tuple[int, str]] | None = None
+_LEVEL_RANK: dict[str, int] = {
+    "고난도 심화": 3,
+    "수능 1등급 필수": 2,
+    "고1~2 핵심": 1,
+    "필수 기초": 0,
+}
+
+
+def _load_seed_vocab_map() -> dict[str, tuple[int, str]]:
+    global _SEED_VOCAB_CACHE
+    with _SEED_VOCAB_LOCK:
+        if _SEED_VOCAB_CACHE is not None:
+            return _SEED_VOCAB_CACHE
+        seed_path = Path(__file__).resolve().parents[2] / "data" / "csat_vocab_seed.json"
+        mapping: dict[str, tuple[int, str]] = {}
+        try:
+            if seed_path.exists():
+                raw_data = json.loads(seed_path.read_text(encoding="utf-8"))
+                entries = raw_data.get("entries") if isinstance(raw_data, dict) else {}
+                if isinstance(entries, dict):
+                    for k, item in entries.items():
+                        if not isinstance(item, dict):
+                            continue
+                        hw = str(item.get("headword") or k).strip().lower()
+                        meaning = str(item.get("summary_ko") or "").strip()
+                        lvl = str(item.get("cefr_level") or "").strip()
+                        if hw and meaning:
+                            mapping[hw] = (_LEVEL_RANK.get(lvl, 1), meaning)
+        except Exception:
+            pass
+        _SEED_VOCAB_CACHE = mapping
+        return mapping
+
+
+def _candidate_lemmas(word: str) -> list[str]:
+    cands = [word]
+    if len(word) >= 5:
+        if word.endswith("ies"):
+            cands.append(word[:-3] + "y")
+        if word.endswith("es"):
+            cands.extend([word[:-2], word[:-1]])
+        elif word.endswith("s") and not word.endswith("ss"):
+            cands.append(word[:-1])
+        if word.endswith("ed"):
+            cands.extend([word[:-2], word[:-1]])
+        if word.endswith("ing") and len(word) >= 6:
+            cands.extend([word[:-3], word[:-3] + "e"])
+        if word.endswith("ly") and len(word) >= 6:
+            cands.append(word[:-2])
+    return cands
+
+
+def extract_passage_key_vocab(
+    clean_text: str,
+    hint_vocab: Sequence[str] | None = None,
+    limit: int = 5,
+) -> list[str]:
+    """Return key CSAT vocabulary ('word: 뜻') at zero LLM token cost using DB hints or seed dictionary."""
+    if hint_vocab:
+        valid_hints = [str(v).strip() for v in hint_vocab if str(v or "").strip()]
+        if valid_hints:
+            return valid_hints[:limit]
+
+    seed_map = _load_seed_vocab_map()
+    if not seed_map or not clean_text:
+        return []
+
+    seen_hw: set[str] = set()
+    hits: list[tuple[int, int, str]] = []
+    for raw_tok in re.findall(r"[A-Za-z]{4,}", clean_text):
+        w_low = raw_tok.lower()
+        for lem in _candidate_lemmas(w_low):
+            if lem in seed_map and lem not in seen_hw:
+                rank, meaning = seed_map[lem]
+                if rank >= 1:
+                    seen_hw.add(lem)
+                    hits.append((rank, len(lem), f"{lem}: {meaning}"))
+                break
+
+    hits.sort(key=lambda x: (-x[0], -x[1]))
+    return [h[2] for h in hits[:limit]]

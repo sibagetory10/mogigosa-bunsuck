@@ -70,77 +70,77 @@ def classify_target_family(target_type: str, vocab_style: str = "") -> QuestionF
 
 
 def _build_cost_saver_rules() -> dict[str, TypeRoutingRule]:
-    """100% gemini-3.5-flash-lite profile with per-type thinking_level differentiation."""
+    """Token-calibrated 100% gemini-3.5-flash-lite profile preserving Gate 1 + Gate 2 accuracy."""
     return {
         "gist": TypeRoutingRule(
             family="gist",
             generate=StageRoute(FLASH_LITE_MODEL, "minimal", 0.25),
-            retry_2_generate=StageRoute(FLASH_LITE_MODEL, "low", 0.30),
+            retry_2_generate=StageRoute(FLASH_LITE_MODEL, "low", 0.35),
             require_blind_solver=False,
             blind_solver=None,
         ),
         "함축적 의미 추론": TypeRoutingRule(
             family="span_inference",
             generate=StageRoute(FLASH_LITE_MODEL, "low", 0.25),
-            retry_2_generate=StageRoute(FLASH_LITE_MODEL, "medium", 0.30),
+            retry_2_generate=StageRoute(FLASH_LITE_MODEL, "medium", 0.35),
             require_blind_solver=True,
-            blind_solver=StageRoute(FLASH_LITE_MODEL, "medium", 0.10),
+            blind_solver=StageRoute(FLASH_LITE_MODEL, "minimal", 0.10),
         ),
         "span_inference": TypeRoutingRule(
             family="span_inference",
-            generate=StageRoute(FLASH_LITE_MODEL, "medium", 0.25),
-            retry_2_generate=StageRoute(FLASH_LITE_MODEL, "high", 0.30),
+            generate=StageRoute(FLASH_LITE_MODEL, "low", 0.25),
+            retry_2_generate=StageRoute(FLASH_LITE_MODEL, "medium", 0.35),
             require_blind_solver=True,
-            blind_solver=StageRoute(FLASH_LITE_MODEL, "medium", 0.10),
+            blind_solver=StageRoute(FLASH_LITE_MODEL, "low", 0.10),
         ),
         "어법": TypeRoutingRule(
             family="underline_5",
-            generate=StageRoute(FLASH_LITE_MODEL, "medium", 0.20),
-            retry_2_generate=StageRoute(FLASH_LITE_MODEL, "high", 0.25),
+            generate=StageRoute(FLASH_LITE_MODEL, "low", 0.20),
+            retry_2_generate=StageRoute(FLASH_LITE_MODEL, "medium", 0.30),
             require_blind_solver=True,
-            blind_solver=StageRoute(FLASH_LITE_MODEL, "medium", 0.10),
+            blind_solver=StageRoute(FLASH_LITE_MODEL, "low", 0.10),
         ),
         "underline_5": TypeRoutingRule(
             family="underline_5",
             generate=StageRoute(FLASH_LITE_MODEL, "low", 0.20),
-            retry_2_generate=StageRoute(FLASH_LITE_MODEL, "medium", 0.25),
+            retry_2_generate=StageRoute(FLASH_LITE_MODEL, "medium", 0.30),
             require_blind_solver=True,
-            blind_solver=StageRoute(FLASH_LITE_MODEL, "medium", 0.10),
+            blind_solver=StageRoute(FLASH_LITE_MODEL, "minimal", 0.10),
         ),
         "choice_abc": TypeRoutingRule(
             family="choice_abc",
             generate=StageRoute(FLASH_LITE_MODEL, "low", 0.20),
-            retry_2_generate=StageRoute(FLASH_LITE_MODEL, "medium", 0.25),
+            retry_2_generate=StageRoute(FLASH_LITE_MODEL, "medium", 0.30),
             require_blind_solver=True,
-            blind_solver=StageRoute(FLASH_LITE_MODEL, "low", 0.10),
+            blind_solver=StageRoute(FLASH_LITE_MODEL, "minimal", 0.10),
         ),
         "irrelevant": TypeRoutingRule(
             family="irrelevant",
             generate=StageRoute(FLASH_LITE_MODEL, "low", 0.25),
-            retry_2_generate=StageRoute(FLASH_LITE_MODEL, "medium", 0.30),
+            retry_2_generate=StageRoute(FLASH_LITE_MODEL, "medium", 0.35),
             require_blind_solver=True,
-            blind_solver=StageRoute(FLASH_LITE_MODEL, "low", 0.10),
+            blind_solver=StageRoute(FLASH_LITE_MODEL, "minimal", 0.10),
         ),
         "order": TypeRoutingRule(
             family="order",
-            generate=StageRoute(FLASH_LITE_MODEL, "medium", 0.25),
-            retry_2_generate=StageRoute(FLASH_LITE_MODEL, "high", 0.35),
+            generate=StageRoute(FLASH_LITE_MODEL, "minimal", 0.20),
+            retry_2_generate=StageRoute(FLASH_LITE_MODEL, "low", 0.25),
             require_blind_solver=True,
-            blind_solver=StageRoute(FLASH_LITE_MODEL, "high", 0.10),
+            blind_solver=StageRoute(FLASH_LITE_MODEL, "low", 0.10),
         ),
         "insertion": TypeRoutingRule(
             family="insertion",
-            generate=StageRoute(FLASH_LITE_MODEL, "medium", 0.25),
-            retry_2_generate=StageRoute(FLASH_LITE_MODEL, "high", 0.35),
+            generate=StageRoute(FLASH_LITE_MODEL, "minimal", 0.20),
+            retry_2_generate=StageRoute(FLASH_LITE_MODEL, "low", 0.25),
             require_blind_solver=True,
-            blind_solver=StageRoute(FLASH_LITE_MODEL, "high", 0.10),
+            blind_solver=StageRoute(FLASH_LITE_MODEL, "low", 0.10),
         ),
         "summary": TypeRoutingRule(
             family="summary",
             generate=StageRoute(FLASH_LITE_MODEL, "low", 0.25),
-            retry_2_generate=StageRoute(FLASH_LITE_MODEL, "medium", 0.30),
+            retry_2_generate=StageRoute(FLASH_LITE_MODEL, "medium", 0.35),
             require_blind_solver=True,
-            blind_solver=StageRoute(FLASH_LITE_MODEL, "low", 0.10),
+            blind_solver=StageRoute(FLASH_LITE_MODEL, "minimal", 0.10),
         ),
     }
 
@@ -192,11 +192,7 @@ def get_type_routing_rule(
 
 
 def resolve_execution_tier(batch_size: int) -> tuple[ExecutionTier, bool]:
-    """Select execution tier and whether to attempt short-TTL explicit caching.
-
-    - 1~4 items: Standard + Implicit prefix cache (zero cache storage fee).
-    - 5+ items: Flex (50% discount, auto-fallback to Standard) + short-TTL Explicit cache.
-    """
-    if int(batch_size) >= 5:
-        return "flex", True
+    """Select execution tier: 3+ uncached items activate Flex API (50% cost discount)."""
+    if int(batch_size) >= 3:
+        return "flex", False
     return "standard", False
