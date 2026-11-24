@@ -40,7 +40,7 @@ from src.english_v3.schemas import (
     Underline5Spec,
     UnderlineTargetItem,
 )
-from src.english_v3.transport import call_structured_v3
+from src.english_v3.transport import call_structured_v3, extract_json_object_text
 from src.gemini.usage import bind_usage_tracker, calculate_token_cost_usd
 from src.models.question import QuestionRecord
 from src.pdf.exam_pdf import generate_custom_exam_pdf
@@ -735,6 +735,83 @@ def test_poulet_quote_preservation_and_source_reconciliation() -> None:
     assert reconciled_q36.index("No, because") < reconciled_q36.index("If a tree falls")
 
 
+def test_live_server_regression_schemas_json_fence_blank_root_and_long_markers() -> None:
+    from google import genai
+    from google.genai import _transformers, batches
+    from src.english_v3.routing import StageRoute
+    from src.english_v3.transport import _parse_v3_structured, build_inlined_request_dict
+
+    # 1) All 9 Pydantic schemas must transform cleanly via google-genai SDK t_schema & Batch wire serializer
+    dummy_client = genai.Client(api_key="dummy-test-key")
+    all_specs = (
+        GistSpec,
+        SpanInferenceSpec,
+        Underline5Spec,
+        ChoiceAbcSpec,
+        IrrelevantSpec,
+        OrderSpec,
+        InsertionSpec,
+        SummarySpec,
+        BlindSolverVerdict,
+    )
+    for cls in all_specs:
+        _transformers.t_schema(dummy_client, cls)
+        inlined = build_inlined_request_dict(
+            route=StageRoute(),
+            user_prompt="test",
+            schema_cls=cls,
+            metadata={"i": "0"},
+        )
+        batches._InlinedRequest_to_mldev(dummy_client._api_client, inlined)
+
+    # 2) Conversational preamble + markdown fence JSON extraction
+    fenced = (
+        "Here is the JSON requested:\n```json\n"
+        '{"selected_answer": "3", "ambiguous_choices": [], "confidence": "high", "note_ko": "테스트 근거입니다."}\n'
+        "```"
+    )
+    extracted = extract_json_object_text(fenced)
+    assert extracted.startswith("{") and extracted.endswith("}")
+    parsed = _parse_v3_structured(py_types.SimpleNamespace(parsed=None, text=fenced), BlindSolverVerdict)
+    assert parsed.selected_answer == "3"
+
+    # 3) Blank word-unit paraphrasing: allow reflexive pronouns & distinct words sharing 5-char prefix; block same root
+    indexed = build_indexed_passage(
+        "People often deceive themselves when they try to adapt quickly. "
+        "They rely on familiar habits across daily routines. "
+        "However, clear feedback helps them adjust their goals effectively."
+    )
+    ok_reflexive_spec = SpanInferenceSpec(
+        target_sentence_idx=0,
+        exact_target_span="deceive themselves",
+        correct_choice="mislead themselves",
+        distractors=["help others", "ignore rumors", "praise friends", "avoid risks"],
+        explanation_ko="재귀대명사 themselves는 기능어이므로 동사 패러프레이징 시 허용된다.",
+    )
+    rw_ok, meta_ok = assemble_question(indexed, ok_reflexive_spec, target_type="빈칸 추론", blank_unit="단어 (1~2단어)")
+    assert validate_assembled_question(indexed, ok_reflexive_spec, rw_ok, meta_ok) == []
+
+    bad_root_spec = SpanInferenceSpec(
+        target_sentence_idx=0,
+        exact_target_span="adapt quickly",
+        correct_choice="adapting rapidly",
+        distractors=["resting quietly", "moving slowly", "leaving early", "waiting calmly"],
+        explanation_ko="동일 어근 adapt/adapting 반복은 차단되어야 한다.",
+    )
+    rw_bad, meta_bad = assemble_question(indexed, bad_root_spec, target_type="빈칸 추론", blank_unit="단어 (1~2단어)")
+    assert any("패러프레이징" in v for v in validate_assembled_question(indexed, bad_root_spec, rw_bad, meta_bad))
+
+    # 4) Long-passage (a)~(e) markers stripped cleanly
+    long_raw = (
+        "Researchers (a) observed that urban trees (b) reduce heat islands. "
+        "They (c) measured street temperatures and (d) compared shade levels. "
+        "Finally, city planners (e) expanded green corridors."
+    )
+    idx_long = build_indexed_passage(long_raw)
+    assert not any(f"({ch})" in idx_long.clean_text for ch in ("a", "b", "c", "d", "e"))
+    assert needs_passage_restoration(long_raw, "41~42번 장문 어휘") is True
+
+
 class EnglishV3EngineTestCase(unittest.TestCase):
     def test_all(self) -> None:
         test_preprocessor_strips_noise_preserves_footnotes_and_abbreviations()
@@ -746,6 +823,7 @@ class EnglishV3EngineTestCase(unittest.TestCase):
         test_async_batch_runner_2pass_flow()
         test_order_empty_chunk_and_zero_gen_llm_fast_path()
         test_poulet_quote_preservation_and_source_reconciliation()
+        test_live_server_regression_schemas_json_fence_blank_root_and_long_markers()
 
 
 if __name__ == "__main__":

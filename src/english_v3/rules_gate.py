@@ -26,6 +26,13 @@ _FUNCTION_WORDS: frozenset[str] = frozenset({
     "not", "no", "more", "most", "less", "least", "very", "much", "many",
     "some", "any", "each", "every", "all", "both", "such", "own", "other", "another",
     "than", "then", "also", "only", "just", "even", "still", "already",
+    "myself", "yourself", "himself", "herself", "itself",
+    "ourselves", "yourselves", "themselves", "oneself",
+    "one", "ones", "someone", "anyone", "everyone", "nobody",
+    "somebody", "anybody", "everybody", "something", "anything", "everything", "nothing",
+    "whether", "while", "although", "though", "because", "since",
+    "unless", "until", "whereas", "rather", "instead",
+    "however", "therefore", "thus", "hence",
 })
 
 _META_LEAK_RE = re.compile(r"\[S\d+\]|(?:^|\s)(?:정답|오답)\s*[:：]|[\u4e00-\u9fff]")
@@ -58,6 +65,38 @@ def _verify_source_invariance(indexed: IndexedPassage, rw: RewrittenQuestion, me
     return violations
 
 
+_ROOT_SUFFIXES: tuple[str, ...] = (
+    "ingly", "edly", "ments", "ment", "ness", "tions", "tion",
+    "sions", "sion", "ings", "ing", "es", "ed", "ly", "er", "est", "s",
+)
+
+
+def _normalize_stem(word: str) -> str:
+    w = (word or "").lower().strip()
+    if len(w) <= 3:
+        return w
+    if w.endswith("ies") and len(w) >= 5:
+        return w[:-3] + "y"
+    if w.endswith("ied") and len(w) >= 5:
+        return w[:-3] + "y"
+    for suf in _ROOT_SUFFIXES:
+        if w.endswith(suf) and len(w) - len(suf) >= 4:
+            return w[: -len(suf)]
+    return w
+
+
+def _same_root_word(w1: str, w2: str) -> bool:
+    a = (w1 or "").lower().strip()
+    b = (w2 or "").lower().strip()
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    sa = _normalize_stem(a)
+    sb = _normalize_stem(b)
+    return len(sa) >= 4 and sa == sb
+
+
 def _verify_blank_paraphrase(rw: RewrittenQuestion, meta: AssemblyMetadata) -> list[str]:
     """Block verbatim copy-paste in blank-filling answers and adjacent word duplication."""
     violations: list[str] = []
@@ -76,7 +115,7 @@ def _verify_blank_paraphrase(rw: RewrittenQuestion, meta: AssemblyMetadata) -> l
         if "단어" in meta.blank_unit:
             for ow in orig_content:
                 for aw in ans_content:
-                    if ow == aw or (len(ow) >= 5 and len(aw) >= 5 and ow[:5] == aw[:5]):
+                    if _same_root_word(ow, aw):
                         violations.append(
                             f"빈칸 정답 패러프레이징 위반(단어): 원문 핵심어 '{ow}'가 정답 '{aw}'에 그대로 재사용됨"
                         )

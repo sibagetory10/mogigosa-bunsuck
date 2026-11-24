@@ -81,7 +81,10 @@ def needs_passage_restoration(raw_passage: str, orig_question_type: str = "") ->
         return True
     if re.search(r"\[[A-Za-z\-']+\s*/\s*[A-Za-z\-']+\]", txt):
         return True
-    _ = orig_question_type
+    if all(mk in txt for mk in ("(a)", "(b)", "(c)", "(d)", "(e)")) and any(
+        k in (orig_question_type or "") for k in ("어휘", "장문", "41", "42")
+    ):
+        return True
     return False
 
 
@@ -118,6 +121,8 @@ def sanitize_english_passage_deterministically(raw_text: str) -> tuple[str, list
     body = _U_TAG_RE.sub("", body)
     body = _CIRCLED_WITH_PARENS_RE.sub(" ", body)
     body = _CIRCLED_MARKER_RE.sub("", body)
+    if all(mk in body for mk in ("(a)", "(b)", "(c)", "(d)", "(e)")):
+        body = re.sub(r"\([a-e]\)\s*", "", body)
     body = re.sub(r"[ \t]{2,}", " ", body).strip()
     return body, footnotes
 

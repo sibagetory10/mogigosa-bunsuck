@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import re
 from typing import Any, Iterator, TypeVar
 
 from google import genai
@@ -28,6 +29,7 @@ COMPACT_GEN_SYSTEM_PROMPT: str = (
 
 COMPACT_SOLVER_SYSTEM_PROMPT: str = (
     "Independent Korean CSAT English solver & quality auditor. "
+    "Output raw JSON ONLY (no prose, no markdown fences). "
     "Solve strictly from passage logic, anaphora, and grammar. "
     "Flag any defensible runner-up in ambiguous_choices."
 )
@@ -93,13 +95,62 @@ def _should_fallback_from_flex(exc: Exception) -> bool:
     )
 
 
+_CODE_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL | re.IGNORECASE)
+
+
+def extract_json_object_text(raw_text: str) -> str:
+    """Strip conversational preambles or markdown code fences and isolate the JSON object payload."""
+    txt = (raw_text or "").strip()
+    if not txt:
+        return ""
+    fence_m = _CODE_FENCE_RE.search(txt)
+    if fence_m:
+        inner = fence_m.group(1).strip()
+        if inner:
+            txt = inner
+    if txt.startswith("{"):
+        return txt
+
+    start = txt.find("{")
+    if start < 0:
+        return txt
+
+    depth = 0
+    in_str = False
+    escaped = False
+    for idx in range(start, len(txt)):
+        ch = txt[idx]
+        if in_str:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return txt[start : idx + 1].strip()
+
+    end = txt.rfind("}")
+    if end > start:
+        return txt[start : end + 1].strip()
+    return txt[start:].strip()
+
+
 def _parse_v3_structured(response: Any, schema_cls: type[T]) -> T:
     parsed = getattr(response, "parsed", None)
     if isinstance(parsed, schema_cls):
         return parsed
-    text = getattr(response, "text", None) or ""
-    if not text.strip():
+    raw_text = getattr(response, "text", None) or ""
+    if not raw_text.strip():
         raise RuntimeError("Gemini 응답이 비어 있습니다.")
+    text = extract_json_object_text(raw_text)
     try:
         return schema_cls.model_validate_json(text)
     except ValidationError as orig_err:
@@ -121,9 +172,9 @@ def call_structured_v3(
     service_tier: ExecutionTier = "standard",
     cached_content_name: str | None = None,
     allow_flash_escalation: bool = False,
-    max_parse_retries: int = 1,
+    max_parse_retries: int = 2,
     system_instruction_override: str | None = None,
-    max_output_tokens: int = 750,
+    max_output_tokens: int | None = None,
 ) -> T:
     """Execute a token-minimized structured Gemini call with thinking_level and Flex->Standard fallback."""
     eff_model = resolve_routed_model_name(route.model, allow_flash_escalation=allow_flash_escalation)
@@ -138,7 +189,6 @@ def call_structured_v3(
 
         cfg_kwargs: dict[str, Any] = {
             "temperature": temp,
-            "max_output_tokens": max(128, int(max_output_tokens)),
             "response_mime_type": "application/json",
             "response_schema": schema_cls,
             "thinking_config": types.ThinkingConfig(
@@ -146,6 +196,8 @@ def call_structured_v3(
                 include_thoughts=False,
             ),
         }
+        if max_output_tokens is not None:
+            cfg_kwargs["max_output_tokens"] = max(128, int(max_output_tokens))
         if cached_content_name and not system_instruction_override:
             cfg_kwargs["cached_content"] = cached_content_name
         else:
@@ -201,11 +253,23 @@ def build_inlined_request_dict(
     metadata: dict[str, str],
     allow_flash_escalation: bool = False,
     system_instruction_override: str | None = None,
-    max_output_tokens: int = 750,
+    max_output_tokens: int | None = None,
 ) -> dict[str, Any]:
     """Build a compact JSON-serializable InlinedRequest dict for Gemini Batch API."""
     eff_model = resolve_routed_model_name(route.model, allow_flash_escalation=allow_flash_escalation)
     sys_inst = system_instruction_override or COMPACT_GEN_SYSTEM_PROMPT
+    cfg: dict[str, Any] = {
+        "system_instruction": {"parts": [{"text": sys_inst}]},
+        "temperature": route.temperature,
+        "response_mime_type": "application/json",
+        "response_schema": schema_cls.model_json_schema(),
+        "thinking_config": {
+            "thinking_level": route.thinking_level.upper(),
+            "include_thoughts": False,
+        },
+    }
+    if max_output_tokens is not None:
+        cfg["max_output_tokens"] = max(128, int(max_output_tokens))
     return {
         "model": eff_model,
         "contents": [
@@ -215,15 +279,5 @@ def build_inlined_request_dict(
             }
         ],
         "metadata": metadata,
-        "config": {
-            "system_instruction": {"parts": [{"text": sys_inst}]},
-            "temperature": route.temperature,
-            "max_output_tokens": max(128, int(max_output_tokens)),
-            "response_mime_type": "application/json",
-            "response_schema": schema_cls.model_json_schema(),
-            "thinking_config": {
-                "thinking_level": route.thinking_level.upper(),
-                "include_thoughts": False,
-            },
-        },
+        "config": cfg,
     }

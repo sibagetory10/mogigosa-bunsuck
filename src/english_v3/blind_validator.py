@@ -96,6 +96,5 @@ def run_blind_solver_gate(
         cached_content_name=cached_content_name,
         allow_flash_escalation=allow_flash_escalation,
         system_instruction_override=COMPACT_SOLVER_SYSTEM_PROMPT,
-        max_output_tokens=260,
     )
     return evaluate_blind_verdict(verdict, rw.preserved_answer)

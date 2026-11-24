@@ -32,6 +32,7 @@ from src.english_v3.transport import (
     COMPACT_SOLVER_SYSTEM_PROMPT,
     build_inlined_request_dict,
     build_v3_client,
+    extract_json_object_text,
 )
 from src.models.concept import RewrittenQuestion
 from src.storage.base import _atomic_write_text
@@ -203,7 +204,6 @@ def submit_generation_batch(
                 schema_cls=schema_cls,
                 metadata={"req_idx": str(req_idx)},
                 allow_flash_escalation=allow_escalation,
-                max_output_tokens=600,
             )
         )
         manifest.append({
@@ -260,7 +260,6 @@ def submit_generation_batch(
                     metadata={"p2_idx": str(p2_idx)},
                     allow_flash_escalation=allow_escalation,
                     system_instruction_override=COMPACT_SOLVER_SYSTEM_PROMPT,
-                    max_output_tokens=260,
                 )
             )
             pending_p2_init.append({
@@ -361,7 +360,7 @@ def sync_and_advance_batch_job(
                 rule = get_type_routing_rule(t_type, vocab_style=v_style, profile_name=eff_profile)
 
                 try:
-                    spec = schema_cls.model_validate_json(raw_json)
+                    spec = schema_cls.model_validate_json(extract_json_object_text(raw_json))
                     indexed = IndexedPassage(
                         clean_text=m_entry["clean_text"],
                         sentences=tuple(m_entry["sentences"]),
@@ -418,7 +417,6 @@ def sync_and_advance_batch_job(
                             metadata={"p2_idx": str(p2_idx)},
                             allow_flash_escalation=allow_escalation,
                             system_instruction_override=COMPACT_SOLVER_SYSTEM_PROMPT,
-                            max_output_tokens=260,
                         )
                     )
                     pending_pass2.append({
@@ -446,7 +444,6 @@ def sync_and_advance_batch_job(
                         metadata={"p2_idx": str(p2_idx)},
                         allow_flash_escalation=allow_escalation,
                         system_instruction_override=COMPACT_SOLVER_SYSTEM_PROMPT,
-                        max_output_tokens=260,
                     )
                 )
                 pending_pass2.append({
@@ -501,7 +498,7 @@ def sync_and_advance_batch_job(
                     rejected += 1
                     continue
                 try:
-                    verdict = BlindSolverVerdict.model_validate_json(raw_v)
+                    verdict = BlindSolverVerdict.model_validate_json(extract_json_object_text(raw_v))
                     rw_obj = RewrittenQuestion.model_validate(p2_entry["rw_dump"])
                     ok, _ = evaluate_blind_verdict(verdict, rw_obj.preserved_answer)
                     if ok:

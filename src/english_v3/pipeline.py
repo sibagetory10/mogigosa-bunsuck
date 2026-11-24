@@ -311,7 +311,6 @@ def generate_english_transformed_question(
                     service_tier=_service_tier,
                     cached_content_name=eff_cache_name,
                     allow_flash_escalation=allow_escalation,
-                    max_output_tokens=600,
                 )
 
             seed_val = _seed_from_inputs(
@@ -536,7 +535,6 @@ def generate_english_explanation(
         contents=prompt,
         config=types.GenerateContentConfig(
             temperature=0.25,
-            max_output_tokens=900,
             thinking_config=types.ThinkingConfig(
                 thinking_level=types.ThinkingLevel.MINIMAL,
                 include_thoughts=False,
@@ -578,7 +576,6 @@ def chat_followup_with_english(
         contents=prompt,
         config=types.GenerateContentConfig(
             temperature=0.3,
-            max_output_tokens=900,
             thinking_config=types.ThinkingConfig(
                 thinking_level=types.ThinkingLevel.MINIMAL,
                 include_thoughts=False,

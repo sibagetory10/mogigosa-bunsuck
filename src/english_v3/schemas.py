@@ -29,7 +29,7 @@ class UnderlineTargetItem(BaseModel):
 
 class Underline5Spec(BaseModel):
     items: list[UnderlineTargetItem] = Field(..., min_length=5, max_length=5)
-    wrong_item_index: Literal[0, 1, 2, 3, 4]
+    wrong_item_index: int = Field(..., ge=0, le=4)
     mutated_span: str = Field(..., min_length=1)
     explanation_ko: str = Field(..., min_length=8, max_length=220)
 
