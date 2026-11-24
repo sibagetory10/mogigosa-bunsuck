@@ -228,3 +228,32 @@ class UserExamsStoreMixin:
                         old_vocab_path.unlink(missing_ok=True)
             except Exception:
                 pass
+
+            # 5) 크레딧 원장(credit_ledger.jsonl) 사용자명 이관
+            try:
+                if self.credit_ledger_path.exists():
+                    raw_lines = self.credit_ledger_path.read_text(encoding="utf-8").splitlines()
+                    updated_lines: list[str] = []
+                    ledger_changed = False
+                    for ln in raw_lines:
+                        s = ln.strip()
+                        if not s:
+                            continue
+                        try:
+                            row = json.loads(s)
+                            if isinstance(row, dict) and str(row.get("username") or "").strip().lower() == old_u.lower():
+                                row["username"] = new_u
+                                ledger_changed = True
+                                updated_lines.append(json.dumps(row, ensure_ascii=False, separators=(",", ":")))
+                            else:
+                                updated_lines.append(s)
+                        except Exception:
+                            updated_lines.append(s)
+                    if ledger_changed:
+                        _atomic_write_text(
+                            self.credit_ledger_path,
+                            ("\n".join(updated_lines) + "\n") if updated_lines else "",
+                            encoding="utf-8",
+                        )
+            except Exception:
+                pass

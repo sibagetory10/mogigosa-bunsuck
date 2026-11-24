@@ -5,7 +5,14 @@ from typing import Any
 
 import streamlit as st
 
-from src.auth import resolve_active_gemini_api_key
+from src.auth import (
+    CREDIT_COST_CONCEPT_REWRITE,
+    CREDIT_COST_ENGLISH_VARIANT,
+    MAX_CHAT_TURNS_PER_QUESTION,
+    consume_daily_free_ai_quota,
+    refund_daily_free_ai_quota,
+    resolve_active_gemini_api_key,
+)
 from src.config import EXAM_TAGGING_MODEL
 from src.gemini.usage import ForbiddenTermRemainingError
 from src.models import (
@@ -18,13 +25,14 @@ from src.text_formatter import format_chemical_scripts, format_explanation_text,
 from src.ui.common import (
     CIRCLED_MAP,
     _auto_save_current_exam,
-    _ensure_token_quota,
     _infer_exam_subject,
     _record_english_seen_for_user,
     _render_rewritten_card_html,
     _usage_scope,
     is_multiple_choice_question,
     normalize_answer,
+    settle_credits,
+    try_reserve_credits,
 )
 from src.ui.context import AppContext
 from src.ui_styles import render_chips
@@ -256,145 +264,176 @@ def _render_mode_b_solve_fragment(
                     st.caption(concept_ref_str)
 
             # ✨ AI 자동 해설 버튼 & 🔄 이 문제 다시 변환 버튼
-            ai_col1, ai_col2, _ = st.columns([1.15, 1.25, 1.4])
+            regen_cost = CREDIT_COST_ENGLISH_VARIANT if is_eng_item else CREDIT_COST_CONCEPT_REWRITE
+            uname_quiz = ctx.current_user.username if ctx.current_user is not None else ""
+            ai_col1, ai_col2, _ = st.columns([1.15, 1.35, 1.3])
             with ai_col1:
-                if st.button("✨ AI 자동 해설", key=f"ai_btn_{q.id}", width="stretch"):
+                if st.button("✨ AI 자동 해설 (0C)", key=f"ai_btn_{q.id}", width="stretch"):
                     if not active_gemini_key:
                         st.error(f"사용 가능한 Gemini API 키({active_key_label})가 설정되지 않았습니다.")
-                    elif not _ensure_token_quota(ctx):
-                        pass
                     elif is_eng_item:
-                        with st.spinner("영어 구문·논리·오답 분석 해설 생성 중..."):
-                            try:
-                                from src.gemini import generate_english_explanation
+                        ok_free, free_msg = consume_daily_free_ai_quota(
+                            ctx.storage, uname_quiz, "AI 자동 해설"
+                        )
+                        if not ok_free:
+                            st.error(free_msg)
+                        else:
+                            with st.spinner("영어 구문·논리·오답 분석 해설 생성 중..."):
+                                try:
+                                    from src.gemini import generate_english_explanation
 
-                                with _usage_scope(ctx):
-                                    exp_md = generate_english_explanation(
-                                        api_key=active_gemini_key,
-                                        model_name=selected_model,
-                                        question=q,
-                                        rewritten=rw,
-                                        user_answer=st.session_state["user_answers"].get(q.id, ""),
-                                        source_reference=concept_ref_str,
-                                    )
-                                st.session_state["ai_explanations"][q.id] = exp_md
-                            except Exception as exc:
-                                st.error(f"영어 AI 해설 생성 실패: {exc}")
+                                    with _usage_scope(ctx):
+                                        exp_md = generate_english_explanation(
+                                            api_key=active_gemini_key,
+                                            model_name=selected_model,
+                                            question=q,
+                                            rewritten=rw,
+                                            user_answer=st.session_state["user_answers"].get(q.id, ""),
+                                            source_reference=concept_ref_str,
+                                        )
+                                    st.session_state["ai_explanations"][q.id] = exp_md
+                                except Exception as exc:
+                                    refund_daily_free_ai_quota(ctx.storage, uname_quiz)
+                                    st.error(f"영어 AI 해설 생성 실패: {exc}")
                     elif whitelist is None:
                         st.error("개념서 화이트리스트가 필요합니다.")
                     else:
-                        with st.spinner("개념서 범위 내 용어만 사용하여 맞춤 해설 작성 중..."):
-                            try:
-                                from src.gemini import generate_pdf_grounded_explanation
+                        ok_free, free_msg = consume_daily_free_ai_quota(
+                            ctx.storage, uname_quiz, "AI 자동 해설"
+                        )
+                        if not ok_free:
+                            st.error(free_msg)
+                        else:
+                            with st.spinner("개념서 범위 내 용어만 사용하여 맞춤 해설 작성 중..."):
+                                try:
+                                    from src.gemini import generate_pdf_grounded_explanation
 
-                                with _usage_scope(ctx):
-                                    exp_md = generate_pdf_grounded_explanation(
-                                        api_key=active_gemini_key,
-                                        model_name=selected_model,
-                                        question=q,
-                                        crop_png_bytes=crop_b,
-                                        whitelist=whitelist,
-                                        user_answer=st.session_state["user_answers"].get(q.id, ""),
-                                        rewritten=rw,
-                                        sliced_text=st.session_state.get("concept_sliced_text", ""),
-                                        concept_reference=concept_ref_str,
-                                    )
-                                st.session_state["ai_explanations"][q.id] = exp_md
-                            except Exception as exc:
-                                st.error(f"AI 해설 생성 실패: {exc}")
+                                    with _usage_scope(ctx):
+                                        exp_md = generate_pdf_grounded_explanation(
+                                            api_key=active_gemini_key,
+                                            model_name=selected_model,
+                                            question=q,
+                                            crop_png_bytes=crop_b,
+                                            whitelist=whitelist,
+                                            user_answer=st.session_state["user_answers"].get(q.id, ""),
+                                            rewritten=rw,
+                                            sliced_text=st.session_state.get("concept_sliced_text", ""),
+                                            concept_reference=concept_ref_str,
+                                        )
+                                    st.session_state["ai_explanations"][q.id] = exp_md
+                                except Exception as exc:
+                                    refund_daily_free_ai_quota(ctx.storage, uname_quiz)
+                                    st.error(f"AI 해설 생성 실패: {exc}")
 
             with ai_col2:
-                if st.button("🔄 이 문제 다시 변환", key=f"re_rw_btn_{q.id}", width="stretch"):
+                if st.button(f"🔄 이 문제 다시 변환 ({regen_cost}C)", key=f"re_rw_btn_{q.id}", width="stretch"):
                     if not active_gemini_key:
                         st.error(f"사용 가능한 Gemini API 키({active_key_label})가 설정되지 않았습니다.")
-                    elif not _ensure_token_quota(ctx):
-                        pass
-                    elif is_eng_item:
-                        eng_meta = item.get("english_meta") or {}
-                        src_passage = (
-                            eng_meta.get("source_passage")
-                            or getattr(q, "passage_text", "")
-                            or getattr(q, "question_text", "")
-                        )
-                        eng_rw_model = EXAM_TAGGING_MODEL
-                        eng_precision = False
-                        eng_rw_key, eng_rw_key_lbl = resolve_active_gemini_api_key(
-                            ctx.current_user,
-                            ctx.creds.gemini_api_key,
-                            model_name=eng_rw_model,
-                        )
-                        eff_eng_key = eng_rw_key or active_gemini_key
-                        with st.spinner(f"'{eng_target_type}' 유형으로 이 지문을 새롭게 다시 변형 중..."):
-                            try:
-                                from src.gemini import generate_english_transformed_question
-
-                                src_pdf_b = None
-                                if getattr(q, "source_pdf", "") and hasattr(ctx.storage, "get_pdf_bytes"):
-                                    src_pdf_b = ctx.storage.get_pdf_bytes(
-                                        q.source_pdf,
-                                        subject_category="영어",
-                                        exam_name=getattr(q, "exam_name", ""),
-                                    )
-                                with _usage_scope(ctx):
-                                    new_rw = generate_english_transformed_question(
-                                        api_key=eff_eng_key,
-                                        model_name=eng_rw_model,
-                                        source_passage=src_passage,
-                                        target_type=eng_meta.get("target_type") or eng_target_type,
-                                        difficulty=eng_meta.get("difficulty") or "고3 평가원·수능 수준",
-                                        blank_unit=eng_meta.get("blank_unit") or "구 (3~6단어)",
-                                        vocab_style=eng_meta.get("vocab_style") or "밑줄형 (①~⑤)",
-                                        source_label=eng_meta.get("source_label") or eng_source_caption,
-                                        previous_attempt=rw,
-                                        use_precision_mode=eng_precision,
-                                        storage=ctx.storage,
-                                        use_cache=False,
-                                        username=ctx.current_user.username if ctx.current_user is not None else "",
-                                        base_question=q,
-                                        source_pdf_bytes=src_pdf_b,
-                                    )
-                                st.session_state["matched_items"][seq_num - 1]["rewritten"] = new_rw
-                                st.session_state["ai_explanations"].pop(q.id, None)
-                                st.session_state["ai_chats"].pop(q.id, None)
-                                st.session_state["generated_exam_pdf"] = None
-                                st.session_state["generated_exam_pdf_sig"] = ""
-                                st.rerun(scope="fragment")
-                            except Exception as exc:
-                                st.error(f"영어 문항 재변환 실패: {exc}")
-                    elif whitelist is None:
+                    elif not is_eng_item and whitelist is None:
                         st.error("개념서 화이트리스트가 필요합니다.")
                     else:
-                        with st.spinner("이전 변환의 미흡 용어를 보완해 이 문항만 다시 변환 중..."):
+                        ok_regen_res, regen_reservation = try_reserve_credits(
+                            ctx,
+                            regen_cost,
+                            "개별 문항 재변환",
+                        )
+                        if ok_regen_res and regen_reservation is not None:
+                            actual_regen_c = 0
+                            regen_succeeded = False
                             try:
-                                target_oos = list(
-                                    getattr(j, "out_of_scope_terms", [])
-                                    or getattr(q, "advanced_terms", [])
-                                    or []
-                                )
-                                math_rw_model = EXAM_TAGGING_MODEL
-                                from src.gemini import rewrite_question_for_pdf
-
-                                with _usage_scope(ctx):
-                                    new_rw = rewrite_question_for_pdf(
-                                        api_key=active_gemini_key,
-                                        model_name=math_rw_model,
-                                        question=q,
-                                        crop_png_bytes=crop_b,
-                                        whitelist=whitelist,
-                                        out_of_scope_terms=target_oos,
-                                        sliced_text=st.session_state.get("concept_sliced_text", ""),
-                                        previous_attempt=rw,
+                                if is_eng_item:
+                                    eng_meta = item.get("english_meta") or {}
+                                    src_passage = (
+                                        eng_meta.get("source_passage")
+                                        or getattr(q, "passage_text", "")
+                                        or getattr(q, "question_text", "")
                                     )
-                                st.session_state["matched_items"][seq_num - 1]["rewritten"] = new_rw
-                                st.session_state["ai_explanations"].pop(q.id, None)
-                                st.session_state["ai_chats"].pop(q.id, None)
-                                st.session_state["generated_exam_pdf"] = None
-                                st.session_state["generated_exam_pdf_sig"] = ""
-                                st.rerun(scope="fragment")
+                                    eng_rw_model = EXAM_TAGGING_MODEL
+                                    eng_precision = False
+                                    eng_rw_key, _ = resolve_active_gemini_api_key(
+                                        ctx.current_user,
+                                        ctx.creds.gemini_api_key,
+                                        model_name=eng_rw_model,
+                                    )
+                                    eff_eng_key = eng_rw_key or active_gemini_key
+                                    with st.spinner(f"'{eng_target_type}' 유형으로 이 지문을 새롭게 다시 변형 중..."):
+                                        from src.gemini import generate_english_transformed_question
+
+                                        src_pdf_b = None
+                                        if getattr(q, "source_pdf", "") and hasattr(ctx.storage, "get_pdf_bytes"):
+                                            src_pdf_b = ctx.storage.get_pdf_bytes(
+                                                q.source_pdf,
+                                                subject_category="영어",
+                                                exam_name=getattr(q, "exam_name", ""),
+                                            )
+                                        with _usage_scope(ctx):
+                                            new_rw = generate_english_transformed_question(
+                                                api_key=eff_eng_key,
+                                                model_name=eng_rw_model,
+                                                source_passage=src_passage,
+                                                target_type=eng_meta.get("target_type") or eng_target_type,
+                                                difficulty=eng_meta.get("difficulty") or "고3 평가원·수능 수준",
+                                                blank_unit=eng_meta.get("blank_unit") or "구 (3~6단어)",
+                                                vocab_style=eng_meta.get("vocab_style") or "밑줄형 (①~⑤)",
+                                                source_label=eng_meta.get("source_label") or eng_source_caption,
+                                                previous_attempt=rw,
+                                                use_precision_mode=eng_precision,
+                                                storage=ctx.storage,
+                                                use_cache=False,
+                                                username=uname_quiz,
+                                                base_question=q,
+                                                source_pdf_bytes=src_pdf_b,
+                                            )
+                                        st.session_state["matched_items"][seq_num - 1]["rewritten"] = new_rw
+                                        st.session_state["ai_explanations"].pop(q.id, None)
+                                        st.session_state["ai_chats"].pop(q.id, None)
+                                        st.session_state["generated_exam_pdf"] = None
+                                        st.session_state["generated_exam_pdf_sig"] = ""
+                                        actual_regen_c = regen_cost
+                                        regen_succeeded = True
+                                else:
+                                    with st.spinner("이전 변환의 미흡 용어를 보완해 이 문항만 다시 변환 중..."):
+                                        target_oos = list(
+                                            getattr(j, "out_of_scope_terms", [])
+                                            or getattr(q, "advanced_terms", [])
+                                            or []
+                                        )
+                                        math_rw_model = EXAM_TAGGING_MODEL
+                                        from src.gemini import rewrite_question_for_pdf
+
+                                        with _usage_scope(ctx):
+                                            new_rw = rewrite_question_for_pdf(
+                                                api_key=active_gemini_key,
+                                                model_name=math_rw_model,
+                                                question=q,
+                                                crop_png_bytes=crop_b,
+                                                whitelist=whitelist,
+                                                out_of_scope_terms=target_oos,
+                                                sliced_text=st.session_state.get("concept_sliced_text", ""),
+                                                previous_attempt=rw,
+                                            )
+                                        st.session_state["matched_items"][seq_num - 1]["rewritten"] = new_rw
+                                        st.session_state["ai_explanations"].pop(q.id, None)
+                                        st.session_state["ai_chats"].pop(q.id, None)
+                                        st.session_state["generated_exam_pdf"] = None
+                                        st.session_state["generated_exam_pdf_sig"] = ""
+                                        actual_regen_c = regen_cost
+                                        regen_succeeded = True
                             except ForbiddenTermRemainingError as fexc:
-                                st.warning(f"⛔ 재변환 후에도 금지 용어가 남아 반영하지 않았습니다: {fexc}")
+                                actual_regen_c = 0
+                                st.warning(f"⛔ 재변환 후에도 금지 용어가 남아 반영하지 않았습니다 (크레딧 자동 환불): {fexc}")
                             except Exception as exc:
-                                st.error(f"문항 재변환 실패: {exc}")
+                                actual_regen_c = 0
+                                st.error(f"문항 재변환 실패 (크레딧 자동 환불): {exc}")
+                            finally:
+                                settle_credits(
+                                    ctx,
+                                    regen_reservation,
+                                    actual_regen_c,
+                                    detail_note=f"개별 문항 재변환 ({actual_regen_c}C)",
+                                )
+                            if regen_succeeded:
+                                st.rerun(scope="fragment")
 
             if q.id in st.session_state["ai_explanations"]:
                 st.info("✨ **수능 영어 구문·논리·오답 AI 맞춤 해설**" if is_eng_item else "✨ **개념서 범위 기준 AI 맞춤 해설**")
@@ -402,65 +441,75 @@ def _render_mode_b_solve_fragment(
                 if concept_ref_str not in st.session_state["ai_explanations"][q.id]:
                     st.markdown(f"**{_html.escape(concept_ref_str)}**")
 
-                # 문항별 추가 질문 채팅
-                st.markdown("💬 **추가 질문 채팅 (1:1 질의응답)**")
+                # 문항별 추가 질문 채팅 (문항당 최대 5턴 · 일일 무료 한도 적용)
                 q_chat_history: list[dict[str, str]] = st.session_state["ai_chats"].get(q.id, [])
+                user_turns = sum(1 for m in q_chat_history if m.get("role") == "user")
+                st.markdown(f"💬 **추가 질문 채팅 (1:1 질의응답 · {user_turns}/{MAX_CHAT_TURNS_PER_QUESTION}턴 · 0C 무료)**")
                 for msg in q_chat_history:
                     with st.chat_message(msg["role"]):
                         st.markdown(msg["content"])
 
-                with st.form(key=f"chat_form_{q.id}", clear_on_submit=True):
-                    followup_q = st.text_input(
-                        "이 문제에 대해 궁금한 점을 질문하세요",
-                        placeholder=(
-                            "예: 3번 선지가 왜 오답인지, 또는 첫 문장 구문 구조를 설명해 주세요."
-                            if is_eng_item
-                            else "예: 왜 이 식에서 질량비가 이렇게 적용되나요?"
-                        ),
-                        label_visibility="collapsed",
-                    )
-                    send_chat = st.form_submit_button("질문 보내기")
+                if user_turns >= MAX_CHAT_TURNS_PER_QUESTION:
+                    st.info(f"💡 문항당 추가 질문은 최대 {MAX_CHAT_TURNS_PER_QUESTION}턴까지 지원됩니다.")
+                else:
+                    with st.form(key=f"chat_form_{q.id}", clear_on_submit=True):
+                        followup_q = st.text_input(
+                            "이 문제에 대해 궁금한 점을 질문하세요",
+                            placeholder=(
+                                "예: 3번 선지가 왜 오답인지, 또는 첫 문장 구문 구조를 설명해 주세요."
+                                if is_eng_item
+                                else "예: 왜 이 식에서 질량비가 이렇게 적용되나요?"
+                            ),
+                            label_visibility="collapsed",
+                        )
+                        send_chat = st.form_submit_button("질문 보내기")
 
-                if send_chat and followup_q.strip():
-                    if not active_gemini_key or (not is_eng_item and whitelist is None):
-                        st.error(f"사용 가능한 Gemini API 키({active_key_label})가 필요합니다.")
-                    elif not _ensure_token_quota(ctx):
-                        pass
-                    else:
-                        q_chat_history.append({"role": "user", "content": followup_q.strip()})
-                        with st.spinner("답변 생성 중..."):
-                            try:
-                                with _usage_scope(ctx):
-                                    if is_eng_item:
-                                        from src.gemini import chat_followup_with_english
+                    if send_chat and followup_q.strip():
+                        if not active_gemini_key or (not is_eng_item and whitelist is None):
+                            st.error(f"사용 가능한 Gemini API 키({active_key_label})가 필요합니다.")
+                        else:
+                            ok_chat, chat_msg = consume_daily_free_ai_quota(
+                                ctx.storage, uname_quiz, "1:1 질문 채팅"
+                            )
+                            if not ok_chat:
+                                st.error(chat_msg)
+                            else:
+                                q_chat_history.append({"role": "user", "content": followup_q.strip()})
+                                with st.spinner("답변 생성 중..."):
+                                    try:
+                                        with _usage_scope(ctx):
+                                            if is_eng_item:
+                                                from src.gemini import chat_followup_with_english
 
-                                        reply = chat_followup_with_english(
-                                            api_key=active_gemini_key,
-                                            model_name=selected_model,
-                                            question=q,
-                                            rewritten=rw,
-                                            chat_history=q_chat_history[:-1],
-                                            user_query=followup_q.strip(),
-                                        )
-                                    else:
-                                        from src.gemini import chat_followup_with_pdf
+                                                reply = chat_followup_with_english(
+                                                    api_key=active_gemini_key,
+                                                    model_name=selected_model,
+                                                    question=q,
+                                                    rewritten=rw,
+                                                    chat_history=q_chat_history[-10:-1],
+                                                    user_query=followup_q.strip(),
+                                                )
+                                            else:
+                                                from src.gemini import chat_followup_with_pdf
 
-                                        reply = chat_followup_with_pdf(
-                                            api_key=active_gemini_key,
-                                            model_name=selected_model,
-                                            question=q,
-                                            crop_png_bytes=crop_b,
-                                            whitelist=whitelist,
-                                            chat_history=q_chat_history[:-1],
-                                            user_question=followup_q.strip(),
-                                            rewritten=rw,
-                                            sliced_text=st.session_state.get("concept_sliced_text", ""),
-                                        )
-                                q_chat_history.append({"role": "assistant", "content": reply})
-                                st.session_state["ai_chats"][q.id] = q_chat_history
-                                st.rerun(scope="fragment")
-                            except Exception as exc:
-                                st.error(f"답변 생성 오류: {exc}")
+                                                reply = chat_followup_with_pdf(
+                                                    api_key=active_gemini_key,
+                                                    model_name=selected_model,
+                                                    question=q,
+                                                    crop_png_bytes=crop_b,
+                                                    whitelist=whitelist,
+                                                    chat_history=q_chat_history[-10:-1],
+                                                    user_question=followup_q.strip(),
+                                                    rewritten=rw,
+                                                    sliced_text=st.session_state.get("concept_sliced_text", ""),
+                                                )
+                                        q_chat_history.append({"role": "assistant", "content": reply})
+                                        st.session_state["ai_chats"][q.id] = q_chat_history
+                                        st.rerun(scope="fragment")
+                                    except Exception as exc:
+                                        q_chat_history.pop()
+                                        refund_daily_free_ai_quota(ctx.storage, uname_quiz)
+                                        st.error(f"답변 생성 오류: {exc}")
 
     # 하단 채점하기 버튼
     grade_c1, grade_c2 = st.columns([2, 1])

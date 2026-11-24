@@ -6,7 +6,15 @@ from typing import TYPE_CHECKING, Any
 
 import streamlit as st
 
-from src.auth import record_exam_upload_for_user, resolve_active_gemini_api_key
+from src.auth import (
+    MAX_SHARED_UPLOAD_PDF_BYTES,
+    can_admin_shared_db,
+    can_contribute_shared_db,
+    check_daily_shared_upload_quota,
+    consume_daily_shared_upload_quota,
+    record_exam_upload_for_user,
+    resolve_active_gemini_api_key,
+)
 from src.config import EXAM_TAGGING_MODEL, MODEL_LABELS
 from src.models import infer_subject_category, normalize_exam_title_year
 from src.ui.common import (
@@ -29,6 +37,14 @@ def render_tab1(ctx: AppContext) -> None:
     st.subheader("1️⃣ 기출 PDF 수집 및 고해상도 자동 크롭 (250 DPI)")
     db_records = ctx.storage.load_db_readonly()
     _render_exam_coverage_board(ctx, db_records=db_records)
+
+    if not can_contribute_shared_db(ctx.current_user):
+        st.info(
+            "🔒 **기출 모의고사 PDF 업로드 및 AI 자동 태깅은 PRO · ULTRA · ADMIN 전용 기능입니다.**\n\n"
+            "무료(`FREE`) 등급에서는 아래 구축된 **공용 기출 DB 탐색 및 시험지·해설지 내려받기(0C 무료)**를 이용하실 수 있습니다."
+        )
+        render_tab1_db_explorer(ctx, db_records=db_records)
+        return
 
     collect_mode = st.radio(
         "수집 방식 선택",
@@ -85,6 +101,15 @@ def render_tab1(ctx: AppContext) -> None:
             [f for f in (raw_all_uploads or []) if f.name.lower().endswith(".pdf")],
             key=lambda f: f.name,
         )
+        if raw_all_files and not can_admin_shared_db(ctx.current_user):
+            oversized = [f.name for f in raw_all_files if int(getattr(f, "size", 0) or 0) > MAX_SHARED_UPLOAD_PDF_BYTES]
+            if oversized:
+                st.error(
+                    f"🚫 파일당 최대 크기(50MB)를 초과한 PDF가 제외되었습니다: {', '.join(oversized[:5])}"
+                )
+                raw_all_files = [
+                    f for f in raw_all_files if int(getattr(f, "size", 0) or 0) <= MAX_SHARED_UPLOAD_PDF_BYTES
+                ]
 
         prob_files: list[Any] = []
         ans_files: list[Any] = []
@@ -471,6 +496,24 @@ def render_tab1(ctx: AppContext) -> None:
                 return
             if not _ensure_token_quota(ctx):
                 return
+            if not can_admin_shared_db(ctx.current_user):
+                if not is_retry:
+                    norm_new_id = _normalize_exam_identity(meta["exam_name"])
+                    dup_exists = any(
+                        r.exam_name == meta["exam_name"]
+                        or (norm_new_id and _normalize_exam_identity(r.exam_name) == norm_new_id)
+                        for r in ctx.storage.load_db_readonly()
+                    )
+                    if dup_exists:
+                        st.error(
+                            f"🚫 이미 공용 기출 DB에 등록된 회차입니다 (`{meta['exam_name']}`). "
+                            "기존 회차 덮어쓰기 및 재태깅은 최고 관리자(ADMIN) 전용입니다."
+                        )
+                        return
+                    ok_up, _, up_msg = check_daily_shared_upload_quota(ctx.storage, ctx.current_user.username, 1)
+                    if not ok_up:
+                        st.error(up_msg)
+                        return
             if not target_q_nums:
                 st.warning("태깅할 문항을 최소 1개 이상 선택해 주세요.")
                 return
@@ -518,6 +561,8 @@ def render_tab1(ctx: AppContext) -> None:
 
             if not is_retry and newly_saved:
                 record_exam_upload_for_user(ctx.storage, ctx.current_user.username)
+                if not can_admin_shared_db(ctx.current_user):
+                    consume_daily_shared_upload_quota(ctx.storage, ctx.current_user.username, 1)
 
             prev_saved = (
                 st.session_state.get("stage2_saved_q_nums", [])
@@ -603,6 +648,7 @@ def render_tab1(ctx: AppContext) -> None:
                                     rec,
                                     storage=ctx.storage,
                                     key_prefix="stage2_saved",
+                                    allow_edit=can_admin_shared_db(ctx.current_user),
                                     allow_delete=False,
                                 )
 

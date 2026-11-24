@@ -40,15 +40,17 @@
 - **공식 API 단가 (USD / 1M tokens)**: Input `$0.30` (`FLASH_LITE_INPUT_USD_PER_1M`), Cached Input `$0.03` (`FLASH_LITE_CACHED_INPUT_USD_PER_1M`), Output(사고 토큰 포함) `$2.50` (`FLASH_LITE_OUTPUT_USD_PER_1M`).
 - **환율 동기화 (`src/fx_rate.py`)**: `app.py` 시작 시 `start_daily_midnight_fx_scheduler()`가 구동되며 매일 00:00 KST 및 온디맨드로 Google Cloud Billing Catalog API(`6F81-5844-456A`)를 1순위 조회하고, 폴백 환율 조회 결과를 `exam_db/fx_rate_cache.json`에 캐싱한다(기본 폴백 `DEFAULT_USD_TO_KRW = 1335.0`).
 
-### 3.3 회원 등급(`TierType`) & 월간 토큰 한도 (KST 매월 1일 초기화)
-| 등급 | 표기 / 구독료 | 월간 토큰 한도 | 주요 권한 및 제한 |
-| :--- | :--- | :--- | :--- |
-| `FREE` | 무료 (0원) | 50만 (`500,000`) | 1회 배치 최대 5문항 (`FREE_MAX_BATCH_QUESTIONS = 5`) |
-| `CUSTOM` | 개인 키 (0원) | 무제한 (개인 키 과금) | 사이드바 개인 Gemini API 키 등록 시 서버 토큰 차감 없음 |
-| `PRO` | PRO (9,900원/월) | 300만 (`3,000,000`) | 공용 개념서 DB 접근 가능, 배치 문항 제한 해제 |
-| `ULTRA` | ULTRA (19,900원/월) | 1,200만 (`12,000,000`) | 공용 개념서 DB 접근 가능, PRO 대비 정확히 4배 한도 |
-| `ADMIN` | 최고 관리자 | 무제한 | 기본 관리자 `sibagetory10`, 관리자 탭 접근 가능 |
+### 3.3 회원 등급(`TierType`) & 정액 크레딧(`Credit`) / 일일 방어 정책 (KST 매월 1일 초기화)
+| 등급 | 표기 / 구독료 | 월간 기본 크레딧 | `0C` 무료 AI 일일 한도 | 공용 DB 신규 업로드 *(50MB 이하)* | 주요 권한 및 제한 |
+| :--- | :--- | :---: | :---: | :---: | :--- |
+| `FREE` | 무료 (0원) | `30 C` | 일 10회 *(채팅 5턴)* | 불가 (열람만) | 1회 배치 최대 5문항 (`FREE_MAX_BATCH_QUESTIONS = 5`) |
+| `PRO` | PRO (9,900원/월) | `600 C` | 일 40회 *(채팅 5턴)* | 일 3회 (`0C`) | 배치 제한 해제 · 공용 DB 신규 업로드/불러오기 가능 |
+| `ULTRA` | ULTRA (19,900원/월) | `2,400 C` | 일 100회 *(채팅 5턴)* | 일 8회 (`0C`) | PRO 대비 정확히 4배 크레딧 · 공용 DB 신규 업로드/불러오기 가능 |
+| `ADMIN` | 최고 관리자 | 무제한 | 무제한 | 무제한 | 기본 관리자 `sibagetory10`, 공용 DB 수정·삭제·NCIC 관리 단독 권한 |
 
+- **단일 서버 키 & `CUSTOM` 폐지**: 레거시 `CUSTOM`/`BYOK` 계정은 로드 시 `FREE`로 자동 이관되며 `custom_api_key`도 공백으로 파기된다.
+- **정액 크레딧 단가 (신규 생성 · 캐시 풀 히트 동일)**: 영어 변형 `2C/문항`, 영어 분석지 `4C/지문`, 국어 세트 변형·분석지 각 `10C/세트`, 수·사·과·한 `개조 3C / 무개조 1C`, 개인 개념서 PDF 추출 `3C/회`, 개별 재변환 `영어 2C / 수·사·과·한 3C`. AI 해설·1:1 채팅·영단어 사전은 `0C` 무료(단, 시드/캐시 히트 외 신규 AI 호출 시 일일 무료 한도 차감).
+- **원자적 선예치·환불 & 원장**: `acquire_credit_reservation` / `settle_credit_reservation`으로 동시 실행 차단 및 월간 기본 크레딧 우선 차감 후 `bonus_credits` 차감·미성공분 자동 환불을 수행하며 모든 변동은 `exam_db/credit_ledger.jsonl`에 기록된다.
 - **인증 방식**: 로컬 ID/PW 로그인(PBKDF2-HMAC-SHA256 + 서명된 세션 토큰 유지) 및 Google OAuth 2.0 웹 로그인(`src/auth/oauth.py`) 동시 지원.
 
 ---
@@ -101,7 +103,7 @@
 - **런타임 영구 DB (`.gitignore` 제외 대상, 서버 디스크 보존)**:
   - `exam_db/db.json` 및 `exam_db/과목별_기출DB/`: 전체 기출 문항 메타데이터 및 과목별 정리본
   - `exam_db/pdfs/`, `exam_db/crops/`: 업로드된 원본 PDF 및 크롭 문항/지문 PNG
-  - `exam_db/users.json`: 회원 계정, 등급, 월간 토큰·원화 비용 통계
+  - `exam_db/users.json` & `exam_db/credit_ledger.jsonl`: 회원 계정, 등급, 크레딧·보너스·원가 통계 및 크레딧 원장 JSONL 로그
   - `exam_db/fx_rate_cache.json`: 일일 USD→KRW 환율 캐시
   - `exam_db/english_question_pool.json`, `english_analysis_pool.json`, `english_analysis_pdfs/`, `user_english_history.json`, `english_dict_cache.json`, `user_vocab/`
   - `exam_db/korean_analysis_pool.json`, `korean_analysis_pdfs/`

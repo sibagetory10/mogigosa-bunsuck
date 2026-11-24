@@ -8,7 +8,15 @@ from typing import Any
 
 import streamlit as st
 
-from src.auth import TIER_LABELS, can_access_shared_concept_db, resolve_model_for_user
+from src.auth import (
+    MAX_SHARED_UPLOAD_PDF_BYTES,
+    TIER_LABELS,
+    can_access_shared_concept_db,
+    can_admin_shared_db,
+    check_daily_shared_upload_quota,
+    consume_daily_shared_upload_quota,
+    resolve_model_for_user,
+)
 from src.config import CONCEPT_DB_BUILD_MODEL, EXAM_TAGGING_MODEL, MODEL_LABELS
 from src.models import ConceptBookRecord, ConceptUnit
 from src.ui.common import (
@@ -22,7 +30,7 @@ from src.ui.context import AppContext
 from src.ui_styles import render_chips
 
 
-def _render_ncic_curriculum_manager(key_prefix: str = "ncic") -> None:
+def _render_ncic_curriculum_manager(key_prefix: str = "ncic", ctx: AppContext | None = None) -> None:
     """2022 개정 교육과정(NCIC 고시 별책 5·7·8·9·14 PDF) 기준표 현황 조회 및 성취기준 누적 등록 UI."""
     ncic_exp = create_lazy_expander(
         "🧭 2022 개정 교육과정 공식 기준표(NCIC 고시 PDF) 관리 · 성취기준 보강",
@@ -54,6 +62,10 @@ def _render_ncic_curriculum_manager(key_prefix: str = "ncic") -> None:
         r2[0].metric("사회 기준표", f"{stats['사회']['subjects']}과목", f"성취기준 {stats['사회']['standards']}개")
         r2[1].metric("과학 기준표", f"{stats['과학']['subjects']}과목", f"성취기준 {stats['과학']['standards']}개")
         r2[2].metric("한국사 기준표", f"{stats['한국사']['subjects']}과목", f"성취기준 {stats['한국사']['standards']}개")
+
+        if not can_admin_shared_db(ctx.current_user if ctx is not None else None):
+            st.caption("🔒 공식 교육과정 기준표 동기화 · PDF 반영 · 초기화는 최고 관리자(ADMIN) 전용입니다.")
+            return
 
         auto_c1, auto_c2 = st.columns([2.2, 1.4])
         with auto_c1:
@@ -364,6 +376,8 @@ def _render_concept_book_builder_section(ctx: AppContext, key_prefix: str = "tab
             if save_err:
                 st.warning(save_err)
             else:
+                if not can_admin_shared_db(ctx.current_user):
+                    consume_daily_shared_upload_quota(ctx.storage, ctx.current_user.username, 1)
                 st.success(
                     f"🎉 공용 개념서 DB 저장 완료! (`{record.book_title}` · 총 {len(record.units)}개 단원 구조화 · 로컬 ./concept_db 저장 완료)"
                 )
@@ -394,6 +408,8 @@ def _render_concept_book_builder_section(ctx: AppContext, key_prefix: str = "tab
             if auto_preview_btn or auto_build_btn:
                 if not cb_pdf_bytes:
                     st.error("교재/개념서 PDF 파일을 먼저 업로드해 주세요.")
+                elif not can_admin_shared_db(ctx.current_user) and len(cb_pdf_bytes) > MAX_SHARED_UPLOAD_PDF_BYTES:
+                    st.error("🚫 공용 개념서 PDF는 파일당 50MB 이하만 업로드할 수 있습니다.")
                 elif not ctx.active_gemini_key:
                     st.error(f"사용 가능한 Gemini API 키({ctx.active_key_label})가 설정되지 않았습니다.")
                 elif not _ensure_token_quota(ctx):
@@ -403,6 +419,15 @@ def _render_concept_book_builder_section(ctx: AppContext, key_prefix: str = "tab
                 elif auto_build_btn and not subject_grade_in.strip():
                     st.error("과목 및 학년을 입력해 주세요. (예: 고1 통합과학)")
                 else:
+                    if auto_build_btn and not can_admin_shared_db(ctx.current_user):
+                        cand_id = f"{sanitize_id_part(book_title_in)}__{sanitize_id_part(subject_grade_in)}"
+                        if any(b.id == cand_id for b in ctx.storage.load_concept_books()):
+                            st.error("🚫 동일한 교재명·과목으로 등록된 공용 개념서가 이미 존재합니다. 기존 교재 덮어쓰기 및 수정은 최고 관리자(ADMIN) 전용입니다.")
+                            return
+                        ok_up, _, up_msg = check_daily_shared_upload_quota(ctx.storage, ctx.current_user.username, 1)
+                        if not ok_up:
+                            st.error(up_msg)
+                            return
                     status_box = st.empty()
                     try:
                         with _usage_scope(ctx):
@@ -512,6 +537,8 @@ def _render_concept_book_builder_section(ctx: AppContext, key_prefix: str = "tab
             if build_db_btn:
                 if not cb_pdf_bytes:
                     st.error("교재/개념서 PDF 파일을 먼저 업로드해 주세요.")
+                elif not can_admin_shared_db(ctx.current_user) and len(cb_pdf_bytes) > MAX_SHARED_UPLOAD_PDF_BYTES:
+                    st.error("🚫 공용 개념서 PDF는 파일당 50MB 이하만 업로드할 수 있습니다.")
                 elif not book_title_in.strip():
                     st.error("교재명을 입력해 주세요. (예: 완자 통합과학)")
                 elif not subject_grade_in.strip():
@@ -523,6 +550,15 @@ def _render_concept_book_builder_section(ctx: AppContext, key_prefix: str = "tab
                 elif not _ensure_token_quota(ctx):
                     pass
                 else:
+                    if not can_admin_shared_db(ctx.current_user):
+                        cand_id = f"{sanitize_id_part(book_title_in)}__{sanitize_id_part(subject_grade_in)}"
+                        if any(b.id == cand_id for b in ctx.storage.load_concept_books()):
+                            st.error("🚫 동일한 교재명·과목으로 등록된 공용 개념서가 이미 존재합니다. 기존 교재 덮어쓰기 및 수정은 최고 관리자(ADMIN) 전용입니다.")
+                            return
+                        ok_up, _, up_msg = check_daily_shared_upload_quota(ctx.storage, ctx.current_user.username, 1)
+                        if not ok_up:
+                            st.error(up_msg)
+                            return
                     try:
                         total_cb_pages = get_pdf_page_count(cb_pdf_bytes)
                         intervals = parse_page_ranges_spec(page_ranges_in, total_cb_pages)
@@ -574,15 +610,16 @@ def _render_concept_book_builder_section(ctx: AppContext, key_prefix: str = "tab
                         width="stretch",
                     )
                 with b_col3:
-                    if st.button(
-                        "🗑️ 삭제",
-                        key=f"{key_prefix}_del_cb_{b_idx}_{book.id}",
-                        width="stretch",
-                    ):
-                        del_err = ctx.storage.delete_concept_book(book.id)
-                        if del_err:
-                            st.warning(del_err)
-                        st.rerun()
+                    if can_admin_shared_db(ctx.current_user):
+                        if st.button(
+                            "🗑️ 삭제",
+                            key=f"{key_prefix}_del_cb_{b_idx}_{book.id}",
+                            width="stretch",
+                        ):
+                            del_err = ctx.storage.delete_concept_book(book.id)
+                            if del_err:
+                                st.warning(del_err)
+                            st.rerun()
 
                 unit_exp = create_lazy_expander(
                     f"📋 `{book.book_title}` 단원별 개념 및 허용 용어 상세 보기 ({len(book.units)}개 단원)",
@@ -610,5 +647,5 @@ render_concept_book_builder_section = _render_concept_book_builder_section
 
 
 def render_tab3(ctx: AppContext) -> None:
-    render_ncic_curriculum_manager(key_prefix="tab3")
+    render_ncic_curriculum_manager(key_prefix="tab3", ctx=ctx)
     render_concept_book_builder_section(ctx, key_prefix="tab3")

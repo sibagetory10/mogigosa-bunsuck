@@ -10,14 +10,11 @@ from typing import Any
 import streamlit as st
 
 from src.auth import (
+    CREDIT_COST_ENGLISH_VARIANT,
     TIER_LABELS,
     can_use_premium_features,
     consume_extraction_quota,
-    format_token_count,
     get_max_batch_questions,
-    get_monthly_token_limit,
-    get_remaining_monthly_tokens,
-    get_user_by_username,
     resolve_active_gemini_api_key,
 )
 from src.config import EXAM_TAGGING_MODEL, FLASH_LITE_MODEL, MODEL_LABELS
@@ -31,9 +28,11 @@ from src.models import (
 from src.ui.common import (
     _auto_save_current_exam,
     _build_exam_sig,
-    _ensure_token_quota,
     _record_english_seen_for_user,
     _usage_scope,
+    format_credit_balance_inline,
+    settle_credits,
+    try_reserve_credits,
 )
 from src.ui.context import AppContext
 from src.ui_styles import render_chips
@@ -54,12 +53,9 @@ def _execute_english_transform_jobs(
     source_summary_label: str,
     use_precision_mode: bool = False,
 ) -> None:
-    """(영어 지문, 목표 수능 유형) 작업 목록을 Gemini 3.5 Flash-Lite 단일 모델 및 등급별 월간 토큰 한도 하에 실행한다."""
+    """(영어 지문, 목표 수능 유형) 작업 목록을 정액 크레딧(문항당 2C · 풀 동일) 선예치·자동정산 하에 실행한다."""
     if not jobs:
         st.warning("변형할 영어 지문과 목표 수능 유형을 최소 1개 이상 선택해 주세요.")
-        return
-
-    if not _ensure_token_quota(ctx):
         return
 
     user_max_jobs = get_max_batch_questions(ctx.current_user)
@@ -78,6 +74,15 @@ def _execute_english_transform_jobs(
     )
     if not rewrite_api_key:
         st.error(f"영어 지문 변형용 Gemini API 키({rewrite_key_label})가 설정되지 않았습니다.")
+        return
+
+    reserve_credits = len(jobs) * CREDIT_COST_ENGLISH_VARIANT
+    ok_res, reservation = try_reserve_credits(
+        ctx,
+        reserve_credits,
+        f"영어 변형 출제 ({len(jobs)}문항)",
+    )
+    if not ok_res or reservation is None:
         return
 
     from src.english_v3.pipeline import (
@@ -110,45 +115,91 @@ def _execute_english_transform_jobs(
             )
         return pdf_bytes_cache[key]
 
-    # PyMuPDF 멀티스레드 경합/데드락 방지: 메인 스레드에서 1회만 원문 정화·복원 후 워커 스레드에는 정화된 텍스트만 전달
-    cleaned_passages_cache: dict[str, str] = {}
-    prepared_jobs: list[dict[str, Any]] = []
-    with _usage_scope(ctx):
-        for job in jobs:
-            raw_p = str(job.get("passage_text") or "").strip()
-            base_q = job.get("base_question")
-            cache_k = f"{getattr(base_q, 'id', '')}||{hashlib.sha256(raw_p.encode('utf-8')).hexdigest()[:16]}"
-            if cache_k not in cleaned_passages_cache:
-                orig_t = (
-                    (getattr(base_q, "english_question_type", "") if base_q is not None else "")
-                    or (getattr(base_q, "unit_name", "") if base_q is not None else "")
-                )
-                needs_pdf = len(raw_p) < 80 or _needs_english_passage_restoration(raw_p, orig_t)
-                src_pdf_b = _get_job_source_pdf_bytes(base_q) if needs_pdf else None
-                cleaned_passages_cache[cache_k] = prepare_clean_english_source_passage(
-                    api_key=rewrite_api_key,
-                    model_name=rewrite_model,
-                    source_passage=raw_p,
-                    base_question=base_q,
-                    source_pdf_bytes=src_pdf_b,
-                ) or raw_p
-            p_job = dict(job)
-            p_job["passage_text"] = cleaned_passages_cache[cache_k]
-            p_job["key_vocabulary"] = list(getattr(base_q, "key_vocabulary", []) or []) if base_q is not None else []
-            p_job["base_question"] = None
-            prepared_jobs.append(p_job)
+    results_by_idx: dict[int, Any] = {}
+    errors_by_idx: dict[int, str] = {}
+    assembled: list[dict[str, Any]] = []
+    actual_credits = 0
+    try:
+        # PyMuPDF 멀티스레드 경합/데드락 방지: 메인 스레드에서 1회만 원문 정화·복원 후 워커 스레드에는 정화된 텍스트만 전달
+        cleaned_passages_cache: dict[str, str] = {}
+        prepared_jobs: list[dict[str, Any]] = []
+        with _usage_scope(ctx):
+            for job in jobs:
+                raw_p = str(job.get("passage_text") or "").strip()
+                base_q = job.get("base_question")
+                cache_k = f"{getattr(base_q, 'id', '')}||{hashlib.sha256(raw_p.encode('utf-8')).hexdigest()[:16]}"
+                if cache_k not in cleaned_passages_cache:
+                    orig_t = (
+                        (getattr(base_q, "english_question_type", "") if base_q is not None else "")
+                        or (getattr(base_q, "unit_name", "") if base_q is not None else "")
+                    )
+                    needs_pdf = len(raw_p) < 80 or _needs_english_passage_restoration(raw_p, orig_t)
+                    src_pdf_b = _get_job_source_pdf_bytes(base_q) if needs_pdf else None
+                    cleaned_passages_cache[cache_k] = prepare_clean_english_source_passage(
+                        api_key=rewrite_api_key,
+                        model_name=rewrite_model,
+                        source_passage=raw_p,
+                        base_question=base_q,
+                        source_pdf_bytes=src_pdf_b,
+                    ) or raw_p
+                p_job = dict(job)
+                p_job["passage_text"] = cleaned_passages_cache[cache_k]
+                p_job["key_vocabulary"] = list(getattr(base_q, "key_vocabulary", []) or []) if base_q is not None else []
+                p_job["base_question"] = None
+                prepared_jobs.append(p_job)
 
-        def _on_v3_progress(done_cnt: int, tot_cnt: int) -> None:
-            prog.progress(min(1.0, done_cnt / max(1, tot_cnt)))
-            stat.info(f"🔤 영어 지문 수능형 변형 v3 출제·검수 중 ({done_cnt}/{tot_cnt})...")
+            def _on_v3_progress(done_cnt: int, tot_cnt: int) -> None:
+                prog.progress(min(1.0, done_cnt / max(1, tot_cnt)))
+                stat.info(f"🔤 영어 지문 수능형 변형 v3 출제·검수 중 ({done_cnt}/{tot_cnt})...")
 
-        results_by_idx, errors_by_idx = generate_batch_questions_v3(
-            api_key=rewrite_api_key,
-            jobs=prepared_jobs,
-            storage=ctx.storage,
-            username=ctx.current_user.username if ctx.current_user is not None else "",
-            max_workers=n_workers,
-            progress_callback=_on_v3_progress,
+            results_by_idx, errors_by_idx = generate_batch_questions_v3(
+                api_key=rewrite_api_key,
+                jobs=prepared_jobs,
+                storage=ctx.storage,
+                username=ctx.current_user.username if ctx.current_user is not None else "",
+                max_workers=n_workers,
+                progress_callback=_on_v3_progress,
+            )
+
+        for idx, job in enumerate(jobs):
+            rw_item = results_by_idx.get(idx)
+            if rw_item is None:
+                continue
+            base_q: QuestionRecord = job["base_question"]
+            unique_q = base_q.model_copy(
+                update={
+                    "id": f"{base_q.id}__eng_{idx + 1:02d}",
+                    "subject_category": "영어",
+                    "curriculum_subject": "영어",
+                    "unit_name": rw_item.target_question_type or job["target_type"],
+                }
+            )
+            assembled.append(
+                {
+                    "question": unique_q,
+                    "judgment": None,
+                    "crop_png_bytes": None,
+                    "rewritten": rw_item,
+                    "concept_reference": f"📚 {job['source_label']}",
+                    "english_meta": {
+                        "source_passage": job["passage_text"],
+                        "target_type": job["target_type"],
+                        "difficulty": job["difficulty"],
+                        "blank_unit": job["blank_unit"],
+                        "vocab_style": job["vocab_style"],
+                        "source_label": job["source_label"],
+                        "use_precision_mode": use_precision_mode,
+                        "rewrite_model": rewrite_model,
+                    },
+                }
+            )
+        actual_credits = len(assembled) * CREDIT_COST_ENGLISH_VARIANT
+    finally:
+        settle_credits(
+            ctx,
+            reservation,
+            actual_credits,
+            detail_note=f"영어 변형 출제 ({len(assembled)}/{total_jobs}문항 성공 · {actual_credits:,}C 확정)",
         )
 
     prog.progress(1.0)
@@ -158,42 +209,8 @@ def _execute_english_transform_jobs(
         j_info = jobs[idx]
         st.error(f"❌ [{j_info['source_label']} → {j_info['target_type']}] 변형 실패: {err_str}")
 
-    assembled: list[dict[str, Any]] = []
-    for idx, job in enumerate(jobs):
-        rw_item = results_by_idx.get(idx)
-        if rw_item is None:
-            continue
-        base_q: QuestionRecord = job["base_question"]
-        unique_q = base_q.model_copy(
-            update={
-                "id": f"{base_q.id}__eng_{idx + 1:02d}",
-                "subject_category": "영어",
-                "curriculum_subject": "영어",
-                "unit_name": rw_item.target_question_type or job["target_type"],
-            }
-        )
-        assembled.append(
-            {
-                "question": unique_q,
-                "judgment": None,
-                "crop_png_bytes": None,
-                "rewritten": rw_item,
-                "concept_reference": f"📚 {job['source_label']}",
-                "english_meta": {
-                    "source_passage": job["passage_text"],
-                    "target_type": job["target_type"],
-                    "difficulty": job["difficulty"],
-                    "blank_unit": job["blank_unit"],
-                    "vocab_style": job["vocab_style"],
-                    "source_label": job["source_label"],
-                    "use_precision_mode": use_precision_mode,
-                    "rewrite_model": rewrite_model,
-                },
-            }
-        )
-
     if not assembled:
-        st.warning("생성된 영어 변형 문항이 없습니다.")
+        st.warning("생성된 영어 변형 문항이 없습니다. (선예치 크레딧 전액 자동 환불됨)")
         return
 
     consume_extraction_quota(ctx.storage, ctx.current_user.username, len(assembled))
@@ -252,14 +269,11 @@ def _execute_english_transform_jobs(
         except Exception:
             pass
 
-    rem_msg = ""
-    fresh_u = get_user_by_username(ctx.storage, ctx.current_user.username)
-    if fresh_u is not None:
-        m_lim = get_monthly_token_limit(fresh_u)
-        m_rem = get_remaining_monthly_tokens(fresh_u)
-        if m_lim is not None and m_rem is not None:
-            rem_msg = f" | 이번 달 잔여 토큰: {m_rem:,} / {format_token_count(m_lim)}"
-
+    rem_msg = format_credit_balance_inline(
+        ctx.storage,
+        ctx.current_user.username if ctx.current_user is not None else "",
+        charged=actual_credits,
+    )
     st.success(f"🎯 총 **{len(assembled)}문항**의 수능형 영어 변형 문제 출제가 완료되었습니다! 아래 모드 A(시험지 PDF) 또는 모드 B(웹 바로 풀기)에서 확인하세요.{rem_msg}")
 def _filter_english_db_passages(
     ctx: AppContext,
@@ -504,7 +518,7 @@ def _render_english_transform_submode(ctx: AppContext) -> None:
                         )
 
                     run_eng_db_btn = st.form_submit_button(
-                        "🚀 선택한 기출 영어 지문 수능형 변형 문제 생성",
+                        f"🚀 선택한 기출 영어 지문 수능형 변형 문제 생성 (문항당 {CREDIT_COST_ENGLISH_VARIANT}C · 캐시 풀 동일)",
                         type="primary",
                         width="stretch",
                     )
@@ -611,7 +625,7 @@ def _render_english_transform_submode(ctx: AppContext) -> None:
                 f"선택 유형 {len(direct_types)}개 × 지문 수"
             )
             run_eng_direct_btn = st.form_submit_button(
-                "🚀 직접 입력한 영어 지문으로 수능형 변형 문제 생성",
+                f"🚀 직접 입력한 영어 지문으로 수능형 변형 문제 생성 (문항당 {CREDIT_COST_ENGLISH_VARIANT}C · 캐시 풀 동일)",
                 type="primary",
                 width="stretch",
             )

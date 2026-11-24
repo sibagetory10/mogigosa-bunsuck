@@ -28,7 +28,40 @@ def _storage_lock(storage: StorageManager | None):
 KST = timezone(timedelta(hours=9))
 FREE_MAX_BATCH_QUESTIONS = 5
 
-# 월간 토큰 한도 (Gemini 3.5 Flash-Lite 단일 모델 · PRO 대비 ULTRA 정확히 4배)
+# 월간 기본 크레딧 한도 (KST 매월 1일 초기화 · PRO 대비 ULTRA 정확히 4배)
+FREE_MONTHLY_CREDIT_LIMIT = 30
+PRO_MONTHLY_CREDIT_LIMIT = 600
+ULTRA_MONTHLY_CREDIT_LIMIT = 2_400
+MONTHLY_CREDIT_LIMITS: dict[str, int] = {
+    "FREE": FREE_MONTHLY_CREDIT_LIMIT,
+    "PRO": PRO_MONTHLY_CREDIT_LIMIT,
+    "ULTRA": ULTRA_MONTHLY_CREDIT_LIMIT,
+}
+
+# 기능별 정액 크레딧 단가 (신규 생성 · 공용 캐시 풀 히트 동일 차감)
+CREDIT_COST_ENGLISH_VARIANT = 2          # 영어 변형 1문항
+CREDIT_COST_ENGLISH_ANALYSIS = 4         # 영어 정밀 지문 분석지 1지문
+CREDIT_COST_KOREAN_SET_TRANSFORM = 10    # 국어 세트 변형 1세트
+CREDIT_COST_KOREAN_ANALYSIS = 10         # 국어 심층 분석지 1세트
+CREDIT_COST_CONCEPT_MATCH_ORIG = 1       # 수·사·과·한 무개조 원문 추출 1문항
+CREDIT_COST_CONCEPT_REWRITE = 3          # 수·사·과·한 상위용어 개조 1문항
+CREDIT_COST_DIRECT_CONCEPT_PDF = 3       # 탭 2 개인 개념서 PDF 직접 업로드 추출 1회
+
+# 0C 무료 기능 타이트 어뷰징 방어 한도
+MAX_CHAT_TURNS_PER_QUESTION = 5
+MAX_SHARED_UPLOAD_PDF_BYTES = 50 * 1024 * 1024  # 50 MB
+DAILY_FREE_AI_LIMITS: dict[str, int] = {
+    "FREE": 10,
+    "PRO": 40,
+    "ULTRA": 100,
+}
+DAILY_SHARED_UPLOAD_LIMITS: dict[str, int] = {
+    "FREE": 0,
+    "PRO": 3,
+    "ULTRA": 8,
+}
+
+# 하위 호환용 월간 토큰 상수 (관리자 원가 통계용)
 FREE_MONTHLY_TOKEN_LIMIT = 500_000
 PRO_MONTHLY_TOKEN_LIMIT = 3_000_000
 ULTRA_MONTHLY_TOKEN_LIMIT = 12_000_000
@@ -49,10 +82,9 @@ WEEKLY_PREMIUM_LIMITS: dict[str, int] = {}
 FREE_EXAMS_PER_UNLOCK = 3
 PREMIUM_MODEL_IDS: tuple[str, ...] = ()
 
-VALID_TIERS: tuple[TierType, ...] = ("FREE", "CUSTOM", "PRO", "ULTRA", "ADMIN")
+VALID_TIERS: tuple[TierType, ...] = ("FREE", "PRO", "ULTRA", "ADMIN")
 TIER_LABELS: dict[TierType, str] = {
     "FREE": "무료 (0원)",
-    "CUSTOM": "개인 키 (0원)",
     "PRO": "PRO (9,900원/월)",
     "ULTRA": "ULTRA (19,900원/월)",
     "ADMIN": "최고 관리자",
@@ -73,6 +105,12 @@ def get_kst_week_str() -> str:
 def get_kst_month_str() -> str:
     """한국 표준시(KST) 기준 현재 월 YYYY-MM을 반환한다 (매월 1일 초기화)."""
     return datetime.now(KST).strftime("%Y-%m")
+
+
+def format_credit_count(credits: int | float) -> str:
+    """크레딧 수를 읽기 쉬운 표기(예: 600C, 2,400C)로 변환한다."""
+    n = max(0, int(round(credits or 0)))
+    return f"{n:,}C"
 
 
 def format_token_count(tokens: int | float) -> str:

@@ -7,14 +7,19 @@ from typing import Any
 
 import streamlit as st
 
-from src.auth import resolve_active_gemini_api_key
+from src.auth import CREDIT_COST_ENGLISH_ANALYSIS, resolve_active_gemini_api_key
 from src.config import FLASH_LITE_MODEL, MODEL_LABELS
 from src.models import (
     CURRENT_ENGLISH_ANALYSIS_VERSION,
     QuestionRecord,
     normalize_english_group_id,
 )
-from src.ui.common import _ensure_token_quota, _usage_scope
+from src.ui.common import (
+    _usage_scope,
+    format_credit_balance_inline,
+    settle_credits,
+    try_reserve_credits,
+)
 from src.ui.context import AppContext
 
 _ENG_CIRCLED_NUMS = (
@@ -35,289 +40,315 @@ def _execute_english_analysis_jobs(
     include_diagrams: bool = True,
     force_regenerate: bool = False,
 ) -> None:
-    """선택된 영어 지문 목록에 대해 DB 캐시 조회/병렬 AI(주제·도식) 분석/지문별 PDF 저장/합본 PDF 생성을 수행한다."""
+    """선택된 영어 지문 목록에 대해 정액 크레딧(지문당 4C · 캐시 풀 동일) 선예치·자동정산 하에 분석지 PDF를 생성한다."""
     if not items:
         st.warning("분석지를 생성할 영어 지문을 최소 1개 이상 선택해 주세요.")
         return
-    from src.gemini import (
-        generate_english_passage_analysis,
-        generate_english_visual_diagram,
-        submit_with_usage_context,
+
+    reserve_credits = len(items) * CREDIT_COST_ENGLISH_ANALYSIS
+    ok_res, reservation = try_reserve_credits(
+        ctx,
+        reserve_credits,
+        f"영어 지문 분석지 ({len(items)}지문)",
     )
-    from src.pdf.common import merge_korean_analysis_pdfs
-    from src.pdf.english_analysis_pdf import generate_english_passage_analysis_pdf
-    from src.pdf_parser.english_source_extractor import (
-        build_english_sentence_items,
-        extract_english_passage_from_problem_source,
-        extract_english_question_translation_from_pdf,
-    )
+    if not ok_res or reservation is None:
+        return
 
-    # 동일 시험지 PDF 중복 디스크 로드 방지를 위해 사전 캐싱
-    pdf_bytes_cache: dict[tuple[str, str], bytes | None] = {}
-
-    def _get_cached_pdf_bytes(exam_name: str, filename: str) -> bytes | None:
-        fn = (filename or "").strip()
-        if not fn:
-            return None
-        key = ((exam_name or "").strip(), fn)
-        if key not in pdf_bytes_cache:
-            pdf_bytes_cache[key] = ctx.storage.get_pdf_bytes(
-                fn,
-                subject_category="영어",
-                exam_name=(exam_name or "").strip(),
-            )
-        return pdf_bytes_cache[key]
-
-    prepared_slots: list[dict[str, Any]] = []
-    missing_ai_indices: list[int] = []
-    missing_diag_indices: list[int] = []
-
-    for idx_s, it in enumerate(items):
-        p_txt = str(it.get("passage_text") or "").strip()
-        q_lbl = str(it.get("q_label") or "").strip()
-        direct_kor = str(it.get("direct_korean_translation") or "").strip()
-        c_key = ctx.storage.build_english_analysis_key(p_txt, q_lbl, extra_key=direct_kor)
-
-        src_pdf_b = _get_cached_pdf_bytes(str(it.get("exam_name") or ""), str(it.get("source_pdf") or ""))
-        ans_pdf_b = _get_cached_pdf_bytes(str(it.get("exam_name") or ""), str(it.get("answer_pdf") or ""))
-        q_num = int(it.get("q_num") or 0)
-        p_gid = str(it.get("passage_group_id") or "").strip()
-
-        cached_an = None if force_regenerate else ctx.storage.get_cached_english_analysis(c_key)
-        cached_pdf = (
-            None
-            if force_regenerate
-            else (ctx.storage.get_english_analysis_pdf_bytes(c_key) if include_diagrams else None)
+    actual_credits = 0
+    try:
+        from src.gemini import (
+            generate_english_passage_analysis,
+            generate_english_visual_diagram,
+            submit_with_usage_context,
+        )
+        from src.pdf.common import merge_korean_analysis_pdfs
+        from src.pdf.english_analysis_pdf import generate_english_passage_analysis_pdf
+        from src.pdf_parser.english_source_extractor import (
+            build_english_sentence_items,
+            extract_english_passage_from_problem_source,
+            extract_english_question_translation_from_pdf,
         )
 
-        if cached_an is not None:
-            is_stale_ver = int(getattr(cached_an, "analysis_version", 1) or 1) < CURRENT_ENGLISH_ANALYSIS_VERSION
-            if is_stale_ver:
-                cached_an = None
-                cached_pdf = None
+        # 동일 시험지 PDF 중복 디스크 로드 방지를 위해 사전 캐싱
+        pdf_bytes_cache: dict[tuple[str, str], bytes | None] = {}
 
-        # v5 캐시가 있으나 당시 해설지 PDF 미보유로 translation_source=='none'이었던 경우 AI 호출 없이 3번 섹션만 보강
-        if (
-            cached_an is not None
-            and getattr(cached_an, "translation_source", "") == "none"
-            and ans_pdf_b is not None
-            and q_num > 0
-        ):
-            new_kor = extract_english_question_translation_from_pdf(
-                answer_pdf_bytes=ans_pdf_b,
-                q_num=q_num,
-                passage_group_id=p_gid,
-                orig_question_type=str(it.get("orig_type") or ""),
-                answer=str(it.get("answer") or ""),
+        def _get_cached_pdf_bytes(exam_name: str, filename: str) -> bytes | None:
+            fn = (filename or "").strip()
+            if not fn:
+                return None
+            key = ((exam_name or "").strip(), fn)
+            if key not in pdf_bytes_cache:
+                pdf_bytes_cache[key] = ctx.storage.get_pdf_bytes(
+                    fn,
+                    subject_category="영어",
+                    exam_name=(exam_name or "").strip(),
+                )
+            return pdf_bytes_cache[key]
+
+        prepared_slots: list[dict[str, Any]] = []
+        missing_ai_indices: list[int] = []
+        missing_diag_indices: list[int] = []
+
+        for idx_s, it in enumerate(items):
+            p_txt = str(it.get("passage_text") or "").strip()
+            q_lbl = str(it.get("q_label") or "").strip()
+            direct_kor = str(it.get("direct_korean_translation") or "").strip()
+            c_key = ctx.storage.build_english_analysis_key(p_txt, q_lbl, extra_key=direct_kor)
+
+            src_pdf_b = _get_cached_pdf_bytes(str(it.get("exam_name") or ""), str(it.get("source_pdf") or ""))
+            ans_pdf_b = _get_cached_pdf_bytes(str(it.get("exam_name") or ""), str(it.get("answer_pdf") or ""))
+            q_num = int(it.get("q_num") or 0)
+            p_gid = str(it.get("passage_group_id") or "").strip()
+
+            cached_an = None if force_regenerate else ctx.storage.get_cached_english_analysis(c_key)
+            cached_pdf = (
+                None
+                if force_regenerate
+                else (ctx.storage.get_english_analysis_pdf_bytes(c_key) if include_diagrams else None)
             )
-            if new_kor:
-                clean_p, fns = extract_english_passage_from_problem_source(
-                    passage_text=p_txt,
-                    question_text=str(it.get("question_text") or ""),
-                    source_pdf_bytes=src_pdf_b,
+
+            if cached_an is not None:
+                is_stale_ver = int(getattr(cached_an, "analysis_version", 1) or 1) < CURRENT_ENGLISH_ANALYSIS_VERSION
+                if is_stale_ver:
+                    cached_an = None
+                    cached_pdf = None
+
+            # v5 캐시가 있으나 당시 해설지 PDF 미보유로 translation_source=='none'이었던 경우 AI 호출 없이 3번 섹션만 보강
+            if (
+                cached_an is not None
+                and getattr(cached_an, "translation_source", "") == "none"
+                and ans_pdf_b is not None
+                and q_num > 0
+            ):
+                new_kor = extract_english_question_translation_from_pdf(
+                    answer_pdf_bytes=ans_pdf_b,
                     q_num=q_num,
                     passage_group_id=p_gid,
                     orig_question_type=str(it.get("orig_type") or ""),
                     answer=str(it.get("answer") or ""),
                 )
-                new_items = build_english_sentence_items(clean_p or p_txt, new_kor)
-                cached_an = cached_an.model_copy(
-                    update={
-                        "sentence_analyses": new_items,
-                        "footnotes": fns or cached_an.footnotes,
-                        "translation_source": "answer_pdf",
-                    }
-                )
-                cached_pdf = None
-                ctx.storage.save_cached_english_analysis(
-                    c_key,
-                    cached_an,
-                    exam_name=it.get("exam_name", ""),
-                    q_label=q_lbl,
-                    question_type=it.get("orig_type", ""),
-                )
-
-        prepared_slots.append(
-            {
-                "item": it,
-                "cache_key": c_key,
-                "analysis": cached_an,
-                "pdf_bytes": cached_pdf,
-                "source_pdf_bytes": src_pdf_b,
-                "answer_pdf_bytes": ans_pdf_b,
-                "q_num": q_num,
-                "passage_group_id": p_gid,
-                "direct_korean_translation": direct_kor,
-            }
-        )
-        if cached_an is None:
-            missing_ai_indices.append(idx_s)
-        elif include_diagrams and getattr(cached_an, "visual_diagram", None) is None:
-            missing_diag_indices.append(idx_s)
-            prepared_slots[idx_s]["pdf_bytes"] = None
-
-    pdf_hit_cnt = sum(1 for sl in prepared_slots if sl["pdf_bytes"] is not None)
-    json_to_pdf_cnt = 0
-    ai_gen_cnt = 0
-
-    if missing_ai_indices or missing_diag_indices:
-        if not _ensure_token_quota(ctx):
-            return
-        an_model = FLASH_LITE_MODEL
-        an_api_key, an_key_label = resolve_active_gemini_api_key(
-            ctx.current_user, ctx.creds.gemini_api_key, model_name=an_model
-        )
-        if not an_api_key:
-            st.error(f"영어 지문 분석용 Gemini API 키({an_key_label})가 설정되지 않았습니다.")
-            return
-
-        need_total = len(missing_ai_indices) + len(missing_diag_indices)
-        with _usage_scope(ctx):
-            with st.spinner(
-                f"📑 {MODEL_LABELS.get(an_model, an_model)}로 "
-                f"영어 지문 주제·논리흐름·도식 생성 {need_total}건 병렬 진행 중 "
-                f"(DB 로드 {len(items) - len(missing_ai_indices)}건)..."
-            ):
-                if missing_ai_indices:
-                    def _run_ai_slot(slot_i: int):
-                        slot = prepared_slots[slot_i]
-                        it = slot["item"]
-                        an_out = generate_english_passage_analysis(
-                            api_key=an_api_key,
-                            model_name=an_model,
-                            passage_text=it["passage_text"],
-                            source_label=it["q_label"],
-                            orig_question_type=it.get("orig_type", ""),
-                            passage_topic=it.get("passage_topic", ""),
-                            answer=it.get("answer", ""),
-                            choices=it.get("choices", []),
-                            explanation=it.get("explanation", ""),
-                            question_text=it.get("question_text", ""),
-                            source_pdf_bytes=slot["source_pdf_bytes"],
-                            answer_pdf_bytes=slot["answer_pdf_bytes"],
-                            q_num=slot["q_num"],
-                            passage_group_id=slot["passage_group_id"],
-                            direct_korean_translation=slot["direct_korean_translation"],
-                            include_diagrams=include_diagrams,
-                        )
-                        return slot_i, an_out
-
-                    with concurrent.futures.ThreadPoolExecutor(
-                        max_workers=min(4, len(missing_ai_indices))
-                    ) as executor:
-                        fut_map = {
-                            submit_with_usage_context(executor, _run_ai_slot, si): si
-                            for si in missing_ai_indices
+                if new_kor:
+                    clean_p, fns = extract_english_passage_from_problem_source(
+                        passage_text=p_txt,
+                        question_text=str(it.get("question_text") or ""),
+                        source_pdf_bytes=src_pdf_b,
+                        q_num=q_num,
+                        passage_group_id=p_gid,
+                        orig_question_type=str(it.get("orig_type") or ""),
+                        answer=str(it.get("answer") or ""),
+                    )
+                    new_items = build_english_sentence_items(clean_p or p_txt, new_kor)
+                    cached_an = cached_an.model_copy(
+                        update={
+                            "sentence_analyses": new_items,
+                            "footnotes": fns or cached_an.footnotes,
+                            "translation_source": "answer_pdf",
                         }
-                        for fut in concurrent.futures.as_completed(fut_map):
-                            si = fut_map[fut]
-                            slot = prepared_slots[si]
+                    )
+                    cached_pdf = None
+                    ctx.storage.save_cached_english_analysis(
+                        c_key,
+                        cached_an,
+                        exam_name=it.get("exam_name", ""),
+                        q_label=q_lbl,
+                        question_type=it.get("orig_type", ""),
+                    )
+
+            prepared_slots.append(
+                {
+                    "item": it,
+                    "cache_key": c_key,
+                    "analysis": cached_an,
+                    "pdf_bytes": cached_pdf,
+                    "source_pdf_bytes": src_pdf_b,
+                    "answer_pdf_bytes": ans_pdf_b,
+                    "q_num": q_num,
+                    "passage_group_id": p_gid,
+                    "direct_korean_translation": direct_kor,
+                }
+            )
+            if cached_an is None:
+                missing_ai_indices.append(idx_s)
+            elif include_diagrams and getattr(cached_an, "visual_diagram", None) is None:
+                missing_diag_indices.append(idx_s)
+                prepared_slots[idx_s]["pdf_bytes"] = None
+
+        pdf_hit_cnt = sum(1 for sl in prepared_slots if sl["pdf_bytes"] is not None)
+        json_to_pdf_cnt = 0
+        ai_gen_cnt = 0
+
+        if missing_ai_indices or missing_diag_indices:
+            an_model = FLASH_LITE_MODEL
+            an_api_key, an_key_label = resolve_active_gemini_api_key(
+                ctx.current_user, ctx.creds.gemini_api_key, model_name=an_model
+            )
+            if not an_api_key:
+                st.error(f"영어 지문 분석용 Gemini API 키({an_key_label})가 설정되지 않았습니다.")
+                return
+
+            need_total = len(missing_ai_indices) + len(missing_diag_indices)
+            with _usage_scope(ctx):
+                with st.spinner(
+                    f"📑 {MODEL_LABELS.get(an_model, an_model)}로 "
+                    f"영어 지문 주제·논리흐름·도식 생성 {need_total}건 병렬 진행 중 "
+                    f"(DB 로드 {len(items) - len(missing_ai_indices)}건)..."
+                ):
+                    if missing_ai_indices:
+                        def _run_ai_slot(slot_i: int):
+                            slot = prepared_slots[slot_i]
                             it = slot["item"]
-                            try:
-                                _, an_out = fut.result()
-                                slot["analysis"] = an_out
-                                ai_gen_cnt += 1
-                                ctx.storage.save_cached_english_analysis(
-                                    slot["cache_key"],
-                                    an_out,
-                                    exam_name=it.get("exam_name", ""),
-                                    q_label=it.get("q_label", ""),
-                                    question_type=it.get("orig_type", ""),
-                                )
-                            except Exception as exc:
-                                st.error(f"[{it.get('q_label', '영어 지문')}] 지문 분석 실패: {exc}")
+                            an_out = generate_english_passage_analysis(
+                                api_key=an_api_key,
+                                model_name=an_model,
+                                passage_text=it["passage_text"],
+                                source_label=it["q_label"],
+                                orig_question_type=it.get("orig_type", ""),
+                                passage_topic=it.get("passage_topic", ""),
+                                answer=it.get("answer", ""),
+                                choices=it.get("choices", []),
+                                explanation=it.get("explanation", ""),
+                                question_text=it.get("question_text", ""),
+                                source_pdf_bytes=slot["source_pdf_bytes"],
+                                answer_pdf_bytes=slot["answer_pdf_bytes"],
+                                q_num=slot["q_num"],
+                                passage_group_id=slot["passage_group_id"],
+                                direct_korean_translation=slot["direct_korean_translation"],
+                                include_diagrams=include_diagrams,
+                            )
+                            return slot_i, an_out
 
-                valid_diag_indices = [
-                    si for si in missing_diag_indices if prepared_slots[si]["analysis"] is not None
-                ]
-                if valid_diag_indices:
-                    def _run_diag_slot(slot_i: int):
-                        slot = prepared_slots[slot_i]
-                        it = slot["item"]
-                        cur_an = slot["analysis"]
-                        diag_out = generate_english_visual_diagram(
-                            api_key=an_api_key,
-                            model_name=an_model,
-                            passage_text=it["passage_text"],
-                            title=cur_an.title,
-                            core_theme=cur_an.core_theme,
-                        )
-                        return slot_i, diag_out
+                        with concurrent.futures.ThreadPoolExecutor(
+                            max_workers=min(4, len(missing_ai_indices))
+                        ) as executor:
+                            fut_map = {
+                                submit_with_usage_context(executor, _run_ai_slot, si): si
+                                for si in missing_ai_indices
+                            }
+                            for fut in concurrent.futures.as_completed(fut_map):
+                                si = fut_map[fut]
+                                slot = prepared_slots[si]
+                                it = slot["item"]
+                                try:
+                                    _, an_out = fut.result()
+                                    slot["analysis"] = an_out
+                                    ai_gen_cnt += 1
+                                    ctx.storage.save_cached_english_analysis(
+                                        slot["cache_key"],
+                                        an_out,
+                                        exam_name=it.get("exam_name", ""),
+                                        q_label=it.get("q_label", ""),
+                                        question_type=it.get("orig_type", ""),
+                                    )
+                                except Exception as exc:
+                                    st.error(f"[{it.get('q_label', '영어 지문')}] 지문 분석 실패: {exc}")
 
-                    with concurrent.futures.ThreadPoolExecutor(
-                        max_workers=min(4, len(valid_diag_indices))
-                    ) as executor:
-                        fut_map = {
-                            submit_with_usage_context(executor, _run_diag_slot, si): si
-                            for si in valid_diag_indices
-                        }
-                        for fut in concurrent.futures.as_completed(fut_map):
-                            si = fut_map[fut]
-                            slot = prepared_slots[si]
+                    valid_diag_indices = [
+                        si for si in missing_diag_indices if prepared_slots[si]["analysis"] is not None
+                    ]
+                    if valid_diag_indices:
+                        def _run_diag_slot(slot_i: int):
+                            slot = prepared_slots[slot_i]
                             it = slot["item"]
                             cur_an = slot["analysis"]
-                            try:
-                                _, diag_out = fut.result()
-                                updated_an = cur_an.model_copy(update={"visual_diagram": diag_out})
-                                slot["analysis"] = updated_an
-                                ctx.storage.save_cached_english_analysis(
-                                    slot["cache_key"],
-                                    updated_an,
-                                    exam_name=it.get("exam_name", ""),
-                                    q_label=it.get("q_label", ""),
-                                    question_type=it.get("orig_type", ""),
-                                )
-                            except Exception as exc:
-                                st.warning(f"[{it.get('q_label', '영어 지문')}] 이해 도식 생성 건너뜀: {exc}")
+                            diag_out = generate_english_visual_diagram(
+                                api_key=an_api_key,
+                                model_name=an_model,
+                                passage_text=it["passage_text"],
+                                title=cur_an.title,
+                                core_theme=cur_an.core_theme,
+                            )
+                            return slot_i, diag_out
 
-    analyses_list: list[dict[str, Any]] = []
-    pdf_parts: list[bytes] = []
-    missing_ai_set = set(missing_ai_indices)
-    for idx_sl, slot in enumerate(prepared_slots):
-        if slot["analysis"] is None and slot["pdf_bytes"] is None:
-            continue
-        it = slot["item"]
-        single_item = {
-            "exam_name": it.get("exam_name", ""),
-            "q_label": it.get("q_label", ""),
-            "orig_type": it.get("orig_type", "영어 독해"),
-            "passage_text": it.get("passage_text", ""),
-            "analysis": slot["analysis"],
-        }
-        if slot["pdf_bytes"] is None:
-            try:
-                single_pdf = generate_english_passage_analysis_pdf(
-                    [single_item],
-                    include_diagrams=include_diagrams,
-                )
-                if include_diagrams:
-                    ctx.storage.save_english_analysis_pdf_bytes(slot["cache_key"], single_pdf)
-                slot["pdf_bytes"] = single_pdf
-                if idx_sl not in missing_ai_set:
-                    json_to_pdf_cnt += 1
-            except Exception as exc:
-                st.error(f"[{it.get('q_label', '영어 지문')}] 분석 PDF 생성 실패: {exc}")
+                        with concurrent.futures.ThreadPoolExecutor(
+                            max_workers=min(4, len(valid_diag_indices))
+                        ) as executor:
+                            fut_map = {
+                                submit_with_usage_context(executor, _run_diag_slot, si): si
+                                for si in valid_diag_indices
+                            }
+                            for fut in concurrent.futures.as_completed(fut_map):
+                                si = fut_map[fut]
+                                slot = prepared_slots[si]
+                                it = slot["item"]
+                                cur_an = slot["analysis"]
+                                try:
+                                    _, diag_out = fut.result()
+                                    updated_an = cur_an.model_copy(update={"visual_diagram": diag_out})
+                                    slot["analysis"] = updated_an
+                                    ctx.storage.save_cached_english_analysis(
+                                        slot["cache_key"],
+                                        updated_an,
+                                        exam_name=it.get("exam_name", ""),
+                                        q_label=it.get("q_label", ""),
+                                        question_type=it.get("orig_type", ""),
+                                    )
+                                except Exception as exc:
+                                    st.warning(f"[{it.get('q_label', '영어 지문')}] 이해 도식 생성 건너뜀: {exc}")
+
+        analyses_list: list[dict[str, Any]] = []
+        pdf_parts: list[bytes] = []
+        missing_ai_set = set(missing_ai_indices)
+        for idx_sl, slot in enumerate(prepared_slots):
+            if slot["analysis"] is None and slot["pdf_bytes"] is None:
                 continue
-        pdf_parts.append(slot["pdf_bytes"])
-        if slot["analysis"] is not None:
-            analyses_list.append(single_item)
+            it = slot["item"]
+            single_item = {
+                "exam_name": it.get("exam_name", ""),
+                "q_label": it.get("q_label", ""),
+                "orig_type": it.get("orig_type", "영어 독해"),
+                "passage_text": it.get("passage_text", ""),
+                "analysis": slot["analysis"],
+            }
+            if slot["pdf_bytes"] is None:
+                try:
+                    single_pdf = generate_english_passage_analysis_pdf(
+                        [single_item],
+                        include_diagrams=include_diagrams,
+                    )
+                    if include_diagrams:
+                        ctx.storage.save_english_analysis_pdf_bytes(slot["cache_key"], single_pdf)
+                    slot["pdf_bytes"] = single_pdf
+                    if idx_sl not in missing_ai_set:
+                        json_to_pdf_cnt += 1
+                except Exception as exc:
+                    st.error(f"[{it.get('q_label', '영어 지문')}] 분석 PDF 생성 실패: {exc}")
+                    continue
+            pdf_parts.append(slot["pdf_bytes"])
+            if slot["analysis"] is not None:
+                analyses_list.append(single_item)
 
-    if pdf_parts:
-        try:
-            merged_pdf = merge_korean_analysis_pdfs(pdf_parts)
-            st.session_state["eng_analysis_results"] = analyses_list
-            st.session_state["eng_analysis_pdf"] = merged_pdf
-            detail_notes: list[str] = [f"저장 PDF 즉시 이어붙이기 {pdf_hit_cnt}건"]
-            if json_to_pdf_cnt > 0:
-                detail_notes.append(f"기존 분석 JSON→PDF 저장 {json_to_pdf_cnt}건")
-            if ai_gen_cnt > 0:
-                detail_notes.append(f"신규 분석+PDF 저장 {ai_gen_cnt}건")
-            st.success(
-                f"📑 총 {len(analyses_list)}개 영어 지문 분석지 합본 PDF가 생성되었습니다! "
-                f"({' · '.join(detail_notes)})"
-            )
-        except Exception as exc:
-            st.error(f"영어 지문 분석지 PDF 병합 실패: {exc}")
+        if pdf_parts:
+            try:
+                merged_pdf = merge_korean_analysis_pdfs(pdf_parts)
+                st.session_state["eng_analysis_results"] = analyses_list
+                st.session_state["eng_analysis_pdf"] = merged_pdf
+                actual_credits = len(pdf_parts) * CREDIT_COST_ENGLISH_ANALYSIS
+            except Exception as exc:
+                st.error(f"영어 지문 분석지 PDF 병합 실패: {exc}")
+                actual_credits = 0
+    finally:
+        settle_credits(
+            ctx,
+            reservation,
+            actual_credits,
+            detail_note=f"영어 지문 분석지 ({actual_credits // CREDIT_COST_ENGLISH_ANALYSIS if actual_credits else 0}/{len(items)}지문 성공 · {actual_credits:,}C 확정)",
+        )
+
+    if actual_credits > 0:
+        detail_notes: list[str] = [f"저장 PDF 즉시 이어붙이기 {pdf_hit_cnt}건"]
+        if json_to_pdf_cnt > 0:
+            detail_notes.append(f"기존 분석 JSON→PDF 저장 {json_to_pdf_cnt}건")
+        if ai_gen_cnt > 0:
+            detail_notes.append(f"신규 분석+PDF 저장 {ai_gen_cnt}건")
+        bal_msg = format_credit_balance_inline(
+            ctx.storage,
+            ctx.current_user.username if ctx.current_user is not None else "",
+            charged=actual_credits,
+        )
+        st.success(
+            f"📑 총 {len(analyses_list)}개 영어 지문 분석지 합본 PDF가 생성되었습니다! "
+            f"({' · '.join(detail_notes)}){bal_msg}"
+        )
 
 
 def _render_english_analysis_results_section() -> None:
@@ -473,7 +504,7 @@ def _render_english_analysis_submode(ctx: AppContext) -> None:
                             checked_an_rows.append((rec_p, q_label))
 
                     run_eng_db_analysis_btn = st.form_submit_button(
-                        "📑 선택한 기출 영어 지문 분석지 PDF 생성",
+                        f"📑 선택한 기출 영어 지문 분석지 PDF 생성 (지문당 {CREDIT_COST_ENGLISH_ANALYSIS}C · 캐시 풀 동일)",
                         type="primary",
                         width="stretch",
                     )
@@ -547,7 +578,7 @@ def _render_english_analysis_submode(ctx: AppContext) -> None:
                     key="tab2_eng_an_direct_force_regen",
                 )
             run_eng_direct_analysis_btn = st.form_submit_button(
-                "📑 직접 입력한 영어 지문 분석지 PDF 생성",
+                f"📑 직접 입력한 영어 지문 분석지 PDF 생성 (지문당 {CREDIT_COST_ENGLISH_ANALYSIS}C · 캐시 풀 동일)",
                 type="primary",
                 width="stretch",
             )

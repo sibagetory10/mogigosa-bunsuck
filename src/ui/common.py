@@ -11,13 +11,22 @@ from typing import TYPE_CHECKING, Any, Sequence
 import streamlit as st
 
 from src.auth import (
+    CreditReservation,
+    acquire_credit_reservation,
+    check_credit_quota,
     check_token_quota,
     consume_premium_model_usage,
+    format_credit_count,
+    get_bonus_credits,
+    get_monthly_credit_limit,
+    get_remaining_monthly_base_credits,
+    get_total_available_credits,
     get_user_by_username,
     is_premium_model,
     is_server_api_key_user,
     record_token_usage,
     resolve_model_for_user,
+    settle_credit_reservation,
 )
 from src.gemini.usage import TokenUsageRecord, bind_usage_tracker, has_active_usage_tracker
 from src.ui.context import AppContext
@@ -132,9 +141,8 @@ def _usage_scope(
         yield
         return
 
-    cur_user = (ctx.current_user if ctx is not None else None) or get_user_by_username(st_mgr, uname)
     if used_server_key is None:
-        used_server_key = is_server_api_key_user(cur_user)
+        used_server_key = True
 
     acc_lock = threading.Lock()
     acc = {
@@ -187,7 +195,7 @@ def _ensure_token_quota(
     username: str | None = None,
     show_error: bool = True,
 ) -> bool:
-    """API 호출 직전 월간 토큰 한도를 검사하고 초과 시 안내 메시지를 출력한 뒤 False를 반환한다."""
+    """API 호출 직전 계정 유효성을 확인한다 (0C 무료 기능/호환 래퍼)."""
     st_mgr = storage_obj or (ctx.storage if ctx is not None else _get_cached_storage(local_root="./exam_db"))
     uname = (
         username if username is not None else st.session_state.get("logged_in_username", "")
@@ -203,6 +211,96 @@ def _ensure_token_quota(
 
 
 ensure_token_quota = _ensure_token_quota
+
+
+def ensure_credit_quota(
+    ctx: AppContext | None = None,
+    required_credits: int = 1,
+    action_label: str = "",
+    *,
+    storage_obj: StorageManager | None = None,
+    username: str | None = None,
+    show_error: bool = True,
+) -> bool:
+    """유료 기능 실행 전 가용 크레딧 충족 여부를 사전 검사한다."""
+    st_mgr = storage_obj or (ctx.storage if ctx is not None else _get_cached_storage(local_root="./exam_db"))
+    uname = (
+        username if username is not None else st.session_state.get("logged_in_username", "")
+    ) or ""
+    if not st_mgr or not uname:
+        return True
+    allowed, _avail, _limit, msg = check_credit_quota(
+        st_mgr,
+        uname,
+        required_credits=required_credits,
+        action_label=action_label,
+    )
+    if not allowed:
+        if show_error and msg:
+            st.error(msg)
+        return False
+    return True
+
+
+def try_reserve_credits(
+    ctx: AppContext,
+    reserve_credits: int,
+    reason: str = "",
+    *,
+    show_error: bool = True,
+) -> tuple[bool, CreditReservation | None]:
+    """동일 유저 동시 실행을 차단하고 필요 크레딧을 원자적으로 선예치한다."""
+    if ctx.current_user is None:
+        if show_error:
+            st.error("로그인이 필요합니다.")
+        return False, None
+    ok, reservation, msg = acquire_credit_reservation(
+        ctx.storage,
+        ctx.current_user.username,
+        reserve_credits=reserve_credits,
+        reason=reason,
+    )
+    if not ok and show_error and msg:
+        st.error(msg)
+    return ok, reservation
+
+
+def settle_credits(
+    ctx: AppContext,
+    reservation: CreditReservation | None,
+    actual_credits: int,
+    detail_note: str = "",
+) -> None:
+    """선예치된 크레딧을 최종 성공 건수 기준으로 정산하고 미사용분을 자동 환불한다."""
+    settle_credit_reservation(
+        ctx.storage,
+        reservation,
+        actual_credits=actual_credits,
+        detail_note=detail_note,
+    )
+
+
+def format_credit_balance_inline(
+    storage: StorageManager,
+    username: str,
+    charged: int | None = None,
+) -> str:
+    """완료 안내 배너에 붙일 차감 크레딧 및 잔여 크레딧 문자열을 생성한다."""
+    u = get_user_by_username(storage, username) if username else None
+    if u is None:
+        return ""
+    charged_part = f"차감 {format_credit_count(charged)}" if charged is not None else ""
+    if u.tier == "ADMIN":
+        return f" | {charged_part} (ADMIN 무제한)" if charged_part else ""
+    base_lim = get_monthly_credit_limit(u) or 0
+    base_rem = get_remaining_monthly_base_credits(u) or 0
+    bonus = get_bonus_credits(u)
+    avail = get_total_available_credits(u) or 0
+    bonus_part = f" + 보너스 {bonus:,}C" if bonus > 0 else ""
+    bal_part = f"가용 잔액 {avail:,}C (월간 {base_rem:,}/{base_lim:,}C{bonus_part})"
+    if charged_part:
+        return f" | {charged_part} · {bal_part}"
+    return f" | {bal_part}"
 
 
 @st.cache_data(ttl=300, show_spinner=False)

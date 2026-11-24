@@ -12,14 +12,19 @@ from src.auth import (
     TIER_LABELS,
     ULTRA_MONTHLY_PRICE_KRW,
     VALID_TIERS,
+    adjust_user_bonus_credits,
     batch_update_user_tiers,
     delete_users_by_usernames,
     format_krw,
-    format_token_count,
+    get_bonus_credits,
+    get_daily_free_ai_limit,
+    get_daily_free_ai_used,
     get_kst_month_str,
-    get_monthly_token_limit,
-    mask_api_key,
-    reset_user_monthly_tokens,
+    get_monthly_credit_limit,
+    get_total_available_credits,
+    get_used_monthly_credits,
+    reset_user_monthly_credits,
+    sync_all_users_state,
 )
 from src.config import (
     FLASH_LITE_CACHED_INPUT_USD_PER_1M,
@@ -50,19 +55,18 @@ def _render_admin_panel(ctx: AppContext) -> None:
         if st.button("🔄 회원 목록 새로고침", width="stretch", key="admin_refresh_btn"):
             st.rerun()
 
-    users_list = ctx.storage.load_users()
+    users_list = sync_all_users_state(ctx.storage)
     if not users_list:
         st.info("아직 가입한 회원이 없습니다.")
         return
 
     tier_counts = {t: sum(1 for u in users_list if u.tier == t) for t in VALID_TIERS}
-    m1, m2, m3, m4, m5, m6 = st.columns(6)
+    m1, m2, m3, m4, m5 = st.columns(5)
     m1.metric("전체 회원", f"{len(users_list)}명")
-    m2.metric("FREE (0원)", f"{tier_counts['FREE']}명")
-    m3.metric("CUSTOM (0원)", f"{tier_counts['CUSTOM']}명")
-    m4.metric("PRO (9,900원/월)", f"{tier_counts['PRO']}명")
-    m5.metric("ULTRA (19,900원/월)", f"{tier_counts['ULTRA']}명")
-    m6.metric("ADMIN", f"{tier_counts['ADMIN']}명")
+    m2.metric("FREE (0원 · 30C)", f"{tier_counts['FREE']}명")
+    m3.metric("PRO (9,900원 · 600C)", f"{tier_counts['PRO']}명")
+    m4.metric("ULTRA (19,900원 · 2,400C)", f"{tier_counts['ULTRA']}명")
+    m5.metric("ADMIN", f"{tier_counts['ADMIN']}명")
 
     # ------------------------------------------------------------------
     # 💰 실제 API 토큰 사용량 & 원화(₩) 환산 대시보드 (매일 00:00 KST 자동 환율 적용)
@@ -175,29 +179,32 @@ def _render_admin_panel(ctx: AppContext) -> None:
     table_rows = []
     for u in filtered_users:
         u_m_tok = int(_u_month_attr(u, "monthly_total_tokens", 0))
-        u_m_calls = int(_u_month_attr(u, "monthly_api_calls", 0))
         u_m_usd = float(_u_month_attr(u, "monthly_cost_usd", 0.0))
-        u_t_tok = int(getattr(u, "total_total_tokens", 0) or 0)
         u_t_usd = float(getattr(u, "total_cost_usd", 0.0) or 0.0)
-        u_lim = get_monthly_token_limit(u)
-        if u_lim is not None and u_lim > 0:
-            usage_pct = f"{min(999.9, (u_m_tok / u_lim) * 100):.1f}% ({format_token_count(u_lim)})"
-        else:
-            usage_pct = "무제한"
+        u_m_cred = get_used_monthly_credits(u)
+        u_cred_lim = get_monthly_credit_limit(u)
+        u_bonus_c = get_bonus_credits(u)
+        u_avail_c = get_total_available_credits(u)
+        u_tot_c = int(getattr(u, "total_used_credits", 0) or 0)
+        u_free_ai_used = get_daily_free_ai_used(u)
+        u_free_ai_lim = get_daily_free_ai_limit(u)
+        avail_disp = "무제한" if u_avail_c is None else f"{u_avail_c:,}C (월 {u_cred_lim:,}C)"
+        free_ai_disp = "무제한" if u_free_ai_lim is None else f"{u_free_ai_used}/{u_free_ai_lim}"
         table_rows.append(
             {
                 "아이디": u.username,
                 "이름": u.nickname,
                 "Google 연동": (getattr(u, "google_email", "") or "").strip() or "-",
                 "현재 등급": u.tier,
+                "가용 크레딧": avail_disp,
+                "이번 달 사용(C)": u_m_cred,
+                "보너스(C)": u_bonus_c,
+                "누적 사용(C)": u_tot_c,
+                "오늘 무료AI": free_ai_disp,
                 "이번 달 토큰": u_m_tok,
-                "한도 사용률": usage_pct,
                 "이번 달 비용(₩)": format_krw(u_m_usd, usd_to_krw),
-                "누적 토큰": u_t_tok,
                 "누적 비용(₩)": format_krw(u_t_usd, usd_to_krw),
-                "월 호출수": u_m_calls,
                 "기출 업로드": int(getattr(u, "uploaded_exam_count", 0) or 0),
-                "개인 키": mask_api_key(u.custom_api_key) or "-",
             }
         )
 
@@ -212,14 +219,15 @@ def _render_admin_panel(ctx: AppContext) -> None:
                 options=list(VALID_TIERS),
                 required=True,
             ),
+            "가용 크레딧": st.column_config.TextColumn("가용 크레딧", disabled=True),
+            "이번 달 사용(C)": st.column_config.NumberColumn("이번 달 사용(C)", format="%d", disabled=True),
+            "보너스(C)": st.column_config.NumberColumn("보너스(C)", format="%d", disabled=True),
+            "누적 사용(C)": st.column_config.NumberColumn("누적 사용(C)", format="%d", disabled=True),
+            "오늘 무료AI": st.column_config.TextColumn("오늘 무료AI", disabled=True),
             "이번 달 토큰": st.column_config.NumberColumn("이번 달 토큰", format="%d", disabled=True),
-            "한도 사용률": st.column_config.TextColumn("한도 사용률", disabled=True),
             "이번 달 비용(₩)": st.column_config.TextColumn("이번 달 비용(₩)", disabled=True),
-            "누적 토큰": st.column_config.NumberColumn("누적 토큰", format="%d", disabled=True),
             "누적 비용(₩)": st.column_config.TextColumn("누적 비용(₩)", disabled=True),
-            "월 호출수": st.column_config.NumberColumn("월 호출수", format="%d", disabled=True),
             "기출 업로드": st.column_config.NumberColumn("기출 업로드", disabled=True),
-            "개인 키": st.column_config.TextColumn("개인 키", disabled=True),
         },
         hide_index=True,
         width="stretch",
@@ -241,29 +249,110 @@ def _render_admin_panel(ctx: AppContext) -> None:
         else:
             st.info("변경된 등급이 없습니다.")
 
-    with st.expander("🔄 관리자: 회원 이번 달 토큰 사용량 초기화", expanded=False):
+    actor_id_admin = ctx.current_user.username if ctx.current_user is not None else "admin"
+
+    with st.expander("🎁 관리자: 회원 보너스 크레딧 지급 · 차감", expanded=False):
+        bonus_options = [u.username for u in filtered_users]
+        bonus_label_map = {
+            u.username: f"@{u.username} ({u.nickname} · {u.tier} · 보너스 {get_bonus_credits(u):,}C)"
+            for u in filtered_users
+        }
+        bonus_targets = st.multiselect(
+            "보너스 크레딧을 지급하거나 차감할 회원 선택 (월초 초기화 시 소멸되지 않음)",
+            options=bonus_options,
+            format_func=lambda un: bonus_label_map.get(un, un),
+            key="admin_bonus_credit_select",
+        )
+        bc1, bc2 = st.columns([1.0, 2.0])
+        with bc1:
+            bonus_delta = int(
+                st.number_input(
+                    "증감 크레딧 (+지급 / -차감)",
+                    min_value=-100_000,
+                    max_value=100_000,
+                    value=50,
+                    step=10,
+                    key="admin_bonus_delta_input",
+                )
+            )
+        with bc2:
+            bonus_reason = st.text_input(
+                "지급 · 차감 사유 (원장 기록용)",
+                value="관리자 이벤트 지급",
+                key="admin_bonus_reason_input",
+            )
+        if st.button(
+            "🎁 보너스 크레딧 반영하기",
+            disabled=not (bonus_targets and bonus_delta != 0),
+            key="admin_exec_bonus_credits",
+        ):
+            b_cnt, b_err = adjust_user_bonus_credits(
+                ctx.storage,
+                bonus_targets,
+                delta_credits=bonus_delta,
+                reason=bonus_reason,
+                actor_username=actor_id_admin,
+            )
+            if b_err:
+                st.warning(f"{b_cnt}명 반영됨 / 저장 경고: {b_err}")
+            elif b_cnt > 0:
+                st.success(f"✅ {b_cnt}명에게 보너스 크레딧({bonus_delta:+,}C)을 반영하고 원장에 기록했습니다.")
+                st.rerun()
+            else:
+                st.info("변경된 보너스 크레딧이 없습니다.")
+
+    with st.expander("🔄 관리자: 회원 이번 달 사용 크레딧 초기화", expanded=False):
         reset_options = [u.username for u in filtered_users]
         reset_label_map = {
-            u.username: f"@{u.username} ({u.nickname} · {u.tier} · 이번 달 {int(_u_month_attr(u, 'monthly_total_tokens', 0)):,} 토큰)"
+            u.username: f"@{u.username} ({u.nickname} · {u.tier} · 이번 달 사용 {get_used_monthly_credits(u):,}C)"
             for u in filtered_users
         }
         reset_targets = st.multiselect(
-            "이번 달 토큰 사용량을 0으로 초기화할 회원 선택 (누적 토큰·비용 기록은 유지됨)",
+            "이번 달 사용 크레딧을 0C로 초기화할 회원 선택 (보너스 크레딧·누적 API 원가 기록은 유지됨)",
             options=reset_options,
             format_func=lambda un: reset_label_map.get(un, un),
-            key="admin_reset_token_select",
+            key="admin_reset_credit_select",
         )
         if st.button(
-            "🔄 선택한 회원 월간 토큰 초기화",
+            "🔄 선택한 회원 월간 크레딧 초기화",
             disabled=not reset_targets,
-            key="admin_exec_reset_tokens",
+            key="admin_exec_reset_credits",
         ):
-            r_cnt, r_err = reset_user_monthly_tokens(ctx.storage, reset_targets)
+            r_cnt, r_err = reset_user_monthly_credits(
+                ctx.storage,
+                reset_targets,
+                actor_username=actor_id_admin,
+            )
             if r_err:
-                st.warning(f"{r_cnt}명 초기화됨 / Drive 저장 경고: {r_err}")
+                st.warning(f"{r_cnt}명 초기화됨 / 저장 경고: {r_err}")
             elif r_cnt > 0:
-                st.success(f"✅ {r_cnt}명의 이번 달 토큰 사용량을 0으로 초기화했습니다.")
+                st.success(f"✅ {r_cnt}명의 이번 달 사용 크레딧을 0C로 초기화했습니다.")
                 st.rerun()
+
+    with st.expander("📜 크레딧 원장 감사 로그 (credit_ledger.jsonl · 최근 200건)", expanded=False):
+        ledger_filter_u = st.text_input(
+            "아이디 필터 (비워두면 전체 회원 조회)",
+            placeholder="예: student01",
+            key="admin_ledger_user_filter",
+        ).strip()
+        ledger_rows = ctx.storage.read_credit_ledger(username=ledger_filter_u, limit=200)
+        if not ledger_rows:
+            st.info("기록된 크레딧 원장 내역이 없습니다.")
+        else:
+            disp_rows = [
+                {
+                    "시각": str(r.get("ts") or "").replace("T", " ")[:19],
+                    "아이디": str(r.get("username") or ""),
+                    "유형": str(r.get("event") or ""),
+                    "증감(C)": int(r.get("delta") or 0),
+                    "사유": str(r.get("reason") or ""),
+                    "가용 잔액(C)": "무제한" if r.get("avail_after") is None else f"{int(r.get('avail_after') or 0):,}",
+                    "보너스(C)": int(r.get("bonus_after") or 0),
+                    "실행자": str(r.get("actor") or ""),
+                }
+                for r in ledger_rows
+            ]
+            st.dataframe(disp_rows, hide_index=True, width="stretch")
 
     with st.expander("🗑️ 관리자: 회원 계정 삭제", expanded=False):
         actor_id = ctx.current_user.username if ctx.current_user is not None else ""

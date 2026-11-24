@@ -4,9 +4,10 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
-TierType = Literal["FREE", "CUSTOM", "PRO", "ULTRA", "ADMIN"]
+TierType = Literal["FREE", "PRO", "ULTRA", "ADMIN"]
 LEGACY_TIER_MAP: dict[str, str] = {
-    "BYOK": "CUSTOM",
+    "BYOK": "FREE",
+    "CUSTOM": "FREE",
     "VIP": "PRO",
 }
 
@@ -26,10 +27,38 @@ class UserRecord(BaseModel):
         default=True,
         description="직접 등록한 아이디·비밀번호 보유 여부 (구글 전용 가입자는 False)",
     )
-    tier: TierType = Field(default="FREE", description="회원 등급 (FREE / CUSTOM / PRO / ULTRA / ADMIN)")
-    custom_api_key: str = Field(default="", description="CUSTOM 회원의 개인 Gemini API 키")
+    tier: TierType = Field(default="FREE", description="회원 등급 (FREE / PRO / ULTRA / ADMIN)")
+    custom_api_key: str = Field(
+        default="",
+        description="폐지된 레거시 필드 (마이그레이션 시 자동 공백 초기화)",
+    )
     daily_count: int = Field(default=0, ge=0, description="금일 사용한 기출 추출 문항 수 (하위 호환)")
-    last_used_date: str = Field(default="", description="마지막 추출 날짜 (YYYY-MM-DD, KST)")
+    last_used_date: str = Field(default="", description="마지막 사용 날짜 (YYYY-MM-DD, KST)")
+    daily_free_ai_count: int = Field(
+        default=0,
+        ge=0,
+        description="금일 사용한 0C 무료 AI 호출 횟수(해설+채팅+신규영단어, KST 자정 초기화)",
+    )
+    daily_shared_upload_count: int = Field(
+        default=0,
+        ge=0,
+        description="금일 수행한 공용 DB 신규 업로드 횟수(탭1 기출+탭3 개념서, KST 자정 초기화)",
+    )
+    monthly_used_credits: int = Field(
+        default=0,
+        ge=0,
+        description="이번 달 사용한 기본 크레딧 (매월 1일 KST 초기화)",
+    )
+    bonus_credits: int = Field(
+        default=0,
+        ge=0,
+        description="월초 소멸되지 않는 관리자 지급 보너스 크레딧 잔액",
+    )
+    total_used_credits: int = Field(
+        default=0,
+        ge=0,
+        description="누적 사용한 총 크레딧",
+    )
     uploaded_exam_count: int = Field(default=0, ge=0, description="누적 업로드·태깅한 기출 회차 수")
     premium_unlock_credits: int = Field(
         default=0,

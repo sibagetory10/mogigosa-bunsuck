@@ -8,7 +8,11 @@ from typing import Any
 import streamlit as st
 import streamlit.components.v1 as components
 
-from src.auth import resolve_active_gemini_api_key
+from src.auth import (
+    consume_daily_free_ai_quota,
+    refund_daily_free_ai_quota,
+    resolve_active_gemini_api_key,
+)
 from src.config import FLASH_LITE_MODEL
 from src.models import (
     EnglishDictEntry,
@@ -262,8 +266,13 @@ def _execute_dict_lookup(
     )
     if not api_key:
         return None, "", f"영단어 AI 사전 조회용 Gemini API 키({key_label})가 설정되지 않았습니다."
-    if not ensure_token_quota(ctx):
-        return None, "", ""
+    uname_dict = ctx.current_user.username if ctx.current_user is not None else ""
+    if uname_dict:
+        ok_free, free_msg = consume_daily_free_ai_quota(
+            ctx.storage, uname_dict, "영단어 AI 사전 조회"
+        )
+        if not ok_free:
+            return None, "", free_msg
 
     records = ctx.storage.load_db_readonly()
     ctx_hits = find_word_in_exam_passages(records, q, raw_query=q, max_hits=2)
@@ -282,6 +291,8 @@ def _execute_dict_lookup(
         ctx.storage.save_cached_english_dict_entry(entry, aliases=[q])
         return entry, "ai", ""
     except Exception as exc:
+        if uname_dict:
+            refund_daily_free_ai_quota(ctx.storage, uname_dict)
         return None, "", f"영단어 조회 중 오류가 발생했습니다: {exc}"
 
 
@@ -306,7 +317,7 @@ def _render_dict_entry_card(ctx: AppContext, entry: EnglishDictEntry, origin_tag
             )
             src_badge = (
                 "<span style='background:#EFF6FF; color:#1D4ED8; font-size:0.75rem; font-weight:700; "
-                "padding:2px 8px; border-radius:999px; margin-left:6px;'>⚡ 공용 사전 DB (토큰 0)</span>"
+                "padding:2px 8px; border-radius:999px; margin-left:6px;'>⚡ 공용 사전 DB (0C 무료)</span>"
                 if origin_tag == "cache"
                 else "<span style='background:#FEF3C7; color:#92400E; font-size:0.75rem; font-weight:700; "
                 "padding:2px 8px; border-radius:999px; margin-left:6px;'>✨ AI 정밀 생성 · DB 저장됨</span>"

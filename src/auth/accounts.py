@@ -6,7 +6,9 @@ from datetime import datetime
 from typing import TYPE_CHECKING
 
 from src.auth.tokens import (
+    FREE_MONTHLY_CREDIT_LIMIT,
     KST,
+    MONTHLY_CREDIT_LIMITS,
     TIER_LABELS,
     USERNAME_RE,
     VALID_TIERS,
@@ -26,12 +28,20 @@ if TYPE_CHECKING:
     from src.storage import StorageManager
 
 def _sync_user_state(user: UserRecord, today: str, admin_usernames: set[str]) -> bool:
-    """자정(KST) · 주간(KST) · 월간(KST) 초기화 및 관리자 아이디 자동 ADMIN 승급을 동기화한다."""
+    """자정(KST) · 주간(KST) · 월간(KST) 초기화, 레거시 CUSTOM/개인키 파기 및 관리자 자동 승급을 동기화한다."""
     changed = False
     current_week = get_kst_week_str()
     current_month = get_kst_month_str()
+    if getattr(user, "custom_api_key", ""):
+        user.custom_api_key = ""
+        changed = True
+    if user.tier not in VALID_TIERS:
+        user.tier = "FREE"
+        changed = True
     if getattr(user, "last_used_date", "") != today:
         user.daily_count = 0
+        user.daily_free_ai_count = 0
+        user.daily_shared_upload_count = 0
         user.last_used_date = today
         changed = True
     if hasattr(user, "last_used_week") and getattr(user, "last_used_week", "") != current_week:
@@ -47,12 +57,28 @@ def _sync_user_state(user: UserRecord, today: str, admin_usernames: set[str]) ->
         user.monthly_api_calls = 0
         user.monthly_cost_usd = 0.0
         user.monthly_server_cost_usd = 0.0
+        user.monthly_used_credits = 0
         user.last_used_month = current_month
         changed = True
     if user.username in admin_usernames and user.tier != "ADMIN":
         user.tier = "ADMIN"
         changed = True
     return changed
+
+
+def sync_all_users_state(storage: StorageManager) -> list[UserRecord]:
+    """users.json 전체 회원의 월/일 상태 및 레거시 CUSTOM/개인키 정리를 일괄 동기화해 반환한다."""
+    with _storage_lock(storage):
+        users = storage.load_users()
+        today = get_kst_today_str()
+        admin_names = resolve_admin_config().admin_usernames
+        changed = False
+        for u in users:
+            if _sync_user_state(u, today, admin_names):
+                changed = True
+        if changed:
+            storage.save_users(users)
+        return users
 
 
 def get_user_by_username(storage: StorageManager, username: str) -> UserRecord | None:
@@ -414,58 +440,94 @@ def save_user_custom_api_key(
     username: str,
     api_key: str,
 ) -> tuple[bool, str, UserRecord | None]:
-    """개인 Gemini API 키를 저장하고 즉시 CUSTOM 등급으로 전환한다."""
-    cleaned_key = (api_key or "").strip()
-    if len(cleaned_key) < 12 or " " in cleaned_key:
-        return False, "올바른 형식의 Gemini API 키(`AIza...`)를 입력해 주세요.", None
-
-    norm_id = normalize_username(username)
-    with _storage_lock(storage):
-        users = storage.load_users()
-        target: UserRecord | None = None
-
-        for u in users:
-            if u.username == norm_id:
-                u.custom_api_key = cleaned_key
-                if u.tier != "ADMIN":
-                    u.tier = "CUSTOM"
-                target = u
-                break
-
-        if target is None:
-            return False, "사용자 계정을 찾을 수 없습니다.", None
-
-        err = storage.save_users(users)
-    if err:
-        return True, f"개인 API 키 저장 완료 ({err})", target
-    return True, "개인 API 키가 계정에 영구 저장되어 '개인 키 모드(CUSTOM)'로 전환되었습니다!", target
+    """하위 호환용 안내 (개인 API 키 CUSTOM 등급 폐지)."""
+    _ = (storage, username, api_key)
+    return False, "개인 API 키(CUSTOM) 모드는 폐지되었습니다. 서버 기본 크레딧 요금제를 이용해 주세요.", None
 
 
 def clear_user_custom_api_key(
     storage: StorageManager,
     username: str,
 ) -> tuple[bool, str, UserRecord | None]:
-    """저장된 개인 API 키를 삭제하고 FREE(무료 회원) 등급으로 복귀시킨다."""
+    """저장된 레거시 개인 API 키 필드를 비운다."""
     norm_id = normalize_username(username)
     with _storage_lock(storage):
         users = storage.load_users()
         target: UserRecord | None = None
-
         for u in users:
             if u.username == norm_id:
                 u.custom_api_key = ""
-                if u.tier != "ADMIN":
+                if u.tier not in VALID_TIERS:
                     u.tier = "FREE"
                 target = u
                 break
-
         if target is None:
             return False, "사용자 계정을 찾을 수 없습니다.", None
-
         err = storage.save_users(users)
     if err:
-        return True, f"개인 키 삭제 완료 ({err})", target
-    return True, "개인 API 키를 삭제하고 무료 회원(FREE)으로 복귀했습니다.", target
+        return True, f"정리 완료 ({err})", target
+    return True, "무료 회원(FREE) 상태로 정리되었습니다.", target
+
+
+def adjust_user_bonus_credits(
+    storage: StorageManager,
+    target_usernames: list[str],
+    delta_credits: int,
+    reason: str = "",
+    actor_username: str = "admin",
+) -> tuple[int, str | None]:
+    """관리자가 지정한 회원의 영구 보너스 크레딧을 지급(+) 또는 차감(-)하고 원장에 기록한다."""
+    targets = {normalize_username(u) for u in target_usernames if normalize_username(u)}
+    delta = int(delta_credits or 0)
+    if not targets or delta == 0:
+        return 0, None
+
+    today = get_kst_today_str()
+    now_iso = datetime.now(KST).isoformat(timespec="seconds")
+    admin_names = resolve_admin_config().admin_usernames
+    actor_norm = normalize_username(actor_username) or "admin"
+    clean_reason = (reason or "").strip() or ("관리자 보너스 지급" if delta > 0 else "관리자 보너스 차감")
+
+    with _storage_lock(storage):
+        users = storage.load_users()
+        updated_cnt = 0
+        ledger_entries: list[dict[str, object]] = []
+        for u in users:
+            if u.username in targets:
+                _sync_user_state(u, today, admin_names)
+                before_bonus = max(0, int(getattr(u, "bonus_credits", 0) or 0))
+                after_bonus = max(0, before_bonus + delta)
+                actual_delta = after_bonus - before_bonus
+                if actual_delta == 0:
+                    continue
+                u.bonus_credits = after_bonus
+                updated_cnt += 1
+                if u.tier == "ADMIN":
+                    avail_after: int | None = None
+                else:
+                    lim = MONTHLY_CREDIT_LIMITS.get(u.tier, FREE_MONTHLY_CREDIT_LIMIT)
+                    base_rem = max(0, lim - max(0, int(getattr(u, "monthly_used_credits", 0) or 0)))
+                    avail_after = base_rem + after_bonus
+                ledger_entries.append(
+                    {
+                        "ts": now_iso,
+                        "username": u.username,
+                        "event": "BONUS_GRANT" if actual_delta > 0 else "BONUS_DEDUCT",
+                        "delta": actual_delta,
+                        "reason": clean_reason,
+                        "base_used_after": int(getattr(u, "monthly_used_credits", 0) or 0),
+                        "bonus_after": after_bonus,
+                        "avail_after": avail_after,
+                        "actor": actor_norm,
+                    }
+                )
+        if updated_cnt > 0:
+            err = storage.save_users(users)
+            if hasattr(storage, "append_credit_ledger"):
+                for entry in ledger_entries:
+                    storage.append_credit_ledger(entry)
+            return updated_cnt, err
+        return 0, None
 def batch_update_user_tiers(
     storage: StorageManager,
     tier_updates: dict[str, TierType],

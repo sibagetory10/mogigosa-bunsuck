@@ -6,7 +6,13 @@ from typing import Any
 
 import streamlit as st
 
-from src.auth import record_exam_upload_for_user, resolve_active_gemini_api_key
+from src.auth import (
+    can_admin_shared_db,
+    check_daily_shared_upload_quota,
+    consume_daily_shared_upload_quota,
+    record_exam_upload_for_user,
+    resolve_active_gemini_api_key,
+)
 from src.models import infer_subject_category, normalize_exam_title_year
 from src.ui.common import _ensure_token_quota
 from src.ui.context import AppContext
@@ -175,8 +181,14 @@ def render_tab1_batch_queue(
 
             for idx, prob_f in enumerate(prob_files, start=1):
                 if not _ensure_token_quota(ctx):
-                    _append_batch_log("🚫 월간 토큰 한도 도달로 남은 대기열을 중단했습니다.")
+                    _append_batch_log("🚫 계정 상태 확인 실패로 남은 대기열을 중단했습니다.")
                     break
+                if not can_admin_shared_db(ctx.current_user):
+                    ok_up, _, up_msg = check_daily_shared_upload_quota(ctx.storage, ctx.current_user.username, 1)
+                    if not ok_up:
+                        _append_batch_log(f"🚫 일일 공용 DB 업로드 한도 도달 → 남은 대기열 중단: {up_msg}")
+                        st.warning(up_msg)
+                        break
                 prob_base = _pdf_display_basename(prob_f.name)
                 matched_ans_i = selected_ans_indices[idx - 1]
                 ans_f = ans_files[matched_ans_i] if matched_ans_i is not None else None
@@ -280,6 +292,8 @@ def render_tab1_batch_queue(
                         if norm_exam_id:
                             existing_exam_ids.add(norm_exam_id)
                         record_exam_upload_for_user(ctx.storage, ctx.current_user.username)
+                        if not can_admin_shared_db(ctx.current_user):
+                            consume_daily_shared_upload_quota(ctx.storage, ctx.current_user.username, 1)
                     failed_qs = res["failed_q_nums"]
                     sync_err = res["sync_err"]
                     msg_parts = [f"{len(newly_saved_items)}문항 저장 ({res['elapsed_s']:.1f}초)"]

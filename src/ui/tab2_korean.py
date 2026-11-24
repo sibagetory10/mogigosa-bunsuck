@@ -8,14 +8,20 @@ from typing import Any, Callable
 import streamlit as st
 
 from src.auth import (
+    CREDIT_COST_KOREAN_ANALYSIS,
+    CREDIT_COST_KOREAN_SET_TRANSFORM,
+    acquire_credit_reservation,
     get_max_batch_questions,
     resolve_active_gemini_api_key,
+    settle_credit_reservation,
 )
 from src.config import (
     EXAM_TAGGING_MODEL,
     MODEL_LABELS,
 )
+from src.gemini import submit_with_usage_context
 from src.models import normalize_korean_group_id
+from src.ui.common import format_credit_balance_inline
 
 
 def render_tab2_korean_transform_section(
@@ -189,13 +195,13 @@ def render_tab2_korean_transform_section(
         kb_c1, kb_c2 = st.columns(2)
         with kb_c1:
             run_kor_btn = st.form_submit_button(
-                "🚀 선택한 국어 지문 세트 변형문제 생성",
+                f"🚀 선택한 국어 지문 세트 변형문제 생성 (세트당 {CREDIT_COST_KOREAN_SET_TRANSFORM}C)",
                 type="primary",
                 width="stretch",
             )
         with kb_c2:
             run_kor_analysis_btn = st.form_submit_button(
-                "📑 선택한 지문 분석지 PDF 생성",
+                f"📑 선택한 지문 분석지 PDF 생성 (세트당 {CREDIT_COST_KOREAN_ANALYSIS}C · 캐시 동일)",
                 type="secondary",
                 width="stretch",
             )
@@ -228,44 +234,68 @@ def render_tab2_korean_transform_section(
         if not kor_api_key:
             st.error(f"사용 가능한 Gemini API 키({kor_key_label})가 설정되지 않았습니다.")
             return
-        if not ensure_token_quota_fn():
+
+        uname_kor = current_user.username if current_user is not None else ""
+        reserve_c = len(chosen_sets) * CREDIT_COST_KOREAN_SET_TRANSFORM
+        ok_res, reservation, res_msg = acquire_credit_reservation(
+            storage,
+            uname_kor,
+            reserve_credits=reserve_c,
+            reason=f"국어 지문 세트 변형 ({len(chosen_sets)}세트)",
+        )
+        if not ok_res or reservation is None:
+            if res_msg:
+                st.error(res_msg)
             return
 
         new_matched: list[dict[str, Any]] = []
-        with usage_scope_fn():
-            with st.spinner(f"🤖 {MODEL_LABELS.get(EXAM_TAGGING_MODEL, EXAM_TAGGING_MODEL)}로 국어 지문 세트({len(chosen_sets)}개 세트) 변형문제 생성 중..."):
-                for s_entry in chosen_sets:
-                    curr_subj = s_entry["curr_subj"]
-                    kor_sec = _classify_kor_sec(curr_subj)
-                    m_sub = re.search(r"\(([^)]+)\)", curr_subj)
-                    kor_sub = m_sub.group(1) if m_sub else ""
-                    try:
-                        from src.gemini.korean import generate_korean_set_reconstruction
+        succeeded_sets = 0
+        actual_c = 0
+        try:
+            with usage_scope_fn():
+                with st.spinner(f"🤖 {MODEL_LABELS.get(EXAM_TAGGING_MODEL, EXAM_TAGGING_MODEL)}로 국어 지문 세트({len(chosen_sets)}개 세트) 변형문제 생성 중..."):
+                    for s_entry in chosen_sets:
+                        curr_subj = s_entry["curr_subj"]
+                        kor_sec = _classify_kor_sec(curr_subj)
+                        m_sub = re.search(r"\(([^)]+)\)", curr_subj)
+                        kor_sub = m_sub.group(1) if m_sub else ""
+                        try:
+                            from src.gemini.korean import generate_korean_set_reconstruction
 
-                        pairs = generate_korean_set_reconstruction(
-                            api_key=kor_api_key,
-                            model_name=EXAM_TAGGING_MODEL,
-                            source_records=s_entry["records"],
-                            passage_text=s_entry["passage_text"],
-                            korean_section=kor_sec,
-                            korean_subgenre=kor_sub,
-                            passage_topic=s_entry["passage_topic"],
-                        )
-                        for rec, rw in pairs:
-                            new_matched.append(
-                                {
-                                    "question": rec,
-                                    "rewritten": rw,
-                                    "concept_ref": f"출처: {s_entry['exam_name']} [{s_entry['group_id']}번]",
-                                    "korean_meta": {
-                                        "section": kor_sec,
-                                        "subgenre": kor_sub,
-                                        "group_id": s_entry["group_id"],
-                                    },
-                                }
+                            pairs = generate_korean_set_reconstruction(
+                                api_key=kor_api_key,
+                                model_name=EXAM_TAGGING_MODEL,
+                                source_records=s_entry["records"],
+                                passage_text=s_entry["passage_text"],
+                                korean_section=kor_sec,
+                                korean_subgenre=kor_sub,
+                                passage_topic=s_entry["passage_topic"],
                             )
-                    except Exception as exc:
-                        st.error(f"[{s_entry['exam_name']} {s_entry['group_id']}번] 세트 재구성 실패: {exc}")
+                            if pairs:
+                                succeeded_sets += 1
+                            for rec, rw in pairs:
+                                new_matched.append(
+                                    {
+                                        "question": rec,
+                                        "rewritten": rw,
+                                        "concept_ref": f"출처: {s_entry['exam_name']} [{s_entry['group_id']}번]",
+                                        "korean_meta": {
+                                            "section": kor_sec,
+                                            "subgenre": kor_sub,
+                                            "group_id": s_entry["group_id"],
+                                        },
+                                    }
+                                )
+                        except Exception as exc:
+                            st.error(f"[{s_entry['exam_name']} {s_entry['group_id']}번] 세트 재구성 실패: {exc}")
+            actual_c = succeeded_sets * CREDIT_COST_KOREAN_SET_TRANSFORM
+        finally:
+            settle_credit_reservation(
+                storage,
+                reservation,
+                actual_credits=actual_c,
+                detail_note=f"국어 세트 변형 ({succeeded_sets}/{len(chosen_sets)}세트 성공 · {actual_c:,}C 확정)",
+            )
 
         if new_matched:
             st.session_state["matched_items"] = new_matched
@@ -274,7 +304,10 @@ def render_tab2_korean_transform_section(
             st.session_state["web_quiz_answers"] = {}
             st.session_state["web_quiz_graded"] = False
             st.session_state["web_quiz_ai_exps"] = {}
-            st.success(f"🎯 총 {len(chosen_sets)}개 지문 세트({len(new_matched)}문항) 변형문제 생성 완료! 아래 [모드 A] PDF 또는 [모드 B] 웹 풀기를 이용해 주세요.")
+            bal_msg = format_credit_balance_inline(storage, uname_kor, charged=actual_c)
+            st.success(
+                f"🎯 총 {succeeded_sets}개 지문 세트({len(new_matched)}문항) 변형문제 생성 완료! 아래 [모드 A] PDF 또는 [모드 B] 웹 풀기를 이용해 주세요.{bal_msg}"
+            )
 
     if run_kor_analysis_btn:
         if not selected_set_indices:
@@ -282,227 +315,260 @@ def render_tab2_korean_transform_section(
             return
 
         chosen_sets = [filtered_sets[i] for i in selected_set_indices]
-        prepared_slots: list[dict[str, Any]] = []
-        missing_ai_indices: list[int] = []
-        missing_diag_indices: list[int] = []
-        for idx_s, s_entry in enumerate(chosen_sets):
-            curr_subj = s_entry["curr_subj"]
-            kor_sec = _classify_kor_sec(curr_subj)
-            m_sub = re.search(r"\(([^)]+)\)", curr_subj)
-            kor_sub = m_sub.group(1) if m_sub else ""
-            c_key = storage.build_korean_analysis_key(
-                s_entry["passage_text"],
-                s_entry["group_id"],
-                kor_sec,
-            )
-            cached_an = storage.get_cached_korean_analysis(c_key)
-            cached_pdf = storage.get_korean_analysis_pdf_bytes(c_key) if include_kor_diagrams else None
-            prepared_slots.append(
-                {
-                    "entry": s_entry,
-                    "curr_subj": curr_subj,
-                    "kor_sec": kor_sec,
-                    "kor_sub": kor_sub,
-                    "cache_key": c_key,
-                    "analysis": cached_an,
-                    "pdf_bytes": cached_pdf,
-                }
-            )
-            if cached_an is None:
-                missing_ai_indices.append(idx_s)
-            elif (
-                include_kor_diagrams
-                and kor_sec in ("독서", "문학")
-                and getattr(cached_an, "visual_diagram", None) is None
-            ):
-                missing_diag_indices.append(idx_s)
-                prepared_slots[idx_s]["pdf_bytes"] = None
+        uname_kor = current_user.username if current_user is not None else ""
+        reserve_c_an = len(chosen_sets) * CREDIT_COST_KOREAN_ANALYSIS
+        ok_res_an, reservation_an, res_msg_an = acquire_credit_reservation(
+            storage,
+            uname_kor,
+            reserve_credits=reserve_c_an,
+            reason=f"국어 지문 분석지 ({len(chosen_sets)}세트)",
+        )
+        if not ok_res_an or reservation_an is None:
+            if res_msg_an:
+                st.error(res_msg_an)
+            return
 
-        pdf_hit_cnt = sum(1 for sl in prepared_slots if sl["pdf_bytes"] is not None)
-        json_to_pdf_cnt = 0
-        ai_gen_cnt = 0
-
-        if missing_ai_indices or missing_diag_indices:
-            kor_api_key, kor_key_label = resolve_active_gemini_api_key(
-                current_user, creds.gemini_api_key, model_name=EXAM_TAGGING_MODEL
-            )
-            if not kor_api_key:
-                st.error(f"사용 가능한 Gemini API 키({kor_key_label})가 설정되지 않았습니다.")
-                return
-            if not ensure_token_quota_fn():
-                return
-
-            with usage_scope_fn():
-                need_total = len(missing_ai_indices) + len(missing_diag_indices)
-                mode_lbl = "2차 교정 포함" if enable_kor_proofread else "고속 병렬"
-                with st.spinner(
-                    f"📑 {MODEL_LABELS.get(EXAM_TAGGING_MODEL, EXAM_TAGGING_MODEL)}로 "
-                    f"국어 지문 분석지·도식 생성 ({mode_lbl}) {need_total}건 병렬 진행 중 "
-                    f"(DB 로드 {len(chosen_sets) - len(missing_ai_indices)}세트)..."
+        actual_c_an = 0
+        succeeded_an_sets = 0
+        try:
+            prepared_slots: list[dict[str, Any]] = []
+            missing_ai_indices: list[int] = []
+            missing_diag_indices: list[int] = []
+            for idx_s, s_entry in enumerate(chosen_sets):
+                curr_subj = s_entry["curr_subj"]
+                kor_sec = _classify_kor_sec(curr_subj)
+                m_sub = re.search(r"\(([^)]+)\)", curr_subj)
+                kor_sub = m_sub.group(1) if m_sub else ""
+                c_key = storage.build_korean_analysis_key(
+                    s_entry["passage_text"],
+                    s_entry["group_id"],
+                    kor_sec,
+                )
+                cached_an = storage.get_cached_korean_analysis(c_key)
+                cached_pdf = storage.get_korean_analysis_pdf_bytes(c_key) if include_kor_diagrams else None
+                prepared_slots.append(
+                    {
+                        "entry": s_entry,
+                        "curr_subj": curr_subj,
+                        "kor_sec": kor_sec,
+                        "kor_sub": kor_sub,
+                        "cache_key": c_key,
+                        "analysis": cached_an,
+                        "pdf_bytes": cached_pdf,
+                    }
+                )
+                if cached_an is None:
+                    missing_ai_indices.append(idx_s)
+                elif (
+                    include_kor_diagrams
+                    and kor_sec in ("독서", "문학")
+                    and getattr(cached_an, "visual_diagram", None) is None
                 ):
-                    if missing_ai_indices:
-                        def _run_ai_slot(slot_i: int):
-                            from src.gemini.korean import generate_korean_passage_analysis
+                    missing_diag_indices.append(idx_s)
+                    prepared_slots[idx_s]["pdf_bytes"] = None
 
-                            slot = prepared_slots[slot_i]
-                            s_entry = slot["entry"]
-                            an_out = generate_korean_passage_analysis(
-                                api_key=kor_api_key,
-                                model_name=EXAM_TAGGING_MODEL,
-                                exam_name=s_entry["exam_name"],
-                                group_id=s_entry["group_id"],
-                                passage_text=s_entry["passage_text"],
-                                korean_section=slot["kor_sec"],
-                                korean_subgenre=slot["kor_sub"],
-                                passage_topic=s_entry["passage_topic"],
-                                enable_proofread=enable_kor_proofread,
-                                enable_web_search=enable_kor_web_search,
-                            )
-                            return slot_i, an_out
+            pdf_hit_cnt = sum(1 for sl in prepared_slots if sl["pdf_bytes"] is not None)
+            json_to_pdf_cnt = 0
+            ai_gen_cnt = 0
 
-                        with concurrent.futures.ThreadPoolExecutor(
-                            max_workers=min(4, len(missing_ai_indices))
-                        ) as executor:
-                            fut_map = {executor.submit(_run_ai_slot, si): si for si in missing_ai_indices}
-                            for fut in concurrent.futures.as_completed(fut_map):
-                                si = fut_map[fut]
-                                slot = prepared_slots[si]
+            if missing_ai_indices or missing_diag_indices:
+                kor_api_key, kor_key_label = resolve_active_gemini_api_key(
+                    current_user, creds.gemini_api_key, model_name=EXAM_TAGGING_MODEL
+                )
+                if not kor_api_key:
+                    st.error(f"사용 가능한 Gemini API 키({kor_key_label})가 설정되지 않았습니다.")
+                    return
+
+                with usage_scope_fn():
+                    need_total = len(missing_ai_indices) + len(missing_diag_indices)
+                    mode_lbl = "2차 교정 포함" if enable_kor_proofread else "고속 병렬"
+                    with st.spinner(
+                        f"📑 {MODEL_LABELS.get(EXAM_TAGGING_MODEL, EXAM_TAGGING_MODEL)}로 "
+                        f"국어 지문 분석지·도식 생성 ({mode_lbl}) {need_total}건 병렬 진행 중 "
+                        f"(DB 로드 {len(chosen_sets) - len(missing_ai_indices)}세트)..."
+                    ):
+                        if missing_ai_indices:
+                            def _run_ai_slot(slot_i: int):
+                                from src.gemini.korean import generate_korean_passage_analysis
+
+                                slot = prepared_slots[slot_i]
                                 s_entry = slot["entry"]
-                                try:
-                                    _, an_out = fut.result()
-                                    slot["analysis"] = an_out
-                                    ai_gen_cnt += 1
-                                    storage.save_cached_korean_analysis(
-                                        slot["cache_key"],
-                                        an_out,
-                                        exam_name=s_entry["exam_name"],
-                                        group_id=s_entry["group_id"],
-                                        korean_section=slot["kor_sec"],
-                                        korean_subgenre=slot["kor_sub"],
-                                    )
-                                except Exception as exc:
-                                    st.error(f"[{s_entry['exam_name']} {s_entry['group_id']}번] 지문 분석 실패: {exc}")
+                                an_out = generate_korean_passage_analysis(
+                                    api_key=kor_api_key,
+                                    model_name=EXAM_TAGGING_MODEL,
+                                    exam_name=s_entry["exam_name"],
+                                    group_id=s_entry["group_id"],
+                                    passage_text=s_entry["passage_text"],
+                                    korean_section=slot["kor_sec"],
+                                    korean_subgenre=slot["kor_sub"],
+                                    passage_topic=s_entry["passage_topic"],
+                                    enable_proofread=enable_kor_proofread,
+                                    enable_web_search=enable_kor_web_search,
+                                )
+                                return slot_i, an_out
 
-                    valid_diag_indices = [
-                        si for si in missing_diag_indices if prepared_slots[si]["analysis"] is not None
-                    ]
-                    if valid_diag_indices:
-                        def _run_diag_slot(slot_i: int):
-                            from src.gemini.korean import generate_korean_visual_diagram
+                            with concurrent.futures.ThreadPoolExecutor(
+                                max_workers=min(4, len(missing_ai_indices))
+                            ) as executor:
+                                fut_map = {
+                                    submit_with_usage_context(executor, _run_ai_slot, si): si
+                                    for si in missing_ai_indices
+                                }
+                                for fut in concurrent.futures.as_completed(fut_map):
+                                    si = fut_map[fut]
+                                    slot = prepared_slots[si]
+                                    s_entry = slot["entry"]
+                                    try:
+                                        _, an_out = fut.result()
+                                        slot["analysis"] = an_out
+                                        ai_gen_cnt += 1
+                                        storage.save_cached_korean_analysis(
+                                            slot["cache_key"],
+                                            an_out,
+                                            exam_name=s_entry["exam_name"],
+                                            group_id=s_entry["group_id"],
+                                            korean_section=slot["kor_sec"],
+                                            korean_subgenre=slot["kor_sub"],
+                                        )
+                                    except Exception as exc:
+                                        st.error(f"[{s_entry['exam_name']} {s_entry['group_id']}번] 지문 분석 실패: {exc}")
 
-                            slot = prepared_slots[slot_i]
-                            s_entry = slot["entry"]
-                            cur_an = slot["analysis"]
-                            diag_out = generate_korean_visual_diagram(
-                                api_key=kor_api_key,
-                                model_name=EXAM_TAGGING_MODEL,
-                                passage_text=s_entry["passage_text"],
-                                title=cur_an.title,
-                                core_theme=cur_an.core_theme,
-                                korean_section=slot["kor_sec"],
-                            )
-                            return slot_i, diag_out
+                        valid_diag_indices = [
+                            si for si in missing_diag_indices if prepared_slots[si]["analysis"] is not None
+                        ]
+                        if valid_diag_indices:
+                            def _run_diag_slot(slot_i: int):
+                                from src.gemini.korean import generate_korean_visual_diagram
 
-                        with concurrent.futures.ThreadPoolExecutor(
-                            max_workers=min(4, len(valid_diag_indices))
-                        ) as executor:
-                            fut_map = {executor.submit(_run_diag_slot, si): si for si in valid_diag_indices}
-                            for fut in concurrent.futures.as_completed(fut_map):
-                                si = fut_map[fut]
-                                slot = prepared_slots[si]
+                                slot = prepared_slots[slot_i]
                                 s_entry = slot["entry"]
                                 cur_an = slot["analysis"]
-                                try:
-                                    _, diag_out = fut.result()
-                                    updated_an = cur_an.model_copy(update={"visual_diagram": diag_out})
-                                    slot["analysis"] = updated_an
-                                    storage.save_cached_korean_analysis(
-                                        slot["cache_key"],
-                                        updated_an,
-                                        exam_name=s_entry["exam_name"],
-                                        group_id=s_entry["group_id"],
-                                        korean_section=slot["kor_sec"],
-                                        korean_subgenre=slot["kor_sub"],
-                                    )
-                                except Exception as exc:
-                                    st.warning(f"[{s_entry['exam_name']} {s_entry['group_id']}번] 이해 도식 생성 건너뜀: {exc}")
+                                diag_out = generate_korean_visual_diagram(
+                                    api_key=kor_api_key,
+                                    model_name=EXAM_TAGGING_MODEL,
+                                    passage_text=s_entry["passage_text"],
+                                    title=cur_an.title,
+                                    core_theme=cur_an.core_theme,
+                                    korean_section=slot["kor_sec"],
+                                )
+                                return slot_i, diag_out
 
-        analyses_list: list[dict[str, Any]] = []
-        pdf_parts: list[bytes] = []
-        if prepared_slots:
-            from src.pdf.korean_analysis_pdf import (
-                _is_korean_poetry_item,
-                generate_korean_passage_analysis_pdf,
-                generate_korean_passage_only_pdf,
-            )
+                            with concurrent.futures.ThreadPoolExecutor(
+                                max_workers=min(4, len(valid_diag_indices))
+                            ) as executor:
+                                fut_map = {
+                                    submit_with_usage_context(executor, _run_diag_slot, si): si
+                                    for si in valid_diag_indices
+                                }
+                                for fut in concurrent.futures.as_completed(fut_map):
+                                    si = fut_map[fut]
+                                    slot = prepared_slots[si]
+                                    s_entry = slot["entry"]
+                                    cur_an = slot["analysis"]
+                                    try:
+                                        _, diag_out = fut.result()
+                                        updated_an = cur_an.model_copy(update={"visual_diagram": diag_out})
+                                        slot["analysis"] = updated_an
+                                        storage.save_cached_korean_analysis(
+                                            slot["cache_key"],
+                                            updated_an,
+                                            exam_name=s_entry["exam_name"],
+                                            group_id=s_entry["group_id"],
+                                            korean_section=slot["kor_sec"],
+                                            korean_subgenre=slot["kor_sub"],
+                                        )
+                                    except Exception as exc:
+                                        st.warning(f"[{s_entry['exam_name']} {s_entry['group_id']}번] 이해 도식 생성 건너뜀: {exc}")
 
-        for slot in prepared_slots:
-            if slot["analysis"] is None and slot["pdf_bytes"] is None:
-                continue
-            s_entry = slot["entry"]
-            single_item = {
-                "exam_name": s_entry["exam_name"],
-                "group_id": s_entry["group_id"],
-                "section_label": slot["curr_subj"],
-                "subgenre": slot["kor_sub"],
-                "passage_text": s_entry["passage_text"],
-                "analysis": slot["analysis"],
-            }
-            is_poetry_slot = _is_korean_poetry_item(
-                slot["curr_subj"], slot["kor_sub"], s_entry["passage_text"], slot["analysis"]
-            )
-            if slot["pdf_bytes"] is None:
-                try:
-                    single_pdf = generate_korean_passage_analysis_pdf(
-                        [single_item],
-                        include_diagrams=include_kor_diagrams,
-                        include_passage=False,
-                    )
-                    if include_kor_diagrams:
-                        storage.save_korean_analysis_pdf_bytes(slot["cache_key"], single_pdf)
-                    slot["pdf_bytes"] = single_pdf
-                    if slot not in [prepared_slots[i] for i in missing_ai_indices]:
-                        json_to_pdf_cnt += 1
-                except Exception as exc:
-                    st.error(f"[{s_entry['exam_name']} {s_entry['group_id']}번] 지문 분석 PDF 생성 실패: {exc}")
-                    continue
-
-            # 시 갈래는 분석 PDF 자체에 밑줄 원문이 항상 포함되므로 원문 전용 PDF 중복 병합 제외
-            passage_pdf_bytes = None
-            if include_kor_passage and not is_poetry_slot:
-                passage_pdf_bytes = storage.get_korean_passage_pdf_bytes(slot["cache_key"])
-                if passage_pdf_bytes is None and (s_entry.get("passage_text") or "").strip():
-                    try:
-                        passage_pdf_bytes = generate_korean_passage_only_pdf(single_item)
-                        storage.save_korean_passage_pdf_bytes(slot["cache_key"], passage_pdf_bytes)
-                    except Exception as exc_p:
-                        st.warning(f"[{s_entry['exam_name']} {s_entry['group_id']}번] 원문 PDF 생성 건너뜀: {exc_p}")
-
-            pdf_parts.append(slot["pdf_bytes"])
-            if include_kor_passage and passage_pdf_bytes:
-                pdf_parts.append(passage_pdf_bytes)
-            if slot["analysis"] is not None:
-                analyses_list.append(single_item)
-
-        if pdf_parts:
-            try:
-                from src.pdf.common import merge_korean_analysis_pdfs
-
-                pdf_bytes = merge_korean_analysis_pdfs(pdf_parts)
-                st.session_state["kor_analysis_results"] = analyses_list
-                st.session_state["kor_analysis_pdf"] = pdf_bytes
-                detail_notes: list[str] = [f"저장 PDF 즉시 이어붙이기 {pdf_hit_cnt}세트"]
-                if json_to_pdf_cnt > 0:
-                    detail_notes.append(f"기존 분석 JSON→PDF 저장 {json_to_pdf_cnt}세트")
-                if ai_gen_cnt > 0:
-                    detail_notes.append(f"신규 AI 분석+PDF 저장 {ai_gen_cnt}세트")
-                mode_note = "원문 지문 포함 ON" if include_kor_passage else "원문 지문 제외 OFF"
-                st.success(
-                    f"📑 총 {len(analyses_list)}개 국어 지문 분석지 합본 PDF가 생성되었습니다! ({mode_note} · "
-                    f"{' · '.join(detail_notes)})"
+            analyses_list: list[dict[str, Any]] = []
+            pdf_parts: list[bytes] = []
+            if prepared_slots:
+                from src.pdf.korean_analysis_pdf import (
+                    _is_korean_poetry_item,
+                    generate_korean_passage_analysis_pdf,
+                    generate_korean_passage_only_pdf,
                 )
-            except Exception as exc:
-                st.error(f"분석지 PDF 병합 실패: {exc}")
+
+            for slot in prepared_slots:
+                if slot["analysis"] is None and slot["pdf_bytes"] is None:
+                    continue
+                s_entry = slot["entry"]
+                single_item = {
+                    "exam_name": s_entry["exam_name"],
+                    "group_id": s_entry["group_id"],
+                    "section_label": slot["curr_subj"],
+                    "subgenre": slot["kor_sub"],
+                    "passage_text": s_entry["passage_text"],
+                    "analysis": slot["analysis"],
+                }
+                is_poetry_slot = _is_korean_poetry_item(
+                    slot["curr_subj"], slot["kor_sub"], s_entry["passage_text"], slot["analysis"]
+                )
+                if slot["pdf_bytes"] is None:
+                    try:
+                        single_pdf = generate_korean_passage_analysis_pdf(
+                            [single_item],
+                            include_diagrams=include_kor_diagrams,
+                            include_passage=False,
+                        )
+                        if include_kor_diagrams:
+                            storage.save_korean_analysis_pdf_bytes(slot["cache_key"], single_pdf)
+                        slot["pdf_bytes"] = single_pdf
+                        if slot not in [prepared_slots[i] for i in missing_ai_indices]:
+                            json_to_pdf_cnt += 1
+                    except Exception as exc:
+                        st.error(f"[{s_entry['exam_name']} {s_entry['group_id']}번] 지문 분석 PDF 생성 실패: {exc}")
+                        continue
+
+                # 시 갈래는 분석 PDF 자체에 밑줄 원문이 항상 포함되므로 원문 전용 PDF 중복 병합 제외
+                passage_pdf_bytes = None
+                if include_kor_passage and not is_poetry_slot:
+                    passage_pdf_bytes = storage.get_korean_passage_pdf_bytes(slot["cache_key"])
+                    if passage_pdf_bytes is None and (s_entry.get("passage_text") or "").strip():
+                        try:
+                            passage_pdf_bytes = generate_korean_passage_only_pdf(single_item)
+                            storage.save_korean_passage_pdf_bytes(slot["cache_key"], passage_pdf_bytes)
+                        except Exception as exc_p:
+                            st.warning(f"[{s_entry['exam_name']} {s_entry['group_id']}번] 원문 PDF 생성 건너뜀: {exc_p}")
+
+                pdf_parts.append(slot["pdf_bytes"])
+                succeeded_an_sets += 1
+                if include_kor_passage and passage_pdf_bytes:
+                    pdf_parts.append(passage_pdf_bytes)
+                if slot["analysis"] is not None:
+                    analyses_list.append(single_item)
+
+            if pdf_parts:
+                try:
+                    from src.pdf.common import merge_korean_analysis_pdfs
+
+                    pdf_bytes = merge_korean_analysis_pdfs(pdf_parts)
+                    st.session_state["kor_analysis_results"] = analyses_list
+                    st.session_state["kor_analysis_pdf"] = pdf_bytes
+                    actual_c_an = succeeded_an_sets * CREDIT_COST_KOREAN_ANALYSIS
+                except Exception as exc:
+                    st.error(f"분석지 PDF 병합 실패: {exc}")
+                    actual_c_an = 0
+        finally:
+            settle_credit_reservation(
+                storage,
+                reservation_an,
+                actual_credits=actual_c_an,
+                detail_note=f"국어 지문 분석지 ({succeeded_an_sets}/{len(chosen_sets)}세트 성공 · {actual_c_an:,}C 확정)",
+            )
+
+        if actual_c_an > 0:
+            detail_notes: list[str] = [f"저장 PDF 즉시 이어붙이기 {pdf_hit_cnt}세트"]
+            if json_to_pdf_cnt > 0:
+                detail_notes.append(f"기존 분석 JSON→PDF 저장 {json_to_pdf_cnt}세트")
+            if ai_gen_cnt > 0:
+                detail_notes.append(f"신규 AI 분석+PDF 저장 {ai_gen_cnt}세트")
+            mode_note = "원문 지문 포함 ON" if include_kor_passage else "원문 지문 제외 OFF"
+            bal_msg = format_credit_balance_inline(storage, uname_kor, charged=actual_c_an)
+            st.success(
+                f"📑 총 {len(analyses_list)}개 국어 지문 분석지 합본 PDF가 생성되었습니다! ({mode_note} · "
+                f"{' · '.join(detail_notes)}){bal_msg}"
+            )
 
     saved_analyses: list[dict[str, Any]] = st.session_state.get("kor_analysis_results") or []
     saved_analysis_pdf: bytes | None = st.session_state.get("kor_analysis_pdf")

@@ -397,7 +397,6 @@ def inject_responsive_css() -> None:
             letter-spacing: 0.03em;
         }
         .tier-FREE { background: #F1F5F9; color: #334155; border: 1px solid #CBD5E1; }
-        .tier-CUSTOM { background: #DCFCE7; color: #166534; border: 1px solid #86EFAC; }
         .tier-PRO { background: #DBEAFE; color: #1D4ED8; border: 1px solid #93C5FD; }
         .tier-ULTRA {
             background: linear-gradient(135deg, #F59E0B 0%, #EA580C 100%);

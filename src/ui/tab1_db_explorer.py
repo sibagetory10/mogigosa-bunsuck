@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any, Sequence
 
 import streamlit as st
 
-from src.auth import resolve_active_gemini_api_key
+from src.auth import can_admin_shared_db, resolve_active_gemini_api_key
 from src.curriculum_2022 import get_official_subjects_for_category
 from src.models import (
     QuestionRecord,
@@ -33,6 +33,7 @@ def _render_question_tag_details(
     storage: StorageManager,
     key_prefix: str,
     allow_delete: bool = False,
+    allow_edit: bool = False,
 ) -> None:
     """문항 1건의 2022 원리/용어 분리 결과(또는 영어 전용 지문·유형·어휘)·인라인 교정 UI를 공통 렌더링한다."""
     if rec.subject_category == "영어":
@@ -59,47 +60,48 @@ def _render_question_tag_details(
                 )
         st.write(f"**공식 해설 요약:** {rec.official_explanation}")
 
-        with st.expander("✏️ 영어 유형·주제·지문 원문·정답 빠른 수정", expanded=False):
-            ec1, ec2, ec3 = st.columns([1.2, 1.8, 0.8])
-            with ec1:
-                new_eng_type = st.text_input(
-                    "원래 문항 유형",
-                    value=eng_type,
-                    key=f"{key_prefix}_edit_eng_type_{rec.id}",
+        if allow_edit:
+            with st.expander("✏️ 영어 유형·주제·지문 원문·정답 빠른 수정", expanded=False):
+                ec1, ec2, ec3 = st.columns([1.2, 1.8, 0.8])
+                with ec1:
+                    new_eng_type = st.text_input(
+                        "원래 문항 유형",
+                        value=eng_type,
+                        key=f"{key_prefix}_edit_eng_type_{rec.id}",
+                    )
+                with ec2:
+                    new_topic = st.text_input(
+                        "지문 주제·소재",
+                        value="" if topic == "-" else topic,
+                        key=f"{key_prefix}_edit_eng_topic_{rec.id}",
+                    )
+                with ec3:
+                    new_ans = st.text_input(
+                        "정답",
+                        value=rec.answer,
+                        key=f"{key_prefix}_edit_eng_ans_{rec.id}",
+                    )
+                new_passage = st.text_area(
+                    "영어 지문 원문 (passage_text)",
+                    value=passage_txt,
+                    height=130,
+                    key=f"{key_prefix}_edit_eng_passage_{rec.id}",
                 )
-            with ec2:
-                new_topic = st.text_input(
-                    "지문 주제·소재",
-                    value="" if topic == "-" else topic,
-                    key=f"{key_prefix}_edit_eng_topic_{rec.id}",
-                )
-            with ec3:
-                new_ans = st.text_input(
-                    "정답",
-                    value=rec.answer,
-                    key=f"{key_prefix}_edit_eng_ans_{rec.id}",
-                )
-            new_passage = st.text_area(
-                "영어 지문 원문 (passage_text)",
-                value=passage_txt,
-                height=130,
-                key=f"{key_prefix}_edit_eng_passage_{rec.id}",
-            )
-            if st.button("💾 영어 문항 수정 저장", key=f"{key_prefix}_save_eng_edit_{rec.id}"):
-                all_recs = storage.load_db()
-                for r in all_recs:
-                    if r.id == rec.id:
-                        r.english_question_type = new_eng_type.strip() or r.english_question_type
-                        r.unit_name = r.english_question_type or r.unit_name
-                        r.passage_topic = new_topic.strip()
-                        r.core_principles = [r.passage_topic] if r.passage_topic else [r.unit_name]
-                        r.answer = new_ans.strip() or r.answer
-                        r.passage_text = new_passage.strip()
-                        break
-                storage.save_db(all_recs, target_exams={rec.exam_name})
-                _build_cached_exam_exports.clear()
-                st.success("영어 문항 정보를 저장했습니다.")
-                st.rerun()
+                if st.button("💾 영어 문항 수정 저장", key=f"{key_prefix}_save_eng_edit_{rec.id}"):
+                    all_recs = storage.load_db()
+                    for r in all_recs:
+                        if r.id == rec.id:
+                            r.english_question_type = new_eng_type.strip() or r.english_question_type
+                            r.unit_name = r.english_question_type or r.unit_name
+                            r.passage_topic = new_topic.strip()
+                            r.core_principles = [r.passage_topic] if r.passage_topic else [r.unit_name]
+                            r.answer = new_ans.strip() or r.answer
+                            r.passage_text = new_passage.strip()
+                            break
+                    storage.save_db(all_recs, target_exams={rec.exam_name})
+                    _build_cached_exam_exports.clear()
+                    st.success("영어 문항 정보를 저장했습니다.")
+                    st.rerun()
 
         if allow_delete:
             if st.button("이 문항 삭제", key=f"{key_prefix}_del_{rec.id}"):
@@ -142,47 +144,48 @@ def _render_question_tag_details(
                 )
         st.write(f"**공식 해설 요약:** {rec.official_explanation}")
 
-        with st.expander("✏️ 국어 갈래·유형·주제·지문 원문·정답 빠른 수정", expanded=False):
-            kc1, kc2, kc3 = st.columns([1.2, 1.8, 0.8])
-            with kc1:
-                new_kor_type = st.text_input(
-                    "원래 문항 유형",
-                    value=kor_qtype,
-                    key=f"{key_prefix}_edit_kor_type_{rec.id}",
+        if allow_edit:
+            with st.expander("✏️ 국어 갈래·유형·주제·지문 원문·정답 빠른 수정", expanded=False):
+                kc1, kc2, kc3 = st.columns([1.2, 1.8, 0.8])
+                with kc1:
+                    new_kor_type = st.text_input(
+                        "원래 문항 유형",
+                        value=kor_qtype,
+                        key=f"{key_prefix}_edit_kor_type_{rec.id}",
+                    )
+                with kc2:
+                    new_kor_topic = st.text_input(
+                        "지문 주제·작품",
+                        value="" if topic == "-" else topic,
+                        key=f"{key_prefix}_edit_kor_topic_{rec.id}",
+                    )
+                with kc3:
+                    new_kor_ans = st.text_input(
+                        "정답",
+                        value=rec.answer,
+                        key=f"{key_prefix}_edit_kor_ans_{rec.id}",
+                    )
+                new_kor_passage = st.text_area(
+                    "국어 지문 원문 (passage_text)",
+                    value=passage_txt,
+                    height=140,
+                    key=f"{key_prefix}_edit_kor_passage_{rec.id}",
                 )
-            with kc2:
-                new_kor_topic = st.text_input(
-                    "지문 주제·작품",
-                    value="" if topic == "-" else topic,
-                    key=f"{key_prefix}_edit_kor_topic_{rec.id}",
-                )
-            with kc3:
-                new_kor_ans = st.text_input(
-                    "정답",
-                    value=rec.answer,
-                    key=f"{key_prefix}_edit_kor_ans_{rec.id}",
-                )
-            new_kor_passage = st.text_area(
-                "국어 지문 원문 (passage_text)",
-                value=passage_txt,
-                height=140,
-                key=f"{key_prefix}_edit_kor_passage_{rec.id}",
-            )
-            if st.button("💾 국어 문항 수정 저장", key=f"{key_prefix}_save_kor_edit_{rec.id}"):
-                all_recs = storage.load_db()
-                for r in all_recs:
-                    if r.id == rec.id:
-                        r.english_question_type = new_kor_type.strip() or r.english_question_type
-                        r.unit_name = r.english_question_type or r.unit_name
-                        r.passage_topic = new_kor_topic.strip()
-                        r.core_principles = [r.passage_topic] if r.passage_topic else [r.unit_name]
-                        r.answer = new_kor_ans.strip() or r.answer
-                        r.passage_text = new_kor_passage.strip()
-                        break
-                storage.save_db(all_recs, target_exams={rec.exam_name})
-                _build_cached_exam_exports.clear()
-                st.success("국어 문항 정보를 저장했습니다.")
-                st.rerun()
+                if st.button("💾 국어 문항 수정 저장", key=f"{key_prefix}_save_kor_edit_{rec.id}"):
+                    all_recs = storage.load_db()
+                    for r in all_recs:
+                        if r.id == rec.id:
+                            r.english_question_type = new_kor_type.strip() or r.english_question_type
+                            r.unit_name = r.english_question_type or r.unit_name
+                            r.passage_topic = new_kor_topic.strip()
+                            r.core_principles = [r.passage_topic] if r.passage_topic else [r.unit_name]
+                            r.answer = new_kor_ans.strip() or r.answer
+                            r.passage_text = new_kor_passage.strip()
+                            break
+                    storage.save_db(all_recs, target_exams={rec.exam_name})
+                    _build_cached_exam_exports.clear()
+                    st.success("국어 문항 정보를 저장했습니다.")
+                    st.rerun()
 
         if allow_delete:
             if st.button("이 문항 삭제", key=f"{key_prefix}_del_{rec.id}"):
@@ -229,69 +232,70 @@ def _render_question_tag_details(
     st.write(f"**단일 개념 여부:** {'예 (단일 원리)' if rec.is_single_concept else '아니오 (복합 원리)'}")
     st.write(f"**공식 해설 요약:** {rec.official_explanation}")
 
-    with st.expander("✏️ 2022 과목·최저 학년·성취기준 빠른 수정", expanded=False):
-        official_subjs = [s["name"] for s in get_official_subjects_for_category(rec.subject_category)]
-        if rec.curriculum_subject and rec.curriculum_subject not in official_subjs:
-            official_subjs = [rec.curriculum_subject] + official_subjs
+    if allow_edit:
+        with st.expander("✏️ 2022 과목·최저 학년·성취기준 빠른 수정", expanded=False):
+            official_subjs = [s["name"] for s in get_official_subjects_for_category(rec.subject_category)]
+            if rec.curriculum_subject and rec.curriculum_subject not in official_subjs:
+                official_subjs = [rec.curriculum_subject] + official_subjs
 
-        ec1, ec2, ec3 = st.columns([1.4, 1.4, 0.8])
-        with ec1:
-            new_subj = st.selectbox(
-                "2022 세부 과목",
-                options=official_subjs or [rec.curriculum_subject],
-                index=(official_subjs.index(rec.curriculum_subject) if rec.curriculum_subject in official_subjs else 0),
-                key=f"{key_prefix}_edit_subj_{rec.id}",
-            )
-        with ec2:
-            new_unit = st.text_input(
-                "단원명",
-                value=rec.unit_name,
-                key=f"{key_prefix}_edit_unit_{rec.id}",
-            )
-        with ec3:
-            new_grade = st.selectbox(
-                "최저 학년",
-                options=[1, 2, 3],
-                index=max(0, min(2, int(rec.min_grade) - 1)),
-                format_func=lambda g: f"고{g}",
-                key=f"{key_prefix}_edit_grade_{rec.id}",
-            )
-        ec4, ec5 = st.columns([1.2, 1.8])
-        with ec4:
-            new_std_str = st.text_input(
-                "성취기준 코드 (복수 시 쉼표 구분)",
-                value=", ".join(std_codes) if std_codes else std_code,
-                key=f"{key_prefix}_edit_std_{rec.id}",
-            )
-        with ec5:
-            new_ev = st.text_input(
-                "학년 판정 근거",
-                value=grade_ev,
-                key=f"{key_prefix}_edit_ev_{rec.id}",
-            )
-        if st.button("💾 수정 저장 (검토 완료 처리)", key=f"{key_prefix}_save_edit_{rec.id}"):
-            parsed_stds = [
-                re.sub(r"[\[\]\s]+", "", tok)
-                for tok in new_std_str.split(",")
-                if re.sub(r"[\[\]\s]+", "", tok)
-            ]
-            dedup_stds = list(dict.fromkeys(parsed_stds))
-            all_recs = storage.load_db()
-            for r in all_recs:
-                if r.id == rec.id:
-                    r.curriculum_subject = new_subj
-                    r.unit_name = new_unit.strip() or r.unit_name
-                    r.min_grade = int(new_grade)
-                    r.standard_code = dedup_stds[0] if dedup_stds else ""
-                    r.standard_codes = dedup_stds
-                    r.grade_evidence = new_ev.strip()
-                    r.needs_review = False
-                    r.review_notes = []
-                    break
-            storage.save_db(all_recs, target_exams={rec.exam_name})
-            _build_cached_exam_exports.clear()
-            st.success("수정 사항을 저장했습니다.")
-            st.rerun()
+            ec1, ec2, ec3 = st.columns([1.4, 1.4, 0.8])
+            with ec1:
+                new_subj = st.selectbox(
+                    "2022 세부 과목",
+                    options=official_subjs or [rec.curriculum_subject],
+                    index=(official_subjs.index(rec.curriculum_subject) if rec.curriculum_subject in official_subjs else 0),
+                    key=f"{key_prefix}_edit_subj_{rec.id}",
+                )
+            with ec2:
+                new_unit = st.text_input(
+                    "단원명",
+                    value=rec.unit_name,
+                    key=f"{key_prefix}_edit_unit_{rec.id}",
+                )
+            with ec3:
+                new_grade = st.selectbox(
+                    "최저 학년",
+                    options=[1, 2, 3],
+                    index=max(0, min(2, int(rec.min_grade) - 1)),
+                    format_func=lambda g: f"고{g}",
+                    key=f"{key_prefix}_edit_grade_{rec.id}",
+                )
+            ec4, ec5 = st.columns([1.2, 1.8])
+            with ec4:
+                new_std_str = st.text_input(
+                    "성취기준 코드 (복수 시 쉼표 구분)",
+                    value=", ".join(std_codes) if std_codes else std_code,
+                    key=f"{key_prefix}_edit_std_{rec.id}",
+                )
+            with ec5:
+                new_ev = st.text_input(
+                    "학년 판정 근거",
+                    value=grade_ev,
+                    key=f"{key_prefix}_edit_ev_{rec.id}",
+                )
+            if st.button("💾 수정 저장 (검토 완료 처리)", key=f"{key_prefix}_save_edit_{rec.id}"):
+                parsed_stds = [
+                    re.sub(r"[\[\]\s]+", "", tok)
+                    for tok in new_std_str.split(",")
+                    if re.sub(r"[\[\]\s]+", "", tok)
+                ]
+                dedup_stds = list(dict.fromkeys(parsed_stds))
+                all_recs = storage.load_db()
+                for r in all_recs:
+                    if r.id == rec.id:
+                        r.curriculum_subject = new_subj
+                        r.unit_name = new_unit.strip() or r.unit_name
+                        r.min_grade = int(new_grade)
+                        r.standard_code = dedup_stds[0] if dedup_stds else ""
+                        r.standard_codes = dedup_stds
+                        r.grade_evidence = new_ev.strip()
+                        r.needs_review = False
+                        r.review_notes = []
+                        break
+                storage.save_db(all_recs, target_exams={rec.exam_name})
+                _build_cached_exam_exports.clear()
+                st.success("수정 사항을 저장했습니다.")
+                st.rerun()
 
     if allow_delete:
         if st.button("이 문항 삭제", key=f"{key_prefix}_del_{rec.id}"):
@@ -625,9 +629,8 @@ def render_tab1_db_explorer(
             if not matched_keys:
                 st.warning("선택한 조건(시행 년도·시행 월·학년·과목)에 일치하는 기출 회차가 없습니다.")
             else:
-                can_retag_exam = bool(
-                    ctx.current_user is not None and ctx.current_user.tier in ("PRO", "ULTRA", "ADMIN")
-                )
+                can_admin_db = can_admin_shared_db(ctx.current_user)
+                can_retag_exam = can_admin_db
                 retag_notice = st.session_state.pop("tab1_retag_notice", None)
                 if retag_notice:
                     prev_cnt = retag_notice.get("prev_count", retag_notice["saved"])
@@ -679,23 +682,11 @@ def render_tab1_db_explorer(
                                     st.success(f"'{exam_name}' ({cnt}문항) 삭제 완료")
                                     st.rerun()
                         else:
-                            head_col1, head_col2 = st.columns([3, 1])
-                            with head_col1:
-                                st.markdown(f"#### 📘 {exam_name}")
-                                st.caption(
-                                    f"과목: **{subj_cat}** · 저장 문항: **{len(exam_recs)}문항** · 단원: {', '.join(units_preview[:4])}"
-                                    + (" 등" if len(units_preview) > 4 else "")
-                                )
-                            with head_col2:
-                                if st.button(
-                                    "🗑️ 회차 삭제",
-                                    key=f"del_exam_search_{subj_cat}_{exam_uid}",
-                                    width="stretch",
-                                ):
-                                    cnt = ctx.storage.delete_exam(exam_name)
-                                    _build_cached_exam_exports.clear()
-                                    st.success(f"'{exam_name}' ({cnt}문항) 삭제 완료")
-                                    st.rerun()
+                            st.markdown(f"#### 📘 {exam_name}")
+                            st.caption(
+                                f"과목: **{subj_cat}** · 저장 문항: **{len(exam_recs)}문항** · 단원: {', '.join(units_preview[:4])}"
+                                + (" 등" if len(units_preview) > 4 else "")
+                            )
 
                         if can_retag_exam:
                             with st.expander("✏️ 회차명 수정 (잘못 저장된 연도/과목명 교정)", expanded=False):
@@ -992,6 +983,7 @@ def render_tab1_db_explorer(
                                             rec,
                                             storage=ctx.storage,
                                             key_prefix="db_search",
-                                            allow_delete=True,
+                                            allow_edit=can_admin_db,
+                                            allow_delete=can_admin_db,
                                         )
                                     st.markdown("---")

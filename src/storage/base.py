@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 import threading
@@ -85,6 +86,7 @@ class StorageBase:
         self.organized_dir = self.local_root / "과목별_기출DB"
         self.db_path = self.local_root / "db.json"
         self.users_path = self.local_root / "users.json"
+        self.credit_ledger_path = self.local_root / "credit_ledger.jsonl"
         self.english_pool_path = self.local_root / "english_question_pool.json"
         self.english_analysis_pool_path = self.local_root / "english_analysis_pool.json"
         self.english_analysis_pdfs_root = self.local_root / "english_analysis_pdfs"
@@ -131,3 +133,49 @@ class StorageBase:
                 return data if data else None
             except OSError:
                 return None
+
+    def append_credit_ledger(self, entry: dict[str, Any], max_lines: int = 10_000, keep_lines: int = 5_000) -> None:
+        """크레딧 변동 내역을 credit_ledger.jsonl에 스레드 안전하게 추가 기록한다."""
+        with self._lock:
+            self.credit_ledger_path.parent.mkdir(parents=True, exist_ok=True)
+            line = json.dumps(entry, ensure_ascii=False, separators=(",", ":")) + "\n"
+            with self.credit_ledger_path.open("a", encoding="utf-8") as fp:
+                fp.write(line)
+            try:
+                if self.credit_ledger_path.stat().st_size > 2 * 1024 * 1024:
+                    lines = self.credit_ledger_path.read_text(encoding="utf-8").splitlines()
+                    if len(lines) > max_lines:
+                        trimmed = "\n".join(lines[-keep_lines:]) + "\n"
+                        _atomic_write_text(self.credit_ledger_path, trimmed, encoding="utf-8")
+            except OSError:
+                pass
+
+    def read_credit_ledger(self, username: str = "", limit: int = 100) -> list[dict[str, Any]]:
+        """credit_ledger.jsonl에서 최신순 크레딧 변동 내역을 조회한다."""
+        norm_u = (username or "").strip().lower()
+        max_n = max(1, int(limit or 100))
+        with self._lock:
+            if not self.credit_ledger_path.exists():
+                return []
+            try:
+                raw_lines = self.credit_ledger_path.read_text(encoding="utf-8").splitlines()
+            except OSError:
+                return []
+
+        results: list[dict[str, Any]] = []
+        for ln in reversed(raw_lines):
+            s = ln.strip()
+            if not s:
+                continue
+            try:
+                item = json.loads(s)
+            except Exception:
+                continue
+            if not isinstance(item, dict):
+                continue
+            if norm_u and str(item.get("username") or "").strip().lower() != norm_u:
+                continue
+            results.append(item)
+            if len(results) >= max_n:
+                break
+        return results

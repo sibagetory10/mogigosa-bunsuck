@@ -11,14 +11,15 @@ from typing import Any
 import streamlit as st
 
 from src.auth import (
+    CREDIT_COST_CONCEPT_MATCH_ORIG,
+    CREDIT_COST_CONCEPT_REWRITE,
+    CREDIT_COST_DIRECT_CONCEPT_PDF,
     TIER_LABELS,
     can_access_shared_concept_db,
     can_use_premium_features,
     consume_extraction_quota,
-    format_token_count,
     get_max_batch_questions,
-    get_monthly_token_limit,
-    get_remaining_monthly_tokens,
+    get_total_available_credits,
     get_user_by_username,
     resolve_active_gemini_api_key,
 )
@@ -36,14 +37,17 @@ from src.text_formatter import has_visual_reference
 from src.ui.common import (
     _auto_save_current_exam,
     _build_exam_sig,
-    _ensure_token_quota,
     _record_english_seen_for_user,
     _render_rewritten_card_html,
     _usage_scope,
     create_lazy_expander,
     create_lazy_tabs,
+    ensure_credit_quota,
+    format_credit_balance_inline,
     is_container_open,
     sanitize_id_part,
+    settle_credits,
+    try_reserve_credits,
 )
 from src.ui.context import AppContext
 from src.ui_styles import render_chips
@@ -273,43 +277,66 @@ def _render_tab2_direct_pdf_panel(ctx: AppContext) -> None:
                     else:
                         st.caption("단일 페이지가 선택되었습니다.")
 
-            if st.button("🔍 1단계: 업로드된 PDF 지식 화이트리스트 추출", type="primary"):
+            if st.button(
+                f"🔍 1단계: 업로드된 PDF 지식 화이트리스트 추출 ({CREDIT_COST_DIRECT_CONCEPT_PDF}C)",
+                type="primary",
+            ):
                 scope_api_key, scope_key_label = resolve_active_gemini_api_key(
                     ctx.current_user, ctx.creds.gemini_api_key, model_name=CONCEPT_SCOPE_MODEL
                 )
                 if not scope_api_key:
                     st.error(f"사용 가능한 Gemini API 키({scope_key_label})가 설정되지 않았습니다.")
-                elif not _ensure_token_quota(ctx):
-                    pass
                 else:
-                    with st.spinner(f"PDF ({range_disp})의 순수 개념 본문·도표·용어를 정독해 화이트리스트를 구축 중..."):
-                        sliced_bytes, sliced_text, slice_stats = extract_concept_pages_by_ranges(
-                            concept_pdf_bytes, parsed_direct_ranges
-                        )
+                    ok_pdf_res, pdf_reservation = try_reserve_credits(
+                        ctx,
+                        CREDIT_COST_DIRECT_CONCEPT_PDF,
+                        "개인 개념서 PDF 화이트리스트 추출",
+                    )
+                    if ok_pdf_res and pdf_reservation is not None:
+                        actual_pdf_c = 0
                         try:
-                            from src.gemini import extract_concept_whitelist
-
-                            with _usage_scope(ctx):
-                                wl = extract_concept_whitelist(
-                                    api_key=scope_api_key,
-                                    model_name=CONCEPT_SCOPE_MODEL,
-                                    sliced_pdf_bytes=sliced_bytes,
-                                    sliced_text=sliced_text,
-                                    start_page=first_page_num,
-                                    end_page=last_page_num,
-                                    book_title=direct_book_title.strip() or default_book_name,
-                                    range_display=slice_stats["ranges_display"],
+                            with st.spinner(f"PDF ({range_disp})의 순수 개념 본문·도표·용어를 정독해 화이트리스트를 구축 중..."):
+                                sliced_bytes, sliced_text, slice_stats = extract_concept_pages_by_ranges(
+                                    concept_pdf_bytes, parsed_direct_ranges
                                 )
-                            st.session_state["concept_whitelist"] = wl
-                            st.session_state["concept_sliced_text"] = sliced_text
-                            st.session_state["concept_source_label"] = (
-                                f"{direct_book_title.strip() or concept_file.name} ({slice_stats['ranges_display']})"
-                            )
-                            st.session_state["matched_items"] = []
-                            st.session_state["generated_exam_pdf"] = None
-                            st.success("✅ PDF 지식 화이트리스트 추출이 완료되었습니다!")
+                                from src.gemini import extract_concept_whitelist
+
+                                with _usage_scope(ctx):
+                                    wl = extract_concept_whitelist(
+                                        api_key=scope_api_key,
+                                        model_name=CONCEPT_SCOPE_MODEL,
+                                        sliced_pdf_bytes=sliced_bytes,
+                                        sliced_text=sliced_text,
+                                        start_page=first_page_num,
+                                        end_page=last_page_num,
+                                        book_title=direct_book_title.strip() or default_book_name,
+                                        range_display=slice_stats["ranges_display"],
+                                    )
+                                st.session_state["concept_whitelist"] = wl
+                                st.session_state["concept_sliced_text"] = sliced_text
+                                st.session_state["concept_source_label"] = (
+                                    f"{direct_book_title.strip() or concept_file.name} ({slice_stats['ranges_display']})"
+                                )
+                                st.session_state["matched_items"] = []
+                                st.session_state["generated_exam_pdf"] = None
+                                actual_pdf_c = CREDIT_COST_DIRECT_CONCEPT_PDF
                         except Exception as exc:
                             st.error(f"화이트리스트 추출 실패: {exc}")
+                            actual_pdf_c = 0
+                        finally:
+                            settle_credits(
+                                ctx,
+                                pdf_reservation,
+                                actual_pdf_c,
+                                detail_note="개인 개념서 PDF 화이트리스트 추출",
+                            )
+                        if actual_pdf_c > 0:
+                            bal_msg = format_credit_balance_inline(
+                                ctx.storage,
+                                ctx.current_user.username if ctx.current_user is not None else "",
+                                charged=actual_pdf_c,
+                            )
+                            st.success(f"✅ PDF 지식 화이트리스트 추출이 완료되었습니다!{bal_msg}")
 
 
 
@@ -432,7 +459,7 @@ def render_tab2(ctx: AppContext) -> None:
                     )
 
                 run_extract_btn = st.form_submit_button(
-                    "🚀 기출 매칭 & 개념서 맞춤 문제 추출·개조 실행",
+                    f"🚀 기출 매칭 & 개념서 맞춤 문제 추출·개조 실행 (원문 {CREDIT_COST_CONCEPT_MATCH_ORIG}C · 개조 {CREDIT_COST_CONCEPT_REWRITE}C / 문항)",
                     type="primary",
                 )
 
@@ -446,7 +473,7 @@ def render_tab2(ctx: AppContext) -> None:
                 )
                 if not match_api_key:
                     st.error(f"사용 가능한 Gemini API 키({match_key_label})가 설정되지 않았습니다.")
-                elif not _ensure_token_quota(ctx):
+                elif not ensure_credit_quota(ctx, CREDIT_COST_CONCEPT_MATCH_ORIG, "수·사·과·한 문제 추출·개조"):
                     pass
                 elif not db_list:
                     st.warning("저장된 기출 DB가 비어 있습니다. 먼저 [탭 1]에서 모의고사를 수집·태깅해 주세요.")
@@ -533,115 +560,168 @@ def render_tab2(ctx: AppContext) -> None:
                                 )
                                 st.session_state["matched_items"] = []
                             else:
-                                assembled: list[dict[str, Any]] = []
-                                prog = st.progress(0.0)
-                                stat = st.empty()
-                                sliced_text_ctx = st.session_state.get("concept_sliced_text", "")
-                                fallback_source_ctx = st.session_state.get("concept_source_label", "")
-
-                                prepared_items: list[tuple[QuestionRecord, Any, bytes | None, str]] = []
-                                rewrite_indices: list[int] = []
-                                for idx, (q, j) in enumerate(selected_pairs):
-                                    crop_bytes = ctx.storage.get_crop_bytes(
-                                        q.image_filename,
-                                        subject_category=q.subject_category,
-                                        exam_name=q.exam_name,
-                                    )
-                                    concept_ref = resolve_question_concept_reference(
-                                        question=q,
-                                        judgment=j,
-                                        whitelist=whitelist,
-                                        fallback_source_label=fallback_source_ctx,
-                                    )
-                                    prepared_items.append((q, j, crop_bytes, concept_ref))
-                                    if j.needs_rewriting and auto_rewrite_mode:
-                                        rewrite_indices.append(idx)
-
-                                rewritten_results: dict[int, RewrittenQuestion] = {}
-                                failed_indices: set[int] = set()
-                                if rewrite_indices:
-                                    if not rewrite_api_key:
-                                        st.error(
-                                            f"상위 문제 개조용 API 키가 설정되지 않았습니다 ({rewrite_key_label})."
+                                fresh_u_now = get_user_by_username(ctx.storage, ctx.current_user.username)
+                                avail_now = get_total_available_credits(fresh_u_now)
+                                planned_c = sum(
+                                    CREDIT_COST_CONCEPT_REWRITE if (j.needs_rewriting and auto_rewrite_mode) else CREDIT_COST_CONCEPT_MATCH_ORIG
+                                    for _, j in selected_pairs
+                                )
+                                if avail_now is not None and planned_c > avail_now:
+                                    affordable_pairs: list[tuple[QuestionRecord, Any]] = []
+                                    acc_cost = 0
+                                    for q_cand, j_cand in selected_pairs:
+                                        c_step = (
+                                            CREDIT_COST_CONCEPT_REWRITE
+                                            if (j_cand.needs_rewriting and auto_rewrite_mode)
+                                            else CREDIT_COST_CONCEPT_MATCH_ORIG
                                         )
-                                        failed_indices.update(rewrite_indices)
+                                        if acc_cost + c_step <= avail_now:
+                                            affordable_pairs.append((q_cand, j_cand))
+                                            acc_cost += c_step
+                                    if not affordable_pairs:
+                                        st.error(
+                                            f"🚫 적합한 문항({len(selected_pairs)}건)을 출제하기 위한 크레딧이 부족합니다 "
+                                            f"(현재 가용 {avail_now:,}C)."
+                                        )
+                                        selected_pairs = []
                                     else:
-                                        total_rw = len(rewrite_indices)
-                                        stat.info(f"상위 문제 {total_rw}문항 병렬 자동 개조 중 (최대 4스레드)...")
-                                        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
-                                            future_map = {}
-                                            for idx in rewrite_indices:
-                                                q, j, crop_bytes, _ = prepared_items[idx]
-                                                fut = submit_with_usage_context(
-                                                    executor,
-                                                    rewrite_question_for_pdf,
-                                                    api_key=rewrite_api_key,
-                                                    model_name=rewrite_model,
-                                                    question=q,
-                                                    crop_png_bytes=crop_bytes,
-                                                    whitelist=whitelist,
-                                                    out_of_scope_terms=j.out_of_scope_terms,
-                                                    sliced_text=sliced_text_ctx,
+                                        st.warning(
+                                            f"💡 현재 가용 크레딧({avail_now:,}C) 범위 내에서 앞의 **{len(affordable_pairs)}문항**"
+                                            f"(예상 {acc_cost:,}C)만 자동 선별하여 진행합니다. "
+                                            f"(전체 {len(selected_pairs)}문항 필요량 {planned_c:,}C)"
+                                        )
+                                        selected_pairs = affordable_pairs
+                                        planned_c = acc_cost
+
+                            if selected_pairs:
+                                ok_ext_res, ext_reservation = try_reserve_credits(
+                                    ctx,
+                                    planned_c,
+                                    f"수·사·과·한 문제 추출·개조 ({len(selected_pairs)}문항)",
+                                )
+                                if ok_ext_res and ext_reservation is not None:
+                                    actual_ext_c = 0
+                                    try:
+                                        assembled: list[dict[str, Any]] = []
+                                        prog = st.progress(0.0)
+                                        stat = st.empty()
+                                        sliced_text_ctx = st.session_state.get("concept_sliced_text", "")
+                                        fallback_source_ctx = st.session_state.get("concept_source_label", "")
+
+                                        prepared_items: list[tuple[QuestionRecord, Any, bytes | None, str]] = []
+                                        rewrite_indices: list[int] = []
+                                        for idx, (q, j) in enumerate(selected_pairs):
+                                            crop_bytes = ctx.storage.get_crop_bytes(
+                                                q.image_filename,
+                                                subject_category=q.subject_category,
+                                                exam_name=q.exam_name,
+                                            )
+                                            concept_ref = resolve_question_concept_reference(
+                                                question=q,
+                                                judgment=j,
+                                                whitelist=whitelist,
+                                                fallback_source_label=fallback_source_ctx,
+                                            )
+                                            prepared_items.append((q, j, crop_bytes, concept_ref))
+                                            if j.needs_rewriting and auto_rewrite_mode:
+                                                rewrite_indices.append(idx)
+
+                                        rewritten_results: dict[int, RewrittenQuestion] = {}
+                                        failed_indices: set[int] = set()
+                                        if rewrite_indices:
+                                            if not rewrite_api_key:
+                                                st.error(
+                                                    f"상위 문제 개조용 API 키가 설정되지 않았습니다 ({rewrite_key_label})."
                                                 )
-                                                future_map[fut] = idx
+                                                failed_indices.update(rewrite_indices)
+                                            else:
+                                                total_rw = len(rewrite_indices)
+                                                stat.info(f"상위 문제 {total_rw}문항 병렬 자동 개조 중 (최대 4스레드)...")
+                                                with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+                                                    future_map = {}
+                                                    for idx in rewrite_indices:
+                                                        q, j, crop_bytes, _ = prepared_items[idx]
+                                                        fut = submit_with_usage_context(
+                                                            executor,
+                                                            rewrite_question_for_pdf,
+                                                            api_key=rewrite_api_key,
+                                                            model_name=rewrite_model,
+                                                            question=q,
+                                                            crop_png_bytes=crop_bytes,
+                                                            whitelist=whitelist,
+                                                            out_of_scope_terms=j.out_of_scope_terms,
+                                                            sliced_text=sliced_text_ctx,
+                                                        )
+                                                        future_map[fut] = idx
 
-                                            done_cnt = 0
-                                            for fut in concurrent.futures.as_completed(future_map):
-                                                idx = future_map[fut]
-                                                q_done = prepared_items[idx][0]
-                                                done_cnt += 1
-                                                try:
-                                                    rewritten_results[idx] = fut.result()
-                                                except ForbiddenTermRemainingError as fexc:
-                                                    failed_indices.add(idx)
-                                                    st.warning(f"⛔ {q_done.id} 금지 용어 잔존으로 제외: {fexc}")
-                                                except Exception as exc:
-                                                    failed_indices.add(idx)
-                                                    st.error(f"{q_done.id} 개조 실패 (원본 제외): {exc}")
-                                                prog.progress(done_cnt / total_rw)
-                                                stat.info(f"상위 문제 병렬 자동 개조 중 ({done_cnt}/{total_rw})...")
+                                                    done_cnt = 0
+                                                    for fut in concurrent.futures.as_completed(future_map):
+                                                        idx = future_map[fut]
+                                                        q_done = prepared_items[idx][0]
+                                                        done_cnt += 1
+                                                        try:
+                                                            rewritten_results[idx] = fut.result()
+                                                        except ForbiddenTermRemainingError as fexc:
+                                                            failed_indices.add(idx)
+                                                            st.warning(f"⛔ {q_done.id} 금지 용어 잔존으로 제외: {fexc}")
+                                                        except Exception as exc:
+                                                            failed_indices.add(idx)
+                                                            st.error(f"{q_done.id} 개조 실패 (원본 제외): {exc}")
+                                                        prog.progress(done_cnt / total_rw)
+                                                        stat.info(f"상위 문제 병렬 자동 개조 중 ({done_cnt}/{total_rw})...")
 
-                                for idx, (q, j, crop_bytes, concept_ref) in enumerate(prepared_items):
-                                    if idx in failed_indices:
-                                        continue
-                                    assembled.append(
-                                        {
-                                            "question": q,
-                                            "judgment": j,
-                                            "crop_png_bytes": crop_bytes,
-                                            "rewritten": rewritten_results.get(idx),
-                                            "concept_reference": concept_ref,
-                                        }
-                                    )
+                                        for idx, (q, j, crop_bytes, concept_ref) in enumerate(prepared_items):
+                                            if idx in failed_indices:
+                                                continue
+                                            assembled.append(
+                                                {
+                                                    "question": q,
+                                                    "judgment": j,
+                                                    "crop_png_bytes": crop_bytes,
+                                                    "rewritten": rewritten_results.get(idx),
+                                                    "concept_reference": concept_ref,
+                                                }
+                                            )
 
-                                prog.progress(1.0)
-                                stat.empty()
-                                consume_extraction_quota(
-                                    ctx.storage, ctx.current_user.username, len(assembled)
-                                )
-                                rewritten_cnt = sum(1 for it in assembled if it["rewritten"] is not None)
-                                st.session_state["matched_items"] = assembled
-                                st.session_state["generated_exam_pdf"] = None
-                                st.session_state["user_answers"] = {}
-                                st.session_state["graded"] = False
-                                st.session_state["ai_explanations"] = {}
-                                st.session_state["ai_chats"] = {}
-                                st.session_state["_tab2_last_extract_summary"] = (
-                                    len(assembled),
-                                    sum(1 for it in assembled if it["rewritten"] is None),
-                                    rewritten_cnt,
-                                )
+                                        prog.progress(1.0)
+                                        stat.empty()
+                                        consume_extraction_quota(
+                                            ctx.storage, ctx.current_user.username, len(assembled)
+                                        )
+                                        rewritten_cnt = sum(1 for it in assembled if it["rewritten"] is not None)
+                                        orig_cnt = len(assembled) - rewritten_cnt
+                                        actual_ext_c = (
+                                            orig_cnt * CREDIT_COST_CONCEPT_MATCH_ORIG
+                                            + rewritten_cnt * CREDIT_COST_CONCEPT_REWRITE
+                                        )
+                                        st.session_state["matched_items"] = assembled
+                                        st.session_state["generated_exam_pdf"] = None
+                                        st.session_state["user_answers"] = {}
+                                        st.session_state["graded"] = False
+                                        st.session_state["ai_explanations"] = {}
+                                        st.session_state["ai_chats"] = {}
+                                        st.session_state["_tab2_last_extract_summary"] = (
+                                            len(assembled),
+                                            orig_cnt,
+                                            rewritten_cnt,
+                                            actual_ext_c,
+                                        )
+                                    finally:
+                                        settle_credits(
+                                            ctx,
+                                            ext_reservation,
+                                            actual_ext_c,
+                                            detail_note=f"수·사·과·한 추출·개조 ({len(assembled)}문항 확정 · {actual_ext_c:,}C)",
+                                        )
 
                         last_sum = st.session_state.pop("_tab2_last_extract_summary", None)
                         if last_sum is not None:
-                            tot_c, orig_c, rw_c = last_sum
-                            rem_msg = ""
-                            fresh_u = get_user_by_username(ctx.storage, ctx.current_user.username)
-                            if fresh_u is not None:
-                                m_lim = get_monthly_token_limit(fresh_u)
-                                m_rem = get_remaining_monthly_tokens(fresh_u)
-                                if m_lim is not None and m_rem is not None:
-                                    rem_msg = f" | 이번 달 잔여 토큰: {m_rem:,} / {format_token_count(m_lim)}"
+                            tot_c, orig_c, rw_c, charged_c = last_sum
+                            rem_msg = format_credit_balance_inline(
+                                ctx.storage,
+                                ctx.current_user.username if ctx.current_user is not None else "",
+                                charged=charged_c,
+                            )
                             st.success(
                                 f"🎯 총 {tot_c}문항 추출 완료! "
                                 f"(원문 그대로 {orig_c}문항 · 개념서 기준 개조 {rw_c}문항){rem_msg}"

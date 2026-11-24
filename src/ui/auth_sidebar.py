@@ -6,27 +6,33 @@ from typing import Any
 import streamlit as st
 
 from src.auth import (
+    CREDIT_COST_DIRECT_CONCEPT_PDF,
+    CREDIT_COST_ENGLISH_ANALYSIS,
+    CREDIT_COST_ENGLISH_VARIANT,
+    CREDIT_COST_KOREAN_ANALYSIS,
+    CREDIT_COST_KOREAN_SET_TRANSFORM,
     FREE_MAX_BATCH_QUESTIONS,
-    FREE_MONTHLY_TOKEN_LIMIT,
-    PRO_MONTHLY_TOKEN_LIMIT,
+    FREE_MONTHLY_CREDIT_LIMIT,
+    PRO_MONTHLY_CREDIT_LIMIT,
     TIER_LABELS,
-    ULTRA_MONTHLY_TOKEN_LIMIT,
+    ULTRA_MONTHLY_CREDIT_LIMIT,
     authenticate_google_user,
     authenticate_user,
-    clear_user_custom_api_key,
     create_session_token,
-    format_token_count,
-    get_monthly_token_limit,
-    get_remaining_monthly_tokens,
-    get_used_monthly_tokens,
+    format_credit_count,
+    get_bonus_credits,
+    get_daily_free_ai_limit,
+    get_daily_free_ai_used,
+    get_monthly_credit_limit,
+    get_remaining_monthly_base_credits,
+    get_total_available_credits,
+    get_used_monthly_credits,
     get_user_by_username,
     link_google_account,
-    mask_api_key,
     register_google_user,
     register_local_credentials_for_user,
     register_user,
     resolve_active_gemini_api_key,
-    save_user_custom_api_key,
     unlink_google_account,
     verify_session_token,
 )
@@ -329,46 +335,44 @@ def render_auth_and_sidebar(
             upload_gemini_key, upload_key_label = resolve_active_gemini_api_key(
                 current_user, creds.gemini_api_key, force_server_key=True
             )
-            monthly_limit = get_monthly_token_limit(current_user)
-            monthly_used = get_used_monthly_tokens(current_user)
-            monthly_rem = get_remaining_monthly_tokens(current_user)
+            credit_limit = get_monthly_credit_limit(current_user)
+            credit_used = get_used_monthly_credits(current_user)
+            base_rem = get_remaining_monthly_base_credits(current_user)
+            bonus_rem = get_bonus_credits(current_user)
+            total_avail = get_total_available_credits(current_user)
+            free_ai_used = get_daily_free_ai_used(current_user)
+            free_ai_lim = get_daily_free_ai_limit(current_user)
+            bonus_html = f" <span style='color:#059669;'>(+보너스 {bonus_rem:,}C)</span>" if bonus_rem > 0 else ""
 
             if tier_code == "FREE":
                 status_line = (
                     f"<div style='font-size:0.83rem; color:#334155; margin-top:0.45rem;'>"
-                    f"모델: <b>Gemini 3.5 Flash-Lite</b> (1회 최대 {FREE_MAX_BATCH_QUESTIONS}문항)<br/>"
-                    f"월간 토큰 잔여: <b>{monthly_rem:,} / {format_token_count(monthly_limit or 0)}</b> "
-                    f"<span style='color:#64748B;'>(사용 {monthly_used:,})</span>"
+                    f"가용 크레딧: <b>{total_avail:,}C</b> "
+                    f"<span style='color:#64748B;'>(월간 {base_rem:,}/{credit_limit or 0:,}C)</span>{bonus_html}<br/>"
+                    f"1회 최대 {FREE_MAX_BATCH_QUESTIONS}문항 · 오늘 무료 AI {free_ai_used}/{free_ai_lim}회"
                     f"</div>"
-                )
-            elif tier_code == "CUSTOM":
-                masked = _html.escape(mask_api_key(current_user.custom_api_key))
-                status_line = (
-                    f"<div style='font-size:0.83rem; color:#166534; margin-top:0.45rem;'>"
-                    f"등록된 개인 키: <code>{masked}</code>"
-                    f"<br/><b>Gemini 3.5 Flash-Lite · 개인 키 무제한</b>"
-                    f"<br/><span style='color:#64748B;'>이번 달 사용: {monthly_used:,} 토큰</span></div>"
                 )
             elif tier_code == "PRO":
                 status_line = (
                     f"<div style='font-size:0.83rem; color:#1D4ED8; margin-top:0.45rem;'>"
-                    f"✨ 모델: <b>Gemini 3.5 Flash-Lite</b> · 배치 무제한<br/>"
-                    f"월간 토큰 잔여: <b>{monthly_rem:,} / {format_token_count(monthly_limit or 0)}</b> "
-                    f"<span style='color:#64748B;'>(사용 {monthly_used:,})</span>"
+                    f"✨ 가용 크레딧: <b>{total_avail:,}C</b> "
+                    f"<span style='color:#64748B;'>(월간 {base_rem:,}/{credit_limit or 0:,}C)</span>{bonus_html}<br/>"
+                    f"배치 무제한 · 오늘 무료 AI {free_ai_used}/{free_ai_lim}회"
                     f"</div>"
                 )
             elif tier_code == "ULTRA":
                 status_line = (
-                    "<div style='font-size:0.83rem; color:#C2410C; font-weight:600; margin-top:0.45rem;'>"
-                    "🔥 모델: <b>Gemini 3.5 Flash-Lite</b> · PRO 대비 4배<br/>"
-                    f"월간 토큰 잔여: <b>{monthly_rem:,} / {format_token_count(monthly_limit or 0)}</b> "
-                    f"<span style='color:#9A3412; font-weight:400;'>(사용 {monthly_used:,})</span></div>"
+                    f"<div style='font-size:0.83rem; color:#C2410C; font-weight:600; margin-top:0.45rem;'>"
+                    f"🔥 가용 크레딧: <b>{total_avail:,}C</b> "
+                    f"<span style='color:#9A3412; font-weight:400;'>(월간 {base_rem:,}/{credit_limit or 0:,}C)</span>{bonus_html}<br/>"
+                    f"PRO 대비 4배 · 오늘 무료 AI {free_ai_used}/{free_ai_lim}회"
+                    f"</div>"
                 )
             else:
                 status_line = (
                     "<div style='font-size:0.83rem; color:#1D4ED8; font-weight:600; margin-top:0.45rem;'>"
-                    "🛡️ 최고 관리자 · 전체 기능 및 토큰·비용 관리<br/>"
-                    f"<span style='color:#64748B; font-weight:400;'>이번 달 사용: {monthly_used:,} 토큰</span></div>"
+                    "🛡️ 최고 관리자 · 크레딧 & 공용 DB 무제한<br/>"
+                    f"<span style='color:#64748B; font-weight:400;'>이번 달 누적 사용: {credit_used:,}C</span></div>"
                 )
 
             _has_local = bool(getattr(current_user, "has_local_credentials", True) and current_user.password_hash)
@@ -397,50 +401,42 @@ def render_auth_and_sidebar(
                 unsafe_allow_html=True,
             )
 
-            if monthly_limit is not None and monthly_rem is not None:
-                rem_ratio = max(0.0, min(1.0, monthly_rem / max(1, monthly_limit)))
+            if credit_limit is not None and base_rem is not None:
+                rem_ratio = max(0.0, min(1.0, base_rem / max(1, credit_limit)))
                 st.progress(rem_ratio)
 
-            # CUSTOM 개인 API 키 관리 UI
-            if tier_code == "FREE":
-                show_custom_form = st.toggle(
-                    "🔑 개인 API 키 등록하여 무제한 쓰기",
-                    key="sidebar_toggle_custom_key",
-                )
-                if show_custom_form:
-                    with st.form("sidebar_custom_key_form", clear_on_submit=True):
-                        user_api_input = st.text_input(
-                            "내 Gemini API 키 (AIza...)",
-                            type="password",
-                            placeholder="AIzaSy...",
+            _show_credit_ledger = st.toggle(
+                "📜 내 크레딧 사용 내역 (최근 20건)",
+                key="sidebar_toggle_my_credit_ledger",
+            )
+            if _show_credit_ledger:
+                ledger_rows = storage.read_credit_ledger(username=current_user.username, limit=20)
+                if not ledger_rows:
+                    st.caption("아직 크레딧 사용·지급 내역이 없습니다.")
+                else:
+                    for lr in ledger_rows:
+                        ts_disp = str(lr.get("ts") or "")[5:16].replace("T", " ")
+                        delta_v = int(lr.get("delta") or 0)
+                        delta_str = f"+{delta_v:,}C" if delta_v > 0 else f"{delta_v:,}C"
+                        ev = str(lr.get("event") or "")
+                        ev_badge = {
+                            "USE": "차감",
+                            "REFUND": "환불",
+                            "BONUS_GRANT": "보너스",
+                            "BONUS_DEDUCT": "회수",
+                            "MONTHLY_RESET": "초기화",
+                        }.get(ev, ev)
+                        avail_v = lr.get("avail_after")
+                        bal_txt = "무제한" if avail_v is None else f"{int(avail_v):,}C"
+                        rsn = _html.escape(str(lr.get("reason") or ""))
+                        st.markdown(
+                            f"<div style='font-size:0.75rem; padding:4px 6px; margin-bottom:4px; "
+                            f"background:#F8FAFC; border:1px solid #E2E8F0; border-radius:6px;'>"
+                            f"<b>[{ev_badge}] {delta_str}</b> · 잔여 {bal_txt} "
+                            f"<span style='color:#64748B;'>({ts_disp})</span><br/>"
+                            f"<span style='color:#334155;'>{rsn}</span></div>",
+                            unsafe_allow_html=True,
                         )
-                        save_key_btn = st.form_submit_button(
-                            "💾 개인 키 저장 & 무제한 모드 전환",
-                            type="primary",
-                            width="stretch",
-                        )
-                    if save_key_btn:
-                        ok_k, msg_k, updated_u = save_user_custom_api_key(
-                            storage, current_user.username, user_api_input
-                        )
-                        if ok_k:
-                            st.success(msg_k)
-                            st.rerun()
-                        else:
-                            st.error(msg_k)
-            elif tier_code == "CUSTOM" or bool(current_user.custom_api_key):
-                st.caption(f"저장된 개인 키: `{mask_api_key(current_user.custom_api_key)}`")
-                if st.button(
-                    "🗑️ 개인 키 삭제 / 무료 회원으로 복귀",
-                    key="clear_custom_key_btn",
-                    width="stretch",
-                ):
-                    ok_c, msg_c, _ = clear_user_custom_api_key(storage, current_user.username)
-                    if ok_c:
-                        st.info(msg_c)
-                        st.rerun()
-                    else:
-                        st.error(msg_c)
 
             # 계정 · Google 연동 관리 UI
             _show_acc_link = st.toggle(
@@ -553,42 +549,44 @@ def render_auth_and_sidebar(
 
 
 def render_guest_landing() -> None:
-    """비로그인 상태일 때 멤버십 등급 안내 카드 5종을 출력한다."""
-    st.info("👈 좌측 사이드바 상단의 **[로그인 / 회원가입]** 탭에서 로그인하시면 기출 수집·추출·문제 개조 기능을 이용하실 수 있습니다.")
-    t_col1, t_col2, t_col3, t_col4, t_col5 = st.columns(5)
+    """비로그인 상태일 때 멤버십 등급 안내 카드 4종 및 정액 크레딧 단가표를 출력한다."""
+    st.info("👈 좌측 사이드바 상단의 **[로그인 / 회원가입]** 탭에서 로그인하시면 기출 탐색·변형문제 출제·지문 분석지 PDF 기능을 이용하실 수 있습니다.")
+    t_col1, t_col2, t_col3, t_col4 = st.columns(4)
     with t_col1:
         with st.container(border=True):
             st.markdown("<span class='tier-badge tier-FREE'>FREE · 0원</span>", unsafe_allow_html=True)
             st.markdown("#### 무료 회원")
-            st.write(f"- Gemini 3.5 Flash-Lite **월 {format_token_count(FREE_MONTHLY_TOKEN_LIMIT)} 토큰**")
+            st.write(f"- **월 {format_credit_count(FREE_MONTHLY_CREDIT_LIMIT)}** 크레딧 제공")
             st.write(f"- 1회 생성 **최대 {FREE_MAX_BATCH_QUESTIONS}문항** 제한")
-            st.write("- 매월 1일(KST) 한도 자동 초기화")
+            st.write("- 기출 DB 열람 · AI 해설/영단어 무료")
     with t_col2:
-        with st.container(border=True):
-            st.markdown("<span class='tier-badge tier-CUSTOM'>CUSTOM · 0원</span>", unsafe_allow_html=True)
-            st.markdown("#### 개인 API 키")
-            st.write("- **본인 Gemini API 키** 등록")
-            st.write("- Gemini 3.5 Flash-Lite **토큰 무제한**")
-            st.write("- 1회 배치 제한 없음 · 즉시 전환")
-    with t_col3:
         with st.container(border=True):
             st.markdown("<span class='tier-badge tier-PRO'>PRO · 9,900원/월</span>", unsafe_allow_html=True)
             st.markdown("#### 스탠다드 유료")
-            st.write(f"- Gemini 3.5 Flash-Lite **월 {format_token_count(PRO_MONTHLY_TOKEN_LIMIT)} 토큰**")
+            st.write(f"- **월 {format_credit_count(PRO_MONTHLY_CREDIT_LIMIT)}** 크레딧 제공")
             st.write("- 1회 생성 문항 수 **제한 없음**")
-            st.write("- **공용 개념서 DB** 구축·이용 & 재태깅")
-    with t_col4:
+            st.write("- **공용 기출·개념서 DB** 구축/이용 (0C)")
+    with t_col3:
         with st.container(border=True):
             st.markdown("<span class='tier-badge tier-ULTRA'>ULTRA · 19,900원/월</span>", unsafe_allow_html=True)
             st.markdown("#### 대용량 유료 (4배)")
             st.write("- PRO 모든 혜택 포함")
-            st.write(f"- Gemini 3.5 Flash-Lite **월 {format_token_count(ULTRA_MONTHLY_TOKEN_LIMIT)} 토큰** (PRO 4배)")
-            st.write("- **공용 개념서 DB** 구축·이용 & 재태깅")
-    with t_col5:
+            st.write(f"- **월 {format_credit_count(ULTRA_MONTHLY_CREDIT_LIMIT)}** 크레딧 (PRO 4배)")
+            st.write("- 학원·교사용 대용량 출제 최적화")
+    with t_col4:
         with st.container(border=True):
             st.markdown("<span class='tier-badge tier-ADMIN'>ADMIN</span>", unsafe_allow_html=True)
             st.markdown("#### 최고 관리자")
-            st.write("- 모든 기능·토큰 **무제한** (관리자 전용)")
-            st.write("- **공용 개념서 DB** 구축 & 관리")
-            st.write("- **회원 등급 · API 원화 비용** 관리")
+            st.write("- 모든 기능·크레딧 **무제한**")
+            st.write("- 공용 DB 수정·삭제 · NCIC 기준표 관리")
+            st.write("- 회원 등급 · 보너스 · 원화 비용 관리")
+
+    st.caption(
+        f"💳 **정액 크레딧 안내 (신규 생성 · 캐시 풀 동일)**: "
+        f"영어 변형 **{CREDIT_COST_ENGLISH_VARIANT}C/문항** · 영어 분석지 **{CREDIT_COST_ENGLISH_ANALYSIS}C/지문** · "
+        f"국어 변형/분석지 **각 {CREDIT_COST_KOREAN_SET_TRANSFORM}C/세트** · "
+        f"수·사·과·한 **개조 {CREDIT_COST_CONCEPT_REWRITE}C / 무개조 {CREDIT_COST_CONCEPT_MATCH_ORIG}C** · "
+        f"개인 개념서 PDF **{CREDIT_COST_DIRECT_CONCEPT_PDF}C/회** · "
+        f"AI 해설·1:1질문·영단어 사전 **0C 무료**"
+    )
     st.stop()
