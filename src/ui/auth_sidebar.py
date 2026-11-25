@@ -6,6 +6,8 @@ from typing import Any
 import streamlit as st
 
 from src.auth import (
+    CREDIT_COST_CONCEPT_MATCH_ORIG,
+    CREDIT_COST_CONCEPT_REWRITE,
     CREDIT_COST_DIRECT_CONCEPT_PDF,
     CREDIT_COST_ENGLISH_ANALYSIS,
     CREDIT_COST_ENGLISH_VARIANT,

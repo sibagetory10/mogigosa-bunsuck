@@ -37,6 +37,7 @@ from src.text_formatter import has_visual_reference
 from src.ui.common import (
     _auto_save_current_exam,
     _build_exam_sig,
+    _ensure_token_quota,
     _record_english_seen_for_user,
     _render_rewritten_card_html,
     _usage_scope,
