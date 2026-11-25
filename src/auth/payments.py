@@ -30,6 +30,10 @@ if TYPE_CHECKING:
     from src.models import PaymentOrder, PaymentPlanType, UserRecord
     from src.storage import StorageManager
 
+PAYMENT_SUBMIT_COOLDOWN_SECONDS: int = 180
+PAYMENT_MAX_DAILY_SUBMISSIONS: int = 3
+PAYMENT_MAX_DAILY_REJECTIONS: int = 2
+
 PAYMENT_PLAN_SPECS: dict[PaymentPlanType, dict[str, Any]] = {
     "PRO": {
         "tier": "PRO",
@@ -164,6 +168,72 @@ def test_discord_webhook(webhook_url: str) -> tuple[bool, str]:
     return send_discord_payment_notification(webhook_url, order=None, is_test=True, timeout=5)
 
 
+def check_payment_submission_rate_limit(
+    storage: StorageManager,
+    username: str,
+    now_dt: datetime | None = None,
+    orders: list[PaymentOrder] | None = None,
+) -> tuple[bool, str]:
+    """연속 입금 요청 도배를 막기 위해 대기 건, 당일 반려 잠금, 일일 신청 한도, 쿨다운을 검사한다."""
+    norm_id = normalize_username(username)
+    if not norm_id:
+        return False, "로그인 계정 정보를 확인할 수 없습니다. 다시 로그인해 주세요."
+
+    cur_dt = _resolve_cur_kst(now_dt)
+    today = cur_dt.strftime("%Y-%m-%d")
+    all_orders = orders if orders is not None else storage.load_payment_orders()
+    user_orders = [o for o in all_orders if o.username == norm_id]
+
+    if any(o.status == "PENDING" for o in user_orders):
+        return (
+            False,
+            "이미 승인 대기 중인 입금 확인 요청이 있습니다. 기존 요청이 처리되거나 취소한 뒤 다시 신청해 주세요.",
+        )
+
+    today_rejected = sum(
+        1
+        for o in user_orders
+        if o.status == "REJECTED"
+        and str(o.processed_at or o.requested_at or "")[:10] == today
+    )
+    if today_rejected >= PAYMENT_MAX_DAILY_REJECTIONS:
+        return (
+            False,
+            f"🚫 오늘 입금 확인 요청이 {today_rejected}회 반려되어 자정(KST)까지 추가 신청이 제한됩니다. "
+            "실제 입금 후 문의가 필요하면 관리자에게 연락해 주세요.",
+        )
+
+    today_submissions = sum(
+        1 for o in user_orders if str(o.requested_at or "")[:10] == today
+    )
+    if today_submissions >= PAYMENT_MAX_DAILY_SUBMISSIONS:
+        return (
+            False,
+            f"🚫 하루 최대 입금 확인 신청 횟수({PAYMENT_MAX_DAILY_SUBMISSIONS}회)를 모두 사용했습니다. "
+            "매일 자정(KST) 초기화됩니다.",
+        )
+
+    latest_req_dt: datetime | None = None
+    for o in user_orders:
+        req_dt = parse_kst_iso(getattr(o, "requested_at", ""))
+        if req_dt is not None and (latest_req_dt is None or req_dt > latest_req_dt):
+            latest_req_dt = req_dt
+
+    if latest_req_dt is not None:
+        elapsed = (cur_dt - latest_req_dt).total_seconds()
+        if 0 <= elapsed < PAYMENT_SUBMIT_COOLDOWN_SECONDS:
+            wait_sec = int(PAYMENT_SUBMIT_COOLDOWN_SECONDS - elapsed + 0.999)
+            mins, secs = divmod(max(1, wait_sec), 60)
+            wait_txt = f"{mins}분 {secs}초" if mins > 0 else f"{secs}초"
+            return (
+                False,
+                f"⏳ 연속 신청 방지를 위해 직전 요청 후 {PAYMENT_SUBMIT_COOLDOWN_SECONDS // 60}분간 "
+                f"재신청이 제한됩니다. **{wait_txt}** 뒤에 다시 시도해 주세요.",
+            )
+
+    return True, ""
+
+
 def submit_payment_order(
     storage: StorageManager,
     username: str,
@@ -203,12 +273,14 @@ def submit_payment_order(
             return False, "현재 관리자가 입금 계좌 정보를 준비 중입니다. 잠시 후 다시 시도해 주세요.", None
 
         orders = storage.load_payment_orders()
-        if any(o.username == norm_id and o.status == "PENDING" for o in orders):
-            return (
-                False,
-                "이미 승인 대기 중인 입금 확인 요청이 있습니다. 기존 요청이 처리되거나 취소한 뒤 다시 신청해 주세요.",
-                None,
-            )
+        allowed, limit_msg = check_payment_submission_rate_limit(
+            storage,
+            norm_id,
+            now_dt=cur_dt,
+            orders=orders,
+        )
+        if not allowed:
+            return False, limit_msg, None
 
         existing_ids = {o.order_id for o in orders}
         date_part = cur_dt.strftime("%Y%m%d")

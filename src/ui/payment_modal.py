@@ -8,13 +8,16 @@ import streamlit as st
 from src.auth import (
     FREE_MAX_BATCH_QUESTIONS,
     FREE_MONTHLY_CREDIT_LIMIT,
+    PAYMENT_MAX_DAILY_SUBMISSIONS,
     PAYMENT_PLAN_SPECS,
+    PAYMENT_SUBMIT_COOLDOWN_SECONDS,
     PRO_MONTHLY_CREDIT_LIMIT,
     PRO_MONTHLY_PRICE_KRW,
     TIER_LABELS,
     ULTRA_MONTHLY_CREDIT_LIMIT,
     ULTRA_MONTHLY_PRICE_KRW,
     cancel_my_pending_order,
+    check_payment_submission_rate_limit,
     format_tier_expiry_badge,
     get_effective_tier,
     get_total_available_credits,
@@ -153,49 +156,61 @@ def open_payment_dialog(storage: StorageManager, current_user: UserRecord) -> No
             else:
                 st.error(msg_c)
     elif settings.enabled and settings.has_transfer_method:
-        default_plan: PaymentPlanType = "PRO" if eff_tier != "ULTRA" else "ULTRA"
-        plan_options: list[PaymentPlanType] = ["PRO", "ULTRA"]
-        with st.form("user_submit_payment_order_form"):
-            selected_plan = st.radio(
-                "신청할 요금제 선택",
-                options=plan_options,
-                index=plan_options.index(default_plan),
-                format_func=lambda t: (
-                    f"{PAYMENT_PLAN_SPECS[t]['label']} — ₩{PAYMENT_PLAN_SPECS[t]['price_krw']:,} "
-                    f"(월 {PAYMENT_PLAN_SPECS[t]['monthly_credits']:,}C)"
-                ),
-                horizontal=True,
-            )
-            depositor_name = st.text_input(
-                "입금자명 (실제 계좌이체·송금에 표시된 성함)",
-                value=user.nickname,
-                max_chars=30,
-                placeholder="학부모님 등 다른 분 성함으로 송금하신 경우 실제 입금자명으로 수정해 주세요.",
-            )
-            user_note = st.text_input(
-                "연락처 또는 메모 (선택)",
-                max_chars=120,
-                placeholder="예: 010-1234-5678 / 타인 명의 입금 확인 부탁드립니다.",
-            )
-            submitted = st.form_submit_button(
-                "✅ 입금 완료 · 승인 요청 보내기",
-                type="primary",
-                width="stretch",
+        can_submit, limit_msg = check_payment_submission_rate_limit(
+            storage,
+            user.username,
+            orders=user_orders,
+        )
+        if not can_submit:
+            st.warning(limit_msg)
+        else:
+            default_plan: PaymentPlanType = "PRO" if eff_tier != "ULTRA" else "ULTRA"
+            plan_options: list[PaymentPlanType] = ["PRO", "ULTRA"]
+            with st.form("user_submit_payment_order_form"):
+                selected_plan = st.radio(
+                    "신청할 요금제 선택",
+                    options=plan_options,
+                    index=plan_options.index(default_plan),
+                    format_func=lambda t: (
+                        f"{PAYMENT_PLAN_SPECS[t]['label']} — ₩{PAYMENT_PLAN_SPECS[t]['price_krw']:,} "
+                        f"(월 {PAYMENT_PLAN_SPECS[t]['monthly_credits']:,}C)"
+                    ),
+                    horizontal=True,
+                )
+                depositor_name = st.text_input(
+                    "입금자명 (실제 계좌이체·송금에 표시된 성함)",
+                    value=user.nickname,
+                    max_chars=30,
+                    placeholder="학부모님 등 다른 분 성함으로 송금하신 경우 실제 입금자명으로 수정해 주세요.",
+                )
+                user_note = st.text_input(
+                    "연락처 또는 메모 (선택)",
+                    max_chars=120,
+                    placeholder="예: 010-1234-5678 / 타인 명의 입금 확인 부탁드립니다.",
+                )
+                submitted = st.form_submit_button(
+                    "✅ 입금 완료 · 승인 요청 보내기",
+                    type="primary",
+                    width="stretch",
+                )
+            st.caption(
+                f"※ 도배 방지를 위해 신청 후 {PAYMENT_SUBMIT_COOLDOWN_SECONDS // 60}분 쿨다운 · "
+                f"1일 최대 {PAYMENT_MAX_DAILY_SUBMISSIONS}회까지 요청할 수 있습니다."
             )
 
-        if submitted:
-            ok_s, msg_s, _ = submit_payment_order(
-                storage,
-                username=user.username,
-                plan_tier=selected_plan,
-                depositor_name=depositor_name,
-                user_note=user_note,
-            )
-            if ok_s:
-                st.session_state["auth_flash_msg"] = ("success", msg_s)
-                st.rerun()
-            else:
-                st.error(msg_s)
+            if submitted:
+                ok_s, msg_s, _ = submit_payment_order(
+                    storage,
+                    username=user.username,
+                    plan_tier=selected_plan,
+                    depositor_name=depositor_name,
+                    user_note=user_note,
+                )
+                if ok_s:
+                    st.session_state["auth_flash_msg"] = ("success", msg_s)
+                    st.rerun()
+                else:
+                    st.error(msg_s)
 
     if user_orders:
         st.markdown("---")

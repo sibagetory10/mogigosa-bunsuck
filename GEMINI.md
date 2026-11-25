@@ -51,7 +51,7 @@
 - **단일 서버 키 & `CUSTOM` 폐지**: 레거시 `CUSTOM`/`BYOK` 계정은 로드 시 `FREE`로 자동 이관되며 `custom_api_key`도 공백으로 파기된다.
 - **정액 크레딧 단가 (신규 생성 · 캐시 풀 히트 동일)**: 영어 변형 `2C/문항`, 영어 분석지 `4C/지문`, 국어 세트 변형·분석지 각 `10C/세트`, 수·사·과·한 `개조 3C / 무개조 1C`, 개인 개념서 PDF 추출 `3C/회`, 개별 재변환 `영어 2C / 수·사·과·한 3C`. AI 해설·1:1 채팅·영단어 사전은 `0C` 무료(단, 시드/캐시 히트 외 신규 AI 호출 시 일일 무료 한도 차감).
 - **원자적 선예치·환불 & 원장**: `acquire_credit_reservation` / `settle_credit_reservation`으로 동시 실행 차단 및 월간 기본 크레딧 우선 차감 후 `bonus_credits` 차감·미성공분 자동 환불을 수행하며 모든 변동은 `exam_db/credit_ledger.jsonl`에 기록된다.
-- **무통장입금·송금 링크 결제 수명주기 (`src/auth/payments.py`)**: 사업자등록 전 단계 계좌이체/카카오·토스 링크 안내 → 회원 입금 확인 신청(`PENDING`, 중복 차단) → Discord 웹훅 실시간 알림 → 관리자 원클릭 승인(`APPROVED` · 당월 `0C` 리셋 · 동일 등급 `+30일` 합산 연장 / 타 등급 `승인일+30일`) 및 반려(`REJECTED`). 만료 시각(`tier_expires_at`) 도래 시 `get_effective_tier()` 0초 즉시 `FREE` 판정 + 60초·자정 자동 스윕(`maybe_sweep_expired_users`)으로 강등. 승인 건 환불(`REFUNDED`) 시 직전 구독 복원 및 승인 전후 소비량 역산(`refund_credit_debt` 상계)으로 크레딧 이중 수령을 원천 차단하며, 관리자 표 수동 승급(지인·테스터)은 무기한 유지 및 실매출 집계에서 제외한다.
+- **무통장입금·송금 링크 결제 수명주기 (`src/auth/payments.py`)**: 사업자등록 전 단계 계좌이체/카카오·토스 링크 안내 → 회원 입금 확인 신청(`PENDING`, 중복 차단 및 연속 신청 방지: 3분 쿨다운 · 일 3회 · 일 2회 반려 시 당일 잠금) → Discord 웹훅 실시간 알림 → 관리자 원클릭 승인(`APPROVED` · 당월 `0C` 리셋 · 동일 등급 `+30일` 합산 연장 / 타 등급 `승인일+30일`) 및 반려(`REJECTED`). 만료 시각(`tier_expires_at`) 도래 시 `get_effective_tier()` 0초 즉시 `FREE` 판정 + 60초·자정 자동 스윕(`maybe_sweep_expired_users`)으로 강등. 승인 건 환불(`REFUNDED`) 시 직전 구독 복원 및 승인 전후 소비량 역산(`refund_credit_debt` 상계)으로 크레딧 이중 수령을 원천 차단하며, 관리자 표 수동 승급(지인·테스터)은 무기한 유지 및 실매출 집계에서 제외한다.
 - **인증 방식**: 로컬 ID/PW 로그인(PBKDF2-HMAC-SHA256 + 서명된 세션 토큰 유지) 및 Google OAuth 2.0 웹 로그인(`src/auth/oauth.py`) 동시 지원.
 
 ---

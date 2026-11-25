@@ -95,9 +95,13 @@ _SUBMODULE_EXPORTS: dict[str, tuple[str, ...]] = {
         "unlink_google_account",
     ),
     "src.auth.payments": (
+        "PAYMENT_MAX_DAILY_REJECTIONS",
+        "PAYMENT_MAX_DAILY_SUBMISSIONS",
         "PAYMENT_PLAN_SPECS",
+        "PAYMENT_SUBMIT_COOLDOWN_SECONDS",
         "approve_payment_order",
         "cancel_my_pending_order",
+        "check_payment_submission_rate_limit",
         "format_tier_expiry_badge",
         "get_order_consumed_base_credits",
         "refund_payment_order",

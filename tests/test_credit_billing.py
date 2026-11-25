@@ -316,16 +316,18 @@ class CreditBillingTests(unittest.TestCase):
         ok_can, _ = cancel_my_pending_order(self.storage, "pay_u2", ord1.order_id, now_dt=t0)
         self.assertTrue(ok_can)
 
-        ok2, _, ord2 = submit_payment_order(self.storage, "pay_u2", "ULTRA", "유저2", now_dt=t0)
+        t1 = t0 + timedelta(minutes=4)
+        ok2, _, ord2 = submit_payment_order(self.storage, "pay_u2", "ULTRA", "유저2", now_dt=t1)
         self.assertTrue(ok2 and ord2 is not None)
         assert ord2 is not None
 
         ok_rej, _ = reject_payment_order(
-            self.storage, ord2.order_id, admin_username="admin", reason="입금 미확인", now_dt=t0
+            self.storage, ord2.order_id, admin_username="admin", reason="입금 미확인", now_dt=t1
         )
         self.assertTrue(ok_rej)
 
-        ok3, _, ord3 = submit_payment_order(self.storage, "pay_u2", "ULTRA", "유저2", now_dt=t0)
+        t2 = t1 + timedelta(minutes=4)
+        ok3, _, ord3 = submit_payment_order(self.storage, "pay_u2", "ULTRA", "유저2", now_dt=t2)
         self.assertTrue(ok3 and ord3 is not None)
 
     def test_same_tier_extension_stacks_and_cross_tier_resets_30_days(self) -> None:
@@ -434,9 +436,10 @@ class CreditBillingTests(unittest.TestCase):
         self.assertEqual(rev_after_rf["total_refunded_krw"], 19800)
 
         # 재결제 시 400C 부채가 즉시 상계되어 가용 200C만 남고 부채 0으로 정리
-        _, _, ord_b2 = submit_payment_order(self.storage, "sc_b", "PRO", "과소비환불", now_dt=now_dt)
+        t_re = now_dt + timedelta(minutes=4)
+        _, _, ord_b2 = submit_payment_order(self.storage, "sc_b", "PRO", "과소비환불", now_dt=t_re)
         assert ord_b2 is not None
-        approve_payment_order(self.storage, ord_b2.order_id, "admin", now_dt=now_dt)
+        approve_payment_order(self.storage, ord_b2.order_id, "admin", now_dt=t_re)
         u_b2 = get_user_by_username(self.storage, "sc_b")
         assert u_b2 is not None
         self.assertEqual(get_total_available_credits(u_b2), 200)
@@ -506,6 +509,73 @@ class CreditBillingTests(unittest.TestCase):
         orders = self.storage.load_payment_orders()
         self.assertTrue(any(o.username == "real_student01" for o in orders))
         self.assertFalse(any(o.username == "g_temp123" for o in orders))
+
+    def test_payment_request_rate_limit_cooldown_daily_cap_and_reject_lock(self) -> None:
+        self._setup_payment_settings()
+        register_user(self.storage, "spam_u", "도배유저", "1234")
+        t0 = datetime(2026, 11, 25, 10, 0, 0, tzinfo=KST)
+
+        # 1) 신청 -> 취소 -> 60초 뒤 재신청 차단(3분 쿨다운) -> 181초 뒤 허용
+        ok1, _, o1 = submit_payment_order(self.storage, "spam_u", "PRO", "도배", now_dt=t0)
+        self.assertTrue(ok1 and o1 is not None)
+        assert o1 is not None
+        cancel_my_pending_order(self.storage, "spam_u", o1.order_id, now_dt=t0 + timedelta(seconds=10))
+
+        ok_fast, msg_fast, _ = submit_payment_order(
+            self.storage, "spam_u", "PRO", "도배", now_dt=t0 + timedelta(seconds=60)
+        )
+        self.assertFalse(ok_fast)
+        self.assertIn("재신청이 제한됩니다", msg_fast)
+
+        ok2, _, o2 = submit_payment_order(
+            self.storage, "spam_u", "PRO", "도배", now_dt=t0 + timedelta(seconds=181)
+        )
+        self.assertTrue(ok2 and o2 is not None)
+        assert o2 is not None
+        cancel_my_pending_order(self.storage, "spam_u", o2.order_id, now_dt=t0 + timedelta(seconds=190))
+
+        # 2) 당일 3번째 신청 후 취소 -> 4번째 신청은 쿨다운이 지나도 일일 3회 한도 차단 -> 익일 허용
+        ok3, _, o3 = submit_payment_order(
+            self.storage, "spam_u", "PRO", "도배", now_dt=t0 + timedelta(minutes=8)
+        )
+        self.assertTrue(ok3 and o3 is not None)
+        assert o3 is not None
+        cancel_my_pending_order(self.storage, "spam_u", o3.order_id, now_dt=t0 + timedelta(minutes=9))
+
+        ok_4th, msg_4th, _ = submit_payment_order(
+            self.storage, "spam_u", "PRO", "도배", now_dt=t0 + timedelta(minutes=20)
+        )
+        self.assertFalse(ok_4th)
+        self.assertIn("하루 최대 입금 확인 신청 횟수", msg_4th)
+
+        next_day = t0 + timedelta(days=1)
+        ok_next, _, _ = submit_payment_order(self.storage, "spam_u", "PRO", "도배", now_dt=next_day)
+        self.assertTrue(ok_next)
+
+        # 3) 같은 날 2회 반려(REJECTED) 시 당일 3번째 신청 즉시 잠금 -> 익일 허용
+        register_user(self.storage, "rej_u", "반려유저", "1234")
+        _, _, r1 = submit_payment_order(self.storage, "rej_u", "PRO", "반려", now_dt=t0)
+        assert r1 is not None
+        reject_payment_order(self.storage, r1.order_id, "admin", "미입금", now_dt=t0 + timedelta(minutes=1))
+
+        _, _, r2 = submit_payment_order(
+            self.storage, "rej_u", "PRO", "반려", now_dt=t0 + timedelta(minutes=5)
+        )
+        assert r2 is not None
+        reject_payment_order(
+            self.storage, r2.order_id, "admin", "미입금", now_dt=t0 + timedelta(minutes=6)
+        )
+
+        ok_locked, msg_locked, _ = submit_payment_order(
+            self.storage, "rej_u", "PRO", "반려", now_dt=t0 + timedelta(minutes=30)
+        )
+        self.assertFalse(ok_locked)
+        self.assertIn("반려되어 자정(KST)까지 추가 신청이 제한됩니다", msg_locked)
+
+        ok_unlock_next, _, _ = submit_payment_order(
+            self.storage, "rej_u", "PRO", "반려", now_dt=t0 + timedelta(days=1)
+        )
+        self.assertTrue(ok_unlock_next)
 
 
 if __name__ == "__main__":
