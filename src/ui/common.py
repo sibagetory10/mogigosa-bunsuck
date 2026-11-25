@@ -81,6 +81,8 @@ def _init_session_defaults() -> None:
         "logged_in_username": "",
         "pending_google_signup": None,
         "auth_flash_msg": None,
+        "open_payment_modal_requested": False,
+        "_upg_cta_seq": 0,
         "tab1_last_loaded_sig": "",
         "tab1_meta_status": "",
         "meta_year": "",
@@ -213,6 +215,22 @@ def _ensure_token_quota(
 ensure_token_quota = _ensure_token_quota
 
 
+def _render_upgrade_cta_button(prefix: str = "upg_cta") -> None:
+    """크레딧 부족 경고 아래에서 결제 신청 모달을 바로 여는 CTA 버튼을 렌더링한다."""
+    uname = str(st.session_state.get("logged_in_username") or "").strip()
+    if not uname:
+        return
+    seq = int(st.session_state.get("_upg_cta_seq", 0) or 0) + 1
+    st.session_state["_upg_cta_seq"] = seq
+    if st.button(
+        "💎 멤버십 업그레이드 · 입금 신청하기",
+        key=f"{prefix}_{seq}",
+        type="primary",
+    ):
+        st.session_state["open_payment_modal_requested"] = True
+        st.rerun()
+
+
 def ensure_credit_quota(
     ctx: AppContext | None = None,
     required_credits: int = 1,
@@ -238,6 +256,8 @@ def ensure_credit_quota(
     if not allowed:
         if show_error and msg:
             st.error(msg)
+            if ctx is None or not ctx.is_admin:
+                _render_upgrade_cta_button("ensure_upg_cta")
         return False
     return True
 
@@ -262,6 +282,8 @@ def try_reserve_credits(
     )
     if not ok and show_error and msg:
         st.error(msg)
+        if not ctx.is_admin and "크레딧이 부족합니다" in msg:
+            _render_upgrade_cta_button("reserve_upg_cta")
     return ok, reservation
 
 

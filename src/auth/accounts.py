@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import secrets
+import threading
 import time
 from datetime import datetime
 from typing import TYPE_CHECKING
@@ -27,17 +28,91 @@ if TYPE_CHECKING:
     from src.models import TierType, UserRecord
     from src.storage import StorageManager
 
-def _sync_user_state(user: UserRecord, today: str, admin_usernames: set[str]) -> bool:
-    """자정(KST) · 주간(KST) · 월간(KST) 초기화, 레거시 CUSTOM/개인키 파기 및 관리자 자동 승급을 동기화한다."""
+_SWEEP_LOCK = threading.Lock()
+_LAST_SWEEP_MONOTONIC: dict[str, float] = {}
+
+
+def parse_kst_iso(ts_str: str | None) -> datetime | None:
+    """ISO 8601 시각 문자열을 KST aware datetime으로 파싱한다. 비어 있거나 잘못된 형식이면 None."""
+    raw = str(ts_str or "").strip()
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(raw)
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=KST)
+        return dt.astimezone(KST)
+    except (ValueError, TypeError):
+        return None
+
+
+def is_paid_tier_expired(user: UserRecord | None, now_dt: datetime | None = None) -> bool:
+    """유료(PRO/ULTRA) 멤버십의 만료 시각이 도래했는지 즉시 판정한다."""
+    if user is None or user.tier not in ("PRO", "ULTRA"):
+        return False
+    exp_dt = parse_kst_iso(getattr(user, "tier_expires_at", ""))
+    if exp_dt is None:
+        return False
+    cur = (
+        now_dt.astimezone(KST)
+        if (now_dt is not None and now_dt.tzinfo is not None)
+        else (now_dt.replace(tzinfo=KST) if now_dt is not None else datetime.now(KST))
+    )
+    return cur >= exp_dt
+
+
+def get_effective_tier(user: UserRecord | None, now_dt: datetime | None = None) -> TierType:
+    """만료 시각을 즉시 반영한 실질 회원 등급을 반환한다 (디스크 동기화 전에도 0초 지연 판정)."""
+    if user is None:
+        return "FREE"
+    if is_paid_tier_expired(user, now_dt=now_dt):
+        return "FREE"
+    if user.tier not in VALID_TIERS:
+        return "FREE"
+    return user.tier
+
+
+def _flush_ledger_events(storage: StorageManager, events: list[dict[str, object]]) -> None:
+    if not events or not hasattr(storage, "append_credit_ledger"):
+        return
+    for ev in events:
+        try:
+            storage.append_credit_ledger(ev)
+        except Exception:
+            pass
+
+
+def _sync_user_state(
+    user: UserRecord,
+    today: str,
+    admin_usernames: set[str],
+    now_dt: datetime | None = None,
+    expired_events_out: list[dict[str, object]] | None = None,
+) -> bool:
+    """자정(KST) · 주간(KST) · 월간(KST) 초기화, 유료 만료 복귀, 환불 부채 상계 및 관리자 승급을 동기화한다."""
     changed = False
-    current_week = get_kst_week_str()
-    current_month = get_kst_month_str()
+    cur_dt = (
+        now_dt.astimezone(KST)
+        if (now_dt is not None and now_dt.tzinfo is not None)
+        else (now_dt.replace(tzinfo=KST) if now_dt is not None else datetime.now(KST))
+    )
+    current_week = cur_dt.strftime("%G-W%V")
+    current_month = cur_dt.strftime("%Y-%m")
+
     if getattr(user, "custom_api_key", ""):
         user.custom_api_key = ""
         changed = True
     if user.tier not in VALID_TIERS:
         user.tier = "FREE"
         changed = True
+
+    expired_info: tuple[str, str] | None = None
+    if is_paid_tier_expired(user, now_dt=cur_dt):
+        expired_info = (str(user.tier), str(getattr(user, "tier_expires_at", "") or ""))
+        user.tier = "FREE"
+        user.tier_expires_at = ""
+        changed = True
+
     if getattr(user, "last_used_date", "") != today:
         user.daily_count = 0
         user.daily_free_ai_count = 0
@@ -59,26 +134,117 @@ def _sync_user_state(user: UserRecord, today: str, admin_usernames: set[str]) ->
         user.monthly_server_cost_usd = 0.0
         user.monthly_used_credits = 0
         user.last_used_month = current_month
+        # 환불 초과 사용 부채가 남아 있으면 월초 리셋 시 현재 등급 한도 내에서 자동 상계
+        debt = max(0, int(getattr(user, "refund_credit_debt", 0) or 0))
+        if user.tier != "ADMIN" and debt > 0:
+            eff_t = get_effective_tier(user, now_dt=cur_dt)
+            lim = MONTHLY_CREDIT_LIMITS.get(eff_t, FREE_MONTHLY_CREDIT_LIMIT)
+            applied = min(lim, debt)
+            user.monthly_used_credits = applied
+            user.refund_credit_debt = debt - applied
         changed = True
-    if user.username in admin_usernames and user.tier != "ADMIN":
+    if user.username in admin_usernames and (
+        user.tier != "ADMIN" or bool(getattr(user, "tier_expires_at", ""))
+    ):
         user.tier = "ADMIN"
+        user.tier_expires_at = ""
         changed = True
+
+    if expired_info is not None and expired_events_out is not None:
+        exp_tier, exp_at = expired_info
+        lim_after = MONTHLY_CREDIT_LIMITS.get(user.tier, FREE_MONTHLY_CREDIT_LIMIT)
+        base_used_after = max(0, int(getattr(user, "monthly_used_credits", 0) or 0))
+        bonus_after = max(0, int(getattr(user, "bonus_credits", 0) or 0))
+        avail_after: int | None = (
+            None if user.tier == "ADMIN" else (max(0, lim_after - base_used_after) + bonus_after)
+        )
+        expired_events_out.append(
+            {
+                "ts": cur_dt.isoformat(timespec="seconds"),
+                "username": user.username,
+                "event": "SUBSCRIPTION_EXPIRED",
+                "delta": 0,
+                "reason": f"{exp_tier} 멤버십 기간 만료 ({exp_at[:16].replace('T', ' ')}) → FREE 전환",
+                "base_used_after": base_used_after,
+                "bonus_after": bonus_after,
+                "avail_after": avail_after,
+                "actor": "system",
+            }
+        )
     return changed
 
 
-def sync_all_users_state(storage: StorageManager) -> list[UserRecord]:
-    """users.json 전체 회원의 월/일 상태 및 레거시 CUSTOM/개인키 정리를 일괄 동기화해 반환한다."""
+def sync_all_users_state(
+    storage: StorageManager,
+    now_dt: datetime | None = None,
+) -> list[UserRecord]:
+    """users.json 전체 회원의 월/일 상태, 유료 만료 및 레거시 정리를 일괄 동기화해 반환한다."""
+    cur_dt = (
+        now_dt.astimezone(KST)
+        if (now_dt is not None and now_dt.tzinfo is not None)
+        else (now_dt.replace(tzinfo=KST) if now_dt is not None else datetime.now(KST))
+    )
     with _storage_lock(storage):
         users = storage.load_users()
-        today = get_kst_today_str()
+        today = cur_dt.strftime("%Y-%m-%d")
         admin_names = resolve_admin_config().admin_usernames
         changed = False
+        expired_events: list[dict[str, object]] = []
         for u in users:
-            if _sync_user_state(u, today, admin_names):
+            if _sync_user_state(
+                u,
+                today,
+                admin_names,
+                now_dt=cur_dt,
+                expired_events_out=expired_events,
+            ):
                 changed = True
         if changed:
             storage.save_users(users)
+            _flush_ledger_events(storage, expired_events)
         return users
+
+
+def maybe_sweep_expired_users(
+    storage: StorageManager,
+    interval_seconds: float = 60.0,
+    force: bool = False,
+    now_dt: datetime | None = None,
+) -> int:
+    """주기적(기본 60초) 경량 스윕으로 미접속 만료 회원을 users.json에서 즉시 FREE 전환한다."""
+    try:
+        cache_key = str(storage.users_path.resolve())
+    except Exception:
+        cache_key = str(id(storage))
+
+    now_mono = time.monotonic()
+    with _SWEEP_LOCK:
+        last_ts = _LAST_SWEEP_MONOTONIC.get(cache_key, 0.0)
+        if not force and last_ts > 0.0 and (now_mono - last_ts) < max(1.0, float(interval_seconds)):
+            return 0
+        _LAST_SWEEP_MONOTONIC[cache_key] = now_mono
+
+    cur_dt = (
+        now_dt.astimezone(KST)
+        if (now_dt is not None and now_dt.tzinfo is not None)
+        else (now_dt.replace(tzinfo=KST) if now_dt is not None else datetime.now(KST))
+    )
+    today = cur_dt.strftime("%Y-%m-%d")
+    current_month = cur_dt.strftime("%Y-%m")
+    users = storage.load_users()
+    if not users:
+        return 0
+
+    expired_count = sum(1 for u in users if is_paid_tier_expired(u, now_dt=cur_dt))
+    needs_sync = expired_count > 0 or any(
+        getattr(u, "last_used_date", "") != today or getattr(u, "last_used_month", "") != current_month
+        for u in users
+    )
+    if not needs_sync:
+        return 0
+
+    sync_all_users_state(storage, now_dt=cur_dt)
+    return expired_count
 
 
 def get_user_by_username(storage: StorageManager, username: str) -> UserRecord | None:
@@ -89,16 +255,18 @@ def get_user_by_username(storage: StorageManager, username: str) -> UserRecord |
         admin_names = resolve_admin_config().admin_usernames
         changed = False
         found: UserRecord | None = None
+        expired_events: list[dict[str, object]] = []
 
         for u in users:
             if u.username == norm:
-                if _sync_user_state(u, today, admin_names):
+                if _sync_user_state(u, today, admin_names, expired_events_out=expired_events):
                     changed = True
                 found = u
                 break
 
         if changed:
             storage.save_users(users)
+            _flush_ledger_events(storage, expired_events)
         return found
 
 
@@ -167,6 +335,7 @@ def authenticate_user(
         users = storage.load_users()
         today = get_kst_today_str()
         admin_names = resolve_admin_config().admin_usernames
+        expired_events: list[dict[str, object]] = []
         for u in users:
             if u.username == norm_id:
                 if not u.password_hash or not getattr(u, "has_local_credentials", True):
@@ -181,8 +350,9 @@ def authenticate_user(
                 if is_legacy_password_hash(u.password_hash):
                     u.password_hash = hash_password(password)
                     rehashed = True
-                if _sync_user_state(u, today, admin_names) or rehashed:
+                if _sync_user_state(u, today, admin_names, expired_events_out=expired_events) or rehashed:
                     storage.save_users(users)
+                    _flush_ledger_events(storage, expired_events)
                 return True, f"{u.nickname}님, 로그인되었습니다.", u
 
     return False, "등록되지 않은 아이디입니다. 회원가입 탭에서 가입해 주세요.", None
@@ -199,16 +369,18 @@ def get_user_by_google_sub(storage: StorageManager, google_sub: str) -> UserReco
         admin_names = resolve_admin_config().admin_usernames
         changed = False
         found: UserRecord | None = None
+        expired_events: list[dict[str, object]] = []
 
         for u in users:
             if (getattr(u, "google_sub", "") or "").strip() == clean_sub:
-                if _sync_user_state(u, today, admin_names):
+                if _sync_user_state(u, today, admin_names, expired_events_out=expired_events):
                     changed = True
                 found = u
                 break
 
         if changed:
             storage.save_users(users)
+            _flush_ledger_events(storage, expired_events)
         return found
 
 
@@ -227,14 +399,16 @@ def authenticate_google_user(
         users = storage.load_users()
         today = get_kst_today_str()
         admin_names = resolve_admin_config().admin_usernames
+        expired_events: list[dict[str, object]] = []
         for u in users:
             if (getattr(u, "google_sub", "") or "").strip() == clean_sub:
-                changed = _sync_user_state(u, today, admin_names)
+                changed = _sync_user_state(u, today, admin_names, expired_events_out=expired_events)
                 if clean_email and getattr(u, "google_email", "") != clean_email:
                     u.google_email = clean_email
                     changed = True
                 if changed:
                     storage.save_users(users)
+                    _flush_ledger_events(storage, expired_events)
                 return True, f"{u.nickname}님, Google 계정으로 로그인되었습니다.", u
 
     return False, "", None
@@ -492,9 +666,10 @@ def adjust_user_bonus_credits(
         users = storage.load_users()
         updated_cnt = 0
         ledger_entries: list[dict[str, object]] = []
+        expired_events: list[dict[str, object]] = []
         for u in users:
             if u.username in targets:
-                _sync_user_state(u, today, admin_names)
+                _sync_user_state(u, today, admin_names, expired_events_out=expired_events)
                 before_bonus = max(0, int(getattr(u, "bonus_credits", 0) or 0))
                 after_bonus = max(0, before_bonus + delta)
                 actual_delta = after_bonus - before_bonus
@@ -521,29 +696,38 @@ def adjust_user_bonus_credits(
                         "actor": actor_norm,
                     }
                 )
-        if updated_cnt > 0:
+        if updated_cnt > 0 or expired_events:
             err = storage.save_users(users)
-            if hasattr(storage, "append_credit_ledger"):
-                for entry in ledger_entries:
-                    storage.append_credit_ledger(entry)
+            _flush_ledger_events(storage, expired_events)
+            _flush_ledger_events(storage, ledger_entries)
             return updated_cnt, err
         return 0, None
 def batch_update_user_tiers(
     storage: StorageManager,
     tier_updates: dict[str, TierType],
 ) -> tuple[int, str | None]:
-    """관리자가 여러 회원의 등급을 한 번에 업데이트해 users.json에 저장한다."""
+    """관리자가 여러 회원의 등급을 수동으로 일괄 변경한다 (수동 변경 계정은 무기한 유지)."""
     with _storage_lock(storage):
         users = storage.load_users()
+        today = get_kst_today_str()
+        admin_names = resolve_admin_config().admin_usernames
+        expired_events: list[dict[str, object]] = []
+        sync_changed = False
+        for u in users:
+            if _sync_user_state(u, today, admin_names, expired_events_out=expired_events):
+                sync_changed = True
+
         changed_count = 0
         for u in users:
             new_tier = tier_updates.get(u.username)
             if new_tier in VALID_TIERS and u.tier != new_tier:
                 u.tier = new_tier
+                u.tier_expires_at = ""
                 changed_count += 1
 
-        if changed_count > 0:
+        if changed_count > 0 or sync_changed:
             err = storage.save_users(users)
+            _flush_ledger_events(storage, expired_events)
             return changed_count, err
         return 0, None
 
@@ -565,6 +749,14 @@ def delete_users_by_usernames(
 
     with _storage_lock(storage):
         users = storage.load_users()
+        today = get_kst_today_str()
+        admin_names = resolve_admin_config().admin_usernames
+        expired_events: list[dict[str, object]] = []
+        sync_changed = False
+        for u in users:
+            if _sync_user_state(u, today, admin_names, expired_events_out=expired_events):
+                sync_changed = True
+
         admin_count = sum(1 for u in users if u.tier == "ADMIN")
         remaining: list[UserRecord] = []
         deleted_count = 0
@@ -587,8 +779,9 @@ def delete_users_by_usernames(
                 remaining.append(u)
 
         err: str | None = None
-        if deleted_count > 0:
+        if deleted_count > 0 or sync_changed:
             err = storage.save_users(remaining)
+            _flush_ledger_events(storage, expired_events)
 
     note = ""
     if skipped_reasons:

@@ -22,15 +22,18 @@ from src.auth import (
     authenticate_user,
     create_session_token,
     format_credit_count,
+    format_tier_expiry_badge,
     get_bonus_credits,
     get_daily_free_ai_limit,
     get_daily_free_ai_used,
+    get_effective_tier,
     get_monthly_credit_limit,
     get_remaining_monthly_base_credits,
     get_total_available_credits,
     get_used_monthly_credits,
     get_user_by_username,
     link_google_account,
+    maybe_sweep_expired_users,
     register_google_user,
     register_local_credentials_for_user,
     register_user,
@@ -100,6 +103,8 @@ def render_auth_and_sidebar(
     google_login_cfg: Any,
 ) -> AppContext:
     """Google OAuth 콜백 소비, 세션 복원 및 좌측 계정·멤버십 사이드바를 렌더링하고 AppContext를 반환한다."""
+    st.session_state["_upg_cta_seq"] = 0
+    maybe_sweep_expired_users(storage)
     # Google OAuth 2.0 콜백 처리 (code/state 또는 error 파라미터가 있으면 즉시 소비 후 재실행)
     _oauth_code = _qp_scalar("code")
     _oauth_state = _qp_scalar("state")
@@ -194,7 +199,7 @@ def render_auth_and_sidebar(
     elif current_user is not None and not st.query_params.get("session"):
         st.query_params["session"] = create_session_token(current_user.username, storage=storage)
 
-    is_admin = bool(current_user is not None and current_user.tier == "ADMIN")
+    is_admin = bool(current_user is not None and get_effective_tier(current_user) == "ADMIN")
     selected_model = DEFAULT_MODEL
     active_gemini_key = ""
     active_key_label = ""
@@ -329,7 +334,7 @@ def render_auth_and_sidebar(
                             "Google 계정으로 간편 가입",
                         )
         else:
-            tier_code = current_user.tier
+            tier_code = get_effective_tier(current_user)
             tier_kor = TIER_LABELS.get(tier_code, tier_code)
             active_gemini_key, active_key_label = resolve_active_gemini_api_key(
                 current_user, creds.gemini_api_key
@@ -345,6 +350,18 @@ def render_auth_and_sidebar(
             free_ai_used = get_daily_free_ai_used(current_user)
             free_ai_lim = get_daily_free_ai_limit(current_user)
             bonus_html = f" <span style='color:#059669;'>(+보너스 {bonus_rem:,}C)</span>" if bonus_rem > 0 else ""
+            exp_badge = format_tier_expiry_badge(current_user)
+            exp_html = (
+                f"<br/><span style='font-size:0.76rem; font-weight:500;'>📅 {_html.escape(exp_badge)}</span>"
+                if exp_badge
+                else ""
+            )
+            refund_debt = max(0, int(getattr(current_user, "refund_credit_debt", 0) or 0))
+            debt_html = (
+                f"<br/><span style='color:#B45309; font-size:0.75rem;'>⚠️ 환불 미정산 차감 대기: {refund_debt:,}C</span>"
+                if refund_debt > 0
+                else ""
+            )
 
             if tier_code == "FREE":
                 status_line = (
@@ -352,7 +369,7 @@ def render_auth_and_sidebar(
                     f"가용 크레딧: <b>{total_avail:,}C</b> "
                     f"<span style='color:#64748B;'>(월간 {base_rem:,}/{credit_limit or 0:,}C)</span>{bonus_html}<br/>"
                     f"1회 최대 {FREE_MAX_BATCH_QUESTIONS}문항 · 오늘 무료 AI {free_ai_used}/{free_ai_lim}회"
-                    f"</div>"
+                    f"{debt_html}</div>"
                 )
             elif tier_code == "PRO":
                 status_line = (
@@ -360,7 +377,7 @@ def render_auth_and_sidebar(
                     f"✨ 가용 크레딧: <b>{total_avail:,}C</b> "
                     f"<span style='color:#64748B;'>(월간 {base_rem:,}/{credit_limit or 0:,}C)</span>{bonus_html}<br/>"
                     f"배치 무제한 · 오늘 무료 AI {free_ai_used}/{free_ai_lim}회"
-                    f"</div>"
+                    f"{exp_html}{debt_html}</div>"
                 )
             elif tier_code == "ULTRA":
                 status_line = (
@@ -368,7 +385,7 @@ def render_auth_and_sidebar(
                     f"🔥 가용 크레딧: <b>{total_avail:,}C</b> "
                     f"<span style='color:#9A3412; font-weight:400;'>(월간 {base_rem:,}/{credit_limit or 0:,}C)</span>{bonus_html}<br/>"
                     f"PRO 대비 4배 · 오늘 무료 AI {free_ai_used}/{free_ai_lim}회"
-                    f"</div>"
+                    f"{exp_html}{debt_html}</div>"
                 )
             else:
                 status_line = (
@@ -407,6 +424,39 @@ def render_auth_and_sidebar(
                 rem_ratio = max(0.0, min(1.0, base_rem / max(1, credit_limit)))
                 st.progress(rem_ratio)
 
+            if tier_code == "ADMIN":
+                pending_pay_cnt = storage.count_pending_payment_orders()
+                if pending_pay_cnt > 0:
+                    st.warning(
+                        f"🔔 입금 승인 대기 **{pending_pay_cnt}건**이 있습니다! 상단 **[🛡️ 관리자]** 탭에서 확인해 주세요."
+                    )
+            else:
+                _my_pending_pay = any(
+                    o.username == current_user.username and o.status == "PENDING"
+                    for o in storage.load_payment_orders()
+                )
+                if _my_pending_pay:
+                    _pay_btn_label = "⏳ 입금 승인 대기 중 · 신청 내역 보기"
+                    _pay_btn_type = "secondary"
+                elif tier_code == "FREE":
+                    _pay_btn_label = "💎 멤버십 업그레이드 (PRO · ULTRA)"
+                    _pay_btn_type = "primary"
+                else:
+                    _pay_btn_label = "💎 멤버십 연장 · 등급 변경"
+                    _pay_btn_type = "secondary"
+
+                _open_pay_clicked = st.button(
+                    _pay_btn_label,
+                    key="sidebar_open_payment_modal_btn",
+                    type=_pay_btn_type,
+                    width="stretch",
+                )
+                _open_pay_requested = bool(st.session_state.pop("open_payment_modal_requested", False))
+                if _open_pay_clicked or _open_pay_requested:
+                    from src.ui.payment_modal import open_payment_dialog
+
+                    open_payment_dialog(storage, current_user)
+
             _show_credit_ledger = st.toggle(
                 "📜 내 크레딧 사용 내역 (최근 20건)",
                 key="sidebar_toggle_my_credit_ledger",
@@ -427,6 +477,9 @@ def render_auth_and_sidebar(
                             "BONUS_GRANT": "보너스",
                             "BONUS_DEDUCT": "회수",
                             "MONTHLY_RESET": "초기화",
+                            "PAYMENT_APPROVE": "결제승인",
+                            "PAYMENT_REFUND": "환불회수",
+                            "SUBSCRIPTION_EXPIRED": "기간만료",
                         }.get(ev, ev)
                         avail_v = lr.get("avail_after")
                         bal_txt = "무제한" if avail_v is None else f"{int(avail_v):,}C"

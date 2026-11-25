@@ -281,10 +281,11 @@ def seconds_until_next_kst_midnight(now_dt: datetime | None = None) -> float:
 def start_daily_midnight_fx_scheduler(
     cache_dir: str | Path = "./exam_db",
     api_keys: list[str] | None = None,
+    storage: Any = None,
 ) -> bool:
     """
-    매일 00:00 KST에 Gemini API 환율을 자동 갱신하는 단일 백그라운드 데몬 스레드를 시작한다.
-    프로세스당 1회만 기동된다.
+    매일 00:00 KST에 Gemini API 환율을 자동 갱신하고, 주기적으로 만료된 유료 회원을
+    즉시 FREE로 복귀시키는 단일 백그라운드 데몬 스레드를 시작한다. 프로세스당 1회만 기동된다.
     """
     global _SCHEDULER_STARTED
     with _SCHEDULER_LOCK:
@@ -295,25 +296,38 @@ def start_daily_midnight_fx_scheduler(
     keys_snapshot = list(api_keys or [])
     target_dir = Path(cache_dir)
 
+    def _sweep_expired() -> None:
+        if storage is None:
+            return
+        try:
+            from src.auth.accounts import maybe_sweep_expired_users
+
+            maybe_sweep_expired_users(storage, force=True)
+        except Exception:
+            pass
+
     def _loop() -> None:
-        # 기동 직후 오늘(KST) 00시 이후 갱신 이력이 없으면 즉시 1회 확인
+        # 기동 직후 오늘(KST) 00시 이후 갱신 이력이 없으면 즉시 1회 확인 및 만료 회원 정리
         try:
             get_daily_gemini_fx_rate(cache_dir=target_dir, api_keys=keys_snapshot, force_refresh=False)
         except Exception:
             pass
+        _sweep_expired()
 
         while True:
             wait_sec = seconds_until_next_kst_midnight()
-            # 장시간 sleep 중 스레드 종료 반응성을 위해 최대 3600초 단위로 분할 대기
+            # 10분 단위로 깨어나 미접속 만료 회원을 정리하고 자정 도달 시 환율 갱신 수행
             remaining = wait_sec
             while remaining > 0:
-                chunk = min(3600.0, remaining)
+                chunk = min(600.0, remaining)
                 threading.Event().wait(chunk)
                 remaining -= chunk
+                _sweep_expired()
             try:
                 get_daily_gemini_fx_rate(cache_dir=target_dir, api_keys=keys_snapshot, force_refresh=True)
             except Exception:
                 pass
+            _sweep_expired()
 
     t = threading.Thread(target=_loop, name="gemini-fx-midnight-kst", daemon=True)
     t.start()

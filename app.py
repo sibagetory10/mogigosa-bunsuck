@@ -30,7 +30,11 @@ init_session_defaults()
 creds = resolve_credentials()
 storage = get_cached_storage(local_root="./exam_db")
 _fx_api_keys = [k for k in (resolve_billing_api_key(), creds.gemini_api_key) if k]
-start_daily_midnight_fx_scheduler(cache_dir=storage.local_root, api_keys=_fx_api_keys)
+start_daily_midnight_fx_scheduler(
+    cache_dir=storage.local_root,
+    api_keys=_fx_api_keys,
+    storage=storage,
+)
 
 google_login_cfg = resolve_google_login_config()
 ctx = render_auth_and_sidebar(storage, creds, google_login_cfg)
@@ -50,6 +54,12 @@ if ctx.current_user is None:
     st.stop()
 
 if ctx.is_admin:
+    _pending_pay_cnt = storage.count_pending_payment_orders()
+    _admin_tab_label = (
+        f"🛡️ 관리자: 회원·결제 관리 (🔔 {_pending_pay_cnt})"
+        if _pending_pay_cnt > 0
+        else "🛡️ 관리자: 회원·결제 관리"
+    )
     tab1, tab2, tab3, tab4, my_exams_tab, admin_tab = create_lazy_tabs(
         [
             "📥 탭 1: 모의고사 수집 & 2022 원리·용어 분해",
@@ -57,7 +67,7 @@ if ctx.is_admin:
             "📚 탭 3: 공용 개념서·교과서 DB 구축",
             "📖 탭 4: 영단어 사전",
             "📁 나의 시험지",
-            "🛡️ 관리자: 회원 등급 관리",
+            _admin_tab_label,
         ],
         key="main_app_tabs",
     )

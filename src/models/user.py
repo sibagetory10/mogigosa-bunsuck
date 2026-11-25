@@ -28,6 +28,10 @@ class UserRecord(BaseModel):
         description="직접 등록한 아이디·비밀번호 보유 여부 (구글 전용 가입자는 False)",
     )
     tier: TierType = Field(default="FREE", description="회원 등급 (FREE / PRO / ULTRA / ADMIN)")
+    tier_expires_at: str = Field(
+        default="",
+        description="유료 결제 멤버십 만료 시각 ISO 8601 (KST, 빈 문자열이면 무기한 수동 승급 또는 비해당)",
+    )
     custom_api_key: str = Field(
         default="",
         description="폐지된 레거시 필드 (마이그레이션 시 자동 공백 초기화)",
@@ -58,6 +62,16 @@ class UserRecord(BaseModel):
         default=0,
         ge=0,
         description="누적 사용한 총 크레딧",
+    )
+    total_base_credits_used: int = Field(
+        default=0,
+        ge=0,
+        description="보너스 크레딧과 분리된 순수 기본 크레딧 단조 증가 누적 사용량 (환불 역산 기준)",
+    )
+    refund_credit_debt: int = Field(
+        default=0,
+        ge=0,
+        description="환불된 주문에서 초과 소비한 미정산 기본 크레딧 부채 (월초 비소멸, 재결제·익월 리셋 시 자동 상계)",
     )
     uploaded_exam_count: int = Field(default=0, ge=0, description="누적 업로드·태깅한 기출 회차 수")
     premium_unlock_credits: int = Field(

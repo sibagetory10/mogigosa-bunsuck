@@ -87,6 +87,8 @@ class StorageBase:
         self.db_path = self.local_root / "db.json"
         self.users_path = self.local_root / "users.json"
         self.credit_ledger_path = self.local_root / "credit_ledger.jsonl"
+        self.payment_settings_path = self.local_root / "payment_settings.json"
+        self.payment_orders_path = self.local_root / "payment_orders.json"
         self.english_pool_path = self.local_root / "english_question_pool.json"
         self.english_analysis_pool_path = self.local_root / "english_analysis_pool.json"
         self.english_analysis_pdfs_root = self.local_root / "english_analysis_pdfs"

@@ -257,3 +257,20 @@ class UserExamsStoreMixin:
                         )
             except Exception:
                 pass
+
+            # 6) 결제 주문 내역(payment_orders.json) 사용자명 이관
+            try:
+                if hasattr(self, "load_payment_orders") and hasattr(self, "save_payment_orders"):
+                    orders = self.load_payment_orders()
+                    orders_changed = False
+                    for ord_item in orders:
+                        if (ord_item.username or "").strip().lower() == old_u.lower():
+                            ord_item.username = new_u
+                            orders_changed = True
+                        if (ord_item.processed_by or "").strip().lower() == old_u.lower():
+                            ord_item.processed_by = new_u
+                            orders_changed = True
+                    if orders_changed:
+                        self.save_payment_orders(orders)
+            except Exception:
+                pass

@@ -5,7 +5,12 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from src.auth.accounts import _sync_user_state, get_user_by_username
+from src.auth.accounts import (
+    _flush_ledger_events,
+    _sync_user_state,
+    get_effective_tier,
+    get_user_by_username,
+)
 from src.auth.tokens import (
     DAILY_FREE_AI_LIMITS,
     DAILY_SHARED_UPLOAD_LIMITS,
@@ -59,7 +64,8 @@ def resolve_active_gemini_api_key(
     """전 등급(FREE / PRO / ULTRA / ADMIN)에 대해 서버 공용 Gemini API 키를 라우팅한다."""
     _ = (model_name, force_server_key)
     server_key = (server_api_key or "").strip()
-    return server_key, f"서버 키 ({TIER_LABELS.get(user.tier, user.tier)})"
+    eff_tier = get_effective_tier(user)
+    return server_key, f"서버 키 ({TIER_LABELS.get(eff_tier, eff_tier)})"
 
 
 def get_remaining_free_quota(user: UserRecord) -> int | None:
@@ -69,7 +75,7 @@ def get_remaining_free_quota(user: UserRecord) -> int | None:
 
 def get_max_batch_questions(user: UserRecord | None) -> int | None:
     """등급별 1회 최대 생성·변형 문항 수 제한을 반환한다 (FREE=5문항, PRO/ULTRA/ADMIN=제한 없음 None)."""
-    if user is None or user.tier == "FREE":
+    if user is None or get_effective_tier(user) == "FREE":
         return FREE_MAX_BATCH_QUESTIONS
     return None
 
@@ -78,9 +84,10 @@ def get_monthly_credit_limit(user: UserRecord | None) -> int | None:
     """등급별 월간 기본 크레딧 한도를 반환한다 (FREE=30, PRO=600, ULTRA=2,400, ADMIN=None)."""
     if user is None:
         return FREE_MONTHLY_CREDIT_LIMIT
-    if user.tier == "ADMIN":
+    eff_tier = get_effective_tier(user)
+    if eff_tier == "ADMIN":
         return None
-    return MONTHLY_CREDIT_LIMITS.get(user.tier, FREE_MONTHLY_CREDIT_LIMIT)
+    return MONTHLY_CREDIT_LIMITS.get(eff_tier, FREE_MONTHLY_CREDIT_LIMIT)
 
 
 def get_used_monthly_credits(user: UserRecord | None) -> int:
@@ -130,9 +137,10 @@ def get_daily_free_ai_limit(user: UserRecord | None) -> int | None:
     """등급별 0C 무료 AI 보조 기능 일일 한도를 반환한다 (ADMIN=None)."""
     if user is None:
         return DAILY_FREE_AI_LIMITS["FREE"]
-    if user.tier == "ADMIN":
+    eff_tier = get_effective_tier(user)
+    if eff_tier == "ADMIN":
         return None
-    return DAILY_FREE_AI_LIMITS.get(user.tier, DAILY_FREE_AI_LIMITS["FREE"])
+    return DAILY_FREE_AI_LIMITS.get(eff_tier, DAILY_FREE_AI_LIMITS["FREE"])
 
 
 def get_daily_shared_upload_used(user: UserRecord | None) -> int:
@@ -148,9 +156,10 @@ def get_daily_shared_upload_limit(user: UserRecord | None) -> int | None:
     """등급별 공용 DB 신규 업로드 일일 한도를 반환한다 (FREE=0, PRO=3, ULTRA=8, ADMIN=None)."""
     if user is None:
         return 0
-    if user.tier == "ADMIN":
+    eff_tier = get_effective_tier(user)
+    if eff_tier == "ADMIN":
         return None
-    return DAILY_SHARED_UPLOAD_LIMITS.get(user.tier, 0)
+    return DAILY_SHARED_UPLOAD_LIMITS.get(eff_tier, 0)
 
 
 def _append_ledger_safe(storage: StorageManager, entry: dict[str, object]) -> None:
@@ -185,11 +194,12 @@ def check_credit_quota(
         return True, avail, limit, ""
 
     if avail < need:
-        tier_lbl = TIER_LABELS.get(user.tier, user.tier)
+        eff_tier = get_effective_tier(user)
+        tier_lbl = TIER_LABELS.get(eff_tier, eff_tier)
         act_part = f"{action_label} · " if action_label else ""
-        if user.tier == "FREE":
+        if eff_tier == "FREE":
             upgrade_hint = "PRO(월 600C · 9,900원) 또는 ULTRA(월 2,400C · 19,900원) 등급으로 업그레이드해 주세요."
-        elif user.tier == "PRO":
+        elif eff_tier == "PRO":
             upgrade_hint = "매월 1일(KST) 초기화되며, 더 넉넉한 한도가 필요하시면 ULTRA(월 2,400C · 4배)로 업그레이드해 주세요."
         else:
             upgrade_hint = "매월 1일(KST) 자동 초기화됩니다. 급한 경우 관리자에게 보너스 크레딧 지급을 요청해 주세요."
@@ -237,9 +247,10 @@ def acquire_credit_reservation(
 
             target: UserRecord | None = None
             changed = False
+            expired_events: list[dict[str, object]] = []
             for u in users:
                 if u.username == norm_id:
-                    if _sync_user_state(u, today, admin_names):
+                    if _sync_user_state(u, today, admin_names, expired_events_out=expired_events):
                         changed = True
                     target = u
                     break
@@ -247,12 +258,14 @@ def acquire_credit_reservation(
             if target is None:
                 if changed:
                     storage.save_users(users)
+                    _flush_ledger_events(storage, expired_events)
                 _ACTIVE_CREDIT_USERS.discard(norm_id)
                 return False, None, "로그인 계정 정보를 확인할 수 없습니다. 다시 로그인해 주세요."
 
             if target.tier == "ADMIN" or need == 0:
                 if changed:
                     storage.save_users(users)
+                    _flush_ledger_events(storage, expired_events)
                 return (
                     True,
                     CreditReservation(
@@ -275,6 +288,7 @@ def acquire_credit_reservation(
             if avail < need:
                 if changed:
                     storage.save_users(users)
+                    _flush_ledger_events(storage, expired_events)
                 tier_lbl = TIER_LABELS.get(target.tier, target.tier)
                 if target.tier == "FREE":
                     hint = "PRO(월 600C) 또는 ULTRA(월 2,400C) 등급으로 업그레이드해 주세요."
@@ -295,7 +309,11 @@ def acquire_credit_reservation(
             target.monthly_used_credits = base_used + from_base
             target.bonus_credits = bonus_rem - from_bonus
             target.total_used_credits = max(0, int(getattr(target, "total_used_credits", 0) or 0)) + need
+            target.total_base_credits_used = (
+                max(0, int(getattr(target, "total_base_credits_used", 0) or 0)) + from_base
+            )
             storage.save_users(users)
+            _flush_ledger_events(storage, expired_events)
 
             avail_after = max(0, limit - target.monthly_used_credits) + target.bonus_credits
             _append_ledger_safe(
@@ -386,7 +404,8 @@ def settle_credit_reservation(
             admin_names = resolve_admin_config().admin_usernames
             for u in users:
                 if u.username == reservation.username:
-                    _sync_user_state(u, today, admin_names)
+                    expired_events: list[dict[str, object]] = []
+                    _sync_user_state(u, today, admin_names, expired_events_out=expired_events)
                     refund_to_bonus = min(refund, reservation.reserved_from_bonus)
                     refund_to_base = refund - refund_to_bonus
                     u.bonus_credits = max(0, int(getattr(u, "bonus_credits", 0) or 0)) + refund_to_bonus
@@ -396,7 +415,11 @@ def settle_credit_reservation(
                     u.total_used_credits = max(
                         0, int(getattr(u, "total_used_credits", 0) or 0) - refund
                     )
+                    u.total_base_credits_used = max(
+                        0, int(getattr(u, "total_base_credits_used", 0) or 0) - refund_to_base
+                    )
                     storage.save_users(users)
+                    _flush_ledger_events(storage, expired_events)
                     limit = MONTHLY_CREDIT_LIMITS.get(u.tier, FREE_MONTHLY_CREDIT_LIMIT)
                     avail_after = max(0, limit - u.monthly_used_credits) + u.bonus_credits
                     _append_ledger_safe(
@@ -435,16 +458,21 @@ def consume_daily_free_ai_quota(
         admin_names = resolve_admin_config().admin_usernames
         for u in users:
             if u.username == norm_id:
-                changed = _sync_user_state(u, today, admin_names)
+                expired_events: list[dict[str, object]] = []
+                changed = _sync_user_state(
+                    u, today, admin_names, expired_events_out=expired_events
+                )
                 if u.tier == "ADMIN":
                     if changed:
                         storage.save_users(users)
+                        _flush_ledger_events(storage, expired_events)
                     return True, ""
                 limit = DAILY_FREE_AI_LIMITS.get(u.tier, DAILY_FREE_AI_LIMITS["FREE"])
                 used = max(0, int(getattr(u, "daily_free_ai_count", 0) or 0))
                 if used >= limit:
                     if changed:
                         storage.save_users(users)
+                        _flush_ledger_events(storage, expired_events)
                     tier_lbl = TIER_LABELS.get(u.tier, u.tier)
                     return (
                         False,
@@ -452,6 +480,7 @@ def consume_daily_free_ai_quota(
                     )
                 u.daily_free_ai_count = used + 1
                 storage.save_users(users)
+                _flush_ledger_events(storage, expired_events)
                 return True, ""
     return False, "로그인 계정 정보를 확인할 수 없습니다. 다시 로그인해 주세요."
 
@@ -467,11 +496,17 @@ def refund_daily_free_ai_quota(storage: StorageManager, username: str) -> None:
         admin_names = resolve_admin_config().admin_usernames
         for u in users:
             if u.username == norm_id:
-                _sync_user_state(u, today, admin_names)
+                expired_events: list[dict[str, object]] = []
+                changed = _sync_user_state(
+                    u, today, admin_names, expired_events_out=expired_events
+                )
                 cur = int(getattr(u, "daily_free_ai_count", 0) or 0)
                 if cur > 0:
                     u.daily_free_ai_count = cur - 1
+                    changed = True
+                if changed:
                     storage.save_users(users)
+                    _flush_ledger_events(storage, expired_events)
                 break
 
 
@@ -484,17 +519,18 @@ def check_daily_shared_upload_quota(
     user = get_user_by_username(storage, username)
     if user is None:
         return False, 0, "로그인 계정 정보를 확인할 수 없습니다. 다시 로그인해 주세요."
-    if user.tier == "ADMIN":
+    eff_tier = get_effective_tier(user)
+    if eff_tier == "ADMIN":
         return True, None, ""
-    if user.tier not in ("PRO", "ULTRA"):
+    if eff_tier not in ("PRO", "ULTRA"):
         return False, 0, "🔒 공용 DB 신규 업로드는 PRO · ULTRA · ADMIN 전용 기능입니다."
 
-    limit = DAILY_SHARED_UPLOAD_LIMITS.get(user.tier, 0)
+    limit = DAILY_SHARED_UPLOAD_LIMITS.get(eff_tier, 0)
     used = get_daily_shared_upload_used(user)
     rem = max(0, limit - used)
     need = max(1, int(count_needed or 1))
     if used + need > limit:
-        tier_lbl = TIER_LABELS.get(user.tier, user.tier)
+        tier_lbl = TIER_LABELS.get(eff_tier, eff_tier)
         return (
             False,
             rem,
@@ -519,12 +555,18 @@ def consume_daily_shared_upload_quota(
         admin_names = resolve_admin_config().admin_usernames
         for u in users:
             if u.username == norm_id:
-                _sync_user_state(u, today, admin_names)
+                expired_events: list[dict[str, object]] = []
+                changed = _sync_user_state(
+                    u, today, admin_names, expired_events_out=expired_events
+                )
                 if u.tier != "ADMIN":
                     u.daily_shared_upload_count = max(
                         0, int(getattr(u, "daily_shared_upload_count", 0) or 0)
                     ) + add_n
+                    changed = True
+                if changed:
                     storage.save_users(users)
+                    _flush_ledger_events(storage, expired_events)
                 break
 
 
@@ -548,9 +590,10 @@ def reset_user_monthly_credits(
         users = storage.load_users()
         reset_cnt = 0
         ledger_entries: list[dict[str, object]] = []
+        expired_events: list[dict[str, object]] = []
         for u in users:
             if u.username in targets:
-                _sync_user_state(u, today, admin_names)
+                _sync_user_state(u, today, admin_names, expired_events_out=expired_events)
                 prev_used = max(0, int(getattr(u, "monthly_used_credits", 0) or 0))
                 u.monthly_used_credits = 0
                 u.last_used_month = current_month
@@ -574,8 +617,9 @@ def reset_user_monthly_credits(
                         "actor": actor_norm,
                     }
                 )
-        if reset_cnt > 0:
+        if reset_cnt > 0 or expired_events:
             err = storage.save_users(users)
+            _flush_ledger_events(storage, expired_events)
             for entry in ledger_entries:
                 _append_ledger_safe(storage, entry)
             return reset_cnt, err
@@ -590,7 +634,7 @@ def can_contribute_shared_db(user: UserRecord | None) -> bool:
     """공용 기출·개념서 DB 신규 업로드 및 공용 개념서 불러오기 권한 여부 (PRO / ULTRA / ADMIN)."""
     if user is None:
         return False
-    return user.tier in ("PRO", "ULTRA", "ADMIN")
+    return get_effective_tier(user) in ("PRO", "ULTRA", "ADMIN")
 
 
 def can_access_shared_concept_db(user: UserRecord | None) -> bool:
@@ -602,12 +646,12 @@ def can_admin_shared_db(user: UserRecord | None) -> bool:
     """공용 DB 수정·삭제·회차명 변경·다시 태깅·NCIC 기준표 관리 권한 여부 (ADMIN 단독 전용)."""
     if user is None:
         return False
-    return user.tier == "ADMIN"
+    return get_effective_tier(user) == "ADMIN"
 
 
 def can_use_premium_features(user: UserRecord) -> bool:
     """문제 자동 개조 및 맞춤형 시험지 PDF 병합 허용 여부 (전 등급 허용, 크레딧 차감 적용)."""
-    return user.tier in ("FREE", "PRO", "ULTRA", "ADMIN")
+    return get_effective_tier(user) in ("FREE", "PRO", "ULTRA", "ADMIN")
 
 
 def resolve_model_for_user(user: UserRecord, requested_model: str) -> tuple[str, str]:
@@ -624,7 +668,7 @@ def get_monthly_token_limit(user: UserRecord | None) -> int | None:
     """하위 호환용 월간 토큰 참고 한도 반환."""
     if user is None:
         return FREE_MONTHLY_TOKEN_LIMIT
-    return MONTHLY_TOKEN_LIMITS.get(user.tier)
+    return MONTHLY_TOKEN_LIMITS.get(get_effective_tier(user))
 
 
 def get_used_monthly_tokens(user: UserRecord | None) -> int:

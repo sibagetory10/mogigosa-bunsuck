@@ -11,6 +11,12 @@ _SUBMODULE_EXPORTS: dict[str, tuple[str, ...]] = {
         "TierType",
         "UserRecord",
     ),
+    "src.models.payment": (
+        "PaymentOrder",
+        "PaymentOrderStatus",
+        "PaymentPlanType",
+        "PaymentSettings",
+    ),
     "src.models.vocab": (
         "EnglishDictEntry",
         "EnglishDictSense",

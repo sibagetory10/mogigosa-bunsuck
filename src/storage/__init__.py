@@ -17,6 +17,7 @@ from src.storage.base import (
 )
 from src.storage.english_pool_store import EnglishPoolStoreMixin
 from src.storage.exam_store import ExamStoreMixin
+from src.storage.payment_store import PaymentStoreMixin
 from src.storage.user_exams_store import UserExamsStoreMixin
 from src.storage.vocab_store import VocabStoreMixin
 
@@ -24,6 +25,7 @@ from src.storage.vocab_store import VocabStoreMixin
 class StorageManager(
     ExamStoreMixin,
     UserExamsStoreMixin,
+    PaymentStoreMixin,
     EnglishPoolStoreMixin,
     AnalysisPoolStoreMixin,
     VocabStoreMixin,
