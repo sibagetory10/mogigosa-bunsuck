@@ -21,7 +21,13 @@ from src.models import (
     RewrittenQuestion,
     resolve_question_concept_reference,
 )
-from src.text_formatter import format_chemical_scripts, format_explanation_text, has_visual_reference
+from src.text_formatter import (
+    format_chemical_scripts,
+    format_explanation_text,
+    has_visual_reference,
+    render_korean_inline_html,
+    split_korean_passage_units,
+)
 from src.ui.common import (
     CIRCLED_MAP,
     _auto_save_current_exam,
@@ -36,6 +42,33 @@ from src.ui.common import (
 )
 from src.ui.context import AppContext
 from src.ui_styles import render_chips
+
+
+def _build_korean_set_passage_box_html(
+    start_num: int,
+    end_num: int,
+    set_inst: str,
+    clean_p: str,
+    is_keep_lines: bool,
+) -> str:
+    range_tag = f"[{start_num}~{end_num}]" if end_num > start_num else f"[{start_num}]"
+    units = split_korean_passage_units(clean_p, is_poetry_or_dialogue=is_keep_lines)
+    body_parts: list[str] = []
+    for u in units:
+        if u["kind"] == "spacer":
+            body_parts.append("<div style='height:0.45rem;'></div>")
+        elif u["kind"] == "subhead":
+            body_parts.append(f"<div class='kor-set-passage-subhead'>{render_korean_inline_html(u['text'])}</div>")
+        elif u["kind"] == "line":
+            body_parts.append(f"<p class='kor-set-passage-lit'>{render_korean_inline_html(u['text'])}</p>")
+        else:
+            body_parts.append(f"<p class='kor-set-passage-p'>{render_korean_inline_html(u['text'])}</p>")
+    return (
+        "<div class='kor-set-passage-box'>"
+        f"<div class='kor-set-passage-hdr'>{_html.escape(range_tag)} {_html.escape(set_inst)}</div>"
+        f"{''.join(body_parts)}"
+        "</div>"
+    )
 
 
 @st.fragment
@@ -85,17 +118,30 @@ def _render_mode_b_solve_fragment(
             unsafe_allow_html=True,
         )
 
+    from src.pdf.exam_pdf import _compute_korean_set_ranges, _resolve_korean_item_passage_info
+
+    kor_set_starts = _compute_korean_set_ranges(matched_items)
+
     for seq_num, item in enumerate(matched_items, start=1):
+        idx_0 = seq_num - 1
+        if idx_0 in kor_set_starts:
+            s_num, e_num, _, s_inst, s_clean_p, s_keep_lines = kor_set_starts[idx_0]
+            st.markdown(
+                _build_korean_set_passage_box_html(s_num, e_num, s_inst, s_clean_p, s_keep_lines),
+                unsafe_allow_html=True,
+            )
+
         q = item["question"]
-        j = item["judgment"]
+        j = item.get("judgment")
         crop_b = item.get("crop_png_bytes")
         rw = item.get("rewritten")
         truth_ans = rw.preserved_answer if rw else q.answer
-        concept_ref_str = (
-            item.get("concept_reference")
-            or resolve_question_concept_reference(
+        concept_ref_str = item.get("concept_reference") or (
+            resolve_question_concept_reference(
                 q, j, whitelist, fallback_source_label=st.session_state.get("concept_source_label", "")
             )
+            if j is not None
+            else ""
         )
 
         with st.container(border=True):
@@ -103,6 +149,11 @@ def _render_mode_b_solve_fragment(
                 q.subject_category == "영어"
                 or getattr(rw, "subject_domain", "") == "영어"
                 or bool(item.get("english_meta"))
+            )
+            is_kor_item = (
+                q.subject_category == "국어"
+                or getattr(rw, "subject_domain", "") == "국어"
+                or bool(item.get("korean_meta"))
             )
             eng_target_type = (
                 (getattr(rw, "target_question_type", "") if rw is not None else "")
@@ -115,11 +166,27 @@ def _render_mode_b_solve_fragment(
                 if "직접 입력" in (q.exam_name or "")
                 else f"출처: {q.exam_name} {q.q_num}번"
             )
+            kor_meta = item.get("korean_meta") or {}
+            kor_sec_lbl = str(kor_meta.get("section") or q.curriculum_subject or "국어")
+            kor_gid = str(kor_meta.get("group_id") or getattr(q, "passage_group_id", "") or q.q_num)
+            kor_target_type = (
+                (getattr(rw, "target_question_type", "") if rw is not None else "")
+                or q.unit_name
+                or "수능형 변형"
+            )
+            kor_passage_ctx = ""
+            if is_kor_item:
+                _, _, kor_passage_ctx, _, _ = _resolve_korean_item_passage_info(item)
 
             # 카드 상단 헤더 + 번호 배지
             hdr_col1, hdr_col2 = st.columns([3.2, 1])
             with hdr_col1:
-                header_title = f"영어 · {eng_target_type}" if is_eng_item else f"{q.curriculum_subject} · {q.unit_name}"
+                if is_eng_item:
+                    header_title = f"영어 · {eng_target_type}"
+                elif is_kor_item:
+                    header_title = f"국어({kor_sec_lbl}) · {kor_target_type}"
+                else:
+                    header_title = f"{q.curriculum_subject} · {q.unit_name}"
                 st.markdown(
                     f"""
                     <div class="q-badge-row">
@@ -133,17 +200,20 @@ def _render_mode_b_solve_fragment(
                 )
                 if is_eng_item:
                     st.caption(eng_source_caption)
+                elif is_kor_item:
+                    st.caption(f"출처: {q.exam_name} [{kor_gid}번]")
                 else:
                     st.caption(
                         f"출처: {q.exam_name} {q.q_num}번 · 본질 원리: {', '.join(q.core_principles)}"
                     )
             with hdr_col2:
                 if rw is not None:
-                    badge_txt = (
-                        f"✨ 수능형 변형 · {_html.escape(eng_target_type)}"
-                        if is_eng_item
-                        else "✨ 개념서 기준 개조 문항"
-                    )
+                    if is_eng_item:
+                        badge_txt = f"✨ 수능형 변형 · {_html.escape(eng_target_type)}"
+                    elif is_kor_item:
+                        badge_txt = f"✨ 수능형 변형 · {_html.escape(kor_target_type)}"
+                    else:
+                        badge_txt = "✨ 개념서 기준 개조 문항"
                     st.markdown(
                         f"<div style='text-align:right;'><span class='chip chip-blue'>{badge_txt}</span></div>",
                         unsafe_allow_html=True,
@@ -158,7 +228,7 @@ def _render_mode_b_solve_fragment(
             if rw is not None:
                 st.markdown(_render_rewritten_card_html(rw), unsafe_allow_html=True)
 
-                if not is_eng_item:
+                if not is_eng_item and not is_kor_item:
                     vis_term_note = (getattr(rw, "visual_term_note", "") or "").strip()
                     needs_visual_display = bool(crop_b) and (
                         has_visual_reference(rw.rewritten_stem)
@@ -195,23 +265,24 @@ def _render_mode_b_solve_fragment(
                     if rw.replaced_terms_map:
                         render_chips(rw.replaced_terms_map, variant="purple")
             else:
-                if crop_b and not is_eng_item:
+                if crop_b and not is_eng_item and not is_kor_item:
                     st.image(crop_b, width="stretch")
                 else:
                     st.warning("문항 이미지를 불러올 수 없습니다.")
 
-            # 문항 카드 하단: 참고 개념서 단원/페이지 또는 영어 기출 출처 표기
-            st.markdown(
-                f"<div style='background:#EFF6FF; border-left:4px solid #2563EB; padding:8px 12px; "
-                f"border-radius:6px; margin:8px 0; font-size:0.9rem; font-weight:600; color:#1E3A8A;'>"
-                f"{_html.escape(concept_ref_str)}</div>",
-                unsafe_allow_html=True,
-            )
+            # 문항 카드 하단: 참고 개념서 단원/페이지 또는 영어/국어 기출 출처 표기
+            if concept_ref_str:
+                st.markdown(
+                    f"<div style='background:#EFF6FF; border-left:4px solid #2563EB; padding:8px 12px; "
+                    f"border-radius:6px; margin:8px 0; font-size:0.9rem; font-weight:600; color:#1E3A8A;'>"
+                    f"{_html.escape(concept_ref_str)}</div>",
+                    unsafe_allow_html=True,
+                )
 
             # 답안 입력 UI (객관식 1~5 터치 버튼 또는 주관식 입력)
             st.markdown("**내 답안 선택 / 입력:**")
             current_ans = st.session_state["user_answers"].get(q.id, "")
-            is_mc = True if is_eng_item else is_multiple_choice_question(q, rw)
+            is_mc = True if (is_eng_item or is_kor_item) else is_multiple_choice_question(q, rw)
 
             if is_mc:
                 st.markdown("<div class='omr-row'>", unsafe_allow_html=True)
@@ -295,6 +366,31 @@ def _render_mode_b_solve_fragment(
                                 except Exception as exc:
                                     refund_daily_free_ai_quota(ctx.storage, uname_quiz)
                                     st.error(f"영어 AI 해설 생성 실패: {exc}")
+                    elif is_kor_item:
+                        ok_free, free_msg = consume_daily_free_ai_quota(
+                            ctx.storage, uname_quiz, "AI 자동 해설"
+                        )
+                        if not ok_free:
+                            st.error(free_msg)
+                        else:
+                            with st.spinner("국어 지문 근거 기반 AI 자동 해설 생성 중..."):
+                                try:
+                                    from src.gemini import generate_korean_question_explanation
+
+                                    with _usage_scope(ctx):
+                                        exp_md = generate_korean_question_explanation(
+                                            api_key=active_gemini_key,
+                                            model_name=selected_model,
+                                            question=q,
+                                            passage_text=kor_passage_ctx,
+                                            user_answer=st.session_state["user_answers"].get(q.id, ""),
+                                            rewritten=rw,
+                                            source_reference=concept_ref_str,
+                                        )
+                                    st.session_state["ai_explanations"][q.id] = exp_md
+                                except Exception as exc:
+                                    refund_daily_free_ai_quota(ctx.storage, uname_quiz)
+                                    st.error(f"국어 AI 해설 생성 실패: {exc}")
                     elif whitelist is None:
                         st.error("개념서 화이트리스트가 필요합니다.")
                     else:
@@ -329,7 +425,7 @@ def _render_mode_b_solve_fragment(
                 if st.button(f"🔄 이 문제 다시 변환 ({regen_cost}C)", key=f"re_rw_btn_{q.id}", width="stretch"):
                     if not active_gemini_key:
                         st.error(f"사용 가능한 Gemini API 키({active_key_label})가 설정되지 않았습니다.")
-                    elif not is_eng_item and whitelist is None:
+                    elif not is_eng_item and not is_kor_item and whitelist is None:
                         st.error("개념서 화이트리스트가 필요합니다.")
                     else:
                         ok_regen_res, regen_reservation = try_reserve_credits(
@@ -391,6 +487,28 @@ def _render_mode_b_solve_fragment(
                                         st.session_state["generated_exam_pdf_sig"] = ""
                                         actual_regen_c = regen_cost
                                         regen_succeeded = True
+                                elif is_kor_item:
+                                    with st.spinner("국어 지문 근거 2-Gate 검증으로 이 문항만 새롭게 재출제 중..."):
+                                        from src.gemini import regenerate_single_korean_question
+
+                                        with _usage_scope(ctx):
+                                            new_rw = regenerate_single_korean_question(
+                                                api_key=active_gemini_key,
+                                                model_name=EXAM_TAGGING_MODEL,
+                                                question=q,
+                                                passage_text=kor_passage_ctx,
+                                                korean_section=kor_sec_lbl,
+                                                korean_subgenre=str(kor_meta.get("subgenre") or ""),
+                                                passage_topic=getattr(q, "passage_topic", ""),
+                                                previous_attempt=rw,
+                                            )
+                                        st.session_state["matched_items"][seq_num - 1]["rewritten"] = new_rw
+                                        st.session_state["ai_explanations"].pop(q.id, None)
+                                        st.session_state["ai_chats"].pop(q.id, None)
+                                        st.session_state["generated_exam_pdf"] = None
+                                        st.session_state["generated_exam_pdf_sig"] = ""
+                                        actual_regen_c = regen_cost
+                                        regen_succeeded = True
                                 else:
                                     with st.spinner("이전 변환의 미흡 용어를 보완해 이 문항만 다시 변환 중..."):
                                         target_oos = list(
@@ -436,9 +554,18 @@ def _render_mode_b_solve_fragment(
                                 st.rerun(scope="fragment")
 
             if q.id in st.session_state["ai_explanations"]:
-                st.info("✨ **수능 영어 구문·논리·오답 AI 맞춤 해설**" if is_eng_item else "✨ **개념서 범위 기준 AI 맞춤 해설**")
+                exp_banner_title = (
+                    "✨ **수능 영어 구문·논리·오답 AI 맞춤 해설**"
+                    if is_eng_item
+                    else (
+                        "✨ **수능 국어 지문 근거 AI 맞춤 해설**"
+                        if is_kor_item
+                        else "✨ **개념서 범위 기준 AI 맞춤 해설**"
+                    )
+                )
+                st.info(exp_banner_title)
                 st.markdown(st.session_state["ai_explanations"][q.id])
-                if concept_ref_str not in st.session_state["ai_explanations"][q.id]:
+                if concept_ref_str and concept_ref_str not in st.session_state["ai_explanations"][q.id]:
                     st.markdown(f"**{_html.escape(concept_ref_str)}**")
 
                 # 문항별 추가 질문 채팅 (문항당 최대 5턴 · 일일 무료 한도 적용)
@@ -458,14 +585,18 @@ def _render_mode_b_solve_fragment(
                             placeholder=(
                                 "예: 3번 선지가 왜 오답인지, 또는 첫 문장 구문 구조를 설명해 주세요."
                                 if is_eng_item
-                                else "예: 왜 이 식에서 질량비가 이렇게 적용되나요?"
+                                else (
+                                    "예: 2번 선지가 지문의 어느 문장과 어긋나는지 설명해 주세요."
+                                    if is_kor_item
+                                    else "예: 왜 이 식에서 질량비가 이렇게 적용되나요?"
+                                )
                             ),
                             label_visibility="collapsed",
                         )
                         send_chat = st.form_submit_button("질문 보내기")
 
                     if send_chat and followup_q.strip():
-                        if not active_gemini_key or (not is_eng_item and whitelist is None):
+                        if not active_gemini_key or (not is_eng_item and not is_kor_item and whitelist is None):
                             st.error(f"사용 가능한 Gemini API 키({active_key_label})가 필요합니다.")
                         else:
                             ok_chat, chat_msg = consume_daily_free_ai_quota(
@@ -488,6 +619,18 @@ def _render_mode_b_solve_fragment(
                                                     rewritten=rw,
                                                     chat_history=q_chat_history[-10:-1],
                                                     user_query=followup_q.strip(),
+                                                )
+                                            elif is_kor_item:
+                                                from src.gemini import chat_followup_with_korean
+
+                                                reply = chat_followup_with_korean(
+                                                    api_key=active_gemini_key,
+                                                    model_name=selected_model,
+                                                    question=q,
+                                                    passage_text=kor_passage_ctx,
+                                                    chat_history=q_chat_history[-10:-1],
+                                                    user_query=followup_q.strip(),
+                                                    rewritten=rw,
                                                 )
                                             else:
                                                 from src.gemini import chat_followup_with_pdf

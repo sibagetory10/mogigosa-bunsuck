@@ -246,12 +246,19 @@ def format_explanation_text(text: str, for_markdown: bool = False) -> str:
     return out
 
 
+_BOGI_EXIT_STEM_RE = re.compile(
+    r"(?:윗글|위\s*글|<보기>|〈보기〉|보기를|적절한\s*것은|적절하지\s*않은\s*것은|알맞은\s*것은|일치하는|일치하지\s*않는|"
+    r"추론한|이해한|감상한|분석한|비판한|적용한|설명한|고른\s*것은)"
+)
+
+
 def split_stem_blocks(text: str) -> list[tuple[str, Any]]:
     """
     정돈된 발문 텍스트를 순차 블록 리스트로 분해한다:
       - ('text', str)
       - ('data', {'title': str, 'body': str})
       - ('bogi', list[tuple[str, str]])
+      - ('bogi_prose', str)
     """
     norm = normalize_exam_layout_text(text)
     if not norm:
@@ -279,7 +286,9 @@ def split_stem_blocks(text: str) -> list[tuple[str, Any]]:
             if bogi_items:
                 blocks.append(("bogi", list(bogi_items)))
             elif buf_lines:
-                blocks.append(("text", "\n".join(buf_lines).strip()))
+                joined_bogi = "\n".join(buf_lines).strip()
+                if joined_bogi:
+                    blocks.append(("bogi_prose", joined_bogi))
             bogi_items = []
             buf_lines = []
 
@@ -303,17 +312,23 @@ def split_stem_blocks(text: str) -> list[tuple[str, Any]]:
             if not ln:
                 if bogi_items:
                     continue
-            elif _QUESTION_END_RE.search(ln) or re.match(r"^\(?단,\s", ln):
+                if buf_lines and buf_lines[-1] != "":
+                    buf_lines.append("")
+                continue
+            is_exit_stem = bool(re.match(r"^\(?단,\s", ln)) or (
+                bool(_QUESTION_END_RE.search(ln))
+                and (bool(bogi_items) or bool(_BOGI_EXIT_STEM_RE.search(ln)))
+            )
+            if is_exit_stem:
                 _flush()
                 mode = "text"
                 buf_lines.append(ln)
                 continue
-            elif bogi_items:
+            if bogi_items:
                 prev_m, prev_t = bogi_items[-1]
                 bogi_items[-1] = (prev_m, f"{prev_t} {ln}".strip())
                 continue
-            else:
-                buf_lines.append(ln)
+            buf_lines.append(ln)
         elif mode == "data":
             if not ln:
                 if buf_lines and buf_lines[-1] != "":
@@ -690,4 +705,259 @@ def normalize_english_korean_translation(text: str) -> str:
     s = re.sub(r"[ \t]+", " ", s).strip()
     s = re.sub(r"\s+([.,?!;:])", r"\1", s)
     return s
+
+
+# ---------------------------------------------------------------------------
+# 국어 모의고사 지문 정화 · 문단 재조립 · 인라인 HTML 렌더러
+# ---------------------------------------------------------------------------
+
+_KOR_SET_HEADER_RE = re.compile(
+    r"^\s*[\[\【]\s*\d{1,2}\s*[~\-～–—∼〜]\s*\d{1,2}\s*(?:번)?\s*[\]\】]\s*"
+    r"(?:다음\s*(?:글|자료|대화|발표|강연|담화|시).*|물음에\s*답하시오\.?)?\s*$"
+)
+_KOR_PURE_INST_RE = re.compile(
+    r"^\s*다음\s*(?:글|자료|대화|발표|강연|담화)을\s*읽고\s*물음에\s*답하시오\.?\s*$"
+)
+_KOR_NOISE_PAGE_NUM_RE = re.compile(r"^\s*(?:\[\s*\d{1,2}\s*\]|[-–]\s*\d{1,2}\s*[-–]|\d{1,2})\s*$")
+_KOR_NOISE_EXAM_FOOTER_RE = re.compile(
+    r"^(?:(?:국어|수학|영어|한국사|사회탐구|과학탐구|직업탐구)\s*영역(?:\s*\d{1,2})?"
+    r"|(?:\d{1,2}\s+)?(?:국어|수학|영어|한국사)(?:\s+\d{1,2})?"
+    r"|제\s*\d\s*교시|(?:홀수|짝수)\s*형"
+    r"|.*(?:전국연합학력평가|대학수학능력시험|모의평가\s*문제지|한국교육과정평가원|이\s*문제지에\s*관한\s*저작권|답안지의\s*해당란에).*)$"
+)
+_KOR_PASSAGE_SUBHEAD_RE = re.compile(
+    r"^(?:\([가나다라마]\)|<[가-힣\s]+>|\[[가-힣A-Za-z0-9\s]{1,12}\]|-\s*[^-\n]{2,40}\s*-)$"
+)
+_KOR_SENTENCE_END_RE = re.compile(r"[.?!…\"”’\)\]]\s*$")
+_KOR_STANDALONE_1CHAR_WORDS: frozenset[str] = frozenset(
+    {
+        "수", "것", "때", "등", "중", "안", "못", "더", "잘", "다", "또", "및", "각",
+        "한", "두", "세", "네", "이", "그", "저", "큰", "새", "바", "줄", "듯", "채",
+        "뿐", "데", "쪽", "편", "점", "명", "개", "번", "회", "원", "년", "월", "일",
+        "시", "분", "초", "갑", "을", "병", "정", "악", "선", "법", "글", "말", "눈",
+        "손", "힘", "빛", "열", "길", "집", "삶", "꿈", "몸", "맘", "뜻", "값", "폭",
+    }
+)
+_KOR_EOJEOL_PARTICLE_END_RE = re.compile(
+    r"(?:은|는|이|가|을|를|의|에|에서|에게|께|로|으로|와|과|도|만|까지|부터|처럼|보다|이며|이고|이나|라도)$"
+)
+_KOR_BOUND_NEXT_PARTICLE_RE = re.compile(
+    r"^(?:[.,?!:;·\)\]\”\’]|"
+    r"(?:이며|이고|이나|이라|이라는|라는|이라고|라고|이고서|에서|에게|으로|까지|부터|처럼|보다|조차|마저|밖에|이다|입니다|이었다|였다)(?=$|[^가-힣])|"
+    r"(?:은|는|가|을|를|의|에|로|와|과|도|만)(?=$|[.,?!:;·\)\]\”\’\s])|"
+    r"이(?=$|[.,?!:;·\)\]\”\’]|다(?=$|[^가-힣])))"
+)
+_KOR_BOUND_NEXT_VERB_SUFFIX_RE = re.compile(
+    r"^(?:하며|하여|하고|하면|해서|하는|되는|된|한다|된다|했다|되었다)(?=$|[^가-힣])"
+)
+_KOR_MARKER_HIGHLIGHT_RE = re.compile(r"([\u3260-\u327b\u24d0-\u24e9]|\[[A-E]\])")
+_KOR_BOLD_MD_RE = re.compile(r"\*\*([^*\n]+?)\*\*")
+
+
+def _is_korean_exam_noise_line(line: str) -> bool:
+    s = (line or "").strip()
+    if not s:
+        return False
+    if _KOR_SET_HEADER_RE.match(s) or _KOR_PURE_INST_RE.match(s):
+        return True
+    if _KOR_NOISE_PAGE_NUM_RE.match(s):
+        return True
+    if _KOR_NOISE_EXAM_FOOTER_RE.match(s):
+        return True
+    return False
+
+
+def _join_korean_wrapped_line_for_exam(
+    prev_line: str,
+    next_line: str,
+    *,
+    had_noise_between: bool = False,
+) -> str:
+    """2단 시험지 줄바꿈으로 끊긴 국어 산문 줄을 어절 끊김·보조용언 띄어쓰기를 구분해 자연스럽게 잇는다."""
+    if not prev_line:
+        return next_line
+    if not next_line:
+        return prev_line
+    if prev_line.endswith((" ", "\t", "-", "~", "(", "[", "“", "‘")):
+        return prev_line + next_line
+
+    if _KOR_BOUND_NEXT_PARTICLE_RE.match(next_line):
+        return prev_line + next_line
+
+    prev_tokens = prev_line.split()
+    next_tokens = next_line.split()
+    last_tok = prev_tokens[-1] if prev_tokens else ""
+    first_tok = next_tokens[0] if next_tokens else ""
+
+    if (
+        _KOR_BOUND_NEXT_VERB_SUFFIX_RE.match(next_line)
+        and last_tok
+        and not _KOR_EOJEOL_PARTICLE_END_RE.search(last_tok)
+        and last_tok not in _KOR_STANDALONE_1CHAR_WORDS
+    ):
+        return prev_line + next_line
+
+    if (
+        len(last_tok) == 1
+        and re.fullmatch(r"[가-힣]", last_tok)
+        and last_tok not in _KOR_STANDALONE_1CHAR_WORDS
+        and re.match(r"^[가-힣]", first_tok)
+    ):
+        return prev_line + next_line
+
+    if (
+        had_noise_between
+        and 1 <= len(last_tok) <= 2
+        and re.fullmatch(r"[가-힣]+", last_tok)
+        and not _KOR_EOJEOL_PARTICLE_END_RE.search(last_tok)
+        and last_tok not in _KOR_STANDALONE_1CHAR_WORDS
+        and re.match(r"^[가-힣]", first_tok)
+    ):
+        return prev_line + next_line
+
+    return f"{prev_line} {next_line}"
+
+
+def clean_korean_exam_passage(text: str, is_poetry_or_dialogue: bool = False) -> str:
+    """
+    국어 지문 원문에서 세트 헤더(`[11 ~ 14] 다음 글을...`)와 중간에 섞인 쪽번호·푸터(`4`, `5`, `7`, `국어 영역`)를 제거하고,
+    산문 지문은 문단 단위로 자연스럽게 재결합한다. (문제 표지 `(가)/(나)/[A]~[E]/㉠~㉭/ⓐ~ⓩ/<u>`는 100% 보존)
+    """
+    raw = _unescape_newlines(text or "").strip()
+    if not raw:
+        return ""
+
+    filtered: list[tuple[str, bool, bool]] = []
+    saw_noise = False
+    for raw_ln in raw.splitlines():
+        is_indented = bool(re.match(r"^(?:[ \t\u3000]{2,}|\t|\u3000)", raw_ln))
+        s = raw_ln.strip()
+        if not s:
+            if not saw_noise:
+                filtered.append(("", False, False))
+            continue
+        if _is_korean_exam_noise_line(s):
+            saw_noise = True
+            continue
+        filtered.append((s, is_indented, saw_noise))
+        saw_noise = False
+
+    if is_poetry_or_dialogue:
+        out_lit: list[str] = []
+        prev_blank = False
+        for ln, _, _ in filtered:
+            if not ln:
+                if not prev_blank and out_lit:
+                    out_lit.append("")
+                prev_blank = True
+            else:
+                out_lit.append(ln)
+                prev_blank = False
+        while out_lit and not out_lit[-1]:
+            out_lit.pop()
+        return "\n".join(out_lit)
+
+    prose_lens = sorted(len(ln) for ln, _, _ in filtered if len(ln) >= 15)
+    full_len = prose_lens[int(len(prose_lens) * 0.8)] if prose_lens else 30
+    short_end_thresh = max(24, int(full_len * 0.84))
+
+    paragraphs: list[str] = []
+    cur_para = ""
+    prev_raw_ln = ""
+    for ln, is_indented, had_noise in filtered:
+        if not ln:
+            if cur_para:
+                paragraphs.append(cur_para)
+                cur_para = ""
+                prev_raw_ln = ""
+            continue
+        if _KOR_PASSAGE_SUBHEAD_RE.match(ln):
+            if cur_para:
+                paragraphs.append(cur_para)
+                cur_para = ""
+                prev_raw_ln = ""
+            paragraphs.append(ln)
+            continue
+        if cur_para:
+            if (
+                not had_noise
+                and _KOR_SENTENCE_END_RE.search(prev_raw_ln)
+                and (is_indented or len(prev_raw_ln) <= short_end_thresh)
+            ):
+                paragraphs.append(cur_para)
+                cur_para = ln
+            else:
+                cur_para = _join_korean_wrapped_line_for_exam(
+                    cur_para, ln, had_noise_between=had_noise
+                )
+            prev_raw_ln = ln
+        else:
+            cur_para = ln
+            prev_raw_ln = ln
+
+    if cur_para:
+        paragraphs.append(cur_para)
+    return "\n\n".join(p for p in paragraphs if p.strip())
+
+
+def split_korean_passage_units(
+    text: str,
+    is_poetry_or_dialogue: bool = False,
+) -> list[dict[str, str]]:
+    """정제된 국어 지문을 PDF 다단 분할 및 웹 렌더링용 단위 리스트({'kind': subhead|para|line, 'text': ...})로 분해한다."""
+    cleaned = clean_korean_exam_passage(text, is_poetry_or_dialogue=is_poetry_or_dialogue)
+    if not cleaned:
+        return []
+    units: list[dict[str, str]] = []
+    for raw_ln in cleaned.splitlines():
+        s = raw_ln.strip()
+        if not s:
+            if is_poetry_or_dialogue and units and units[-1]["kind"] != "spacer":
+                units.append({"kind": "spacer", "text": ""})
+            continue
+        if _KOR_PASSAGE_SUBHEAD_RE.match(s):
+            units.append({"kind": "subhead", "text": s})
+        elif is_poetry_or_dialogue:
+            units.append({"kind": "line", "text": s})
+        else:
+            units.append({"kind": "para", "text": s})
+    while units and units[-1]["kind"] == "spacer":
+        units.pop()
+    return units
+
+
+def render_korean_inline_html(text: str, *, bold_to_underline: bool = False) -> str:
+    """
+    국어 지문·발문·선지용 안전한 인라인 HTML 변환기.
+    - 화학식 첨자 변환을 호출하지 않아 국어 기호/영문 약어를 보호한다.
+    - <u>...</u> 밑줄과 **강조** 마크다운(어휘 문항 선지는 밑줄)을 안전하게 변환한다.
+    - ㉠~㉭, ⓐ~ⓩ, [A]~[E] 기호를 베이스라인 정렬 강조 태그로 감싼다.
+    """
+    if not text:
+        return ""
+    norm = _unescape_newlines(text)
+    u_segments: list[str] = []
+
+    def _stash_u(m: re.Match[str]) -> str:
+        idx = len(u_segments)
+        u_segments.append(m.group(1))
+        return f"@@KOR_U_{idx}@@"
+
+    stashed = _ENG_U_TAG_RE.sub(_stash_u, norm)
+    escaped = _html.escape(stashed)
+
+    for idx, inner in enumerate(u_segments):
+        safe_inner = _html.escape(inner)
+        escaped = escaped.replace(
+            f"@@KOR_U_{idx}@@",
+            f"<u class='kor-u'>{safe_inner}</u>",
+        )
+
+    if bold_to_underline:
+        escaped = _KOR_BOLD_MD_RE.sub(r"<u class='kor-u'>\1</u>", escaped)
+    else:
+        escaped = _KOR_BOLD_MD_RE.sub(r"<b>\1</b>", escaped)
+
+    escaped = _KOR_MARKER_HIGHLIGHT_RE.sub(r"<span class='kor-mk'>\1</span>", escaped)
+    return escaped.replace("\n", "<br/>")
 

@@ -761,8 +761,33 @@ def render_tab2(ctx: AppContext) -> None:
             shuf_c1, shuf_c2, shuf_c3 = st.columns([1.15, 1.05, 2.3])
             with shuf_c1:
                 if st.button("🔀 문항 순서 섞기", key="tab2_shuffle_matched_items", width="stretch"):
-                    shuffled_items = list(matched_items)
-                    random.shuffle(shuffled_items)
+                    has_kor_sets = any(
+                        getattr(it["question"], "subject_category", "") == "국어"
+                        or getattr(it.get("rewritten"), "subject_domain", "") == "국어"
+                        or bool(it.get("korean_meta"))
+                        for it in matched_items
+                    )
+                    if has_kor_sets:
+                        # 국어 세트 문항은 지문이 깨지지 않도록 세트 묶음 단위로 순서 섞기
+                        blocks_by_key: list[list[dict[str, Any]]] = []
+                        key_to_idx: dict[str, int] = {}
+                        for it in matched_items:
+                            rw_i = it.get("rewritten")
+                            km_i = it.get("korean_meta") or {}
+                            q_i = it["question"]
+                            g_k = (
+                                (getattr(rw_i, "passage_group_key", "") if rw_i is not None else "")
+                                or f"{q_i.exam_name}::{km_i.get('group_id') or getattr(q_i, 'passage_group_id', '') or q_i.id}"
+                            )
+                            if g_k not in key_to_idx:
+                                key_to_idx[g_k] = len(blocks_by_key)
+                                blocks_by_key.append([])
+                            blocks_by_key[key_to_idx[g_k]].append(it)
+                        random.shuffle(blocks_by_key)
+                        shuffled_items = [it for blk in blocks_by_key for it in blk]
+                    else:
+                        shuffled_items = list(matched_items)
+                        random.shuffle(shuffled_items)
                     st.session_state["matched_items"] = shuffled_items
                     st.session_state["generated_exam_pdf"] = None
                     st.session_state["generated_exam_pdf_sig"] = ""
@@ -875,10 +900,21 @@ def render_tab2(ctx: AppContext) -> None:
                             try:
                                 from src.pdf.exam_pdf import generate_custom_exam_pdf
 
+                                eff_source_lbl = st.session_state.get("concept_source_label", "업로드 개념서 PDF")
+                                if is_all_kor_matched and (not eff_source_lbl or "업로드 개념서" in eff_source_lbl):
+                                    kor_exams = list(
+                                        dict.fromkeys(
+                                            str(getattr(it["question"], "exam_name", "") or "").strip()
+                                            for it in matched_items
+                                            if getattr(it["question"], "exam_name", "")
+                                        )
+                                    )
+                                    eff_source_lbl = ", ".join(kor_exams) if kor_exams else "국어 기출 지문 세트"
+
                                 pdf_bytes = generate_custom_exam_pdf(
                                     items=matched_items,
                                     exam_title=pdf_title.strip() or "맞춤형 기출 모의고사",
-                                    source_label=st.session_state.get("concept_source_label", "업로드 개념서 PDF"),
+                                    source_label=eff_source_lbl,
                                     whitelist=whitelist,
                                     two_column=(layout_choice == "2단 모의고사 스타일"),
                                     include_original_for_rewritten=include_orig_fig,

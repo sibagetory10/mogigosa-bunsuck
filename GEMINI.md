@@ -25,7 +25,7 @@
 - **핵심 도메인 로직**:
   - **수학 · 사회 · 과학 · 한국사**: 개념서·교과서 PDF(또는 공용 개념서 DB)에 실제로 등장한 핵심 원리(`core_principles`)와 용어(`required_terms` / `basic_terms`)만 허용하고, 원리는 같지만 상위 학년·선택과목 전문 용어(`advanced_terms`)가 포함된 기출문제를 학생의 개념서 언어로 자동 개조(`RewrittenQuestion`)한다.
   - **영어**: 수능/모의고사 영어 독해 지문을 기반으로 11종 수능 유형(`ENGLISH_TRANSFORM_TYPES`)으로 변형 문제를 생성하며(`English Engine v3`: `src/english_v3/` — 원문 정화·문장 인덱싱 `[S0]~[Sn-1]` + 무주석 경량 좌표/델타 Pydantic 스키마 + `순서`/`삽입` Python 담화 응집도 0토큰 후보 조립 + 0토큰 시드 어휘 연동 + Gate 1 하드 규칙 검증 + 중·고난도 8종 정답 은닉 Blind Solver Gate 2 + `gemini-3.5-flash-lite` 내 `thinking_level` 차등 라우팅(`minimal`/`low`→`medium`) + 3문항 이상 Flex 50% 할인 & Batch API + `v3` 캐시 풀 격리), 고품질 문제·해설·영단어장 PDF를 제공한다. 또한 **영어 지문 분석지**(주제 · 논리 전개 흐름 · 공식 각주 · 이해용 시각 도식 · AI 미사용 문제지/해설지 PDF 순수 복붙 문장별 원문+해설 매칭, `analysis_version=5` / PDF `v7`, 기출 포인트 제거)를 생성·캐싱·PDF 출력할 수 있다.
-  - **국어**: 독서·문학·화법과 작문·언어와 매체 세트 지문을 분석하고, 자유 유형 세트 문항 재구성, Pillow 기반 시각 구조도(`diagram_renderer.py`), 2단/분석본 PDF(`korean_pdf_generator.py`)를 생성한다.
+  - **국어**: 독서·문학·화법과 작문·언어와 매체 세트 지문을 정제(`clean_korean_exam_passage` — 세트 헤더·쪽번호·푸터 노이즈 제거, 어절/문단 재결합, 표지 보존)해 분석·시각 구조도(`diagram_renderer.py`)·분석지 PDF(`korean_analysis_pdf.py`)를 생성한다. 세트 변형은 Gate 1(하드 규칙·표지·`<보기>`·비교모순·마크다운 정화) + Gate 2(세트 정답 은닉 Blind Solver + 결함 슬롯 타겟 재출제) + 정답 번호 균등 분산기(`balance_korean_answer_distribution`)로 출제하며, `RewrittenQuestion.shared_passage`에 공통 지문을 분리 저장해 다단 흐름형 시험지 PDF(`exam_pdf.py`)와 웹 실전 풀이(`tab2_quiz.py`)에 무손실 조판한다.
 - **기술 스택**: Python, Streamlit (`>=1.50.0`), PyMuPDF (`pymupdf`), Google GenAI SDK (`google-genai`), Pydantic v2 (`pydantic`), Pillow (`pillow`), Requests, BeautifulSoup4.
 
 ---
@@ -66,8 +66,8 @@
 - **`src/ui/tab1_upload.py`, `tab1_pairing.py`, `tab1_tagging.py`, `tab1_batch_queue.py`, `tab1_db_explorer.py` [탭 1]**: 모의고사 PDF 수집(단일/대기열/EBSi), AI 표지·해설지 매칭, 문항 크롭(`CroppedQuestion`), 2022 원리·용어 분해 태깅, 과목별 기출 DB 탐색/수정/내보내기.
 - **`src/ui/tab2_transform.py` [탭 2 메인]**: 기준 개념서 범위 설정(공용 개념서 DB / 직접 PDF) → 화이트리스트 추출 → 기출 매칭 & 상위 용어 개조, 영어/국어 전용 변형 섹션 지연 분기.
 - **`src/ui/tab2_english.py` & `src/ui/tab2_english_analysis.py` [탭 2 - 영어]**: 11종 수능 독해 유형 변형 배치 실행 및 **영어 정밀 지문 분석지 PDF 생성/미리보기**.
-- **`src/ui/tab2_korean.py` [탭 2 - 국어]**: 독서·문학·화작·언매 지문 세트 선택, 지문 심층 분석, 시각 구조도 생성, 세트 전체 문항 재구성 및 PDF 생성/병합.
-- **`src/ui/tab2_quiz.py` [탭 2 - 실전 풀이]**: `@st.fragment` 기반 웹 바로 풀기, 자동 채점 성적표, 개념서 근거 기반 AI 해설 & 채팅, 문항별 개별 재변환.
+- **`src/ui/tab2_korean.py` [탭 2 - 국어]**: 독서·문학·화작·언매 지문 세트 선택, 지문 심층 분석, 시각 구조도 생성, 세트 전체 문항 병렬 재구성(2-Gate 검수 + 정답 분산) 및 PDF 생성/병합.
+- **`src/ui/tab2_quiz.py` [탭 2 - 실전 풀이]**: `@st.fragment` 기반 웹 바로 풀기, 국어 공통 지문 박스 표시, 자동 채점 성적표, 과목별(개념서·영어·국어) AI 해설 & 채팅, 문항별 개별 재변환.
 - **`src/ui/tab3_concept.py` [탭 3]**: 공용 개념서·교과서 DB 구축 및 2022 개정 교육과정 공식 기준표(NCIC 고시 PDF / 교육부 원문 동기화) 관리.
 - **`src/ui/tab4_dictionary.py` & `src/ui/tab4_vocab_quiz.py` [탭 4]**: 수능 영단어 사전(`data/csat_vocab_seed.json` + AI 검색 캐시), 기출 핵심 어휘 연동, 나만의 단어장 & PDF, 객관식/플래시카드 퀴즈.
 - **`src/ui/my_exams_tab.py` [나의 시험지]**: 계정별·과목별 자동 저장된 시험지 목록 조회, PDF 다운로드, 웹 재풀이 로드.
@@ -80,7 +80,7 @@
 - **`src/gemini/rewrite.py`**: 금지 상위 용어 제거 문항 개조(`rewrite_question_for_pdf`), 개념서 근거 해설, 후속 질의응답.
 - **`src/english_v3/` (`routing.py`, `schemas.py`, `preprocessor.py`, `discourse.py`, `transport.py`, `assembler.py`, `rules_gate.py`, `blind_validator.py`, `pipeline.py`, `batch_runner.py`)**: 백지 재설계 수능 영어 11종 변형 엔진 v3 (초경량 좌표/델타 스키마, `순서`/`삽입` 담화 0토큰 조립 + 단일 Blind Solver 통합 검수, 파이썬 하드규칙 Gate 1, 8종 Blind Solver Gate 2, `thinking_level` 차등 라우팅, Standard/Flex/Batch 50% 할인).
 - **`src/gemini/english_tagging.py`, `english_transform.py`, `english.py`(지연 파사드)**: 영어 문항 태깅 및 정밀 지문 분석지 PDF(`generate_english_passage_analysis`) 전용; 변형문제·해설·채팅 export는 `src/english_v3/pipeline.py`로 연결.
-- **`src/gemini/korean.py`**: 국어 지문 노이즈 제거, 세트 지문 동기화, 문학 작품 웹 브리프 조회, 지문 심층 분석·교열, 시각 다이어그램, 세트 문항 재구성.
+- **`src/gemini/korean.py`**: 국어 지문 노이즈 정제, 세트 지문 동기화, 문학 작품 웹 브리프 조회, 지문 심층 분석·교열, 시각 다이어그램, 2-Gate(하드규칙+Blind Solver) 세트 문항 재구성 및 정답 분산·모드 B 해설/채팅/단일 재출제.
 - **`src/gemini/dictionary.py`**: 영단어 Gemini 사전 조회(`lookup_english_word_with_gemini`).
 - **하위 호환 지연 파사드**: `src/gemini/__init__.py` (`_SUBMODULE_EXPORTS`), `src/gemini_service.py`, `src/korean_gemini_service.py`.
 

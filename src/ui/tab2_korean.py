@@ -253,41 +253,75 @@ def render_tab2_korean_transform_section(
         actual_c = 0
         try:
             with usage_scope_fn():
-                with st.spinner(f"🤖 {MODEL_LABELS.get(EXAM_TAGGING_MODEL, EXAM_TAGGING_MODEL)}로 국어 지문 세트({len(chosen_sets)}개 세트) 변형문제 생성 중..."):
-                    for s_entry in chosen_sets:
+                with st.spinner(f"🤖 {MODEL_LABELS.get(EXAM_TAGGING_MODEL, EXAM_TAGGING_MODEL)}로 국어 지문 세트({len(chosen_sets)}개 세트) 변형문제 병렬 생성·검증 중..."):
+                    from src.gemini.korean import (
+                        balance_korean_answer_distribution,
+                        generate_korean_set_reconstruction,
+                    )
+
+                    def _run_kor_set(set_idx: int, s_entry: dict[str, Any]):
                         curr_subj = s_entry["curr_subj"]
                         kor_sec = _classify_kor_sec(curr_subj)
                         m_sub = re.search(r"\(([^)]+)\)", curr_subj)
                         kor_sub = m_sub.group(1) if m_sub else ""
-                        try:
-                            from src.gemini.korean import generate_korean_set_reconstruction
+                        pairs = generate_korean_set_reconstruction(
+                            api_key=kor_api_key,
+                            model_name=EXAM_TAGGING_MODEL,
+                            source_records=s_entry["records"],
+                            passage_text=s_entry["passage_text"],
+                            korean_section=kor_sec,
+                            korean_subgenre=kor_sub,
+                            passage_topic=s_entry["passage_topic"],
+                        )
+                        return set_idx, kor_sec, kor_sub, pairs
 
-                            pairs = generate_korean_set_reconstruction(
-                                api_key=kor_api_key,
-                                model_name=EXAM_TAGGING_MODEL,
-                                source_records=s_entry["records"],
-                                passage_text=s_entry["passage_text"],
-                                korean_section=kor_sec,
-                                korean_subgenre=kor_sub,
-                                passage_topic=s_entry["passage_topic"],
+                    slot_results: dict[int, tuple[str, str, list[Any]]] = {}
+                    with concurrent.futures.ThreadPoolExecutor(
+                        max_workers=min(3, len(chosen_sets))
+                    ) as executor:
+                        fut_map = {
+                            submit_with_usage_context(executor, _run_kor_set, idx_c, s_entry): (idx_c, s_entry)
+                            for idx_c, s_entry in enumerate(chosen_sets)
+                        }
+                        for fut in concurrent.futures.as_completed(fut_map):
+                            idx_c, s_entry = fut_map[fut]
+                            try:
+                                _, kor_sec, kor_sub, pairs = fut.result()
+                                if pairs:
+                                    slot_results[idx_c] = (kor_sec, kor_sub, pairs)
+                            except Exception as exc:
+                                st.error(f"[{s_entry['exam_name']} {s_entry['group_id']}번] 세트 재구성 실패: {exc}")
+
+                    combined_pairs: list[tuple[Any, Any]] = []
+                    pair_metas: list[tuple[dict[str, Any], str, str]] = []
+                    for idx_c, s_entry in enumerate(chosen_sets):
+                        res_t = slot_results.get(idx_c)
+                        if not res_t:
+                            continue
+                        kor_sec, kor_sub, pairs = res_t
+                        succeeded_sets += 1
+                        for rec, rw in pairs:
+                            combined_pairs.append((rec, rw))
+                            pair_metas.append((s_entry, kor_sec, kor_sub))
+
+                    if combined_pairs:
+                        balanced_pairs = balance_korean_answer_distribution(combined_pairs)
+                        for (rec, rw), (s_entry, kor_sec, kor_sub) in zip(balanced_pairs, pair_metas):
+                            new_matched.append(
+                                {
+                                    "question": rec,
+                                    "judgment": None,
+                                    "crop_png_bytes": None,
+                                    "rewritten": rw,
+                                    "concept_reference": f"출처: {s_entry['exam_name']} [{s_entry['group_id']}번]",
+                                    "korean_meta": {
+                                        "section": kor_sec,
+                                        "subgenre": kor_sub,
+                                        "group_id": s_entry["group_id"],
+                                        "passage_text": getattr(rw, "shared_passage", "") or s_entry["passage_text"],
+                                    },
+                                }
                             )
-                            if pairs:
-                                succeeded_sets += 1
-                            for rec, rw in pairs:
-                                new_matched.append(
-                                    {
-                                        "question": rec,
-                                        "rewritten": rw,
-                                        "concept_ref": f"출처: {s_entry['exam_name']} [{s_entry['group_id']}번]",
-                                        "korean_meta": {
-                                            "section": kor_sec,
-                                            "subgenre": kor_sub,
-                                            "group_id": s_entry["group_id"],
-                                        },
-                                    }
-                                )
-                        except Exception as exc:
-                            st.error(f"[{s_entry['exam_name']} {s_entry['group_id']}번] 세트 재구성 실패: {exc}")
             actual_c = succeeded_sets * CREDIT_COST_KOREAN_SET_TRANSFORM
         finally:
             settle_credit_reservation(
@@ -298,15 +332,18 @@ def render_tab2_korean_transform_section(
             )
 
         if new_matched:
+            exam_labels = list(dict.fromkeys(s["exam_name"] for s in chosen_sets if s.get("exam_name")))
             st.session_state["matched_items"] = new_matched
+            st.session_state["concept_source_label"] = ", ".join(exam_labels) if exam_labels else "국어 기출 지문 세트"
             st.session_state["generated_exam_pdf"] = None
             st.session_state["generated_exam_pdf_sig"] = ""
-            st.session_state["web_quiz_answers"] = {}
-            st.session_state["web_quiz_graded"] = False
-            st.session_state["web_quiz_ai_exps"] = {}
+            st.session_state["user_answers"] = {}
+            st.session_state["graded"] = False
+            st.session_state["ai_explanations"] = {}
+            st.session_state["ai_chats"] = {}
             bal_msg = format_credit_balance_inline(storage, uname_kor, charged=actual_c)
             st.success(
-                f"🎯 총 {succeeded_sets}개 지문 세트({len(new_matched)}문항) 변형문제 생성 완료! 아래 [모드 A] PDF 또는 [모드 B] 웹 풀기를 이용해 주세요.{bal_msg}"
+                f"🎯 총 {succeeded_sets}개 지문 세트({len(new_matched)}문항) 변형문제 생성 및 2-Gate 검수 완료! 아래 [모드 A] PDF 또는 [모드 B] 웹 풀기를 이용해 주세요.{bal_msg}"
             )
 
     if run_kor_analysis_btn:

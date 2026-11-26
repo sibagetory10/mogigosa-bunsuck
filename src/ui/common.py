@@ -442,10 +442,17 @@ def _render_english_rewritten_card_html(rw: RewrittenQuestion) -> str:
 
 
 def _render_rewritten_card_html(rw: RewrittenQuestion) -> str:
-    """개조 문항의 <자료>·<보기> 분리 박스, 화학식 첨자(영어는 수능형 밑줄/박스), 선지 HTML을 모던 학습지 스타일로 조립한다."""
+    """개조 문항의 <자료>·<보기> 분리 박스, 화학식 첨자(영어/국어 전용 렌더러 분기), 선지 HTML을 모던 학습지 스타일로 조립한다."""
     if getattr(rw, "subject_domain", "") == "영어":
         return _render_english_rewritten_card_html(rw)
-    from src.text_formatter import format_chemical_scripts, split_stem_blocks
+    from src.text_formatter import (
+        format_chemical_scripts,
+        render_korean_inline_html,
+        split_stem_blocks,
+    )
+
+    is_kor = getattr(rw, "subject_domain", "") == "국어"
+    fmt_body = (lambda s: render_korean_inline_html(s)) if is_kor else (lambda s: _html.escape(s).replace(chr(10), "<br/>"))
 
     blocks = split_stem_blocks(rw.rewritten_stem)
     body_parts: list[str] = []
@@ -460,7 +467,7 @@ def _render_rewritten_card_html(rw: RewrittenQuestion) -> str:
             line_divs = "".join(
                 "<div style='height:0.35rem;'></div>"
                 if not ln.strip()
-                else f"<div class='data-line'>{_html.escape(ln.strip())}</div>"
+                else f"<div class='data-line'>{fmt_body(ln.strip())}</div>"
                 for ln in d_body.split("\n")
             )
             body_parts.append(
@@ -469,17 +476,27 @@ def _render_rewritten_card_html(rw: RewrittenQuestion) -> str:
         elif kind == "bogi":
             bogi_rows = "".join(
                 f"<div class='bogi-item'><span class='bogi-marker'>{_html.escape(mk)}</span>"
-                f"<span>{_html.escape(txt).replace(chr(10), '<br/>')}</span></div>"
+                f"<span>{fmt_body(txt)}</span></div>"
                 for mk, txt in content
             )
             body_parts.append(
                 f"<div class='bogi-box'><div class='bogi-title'>〈 보 기 〉</div>{bogi_rows}</div>"
             )
+        elif kind == "bogi_prose":
+            bogi_lines = "".join(
+                "<div style='height:0.35rem;'></div>"
+                if not ln.strip()
+                else f"<div class='bogi-prose-line'>{fmt_body(ln.strip())}</div>"
+                for ln in str(content).split("\n")
+            )
+            body_parts.append(
+                f"<div class='bogi-box'><div class='bogi-title'>〈 보 기 〉</div><div class='bogi-prose'>{bogi_lines}</div></div>"
+            )
         else:
             stem_divs = "".join(
                 "<div style='height:0.35rem;'></div>"
                 if not ln.strip()
-                else f"<div class='stem-line'>{_html.escape(ln.strip())}</div>"
+                else f"<div class='stem-line'>{fmt_body(ln.strip())}</div>"
                 for ln in str(content).split("\n")
             )
             body_parts.append(f"<div class='rewritten-stem'>{stem_divs}</div>")
@@ -489,8 +506,11 @@ def _render_rewritten_card_html(rw: RewrittenQuestion) -> str:
         choice_divs = []
         for ci, c_text in enumerate(rw.rewritten_choices):
             sym = CIRCLED_MAP.get(str(ci + 1), f"{ci + 1})")
-            formatted_choice = format_chemical_scripts(c_text.strip())
-            c_html = _html.escape(formatted_choice).replace("\n", "<br/>")
+            if is_kor:
+                c_html = render_korean_inline_html(c_text.strip(), bold_to_underline=True)
+            else:
+                formatted_choice = format_chemical_scripts(c_text.strip())
+                c_html = _html.escape(formatted_choice).replace("\n", "<br/>")
             choice_divs.append(f"<div class='rewritten-choice'><b>{sym}</b> {c_html}</div>")
         choices_html = f"<div class='rewritten-choices-wrap'>{''.join(choice_divs)}</div>"
 
@@ -600,6 +620,7 @@ def _serialize_matched_items(items: list[dict[str, Any]]) -> list[dict[str, Any]
                 "rewritten": rw_obj.model_dump() if hasattr(rw_obj, "model_dump") else None,
                 "concept_reference": str(it.get("concept_reference") or ""),
                 "english_meta": dict(it.get("english_meta") or {}) if it.get("english_meta") else None,
+                "korean_meta": dict(it.get("korean_meta") or {}) if it.get("korean_meta") else None,
             }
         )
     return serialized
@@ -637,6 +658,7 @@ def _deserialize_matched_items(raw_items: list[dict[str, Any]], storage: Storage
                 "rewritten": rw_obj,
                 "concept_reference": str(raw.get("concept_reference") or ""),
                 "english_meta": raw.get("english_meta"),
+                "korean_meta": raw.get("korean_meta"),
             }
         )
     return restored

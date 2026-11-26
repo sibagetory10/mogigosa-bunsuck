@@ -83,16 +83,24 @@ class KoreanSetQuestionOutput(BaseModel):
     )
     stem: str = Field(
         ...,
-        description="발문 및 필요 시 <보기> 박스 포함 문항 본문 (공통 지문 본문은 포함하지 않음)",
+        description="순수 발문 1문장만 작성 (<보기> 본문 및 지문 본문 미포함, 불필요한 기호 괄호 풀이 금지)",
+    )
+    bogi_text: str = Field(
+        default="",
+        description="<보기> 박스 내부 본문 (필요한 문항만 작성, 일반 문항은 빈 문자열)",
     )
     choices: list[str] = Field(
         ...,
-        description="①~⑤ 선지 번호를 제외한 5개 선지 텍스트 리스트",
+        description="①~⑤ 선지 번호를 제외한 5개 선지 텍스트 리스트 (마크다운 ** 금지, 어휘 문항 목표 어휘만 <u>...</u> 밑줄 허용)",
     )
     answer: str = Field(..., description="정답 ('1'~'5' 단일 숫자 문자열)")
     explanation: str = Field(
-        ...,
-        description="지문 근거를 바탕으로 한 단계별 정답 근거 및 오답 선지 소거 해설",
+        default="",
+        description="정답 핵심 근거 요약 (평어체 '~다.')",
+    )
+    choice_explanations: list[str] = Field(
+        default_factory=list,
+        description="choices[0]~choices[4] 순서와 1:1 대응하는 5개 선지별 정오 근거 리스트 (평어체 '~다.')",
     )
 
 
@@ -101,8 +109,42 @@ class KoreanSetReconstructionOutput(BaseModel):
 
     set_intro: str = Field(
         ...,
-        description="세트 공통 발문 (예: '[1~4] 다음 글을 읽고 물음에 답하시오.')",
+        description="세트 공통 발문 (예: '다음 글을 읽고 물음에 답하시오.')",
     )
+    questions: list[KoreanSetQuestionOutput] = Field(default_factory=list)
+
+
+class KoreanBlindQuestionVerdict(BaseModel):
+    """정답 은닉 Blind Solver의 개별 국어 문항 검수 판정."""
+
+    slot_index: int = Field(..., ge=1, description="세트 내 문항 순번")
+    selected_answer: Literal["1", "2", "3", "4", "5"] = Field(
+        ...,
+        description="정답을 보지 않고 지문·발문·선지만 읽고 독립적으로 도출한 유일한 정답 ('1'~'5')",
+    )
+    ambiguous_choices: list[str] = Field(
+        default_factory=list,
+        description="복수 정답 소지가 있거나 경합하는 선지 번호 목록 (예: ['2', '4'])",
+    )
+    has_flaw: bool = Field(
+        default=False,
+        description="지문 사실 불일치, 지문 미존재 표지 참조, 주술 호응/비문, 자체모순 선지, <보기> 오류 등 출제 결함 여부",
+    )
+    flaw_reason: str = Field(
+        default="",
+        description="결함 또는 정답 경합 사유 (문제 없으면 빈 문자열)",
+    )
+
+
+class KoreanBlindSetVerdict(BaseModel):
+    """국어 세트 전체에 대한 Blind Solver 일괄 검수 결과."""
+
+    verdicts: list[KoreanBlindQuestionVerdict] = Field(default_factory=list)
+
+
+class KoreanSetRepairOutput(BaseModel):
+    """결함이 발견된 국어 세트 문항 슬롯만 정밀 재출제하는 출력 스키마."""
+
     questions: list[KoreanSetQuestionOutput] = Field(default_factory=list)
 
 

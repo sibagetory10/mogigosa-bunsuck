@@ -4,7 +4,7 @@ from __future__ import annotations
 
 EXAM_CSS = """
 body {
-    font-family: "NanumGothic", "Malgun Gothic", sans-serif;
+    font-family: "MogiKorSans", "NanumGothic", "Malgun Gothic", sans-serif;
     font-size: 9.4pt;
     line-height: 1.52;
     color: #0F172A;
@@ -296,6 +296,63 @@ sup {
     color: #475569;
     margin-top: 2pt;
     margin-bottom: 3pt;
+}
+.bogi-prose {
+    font-size: 9pt;
+    line-height: 1.48;
+    color: #0F172A;
+    word-break: keep-all;
+}
+.bogi-prose-line {
+    margin-bottom: 2.2pt;
+}
+.bogi-prose-line:last-child { margin-bottom: 0; }
+.kor-u {
+    text-decoration: underline;
+    font-weight: bold;
+    color: #0F172A;
+}
+.kor-mk {
+    font-weight: bold;
+    color: #1E3A8A;
+}
+.kor-set-intro {
+    font-size: 9.4pt;
+    font-weight: bold;
+    color: #0F172A;
+    margin-bottom: 4pt;
+    word-break: keep-all;
+}
+.kor-passage-subhead {
+    font-weight: bold;
+    font-size: 9.2pt;
+    color: #0F172A;
+    margin: 4pt 0 2pt 0;
+}
+.kor-passage-p {
+    font-size: 9.1pt;
+    line-height: 1.56;
+    text-indent: 9pt;
+    text-align: justify;
+    margin: 0 0 3.5pt 0;
+    color: #0F172A;
+    word-break: keep-all;
+}
+.kor-passage-p-cont {
+    font-size: 9.1pt;
+    line-height: 1.56;
+    text-indent: 0;
+    text-align: justify;
+    margin: 0 0 3.5pt 0;
+    color: #0F172A;
+    word-break: keep-all;
+}
+.kor-passage-lit {
+    font-size: 9.1pt;
+    line-height: 1.56;
+    margin: 0 0 1.5pt 0;
+    color: #0F172A;
+    word-break: keep-all;
 }
 """
 

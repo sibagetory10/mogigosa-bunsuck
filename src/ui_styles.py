@@ -222,6 +222,47 @@ def inject_responsive_css() -> None:
         }
         .bogi-item:last-child { margin-bottom: 0; }
         .bogi-marker { font-weight: 800; color: #1E3A8A; }
+        .bogi-prose { font-size: clamp(0.93rem, 1.38vw, 1rem); line-height: 1.72; color: #0F172A; word-break: keep-all; }
+        .bogi-prose-line { margin-bottom: 0.35rem; }
+        .bogi-prose-line:last-child { margin-bottom: 0; }
+        .kor-u { text-decoration: underline; text-underline-offset: 3px; text-decoration-thickness: 1.6px; font-weight: 700; color: #0F172A; }
+        .kor-mk { font-weight: 800; color: #1E3A8A; }
+        .kor-set-passage-box {
+            background: #F8FAFC;
+            border: 1.5px solid #334155;
+            border-radius: 12px;
+            padding: clamp(0.95rem, 2vw, 1.35rem);
+            margin: 0.7rem 0 0.85rem 0;
+            color: #0F172A;
+            box-shadow: 0 2px 10px rgba(15, 23, 42, 0.04);
+        }
+        .kor-set-passage-hdr {
+            font-size: clamp(0.96rem, 1.45vw, 1.05rem);
+            font-weight: 800;
+            color: #1E3A8A;
+            margin-bottom: 0.65rem;
+            padding-bottom: 0.4rem;
+            border-bottom: 1px solid #CBD5E1;
+        }
+        .kor-set-passage-subhead {
+            font-weight: 800;
+            color: #0F172A;
+            margin: 0.6rem 0 0.25rem 0;
+        }
+        .kor-set-passage-p {
+            font-size: clamp(0.94rem, 1.4vw, 1.02rem);
+            line-height: 1.82;
+            text-indent: 1rem;
+            text-align: justify;
+            margin: 0 0 0.55rem 0;
+            word-break: keep-all;
+        }
+        .kor-set-passage-lit {
+            font-size: clamp(0.94rem, 1.4vw, 1.02rem);
+            line-height: 1.78;
+            margin: 0 0 0.25rem 0;
+            word-break: keep-all;
+        }
 
         /* 영어(English) 수능형 변형 전용 스타일 */
         .eng-u {

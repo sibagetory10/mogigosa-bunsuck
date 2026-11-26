@@ -300,6 +300,26 @@ def _collect_content_boxes_in_column(
     return boxes
 
 
+def _strip_shared_passage_header_lines(text: str) -> str:
+    """크롭된 공통 지문 상단의 '[11 ~ 14] 다음 글을 읽고 물음에 답하시오.' 안내 줄을 제거한다."""
+    lines = (text or "").splitlines()
+    out: list[str] = []
+    skipping_head = True
+    for ln in lines:
+        s = ln.strip()
+        if skipping_head:
+            if not s:
+                continue
+            if SHARED_PASSAGE_RE.match(s) or re.match(
+                r"^다음\s*(?:글|자료|대화|발표|강연|담화)을\s*읽고\s*물음에\s*답하시오\.?$",
+                s,
+            ):
+                continue
+            skipping_head = False
+        out.append(ln)
+    return "\n".join(out).strip()
+
+
 def _stitch_vertical_pngs(top_png: bytes, bottom_png: bytes, gap_px: int = 12) -> tuple[bytes, int, int]:
     """이전 단(컬럼)의 세트 지문 PNG와 문항 PNG를 위아래로 깔끔하게 이어 붙인다."""
     with Image.open(io.BytesIO(top_png)) as im_top, Image.open(io.BytesIO(bottom_png)) as im_bot:
@@ -452,6 +472,8 @@ def parse_exam_pdf(
                             if pending_passage_y0 - 2.0 <= l_item["y0"] < ln["y0"] - 1.0
                             and not _is_footer_or_header_noise(l_item["text"], l_item["y0"], page_h)
                         ).strip()
+                        if split_passage_and_question:
+                            same_col_shared_txt = _strip_shared_passage_header_lines(same_col_shared_txt)
                         grp_id = f"{pending_passage_start_q}~{pending_passage_end_q}"
                         active_passage_group = {
                             "start_q": pending_passage_start_q,
@@ -802,6 +824,8 @@ def parse_exam_pdf(
                             and ln["y0"] <= p_clip.y1
                             and not _is_footer_or_header_noise(ln["text"], ln["y0"], page_h)
                         )
+                        if split_passage_and_question:
+                            p_txt = _strip_shared_passage_header_lines(p_txt)
                         grp_str = f"{pending_passage_start_q}~{pending_passage_end_q}"
                         carried_passage = {
                             "start_q": pending_passage_start_q,

@@ -62,6 +62,8 @@ _SUBMODULE_EXPORTS: dict[str, tuple[str, ...]] = {
     ),
     "src.models.korean": (
         "BatchKoreanExamExtractionOutput",
+        "KoreanBlindQuestionVerdict",
+        "KoreanBlindSetVerdict",
         "KoreanCharacterEdge",
         "KoreanDiagramNode",
         "KoreanEmotionPoint",
@@ -78,6 +80,7 @@ _SUBMODULE_EXPORTS: dict[str, tuple[str, ...]] = {
         "KoreanQuestionExtractionItem",
         "KoreanSetQuestionOutput",
         "KoreanSetReconstructionOutput",
+        "KoreanSetRepairOutput",
         "KoreanSingleExtractionOutput",
         "KoreanVisualDiagram",
     ),

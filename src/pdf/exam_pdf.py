@@ -10,18 +10,34 @@ import pymupdf
 from PIL import Image
 
 from src.models import ConceptWhitelist, QuestionRecord, RewrittenQuestion
+from src.pdf.common import _build_korean_story_font_bundle
 from src.pdf.styles import EXAM_CSS
 from src.text_formatter import (
+    clean_korean_exam_passage,
     format_chemical_scripts,
     format_explanation_text,
     render_english_inline_html,
+    render_korean_inline_html,
     split_english_stem_blocks,
+    split_korean_passage_units,
     split_stem_blocks,
     strip_english_embedded_choices,
     unicode_scripts_to_html_tags,
 )
 
 CIRCLED_NUMS = ["①", "②", "③", "④", "⑤"]
+_FONT_BUNDLE_CACHE: tuple[Any | None, str] | None = None
+
+
+def _get_exam_pdf_css_and_archive() -> tuple[Any | None, str]:
+    global _FONT_BUNDLE_CACHE
+    if _FONT_BUNDLE_CACHE is None:
+        arch, fcss = _build_korean_story_font_bundle()
+        eff_css = f"{fcss}\n{EXAM_CSS}" if fcss else EXAM_CSS
+        _FONT_BUNDLE_CACHE = (arch, eff_css)
+    return _FONT_BUNDLE_CACHE
+
+
 def _esc_pdf(text: str) -> str:
     formatted = format_chemical_scripts(text or "")
     escaped = html.escape(formatted).replace("\n", "<br/>")
@@ -81,9 +97,14 @@ def _build_english_stem_blocks_html(stem_text: str) -> str:
     return "".join(parts)
 
 
-def _build_stem_blocks_html(stem_text: str, is_english: bool = False) -> str:
+def _build_stem_blocks_html(
+    stem_text: str,
+    is_english: bool = False,
+    is_korean: bool = False,
+) -> str:
     if is_english:
         return _build_english_stem_blocks_html(stem_text)
+    fmt = (lambda s: render_korean_inline_html(s, bold_to_underline=False)) if is_korean else _esc_pdf
     blocks = split_stem_blocks(stem_text)
     parts: list[str] = []
     for kind, content in blocks:
@@ -97,7 +118,7 @@ def _build_stem_blocks_html(stem_text: str, is_english: bool = False) -> str:
             body_lines = "".join(
                 "<div style='height:3pt;'></div>"
                 if not ln.strip()
-                else f"<div class='data-line'>{_esc_pdf(ln.strip())}</div>"
+                else f"<div class='data-line'>{fmt(ln.strip())}</div>"
                 for ln in d_body.split("\n")
             )
             parts.append(
@@ -110,7 +131,7 @@ def _build_stem_blocks_html(stem_text: str, is_english: bool = False) -> str:
             )
         elif kind == "bogi":
             rows = "".join(
-                f"<tr><td class='bogi-mk'>{html.escape(mk)}</td><td>{_esc_pdf(txt)}</td></tr>"
+                f"<tr><td class='bogi-mk'>{html.escape(mk)}</td><td>{fmt(txt)}</td></tr>"
                 for mk, txt in content
             )
             parts.append(
@@ -121,34 +142,59 @@ def _build_stem_blocks_html(stem_text: str, is_english: bool = False) -> str:
                 </div>
                 """
             )
+        elif kind == "bogi_prose":
+            bogi_lines = "".join(
+                "<div style='height:3pt;'></div>"
+                if not ln.strip()
+                else f"<div class='bogi-prose-line'>{fmt(ln.strip())}</div>"
+                for ln in str(content).split("\n")
+            )
+            parts.append(
+                f"""
+                <div class="pdf-bogi-box">
+                  <div class="pdf-bogi-title">〈 보 기 〉</div>
+                  <div class="bogi-prose">{bogi_lines}</div>
+                </div>
+                """
+            )
         else:
             stem_lines = "".join(
                 "<div style='height:3pt;'></div>"
                 if not ln.strip()
-                else f"<div class='stem-line'>{_esc_pdf(ln.strip())}</div>"
+                else f"<div class='stem-line'>{fmt(ln.strip())}</div>"
                 for ln in str(content).split("\n")
             )
             parts.append(f"<div class='stem-p'>{stem_lines}</div>")
     return "".join(parts)
 
 
-def _build_choices_html(choices: list[str], is_english: bool = False) -> str:
+def _build_choices_html(
+    choices: list[str],
+    is_english: bool = False,
+    is_korean: bool = False,
+) -> str:
     if not choices:
         return ""
     capped = choices[:5]
-    if is_english:
+    if is_english or is_korean:
         formatted_items = [c.strip() for c in capped]
     else:
         formatted_items = [format_chemical_scripts(c.strip()) for c in capped]
-    max_len = max((len(c) for c in formatted_items), default=0)
-    total_len = sum(len(c) + 4 for c in formatted_items)
+    plain_lens = [len(re.sub(r"<[^>]+>", "", c)) for c in formatted_items]
+    max_len = max(plain_lens, default=0)
+    total_len = sum(l + 4 for l in plain_lens)
 
     def _fmt_choice_body(i: int, txt: str) -> str:
         sym = CIRCLED_NUMS[i] if i < len(CIRCLED_NUMS) else f"{i + 1})"
         cleaned = txt.strip()
         if cleaned == sym or not cleaned:
             return f"<b>{sym}</b>"
-        rendered = render_english_inline_html(cleaned) if is_english else _esc_pdf(cleaned)
+        if is_english:
+            rendered = render_english_inline_html(cleaned)
+        elif is_korean:
+            rendered = render_korean_inline_html(cleaned, bold_to_underline=True)
+        else:
+            rendered = _esc_pdf(cleaned)
         return f"<b>{sym}</b> {rendered}"
 
     def _cell(i: int, txt: str) -> str:
@@ -169,15 +215,28 @@ def _build_choices_html(choices: list[str], is_english: bool = False) -> str:
     return f"<div class='choices'>{''.join(rows)}</div>"
 
 
-def _measure_html_height(html_str: str, width: float, max_h: float = 760.0) -> float:
+def _measure_html_height(
+    html_str: str,
+    width: float,
+    max_h: float = 2400.0,
+    *,
+    css: str | None = None,
+    archive: Any | None = None,
+) -> float:
     """스크래치 페이지에서 HTML 박스의 비축소 실제 높이를 측정한다."""
+    if archive is None or css is None:
+        arch_def, css_def = _get_exam_pdf_css_and_archive()
+        archive = arch_def if archive is None else archive
+        css = css_def if css is None else css
     scratch_doc = pymupdf.open()
     try:
         sp = scratch_doc.new_page(width=max(600.0, width + 40.0), height=max_h + 40.0)
         spare_h, scale = sp.insert_htmlbox(
             pymupdf.Rect(0, 0, width, max_h),
             html_str,
-            css=EXAM_CSS,
+            css=css,
+            archive=archive,
+            scale_low=1,
         )
         if scale <= 0:
             return max_h
@@ -189,6 +248,7 @@ def _measure_html_height(html_str: str, width: float, max_h: float = 760.0) -> f
 
 def _draw_page_footer(page: pymupdf.Page, page_num: int, two_column: bool, top_line_y: float = 38.0) -> None:
     w, h = page.rect.width, page.rect.height
+    arch, eff_css = _get_exam_pdf_css_and_archive()
     if two_column:
         page.draw_line(
             pymupdf.Point(w / 2.0, top_line_y),
@@ -199,7 +259,8 @@ def _draw_page_footer(page: pymupdf.Page, page_num: int, two_column: bool, top_l
     page.insert_htmlbox(
         pymupdf.Rect(30, h - 30, w - 30, h - 10),
         f"<div style='text-align:center; font-size:8.5pt; color:#64748B;'>- {page_num} -</div>",
-        css=EXAM_CSS,
+        css=eff_css,
+        archive=arch,
     )
 
 
@@ -209,15 +270,20 @@ def _draw_first_page_banner(
     source_label: str,
     total_count: int,
     is_english_exam: bool = False,
+    is_korean_exam: bool = False,
 ) -> float:
     w = page.rect.width
     today = datetime.now().strftime("%Y.%m.%d")
-    sub_banner = (
-        "수능 · 평가원 · 교육청 영어 기출 지문 맞춤형 수능형 변형 모의고사"
-        if is_english_exam
-        else "2022 개정 교육과정 맞춤형 기출 · 개념서 범위 엄격 준수"
-    )
-    src_prefix = "지문 출처:" if is_english_exam else "기준 개념서:"
+    arch, eff_css = _get_exam_pdf_css_and_archive()
+    if is_english_exam:
+        sub_banner = "수능 · 평가원 · 교육청 영어 기출 지문 맞춤형 수능형 변형 모의고사"
+        src_prefix = "지문 출처:"
+    elif is_korean_exam:
+        sub_banner = "수능 · 평가원 · 교육청 국어 기출 지문 맞춤형 수능형 변형 모의고사"
+        src_prefix = "지문 출처:"
+    else:
+        sub_banner = "2022 개정 교육과정 맞춤형 기출 · 개념서 범위 엄격 준수"
+        src_prefix = "기준 개념서:"
     banner_html = f"""
     <div>
       <div class="exam-banner">
@@ -235,8 +301,13 @@ def _draw_first_page_banner(
       <div class="double-rule-bot"></div>
     </div>
     """
-    banner_h = _measure_html_height(banner_html, w - 60.0, max_h=170.0)
-    page.insert_htmlbox(pymupdf.Rect(30, 22, w - 60.0 + 30.0, 22 + banner_h + 4.0), banner_html, css=EXAM_CSS)
+    banner_h = _measure_html_height(banner_html, w - 60.0, max_h=220.0, css=eff_css, archive=arch)
+    page.insert_htmlbox(
+        pymupdf.Rect(30, 22, w - 60.0 + 30.0, 22 + banner_h + 4.0),
+        banner_html,
+        css=eff_css,
+        archive=arch,
+    )
     return 22.0 + banner_h + 10.0
 
 
@@ -250,10 +321,162 @@ def _is_english_item_dict(item: dict[str, Any]) -> bool:
     )
 
 
+def _is_korean_item_dict(item: dict[str, Any]) -> bool:
+    q = item.get("question")
+    rw = item.get("rewritten")
+    return (
+        getattr(q, "subject_category", "") == "국어"
+        or getattr(rw, "subject_domain", "") == "국어"
+        or bool(item.get("korean_meta"))
+    )
+
+
 def _format_english_source_text(q: QuestionRecord) -> str:
     if "직접 입력" in (q.exam_name or ""):
         return f"출처: {q.exam_name}"
     return f"출처: {q.exam_name} {q.q_num}번"
+
+
+def _format_korean_source_text(q: QuestionRecord, item: dict[str, Any]) -> str:
+    k_meta = item.get("korean_meta") or {}
+    gid = str(k_meta.get("group_id") or getattr(q, "passage_group_id", "") or q.q_num).strip()
+    return f"출처: {q.exam_name} [{gid}번]"
+
+
+def _resolve_korean_item_passage_info(item: dict[str, Any]) -> tuple[str, str, str, str, bool]:
+    """
+    국어 문항 아이템에서 (group_key, set_instruction, clean_passage, question_only_stem, is_poetry_or_dialogue)를 추출한다.
+    신규 분리 저장 포맷(shared_passage)과 레거시 내장 지문 포맷을 모두 지원한다.
+    """
+    q = item["question"]
+    rw = item.get("rewritten")
+    k_meta = item.get("korean_meta") or {}
+
+    sec = str(k_meta.get("section") or getattr(q, "curriculum_subject", "") or "독서")
+    sub = str(k_meta.get("subgenre") or "")
+    is_keep_lines = ("화법" in sec or "대화" in sub or "시" in sub or "극" in sub) and "소설" not in sub
+
+    group_key = (getattr(rw, "passage_group_key", "") if rw is not None else "").strip()
+    if not group_key:
+        gid = str(k_meta.get("group_id") or getattr(q, "passage_group_id", "") or q.q_num).strip()
+        group_key = f"{getattr(q, 'exam_name', '')}::{gid}"
+
+    set_inst = (getattr(rw, "set_instruction", "") if rw is not None else "").strip()
+    set_inst = re.sub(r"^\s*\[?\s*\d{1,2}\s*[~\-～]\s*\d{1,2}\s*\]?\s*", "", set_inst).strip()
+    if not set_inst:
+        set_inst = "다음 글을 읽고 물음에 답하시오."
+
+    raw_stem = (getattr(rw, "rewritten_stem", "") if rw is not None else "").strip()
+    shared_p = (getattr(rw, "shared_passage", "") if rw is not None else "").strip()
+    if not shared_p:
+        shared_p = str(k_meta.get("passage_text") or getattr(q, "passage_text", "") or "").strip()
+
+    # 레거시 내장 지문('[\d+~\d+] 다음 글을 읽고...\n\n<지문>\n\n<발문>') 호환 분리
+    if raw_stem and len(raw_stem) > 400 and re.match(r"^\s*\[\d{1,2}\s*[~\-～]\s*\d{1,2}\]", raw_stem):
+        paras = [p.strip() for p in re.split(r"\n{2,}", raw_stem) if p.strip()]
+        if len(paras) >= 3:
+            if not shared_p:
+                shared_p = "\n\n".join(paras[1:-1])
+            raw_stem = paras[-1]
+
+    clean_p = clean_korean_exam_passage(shared_p, is_poetry_or_dialogue=is_keep_lines)
+    return group_key, set_inst, clean_p, raw_stem, is_keep_lines
+
+
+def _compute_korean_set_ranges(items: list[dict[str, Any]]) -> dict[int, tuple[int, int, str, str, str, bool]]:
+    """
+    연속된 국어 동일 지문 세트 문항들의 실제 모의고사 문항 번호 범위(start_idx..end_idx)를 계산한다.
+    반환 dict 키는 세트의 첫 문항 0-based index이다.
+    """
+    set_starts: dict[int, tuple[int, int, str, str, str, bool]] = {}
+    i = 0
+    n = len(items)
+    while i < n:
+        if not _is_korean_item_dict(items[i]):
+            i += 1
+            continue
+        gkey, set_inst, clean_p, _, is_keep = _resolve_korean_item_passage_info(items[i])
+        j = i + 1
+        while j < n and _is_korean_item_dict(items[j]):
+            gkey_j, _, clean_p_j, _, _ = _resolve_korean_item_passage_info(items[j])
+            if gkey_j != gkey:
+                break
+            if len(clean_p_j) > len(clean_p):
+                clean_p = clean_p_j
+            j += 1
+        if clean_p:
+            set_starts[i] = (i + 1, j, gkey, set_inst, clean_p, is_keep)
+        i = j
+    return set_starts
+
+
+def _format_korean_unit_html(unit_kind: str, unit_text: str, *, is_cont: bool = False) -> str:
+    if unit_kind == "subhead":
+        return f"<div class='kor-passage-subhead'>{render_korean_inline_html(unit_text)}</div>"
+    if unit_kind == "line":
+        return f"<p class='kor-passage-lit'>{render_korean_inline_html(unit_text)}</p>"
+    cls = "kor-passage-p-cont" if is_cont else "kor-passage-p"
+    return f"<p class='{cls}'>{render_korean_inline_html(unit_text)}</p>"
+
+
+def _split_korean_paragraph_to_fit(
+    text: str,
+    width: float,
+    avail_h: float,
+    *,
+    is_cont: bool,
+    css: str,
+    archive: Any,
+) -> tuple[str, str]:
+    """단락 텍스트를 현재 칼럼 남은 높이(avail_h)에 맞게 문장(또는 어절) 경계에서 분할한다."""
+    tokens = re.split(r"(?<=[.?!…\"”’])\s+", text.strip())
+    sep = " "
+    if len(tokens) <= 1 or _measure_html_height(
+        _format_korean_unit_html("para", tokens[0], is_cont=is_cont),
+        width,
+        max_h=2400.0,
+        css=css,
+        archive=archive,
+    ) > avail_h - 4.0:
+        tokens = text.strip().split(" ")
+
+    if len(tokens) <= 1:
+        return "", text
+
+    lo, hi = 1, len(tokens) - 1
+    best = 0
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        cand = sep.join(tokens[:mid]).strip()
+        h = _measure_html_height(
+            _format_korean_unit_html("para", cand, is_cont=is_cont),
+            width,
+            max_h=2400.0,
+            css=css,
+            archive=archive,
+        )
+        if h <= avail_h - 4.0:
+            best = mid
+            lo = mid + 1
+        else:
+            hi = mid - 1
+
+    if best <= 0:
+        return "", text
+    return sep.join(tokens[:best]).strip(), sep.join(tokens[best:]).strip()
+
+
+def _format_quick_ref_for_item(it: dict[str, Any]) -> str:
+    if _is_korean_item_dict(it):
+        q_o = it["question"]
+        rw_o = it.get("rewritten")
+        k_meta = it.get("korean_meta") or {}
+        gid = str(k_meta.get("group_id") or getattr(q_o, "passage_group_id", "") or q_o.q_num).strip()
+        t_type = (getattr(rw_o, "target_question_type", "") or getattr(q_o, "unit_name", "") or "").strip()
+        short_exam = re.sub(r"\s*국어$", "", getattr(q_o, "exam_name", "") or "").strip()
+        base = f"{short_exam} [{gid}번]" if short_exam else f"[{gid}번]"
+        return f"{base} · {t_type}" if t_type else base
+    return _extract_short_page_ref(str(it.get("concept_reference") or ""))
 
 
 def generate_custom_exam_pdf(
@@ -268,12 +491,27 @@ def generate_custom_exam_pdf(
     추출 및 개조된 문항들을 평가원·교육청 모의고사 스타일 PDF로 조판하고,
     뒷장에 [빠른 정답 한눈에 보기] 표와 2단 맞춤 해설 페이지를 부착한다.
     """
+    arch, eff_css = _get_exam_pdf_css_and_archive()
     doc = pymupdf.open()
     page_w, page_h = 595.0, 842.0  # A4
     margin_x = 28.0
     margin_bottom = 42.0
     col_gap = 22.0
     is_english_exam_set = bool(items) and all(_is_english_item_dict(it) for it in items)
+    is_korean_exam_set = bool(items) and all(_is_korean_item_dict(it) for it in items)
+
+    effective_source_label = (source_label or "").strip()
+    if is_korean_exam_set and (
+        not effective_source_label or "업로드 개념서" in effective_source_label
+    ):
+        exam_names = list(
+            dict.fromkeys(
+                str(getattr(it["question"], "exam_name", "") or "").strip()
+                for it in items
+                if getattr(it["question"], "exam_name", "")
+            )
+        )
+        effective_source_label = ", ".join(exam_names) if exam_names else "국어 기출 지문 세트"
 
     def get_col_rects(top_y: float, is_two_col: bool) -> list[tuple[float, float, float]]:
         if is_two_col:
@@ -289,9 +527,10 @@ def generate_custom_exam_pdf(
     first_top = _draw_first_page_banner(
         page,
         exam_title,
-        source_label,
+        effective_source_label,
         len(items),
         is_english_exam=is_english_exam_set,
+        is_korean_exam=is_korean_exam_set,
     )
     first_divider_y = first_top - 2.0
     cur_divider_y = first_divider_y
@@ -312,11 +551,238 @@ def generate_custom_exam_pdf(
             col_idx = 0
             cur_y = col_rects[0][2]
 
-    for idx, item in enumerate(items, start=1):
+    def _draw_korean_shared_passage_section(
+        start_num: int,
+        end_num: int,
+        set_inst: str,
+        clean_p: str,
+        is_keep_lines: bool,
+    ) -> None:
+        nonlocal cur_y
+        col_x0, col_x1, _ = col_rects[col_idx]
+        col_w = col_x1 - col_x0
+        if (page_h - margin_bottom) - cur_y < 95.0 and cur_y > col_rects[col_idx][2] + 5.0:
+            advance_column()
+            col_x0, col_x1, _ = col_rects[col_idx]
+            col_w = col_x1 - col_x0
+
+        range_tag = f"[{start_num}~{end_num}]" if end_num > start_num else f"[{start_num}]"
+        intro_html = f"<div class='kor-set-intro'>{html.escape(range_tag)} {html.escape(set_inst)}</div>"
+        intro_h = _measure_html_height(intro_html, col_w, max_h=2400.0, css=eff_css, archive=arch)
+        if cur_y + intro_h + 48.0 > page_h - margin_bottom and cur_y > col_rects[col_idx][2] + 5.0:
+            advance_column()
+            col_x0, col_x1, _ = col_rects[col_idx]
+            col_w = col_x1 - col_x0
+
+        page.insert_htmlbox(
+            pymupdf.Rect(col_x0, cur_y, col_x1, min(page_h - margin_bottom, cur_y + intro_h + 2.0)),
+            intro_html,
+            css=eff_css,
+            archive=arch,
+            scale_low=1,
+        )
+        cur_y += intro_h + 2.0
+
+        units = split_korean_passage_units(clean_p, is_poetry_or_dialogue=is_keep_lines)
+        if not units:
+            return
+
+        box_top_y = cur_y
+        cur_y += 5.0
+        box_has_content = False
+        inner_x0 = col_x0 + 7.0
+        inner_x1 = col_x1 - 7.0
+        inner_w = inner_x1 - inner_x0
+
+        def _close_box_if_drawn() -> None:
+            nonlocal box_has_content, cur_y
+            if box_has_content:
+                page.draw_rect(
+                    pymupdf.Rect(col_x0, box_top_y, col_x1, min(page_h - margin_bottom, cur_y + 4.0)),
+                    color=(0.20, 0.25, 0.33),
+                    width=0.8,
+                )
+                box_has_content = False
+
+        def _next_box_column() -> None:
+            nonlocal box_top_y, cur_y, col_x0, col_x1, inner_x0, inner_x1, inner_w
+            _close_box_if_drawn()
+            advance_column()
+            col_x0, col_x1, _ = col_rects[col_idx]
+            box_top_y = cur_y
+            cur_y += 5.0
+            inner_x0 = col_x0 + 7.0
+            inner_x1 = col_x1 - 7.0
+            inner_w = inner_x1 - inner_x0
+
+        queue: list[tuple[str, str, bool]] = [(u["kind"], u["text"], False) for u in units]
+        while queue:
+            u_kind, u_text, is_cont = queue.pop(0)
+            if u_kind == "spacer":
+                if box_has_content and cur_y + 6.0 < page_h - margin_bottom - 8.0:
+                    cur_y += 5.0
+                continue
+
+            u_html = _format_korean_unit_html(u_kind, u_text, is_cont=is_cont)
+            uh = _measure_html_height(u_html, inner_w, max_h=2400.0, css=eff_css, archive=arch)
+            avail_h = (page_h - margin_bottom - 6.0) - cur_y
+
+            if u_kind == "subhead" and avail_h < 56.0 and box_has_content:
+                _next_box_column()
+                queue.insert(0, (u_kind, u_text, is_cont))
+                continue
+
+            if uh <= avail_h:
+                page.insert_htmlbox(
+                    pymupdf.Rect(inner_x0, cur_y, inner_x1, min(page_h - margin_bottom - 4.0, cur_y + uh + 2.0)),
+                    u_html,
+                    css=eff_css,
+                    archive=arch,
+                    scale_low=1,
+                )
+                cur_y += uh
+                box_has_content = True
+            elif u_kind == "para" and avail_h >= 42.0:
+                head_txt, tail_txt = _split_korean_paragraph_to_fit(
+                    u_text, inner_w, avail_h, is_cont=is_cont, css=eff_css, archive=arch
+                )
+                if head_txt:
+                    h_html = _format_korean_unit_html("para", head_txt, is_cont=is_cont)
+                    hh = _measure_html_height(h_html, inner_w, max_h=2400.0, css=eff_css, archive=arch)
+                    page.insert_htmlbox(
+                        pymupdf.Rect(inner_x0, cur_y, inner_x1, min(page_h - margin_bottom - 4.0, cur_y + hh + 2.0)),
+                        h_html,
+                        css=eff_css,
+                        archive=arch,
+                        scale_low=1,
+                    )
+                    cur_y += hh
+                    box_has_content = True
+                _next_box_column()
+                if tail_txt:
+                    queue.insert(0, ("para", tail_txt, True))
+            else:
+                if box_has_content or cur_y > col_rects[col_idx][2] + 5.0:
+                    _next_box_column()
+                    queue.insert(0, (u_kind, u_text, is_cont))
+                else:
+                    # 칼럼 전체보다 큰 단일 단위는 강제 분할/배치 방지용 최소 배치
+                    page.insert_htmlbox(
+                        pymupdf.Rect(inner_x0, cur_y, inner_x1, page_h - margin_bottom - 4.0),
+                        u_html,
+                        css=eff_css,
+                        archive=arch,
+                    )
+                    cur_y = page_h - margin_bottom - 4.0
+                    box_has_content = True
+
+        _close_box_if_drawn()
+        cur_y += 12.0
+        if (page_h - margin_bottom) - cur_y < 42.0:
+            advance_column()
+
+    def _render_oversized_question_modular(
+        idx_num: int,
+        badge_lbl: str,
+        meta_lbl: str,
+        stem_txt: str,
+        choices_list: list[str],
+        ref_html: str,
+        *,
+        is_eng_item: bool,
+        is_kor_item: bool,
+    ) -> None:
+        """한 칼럼 높이를 초과하는 초대형 문항도 블록 단위로 칼럼을 넘기며 무손실 조판한다."""
+        nonlocal cur_y
+        chunks: list[str] = []
+        hdr_html = (
+            f"<div class='q-header'><span class='q-num'>{idx_num}.</span> "
+            f"<span class='badge'>{badge_lbl}</span> "
+            f"<span class='meta'>{meta_lbl}</span></div>"
+        )
+        if is_eng_item:
+            chunks.append(hdr_html + _build_stem_blocks_html(stem_txt, is_english=True))
+        else:
+            blocks = split_stem_blocks(stem_txt)
+            first_chunk_done = False
+            for kind, content in blocks:
+                if kind == "data":
+                    d_title = str(content.get("title") or "< 자 료 >") if isinstance(content, dict) else "< 자 료 >"
+                    d_body = str(content.get("body") or "") if isinstance(content, dict) else str(content)
+                    fmt = (lambda s: render_korean_inline_html(s)) if is_kor_item else _esc_pdf
+                    b_lines = "".join(
+                        "<div style='height:3pt;'></div>" if not ln.strip() else f"<div class='data-line'>{fmt(ln.strip())}</div>"
+                        for ln in d_body.split("\n")
+                    )
+                    blk_html = f"<div class='pdf-data-box'><div class='pdf-data-title'>{html.escape(d_title)}</div><div>{b_lines}</div></div>"
+                elif kind == "bogi":
+                    fmt = (lambda s: render_korean_inline_html(s)) if is_kor_item else _esc_pdf
+                    rows = "".join(f"<tr><td class='bogi-mk'>{html.escape(mk)}</td><td>{fmt(txt)}</td></tr>" for mk, txt in content)
+                    blk_html = f"<div class='pdf-bogi-box'><div class='pdf-bogi-title'>〈 보 기 〉</div><table class='bogi-tbl'>{rows}</table></div>"
+                elif kind == "bogi_prose":
+                    fmt = (lambda s: render_korean_inline_html(s)) if is_kor_item else _esc_pdf
+                    b_lines = "".join(
+                        "<div style='height:3pt;'></div>" if not ln.strip() else f"<div class='bogi-prose-line'>{fmt(ln.strip())}</div>"
+                        for ln in str(content).split("\n")
+                    )
+                    blk_html = f"<div class='pdf-bogi-box'><div class='pdf-bogi-title'>〈 보 기 〉</div><div class='bogi-prose'>{b_lines}</div></div>"
+                else:
+                    fmt = (lambda s: render_korean_inline_html(s)) if is_kor_item else _esc_pdf
+                    s_lines = "".join(
+                        "<div style='height:3pt;'></div>" if not ln.strip() else f"<div class='stem-line'>{fmt(ln.strip())}</div>"
+                        for ln in str(content).split("\n")
+                    )
+                    blk_html = f"<div class='stem-p'>{s_lines}</div>"
+                if not first_chunk_done:
+                    chunks.append(hdr_html + blk_html)
+                    first_chunk_done = True
+                else:
+                    chunks.append(blk_html)
+            if not first_chunk_done:
+                chunks.append(hdr_html)
+
+        for ci, c_txt in enumerate(choices_list[:5]):
+            sym = CIRCLED_NUMS[ci] if ci < len(CIRCLED_NUMS) else f"{ci + 1})"
+            if is_eng_item:
+                body = render_english_inline_html(c_txt.strip())
+            elif is_kor_item:
+                body = render_korean_inline_html(c_txt.strip(), bold_to_underline=True)
+            else:
+                body = _esc_pdf(c_txt.strip())
+            chunks.append(f"<div class='choice-item'><b>{sym}</b> {body}</div>")
+        if ref_html:
+            chunks.append(ref_html)
+
+        for ch_html in chunks:
+            cx0, cx1, _ = col_rects[col_idx]
+            cw = cx1 - cx0
+            ch_h = _measure_html_height(ch_html, cw, max_h=2400.0, css=eff_css, archive=arch)
+            if cur_y + ch_h > page_h - margin_bottom and cur_y > col_rects[col_idx][2] + 5.0:
+                advance_column()
+                cx0, cx1, _ = col_rects[col_idx]
+            page.insert_htmlbox(
+                pymupdf.Rect(cx0, cur_y, cx1, min(page_h - margin_bottom, cur_y + ch_h + 3.0)),
+                ch_html,
+                css=eff_css,
+                archive=arch,
+                scale_low=1,
+            )
+            cur_y += ch_h + 1.5
+        cur_y += 10.0
+
+    korean_set_starts = _compute_korean_set_ranges(items)
+
+    for idx_0, item in enumerate(items):
+        idx = idx_0 + 1
+        if idx_0 in korean_set_starts:
+            s_num, e_num, _, s_inst, s_clean_p, s_keep_lines = korean_set_starts[idx_0]
+            _draw_korean_shared_passage_section(s_num, e_num, s_inst, s_clean_p, s_keep_lines)
+
         q: QuestionRecord = item["question"]
         crop_bytes: bytes | None = item.get("crop_png_bytes")
         rewritten: RewrittenQuestion | None = item.get("rewritten")
         is_eng_item = _is_english_item_dict(item)
+        is_kor_item = _is_korean_item_dict(item)
         concept_ref: str = str(item.get("concept_reference") or "").strip()
         ref_html = (
             f"<div class='ref-note'>{html.escape(concept_ref)}</div>"
@@ -329,12 +795,27 @@ def generate_custom_exam_pdf(
         max_col_h = (page_h - margin_bottom) - col_rects[col_idx][2]
 
         if rewritten is not None:
-            stem_body_html = _build_stem_blocks_html(rewritten.rewritten_stem, is_english=is_eng_item)
-            choices_html = _build_choices_html(rewritten.rewritten_choices, is_english=is_eng_item)
+            stem_for_render = rewritten.rewritten_stem
+            if is_kor_item:
+                _, _, _, stem_for_render, _ = _resolve_korean_item_passage_info(item)
+            stem_body_html = _build_stem_blocks_html(
+                stem_for_render, is_english=is_eng_item, is_korean=is_kor_item
+            )
+            choices_html = _build_choices_html(
+                rewritten.rewritten_choices, is_english=is_eng_item, is_korean=is_kor_item
+            )
             if is_eng_item:
                 t_type = (getattr(rewritten, "target_question_type", "") or "수능형 변형").strip()
                 badge_lbl = f"수능형 변형 · {html.escape(t_type)}"
                 meta_lbl = html.escape(_format_english_source_text(q))
+            elif is_kor_item:
+                k_meta = item.get("korean_meta") or {}
+                t_type = (getattr(rewritten, "target_question_type", "") or "수능형 변형").strip()
+                sec_disp = str(k_meta.get("section") or q.curriculum_subject or "국어")
+                sub_disp = str(k_meta.get("subgenre") or "")
+                sec_tag = f"{sec_disp}({sub_disp})" if sub_disp and sub_disp not in sec_disp else sec_disp
+                badge_lbl = f"수능형 변형 · {html.escape(t_type)}"
+                meta_lbl = f"{html.escape(sec_tag)} · {html.escape(_format_korean_source_text(q, item))}"
             else:
                 badge_lbl = "PDF 맞춤 개조"
                 meta_lbl = f"{html.escape(q.curriculum_subject)} · 원본 {html.escape(q.exam_name)} {q.q_num}번"
@@ -351,12 +832,12 @@ def generate_custom_exam_pdf(
               {ref_html}
             </div>
             """
-            text_h = _measure_html_height(card_html, col_w, max_h=735.0)
+            text_h = _measure_html_height(card_html, col_w, max_h=2400.0, css=eff_css, archive=arch)
 
             img_draw_h = 0.0
             img_draw_w = col_w
-            # 영어 변형 문항은 원본 이미지(기존 밑줄·정답 노출)를 절대 수록하지 않음
-            if include_original_for_rewritten and crop_bytes and not is_eng_item:
+            # 영어/국어 변형 문항은 원본 이미지(기존 밑줄·정답 노출)를 절대 수록하지 않음
+            if include_original_for_rewritten and crop_bytes and not is_eng_item and not is_kor_item:
                 with Image.open(io.BytesIO(crop_bytes)) as im:
                     iw, ih = im.size
                 ratio = ih / max(1, iw)
@@ -371,11 +852,30 @@ def generate_custom_exam_pdf(
                 if vis_term_note
                 else ""
             )
-            vis_note_h = _measure_html_height(vis_note_html, col_w, max_h=60.0) if vis_note_html else 0.0
+            vis_note_h = (
+                _measure_html_height(vis_note_html, col_w, max_h=120.0, css=eff_css, archive=arch)
+                if vis_note_html
+                else 0.0
+            )
             note_h = 15.0 if img_draw_h > 0 else 0.0
 
-            # 한 문항의 지문·선지가 칼럼 경계에서 잘리지 않도록 통째로 공간 확인
             total_needed = text_h + note_h + img_draw_h + vis_note_h + 12.0
+            # 한 칼럼 전체보다도 큰 초대형 문항은 블록 단위 분할 조판으로 무손실 출력
+            if text_h > (page_h - margin_bottom - 36.0):
+                if cur_y > col_rects[col_idx][2] + 5.0:
+                    advance_column()
+                _render_oversized_question_modular(
+                    idx,
+                    badge_lbl,
+                    meta_lbl,
+                    stem_for_render,
+                    rewritten.rewritten_choices,
+                    ref_html,
+                    is_eng_item=is_eng_item,
+                    is_kor_item=is_kor_item,
+                )
+                continue
+
             if cur_y + total_needed > page_h - margin_bottom and cur_y > col_rects[col_idx][2] + 5.0:
                 advance_column()
                 col_x0, col_x1, _ = col_rects[col_idx]
@@ -384,7 +884,9 @@ def generate_custom_exam_pdf(
             page.insert_htmlbox(
                 pymupdf.Rect(col_x0, cur_y, col_x1, min(page_h - margin_bottom, cur_y + text_h + 4.0)),
                 card_html,
-                css=EXAM_CSS,
+                css=eff_css,
+                archive=arch,
+                scale_low=1,
             )
             cur_y += text_h + 2.0
 
@@ -395,7 +897,8 @@ def generate_custom_exam_pdf(
                 page.insert_htmlbox(
                     pymupdf.Rect(col_x0, cur_y, col_x1, cur_y + 15.0),
                     "<div class='meta'>[참고용 원본 문항 도표/이미지]</div>",
-                    css=EXAM_CSS,
+                    css=eff_css,
+                    archive=arch,
                 )
                 cur_y += 13.0
                 page.insert_image(
@@ -408,7 +911,8 @@ def generate_custom_exam_pdf(
                     page.insert_htmlbox(
                         pymupdf.Rect(col_x0, cur_y, col_x1, min(page_h - margin_bottom, cur_y + vis_note_h + 3.0)),
                         vis_note_html,
-                        css=EXAM_CSS,
+                        css=eff_css,
+                        archive=arch,
                     )
                     cur_y += vis_note_h + 4.0
 
@@ -423,7 +927,7 @@ def generate_custom_exam_pdf(
               {ref_html}
             </div>
             """
-            header_h = _measure_html_height(header_html, col_w, max_h=80.0)
+            header_h = _measure_html_height(header_html, col_w, max_h=120.0, css=eff_css, archive=arch)
 
             img_draw_w = col_w
             img_draw_h = 40.0
@@ -447,7 +951,8 @@ def generate_custom_exam_pdf(
             page.insert_htmlbox(
                 pymupdf.Rect(col_x0, cur_y, col_x1, cur_y + header_h + 2.0),
                 header_html,
-                css=EXAM_CSS,
+                css=eff_css,
+                archive=arch,
             )
             cur_y += header_h + 2.0
             if crop_bytes:
@@ -464,28 +969,43 @@ def generate_custom_exam_pdf(
 
     # 2) 뒷장: [빠른 정답 한눈에 보기] 표 + 2단 맞춤 해설
     ans_page = doc.new_page(width=page_w, height=page_h)
-    ans_sub_title = (
-        "정답 및 수능 영어 구문·논리·오답 분석 해설"
-        if is_english_exam_set
-        else "정답 및 개념서 용어 기준 맞춤 해설"
-    )
-    ans_src_prefix = "지문 출처" if is_english_exam_set else "기준 개념서"
-    ref_col_header = "출처 / 유형" if is_english_exam_set else "참고 개념서 페이지"
+    if is_english_exam_set:
+        ans_sub_title = "정답 및 수능 영어 구문·논리·오답 분석 해설"
+        ans_src_prefix = "지문 출처"
+        ref_col_header = "출처 / 유형"
+    elif is_korean_exam_set:
+        ans_sub_title = "정답 및 지문 근거 · 선지별 오답 소거 해설"
+        ans_src_prefix = "지문 출처"
+        ref_col_header = "출처 / 유형"
+    else:
+        ans_sub_title = "정답 및 개념서 용어 기준 맞춤 해설"
+        ans_src_prefix = "기준 개념서"
+        ref_col_header = "참고 개념서 페이지"
     ans_header = f"""
     <div class="exam-banner" style="padding:6pt 9pt;">
       <div class="exam-banner-sub">{ans_sub_title}</div>
       <div class="exam-banner-title" style="font-size:12.5pt;">{html.escape(exam_title)}</div>
-      <div class="meta" style="margin-top:2pt;">{ans_src_prefix}: {html.escape(source_label)} &nbsp;|&nbsp; 총 {len(items)}문항</div>
+      <div class="meta" style="margin-top:2pt;">{ans_src_prefix}: {html.escape(effective_source_label)} &nbsp;|&nbsp; 총 {len(items)}문항</div>
     </div>
     """
-    ah = _measure_html_height(ans_header, page_w - 2 * margin_x, max_h=120.0)
-    ans_page.insert_htmlbox(pymupdf.Rect(margin_x, 24, page_w - margin_x, 24 + ah + 4.0), ans_header, css=EXAM_CSS)
+    ah = _measure_html_height(ans_header, page_w - 2 * margin_x, max_h=160.0, css=eff_css, archive=arch)
+    ans_page.insert_htmlbox(
+        pymupdf.Rect(margin_x, 24, page_w - margin_x, 24 + ah + 4.0),
+        ans_header,
+        css=eff_css,
+        archive=arch,
+    )
     ay = 24.0 + ah + 8.0
 
-    # [빠른 정답 한눈에 보기] 요약 표 (문항 번호 · 정답 · 참고 개념서 페이지)
+    # [빠른 정답 한눈에 보기] 요약 표 (문항 번호 · 정답 · 출처/유형 또는 참고 개념서 페이지)
     quick_title_html = "<div style='font-size:9.8pt; font-weight:bold; color:#1E3A8A; margin-bottom:3pt;'>[빠른 정답 한눈에 보기]</div>"
-    qth = _measure_html_height(quick_title_html, page_w - 2 * margin_x, max_h=30.0)
-    ans_page.insert_htmlbox(pymupdf.Rect(margin_x, ay, page_w - margin_x, ay + qth), quick_title_html, css=EXAM_CSS)
+    qth = _measure_html_height(quick_title_html, page_w - 2 * margin_x, max_h=40.0, css=eff_css, archive=arch)
+    ans_page.insert_htmlbox(
+        pymupdf.Rect(margin_x, ay, page_w - margin_x, ay + qth),
+        quick_title_html,
+        css=eff_css,
+        archive=arch,
+    )
     ay += qth + 2.0
 
     half = (len(items) + 1) // 2 if len(items) > 6 else len(items)
@@ -494,12 +1014,12 @@ def generate_custom_exam_pdf(
         for r_i in range(half):
             left_it = items[r_i]
             l_ans = _format_answer_badge(left_it["rewritten"].preserved_answer if left_it.get("rewritten") else left_it["question"].answer)
-            l_pg = _extract_short_page_ref(str(left_it.get("concept_reference") or ""))
+            l_pg = _format_quick_ref_for_item(left_it)
             right_cells = "<td></td><td></td><td></td>"
             if r_i + half < len(items):
                 right_it = items[r_i + half]
                 r_ans = _format_answer_badge(right_it["rewritten"].preserved_answer if right_it.get("rewritten") else right_it["question"].answer)
-                r_pg = _extract_short_page_ref(str(right_it.get("concept_reference") or ""))
+                r_pg = _format_quick_ref_for_item(right_it)
                 right_cells = (
                     f"<td><b>{r_i + half + 1}번</b></td>"
                     f"<td style='color:#DC2626; font-weight:bold;'>{html.escape(r_ans)}</td>"
@@ -518,7 +1038,7 @@ def generate_custom_exam_pdf(
     else:
         for r_i, it in enumerate(items, start=1):
             a_disp = _format_answer_badge(it["rewritten"].preserved_answer if it.get("rewritten") else it["question"].answer)
-            pg_disp = _extract_short_page_ref(str(it.get("concept_reference") or ""))
+            pg_disp = _format_quick_ref_for_item(it)
             summary_rows.append(
                 f"<tr><td><b>{r_i}번</b></td><td style='color:#DC2626; font-weight:bold;'>{html.escape(a_disp)}</td><td>{html.escape(pg_disp)}</td></tr>"
             )
@@ -529,8 +1049,13 @@ def generate_custom_exam_pdf(
             + "</table>"
         )
 
-    th = _measure_html_height(ans_table_html, page_w - 2 * margin_x, max_h=460.0)
-    ans_page.insert_htmlbox(pymupdf.Rect(margin_x, ay, page_w - margin_x, ay + th + 4.0), ans_table_html, css=EXAM_CSS)
+    th = _measure_html_height(ans_table_html, page_w - 2 * margin_x, max_h=480.0, css=eff_css, archive=arch)
+    ans_page.insert_htmlbox(
+        pymupdf.Rect(margin_x, ay, page_w - margin_x, ay + th + 4.0),
+        ans_table_html,
+        css=eff_css,
+        archive=arch,
+    )
     ay += th + 8.0
 
     # 아래부터 2단 구성으로 맞춤 해설 배치
@@ -556,6 +1081,7 @@ def generate_custom_exam_pdf(
         q = item["question"]
         rewritten = item.get("rewritten")
         is_eng_item = _is_english_item_dict(item)
+        is_kor_item = _is_korean_item_dict(item)
         concept_ref = str(item.get("concept_reference") or "").strip()
         exp_ref_html = (
             f"<div class='ref-note'>{html.escape(concept_ref)}</div>"
@@ -573,13 +1099,24 @@ def generate_custom_exam_pdf(
                     + (
                         render_english_inline_html(" / ".join(rewritten.replaced_terms_map))
                         if is_eng_item
-                        else _esc_pdf(" / ".join(rewritten.replaced_terms_map))
+                        else (
+                            render_korean_inline_html(" / ".join(rewritten.replaced_terms_map))
+                            if is_kor_item
+                            else _esc_pdf(" / ".join(rewritten.replaced_terms_map))
+                        )
                     )
                     + "</div>"
                 )
             exp_txt = format_explanation_text(rewritten.pdf_grounded_explanation, for_markdown=False)
-            exp_body = render_english_inline_html(exp_txt) if is_eng_item else _esc_pdf(exp_txt)
-            badge = (getattr(rewritten, "target_question_type", "") or "수능형 영어 변형") if is_eng_item else "PDF 맞춤 개조"
+            if is_eng_item:
+                exp_body = render_english_inline_html(exp_txt)
+                badge = getattr(rewritten, "target_question_type", "") or "수능형 영어 변형"
+            elif is_kor_item:
+                exp_body = render_korean_inline_html(exp_txt)
+                badge = getattr(rewritten, "target_question_type", "") or "수능형 국어 변형"
+            else:
+                exp_body = _esc_pdf(exp_txt)
+                badge = "PDF 맞춤 개조"
         else:
             ans_disp = _format_answer_badge(q.answer)
             swap_info = (
@@ -592,7 +1129,12 @@ def generate_custom_exam_pdf(
             )
             badge = "원본 기출 해설"
 
-        src_meta_str = _format_english_source_text(q) if is_eng_item else f"{q.exam_name} {q.q_num}번"
+        if is_eng_item:
+            src_meta_str = _format_english_source_text(q)
+        elif is_kor_item:
+            src_meta_str = _format_korean_source_text(q, item)
+        else:
+            src_meta_str = f"{q.exam_name} {q.q_num}번"
         exp_html = f"""
         <div class="exp-card">
           <div class="exp-title">
@@ -606,7 +1148,7 @@ def generate_custom_exam_pdf(
         """
         ac_x0, ac_x1, _ = ans_col_rects[ans_col_idx]
         ac_w = ac_x1 - ac_x0
-        eh = _measure_html_height(exp_html, ac_w, max_h=720.0)
+        eh = _measure_html_height(exp_html, ac_w, max_h=2400.0, css=eff_css, archive=arch)
         if ans_y + eh > page_h - margin_bottom and ans_y > ans_col_rects[ans_col_idx][2] + 5.0:
             advance_ans_col()
             ac_x0, ac_x1, _ = ans_col_rects[ans_col_idx]
@@ -615,7 +1157,9 @@ def generate_custom_exam_pdf(
         ans_page.insert_htmlbox(
             pymupdf.Rect(ac_x0, ans_y, ac_x1, min(page_h - margin_bottom, ans_y + eh + 4.0)),
             exp_html,
-            css=EXAM_CSS,
+            css=eff_css,
+            archive=arch,
+            scale_low=1,
         )
         ans_y += eh + 6.0
 

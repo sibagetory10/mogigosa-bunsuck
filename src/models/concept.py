@@ -187,6 +187,18 @@ class RewrittenQuestion(BaseModel):
         default="",
         description="개조/변형 도메인 구분 (''=개념서 기반 개조, '영어'=영어 수능형 지문 변형, '국어'=국어 지문 세트 재구성)",
     )
+    shared_passage: str = Field(
+        default="",
+        description="국어 세트 문항 등이 공유하는 정제된 지문 원문 (개별 발문 rewritten_stem과 분리 저장)",
+    )
+    passage_group_key: str = Field(
+        default="",
+        description="공통 지문을 묶는 세트 식별 키 (예: '2026년 10월 고1 국어::11~14')",
+    )
+    set_instruction: str = Field(
+        default="",
+        description="세트 번호를 제외한 공통 지시문 (예: '다음 글을 읽고 물음에 답하시오.')",
+    )
 class ConceptBookCoverMetadata(BaseModel):
     """개념서·교과서 PDF 표지/앞부분에서 자동 추출한 교재명·과목 및 학년."""
 
