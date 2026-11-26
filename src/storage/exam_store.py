@@ -432,6 +432,7 @@ class ExamStoreMixin:
             self.save_db(remaining)
             self.delete_korean_analyses_by_exam(exam_name)
             self.delete_english_analyses_by_exam(exam_name)
+            self.delete_korean_pool_by_exam(exam_name)
             return len(to_delete)
 
     def rename_exam(self, old_exam_name: str, new_exam_name: str) -> int:
@@ -463,6 +464,7 @@ class ExamStoreMixin:
             self.save_db(records)
             self.rename_korean_analyses_exam(old_n, new_n)
             self.rename_english_analyses_exam(old_n, new_n)
+            self.rename_korean_pool_exam(old_n, new_n)
             return changed
 
     def reset_exam_database(self, delete_users: bool = False) -> dict[str, Any]:
@@ -496,6 +498,8 @@ class ExamStoreMixin:
                 _atomic_write_text(self.english_analysis_pool_path, "{}", encoding="utf-8")
             if self.korean_analysis_pool_path.exists():
                 _atomic_write_text(self.korean_analysis_pool_path, "{}", encoding="utf-8")
+            if self.korean_pool_path.exists():
+                _atomic_write_text(self.korean_pool_path, "{}", encoding="utf-8")
             if delete_users and self.users_path.exists():
                 self.users_path.unlink(missing_ok=True)
 

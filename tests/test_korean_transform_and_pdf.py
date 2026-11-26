@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import tempfile
 import unittest
 from collections import Counter
+from pathlib import Path
+from unittest.mock import patch
 
 import pymupdf
 
@@ -9,9 +12,11 @@ from src.gemini.korean import (
     _extract_korean_passage_markers,
     _validate_and_sanitize_korean_question,
     balance_korean_answer_distribution,
+    generate_korean_set_reconstruction,
 )
 from src.models import KoreanSetQuestionOutput, QuestionRecord, RewrittenQuestion
 from src.pdf.exam_pdf import generate_custom_exam_pdf
+from src.storage import StorageManager
 from src.text_formatter import (
     clean_korean_exam_passage,
     render_korean_inline_html,
@@ -291,6 +296,114 @@ class KoreanTransformAndPdfTests(unittest.TestCase):
             self.assertIn(f"제{q_idx}문항 고유발문확인용", full_text)
             for c_idx in range(1, 6):
                 self.assertIn(f"제{q_idx}문항 선지 {c_idx}번", full_text)
+
+    def test_korean_pool_store_cache_history_and_admin_ops(self) -> None:
+        raw_noisy = (
+            "[11 ~ 14] 다음 글을 읽고 물음에 답하시오.\n"
+            "4\n"
+            "자기장은 자기력이 작용하고 자기장 에너지가 존재하는 공간이다. 전동기는 인력과 척력을 이용한다.\n"
+            "국어 영역\n"
+            "고정자 표면에 전자석이 형성된다."
+        )
+        cleaned = clean_korean_exam_passage(raw_noisy, is_poetry_or_dialogue=False)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            storage = StorageManager(local_root=root / "exam_db", concept_root=root / "concept_db")
+
+            key_raw = storage.build_korean_pool_key(raw_noisy, group_id="[11~14]", korean_section="독서", question_count=2)
+            key_clean = storage.build_korean_pool_key(cleaned, group_id="11~14", korean_section="독서", question_count=2)
+            self.assertEqual(key_raw, key_clean)
+
+            def _make_set(tag: str) -> list[RewrittenQuestion]:
+                return [
+                    RewrittenQuestion(
+                        original_question_id=f"2026_10_고1_국어_{11 + i}",
+                        rewritten_stem=f"[{tag}] 문항 {i + 1} 발문이다.",
+                        rewritten_choices=["선지1", "선지2", "선지3", "선지4", "선지5"],
+                        pdf_grounded_explanation="정답 해설이다.",
+                        preserved_answer=str((i % 5) + 1),
+                        self_verification_note="ok",
+                        target_question_type="내용 일치",
+                        subject_domain="국어",
+                        shared_passage=cleaned,
+                        passage_group_key="2026년 10월 고1 국어::11~14",
+                        set_instruction="다음 글을 읽고 물음에 답하시오.",
+                    )
+                    for i in range(2)
+                ]
+
+            # 최대 max_per_key=5 상한 및 중복 variant_id 방지 검증
+            vids: list[str] = []
+            for idx in range(6):
+                v = storage.save_cached_korean_set(
+                    key_clean,
+                    _make_set(f"V{idx}"),
+                    exam_name="2026년 10월 고1 국어",
+                    group_id="11~14",
+                    korean_section="독서",
+                    korean_subgenre="과학·기술",
+                    passage_topic="동기전동기 원리",
+                    max_per_key=5,
+                )
+                vids.append(v)
+            # 동일 세트 재저장 시 중복 추가되지 않아야 함
+            dup_v = storage.save_cached_korean_set(
+                key_clean,
+                _make_set("V5"),
+                exam_name="2026년 10월 고1 국어",
+                group_id="11~14",
+                korean_section="독서",
+                max_per_key=5,
+            )
+            self.assertEqual(dup_v, vids[5])
+            self.assertEqual(storage.get_korean_pool_set_count(key_clean), 5)
+
+            # 신규 사용자는 즉시 캐시 히트
+            hit1 = storage.get_cached_korean_set(key_clean, expected_count=2, username="alice")
+            self.assertIsNotNone(hit1)
+            _, hit_vid1 = hit1
+            storage.mark_user_seen_korean_sets("alice", [hit_vid1])
+
+            # 이미 본 세트를 모두 마킹하면 미열람 세트가 남아있는 동안 다른 세트를 반환하고, 모두 소진 시 None 반환
+            remaining_vids = [v for v in vids[1:] if v != hit_vid1]
+            for rv in remaining_vids:
+                hit_next = storage.get_cached_korean_set(key_clean, expected_count=2, username="alice")
+                self.assertIsNotNone(hit_next)
+                self.assertNotEqual(hit_next[1], hit_vid1)
+                storage.mark_user_seen_korean_sets("alice", [hit_next[1]])
+            self.assertIsNone(storage.get_cached_korean_set(key_clean, expected_count=2, username="alice"))
+
+            # 다른 사용자(bob)는 풀 캐시를 즉시 히트하고, generate_korean_set_reconstruction도 API 호출 없이 반환
+            recs = [
+                _make_korean_record(11, "11~14", "과학·기술", raw_noisy),
+                _make_korean_record(12, "11~14", "과학·기술", raw_noisy),
+            ]
+            with patch("src.gemini.korean._build_client", side_effect=AssertionError("API 호출되면 안 됨")):
+                out_pairs = generate_korean_set_reconstruction(
+                    api_key="dummy",
+                    model_name="gemini-3.5-flash-lite",
+                    source_records=recs,
+                    passage_text=raw_noisy,
+                    korean_section="독서",
+                    korean_subgenre="과학·기술",
+                    storage=storage,
+                    use_cache=True,
+                    username="bob",
+                )
+            self.assertEqual(len(out_pairs), 2)
+            self.assertEqual(out_pairs[0][0].id, recs[0].id)
+
+            # 관리자 개별 삭제 / 회차명 변경 / 회차 삭제 / 전체 비우기 검증
+            self.assertEqual(storage.delete_korean_pool_entry(key_clean, 0), 1)
+            self.assertEqual(storage.get_korean_pool_set_count(key_clean), 4)
+            self.assertEqual(storage.rename_korean_pool_exam("2026년 10월 고1 국어", "2026년 10월 학평 국어"), 4)
+            self.assertEqual(storage.delete_korean_pool_by_exam("2026년 10월 학평 국어"), 4)
+            self.assertEqual(storage.get_korean_pool_set_count(key_clean), 0)
+
+            storage.save_cached_korean_set(key_clean, _make_set("FINAL"), exam_name="테스트", group_id="1~2")
+            self.assertEqual(storage.clear_korean_pool(), 1)
+            self.assertEqual(storage.load_korean_pool(), {})
 
 
 if __name__ == "__main__":

@@ -409,7 +409,7 @@ def _render_english_pool_admin_section(ctx: AppContext) -> None:
         filtered_entries = [
             (ck, idx, it)
             for ck, idx, it in flat_entries
-            if (sel_type == "전체" or (it.get("target_type") or "기타").strip() == sel_type)
+            if (sel_type == "전체" or str(it.get("target_question_type") or it.get("target_type") or "기타").strip() == sel_type)
             and (
                 not pool_q
                 or pool_q in ck.lower()
@@ -433,6 +433,174 @@ def _render_english_pool_admin_section(ctx: AppContext) -> None:
                     removed = ctx.storage.delete_english_pool_entry(ck, idx)
                     if removed > 0:
                         st.success(f"캐시 항목(`{ck}` #{idx + 1})을 삭제했습니다.")
+                    st.rerun()
+
+
+def _render_korean_pool_admin_section(ctx: AppContext) -> None:
+    st.divider()
+    st.subheader("📖 국어 변형 문제 세트 풀(Pool) 캐시 관리 (v2)")
+    st.caption(
+        "2-Gate 검수(하드 규칙 + Blind Solver)를 통과한 국어 변형 세트는 `./exam_db/korean_question_pool.json`에 "
+        "지문·영역·문항 수 해시(v2)별로 최대 5세트씩 영구 저장됩니다. "
+        "(회원별 중복 출제 방지 이력은 `./exam_db/user_korean_history.json`에 분리 저장됩니다.)"
+    )
+
+    pool = ctx.storage.load_korean_pool()
+    total_keys = len(pool)
+    flat_entries: list[tuple[str, int, dict[str, Any]]] = []
+    exam_names: set[str] = set()
+    sec_counts: dict[str, int] = {}
+    total_questions = 0
+    for c_key, entries in pool.items():
+        for idx, ent in enumerate(entries):
+            if not isinstance(ent, dict):
+                continue
+            ex_n = str(ent.get("exam_name") or "미분류 회차").strip() or "미분류 회차"
+            sec_n = str(ent.get("section") or "독서").strip() or "독서"
+            q_list = ent.get("questions") if isinstance(ent.get("questions"), list) else []
+            q_cnt = int(ent.get("question_count") or len(q_list))
+            total_questions += q_cnt
+            exam_names.add(ex_n)
+            sec_counts[sec_n] = sec_counts.get(sec_n, 0) + 1
+            flat_entries.append((c_key, idx, ent))
+
+    total_sets = len(flat_entries)
+    k_m1, k_m2, k_m3, k_m4 = st.columns(4)
+    k_m1.metric("캐시된 지문 수", f"{total_keys}지문")
+    k_m2.metric("저장된 변형 세트 수", f"{total_sets}세트")
+    k_m3.metric("저장된 총 문항 수", f"{total_questions}문항")
+    k_m4.metric("포함된 회차 수", f"{len(exam_names)}회차")
+
+    if sec_counts:
+        summary_parts = [f"{k}({v})" for k, v in sorted(sec_counts.items(), key=lambda kv: (-kv[1], kv[0]))]
+        st.caption("영역별 세트 분포: " + " · ".join(summary_parts))
+
+    if total_sets == 0:
+        st.info("현재 저장된 국어 변형 문제 세트 캐시가 없습니다.")
+        return
+
+    col_clr1, col_clr2 = st.columns([2, 1])
+    with col_clr1:
+        confirm_clear = st.checkbox(
+            "국어 변형 세트 캐시만 전체 비우기 확인 (기출 DB·회원 DB·국어 분석지 DB는 유지됨)",
+            key="admin_confirm_clear_kor_q_pool",
+        )
+    with col_clr2:
+        if st.button(
+            "🧹 국어 변형 캐시 전체 비우기",
+            disabled=not confirm_clear,
+            width="stretch",
+            key="admin_clear_kor_q_pool_btn",
+        ):
+            removed_cnt = ctx.storage.clear_korean_pool()
+            st.success(f"🧹 국어 변형 캐시 {removed_cnt}세트를 모두 비웠습니다.")
+            st.rerun()
+
+    kor_q_exp = create_lazy_expander(
+        f"📋 저장된 국어 변형 세트 상세 조회 / 미리보기 / 개별 삭제 ({total_sets}세트)",
+        expanded=False,
+        key="admin_kor_q_pool_detail_exp",
+    )
+    with kor_q_exp:
+        if not is_container_open(kor_q_exp):
+            return
+        f_col1, f_col2, f_col3 = st.columns([1.2, 1.0, 1.5])
+        with f_col1:
+            sel_exam = st.selectbox(
+                "회차 필터",
+                options=["전체"] + sorted(exam_names, reverse=True),
+                key="admin_kor_q_pool_exam_filter",
+            )
+        with f_col2:
+            sel_sec = st.selectbox(
+                "영역 필터",
+                options=["전체"] + sorted(sec_counts.keys()),
+                key="admin_kor_q_pool_sec_filter",
+            )
+        with f_col3:
+            kor_q = st.text_input(
+                "주제/발문/회차/키 검색",
+                placeholder="키워드 또는 캐시 키 입력...",
+                key="admin_kor_q_pool_search",
+            ).strip().lower()
+
+        sorted_entries = sorted(
+            flat_entries,
+            key=lambda kv: (str(kv[2].get("saved_at") or ""), str(kv[2].get("exam_name") or ""), -kv[1]),
+            reverse=True,
+        )
+        filtered_entries: list[tuple[str, int, dict[str, Any]]] = []
+        for ck, idx, ent in sorted_entries:
+            ex_n = str(ent.get("exam_name") or "미분류 회차").strip() or "미분류 회차"
+            sec_n = str(ent.get("section") or "독서").strip() or "독서"
+            if sel_exam != "전체" and ex_n != sel_exam:
+                continue
+            if sel_sec != "전체" and sec_n != sel_sec:
+                continue
+            q_list = ent.get("questions") if isinstance(ent.get("questions"), list) else []
+            stems_blob = " ".join(
+                f"{q.get('target_question_type', '')} {q.get('rewritten_stem', '')}"
+                for q in q_list
+                if isinstance(q, dict)
+            ).lower()
+            if kor_q and not (
+                kor_q in ck.lower()
+                or kor_q in ex_n.lower()
+                or kor_q in str(ent.get("group_id") or "").lower()
+                or kor_q in str(ent.get("passage_topic") or "").lower()
+                or kor_q in str(ent.get("variant_id") or "").lower()
+                or kor_q in stems_blob
+            ):
+                continue
+            filtered_entries.append((ck, idx, ent))
+
+        st.caption(f"검색 결과: {len(filtered_entries)}세트 (최대 25건 표시)")
+        for ck, idx, ent in filtered_entries[:25]:
+            ex_n = str(ent.get("exam_name") or "미분류 회차")
+            gid_n = str(ent.get("group_id") or "-")
+            sec_n = str(ent.get("section") or "독서")
+            sub_n = str(ent.get("subgenre") or "")
+            sec_disp = f"{sec_n}({sub_n})" if sub_n else sec_n
+            topic_n = str(ent.get("passage_topic") or "").strip()
+            saved_at = str(ent.get("saved_at") or "")
+            q_list = ent.get("questions") if isinstance(ent.get("questions"), list) else []
+            q_cnt = int(ent.get("question_count") or len(q_list))
+            types_summary = " · ".join(
+                str(q.get("target_question_type") or "문항")
+                for q in q_list[:6]
+                if isinstance(q, dict)
+            )
+
+            r_col1, r_col2 = st.columns([5, 1])
+            with r_col1:
+                st.markdown(
+                    f"**[{ex_n} · {gid_n}번] 세트 #{idx + 1}** (`{sec_disp}` · {q_cnt}문항) · 키 `{ck}`"
+                )
+                cap_parts = [
+                    p
+                    for p in (
+                        f"저장: {saved_at}" if saved_at else "",
+                        f"주제: {topic_n}" if topic_n else "",
+                        f"유형: {types_summary}" if types_summary else "",
+                    )
+                    if p
+                ]
+                if cap_parts:
+                    st.caption(" · ".join(cap_parts))
+                if q_list:
+                    with st.expander(f"🔍 문항 발문/정답 미리보기 ({q_cnt}문항)", expanded=False):
+                        for q_i, q_d in enumerate(q_list, start=1):
+                            if not isinstance(q_d, dict):
+                                continue
+                            qt = str(q_d.get("target_question_type") or "문항")
+                            ans = str(q_d.get("preserved_answer") or "-")
+                            stem_prev = " ".join(str(q_d.get("rewritten_stem") or "").split())[:130]
+                            st.write(f"**Q{q_i}. [{qt}]** {stem_prev} *(정답: {ans}번)*")
+            with r_col2:
+                if st.button("🗑️ 삭제", key=f"del_kor_q_pool_{ck}_{idx}", width="stretch"):
+                    removed = ctx.storage.delete_korean_pool_entry(ck, idx)
+                    if removed > 0:
+                        st.success(f"국어 변형 세트(`{ck}` #{idx + 1})를 삭제했습니다.")
                     st.rerun()
 
 

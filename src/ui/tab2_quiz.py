@@ -33,6 +33,7 @@ from src.ui.common import (
     _auto_save_current_exam,
     _infer_exam_subject,
     _record_english_seen_for_user,
+    _record_korean_seen_for_user,
     _render_rewritten_card_html,
     _usage_scope,
     is_multiple_choice_question,
@@ -660,6 +661,7 @@ def _render_mode_b_solve_fragment(
         if st.button("📝 채점하기", type="primary", width="stretch"):
             st.session_state["graded"] = True
             _record_english_seen_for_user(ctx, matched_items)
+            _record_korean_seen_for_user(ctx, matched_items)
             correct_cnt = 0
             for item_g in matched_items:
                 q_g: QuestionRecord = item_g["question"]

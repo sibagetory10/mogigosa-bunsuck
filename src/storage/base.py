@@ -94,6 +94,8 @@ class StorageBase:
         self.english_analysis_pdfs_root = self.local_root / "english_analysis_pdfs"
         self.korean_analysis_pool_path = self.local_root / "korean_analysis_pool.json"
         self.korean_analysis_pdfs_root = self.local_root / "korean_analysis_pdfs"
+        self.korean_pool_path = self.local_root / "korean_question_pool.json"
+        self.user_korean_history_path = self.local_root / "user_korean_history.json"
         self.user_english_history_path = self.local_root / "user_english_history.json"
         self.saved_exams_root = self.local_root / "saved_exams"
         self.saved_exams_pdfs_root = self.saved_exams_root / "pdfs"

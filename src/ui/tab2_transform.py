@@ -39,6 +39,7 @@ from src.ui.common import (
     _build_exam_sig,
     _ensure_token_quota,
     _record_english_seen_for_user,
+    _record_korean_seen_for_user,
     _render_rewritten_card_html,
     _usage_scope,
     create_lazy_expander,
@@ -922,6 +923,7 @@ def render_tab2(ctx: AppContext) -> None:
                                 st.session_state["generated_exam_pdf"] = pdf_bytes
                                 st.session_state["generated_exam_pdf_sig"] = items_sig
                                 _record_english_seen_for_user(ctx, matched_items)
+                                _record_korean_seen_for_user(ctx, matched_items)
                                 _auto_save_current_exam(
                                     ctx,
                                     matched_items,

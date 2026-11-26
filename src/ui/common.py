@@ -573,6 +573,69 @@ def _record_english_seen_for_user(ctx: AppContext, items: list[dict[str, Any]]) 
 record_english_seen_for_user = _record_english_seen_for_user
 
 
+def _record_korean_seen_for_user(ctx: AppContext, items: list[dict[str, Any]]) -> None:
+    """현재 계정이 생성·PDF·풀이 완료한 국어 변형 세트를 기록해 동일 세트 중복 출제를 방지한다."""
+    if ctx.current_user is None or not items:
+        return
+    from src.models.question import normalize_korean_group_id
+
+    groups: dict[str, dict[str, Any]] = {}
+    for it in items:
+        q_obj: QuestionRecord | None = it.get("question")
+        rw_item: RewrittenQuestion | None = it.get("rewritten")
+        k_meta = it.get("korean_meta") or {}
+        if rw_item is None or q_obj is None:
+            continue
+        is_kor = (
+            getattr(q_obj, "subject_category", "") == "국어"
+            or getattr(rw_item, "subject_domain", "") == "국어"
+            or bool(k_meta)
+        )
+        if not is_kor:
+            continue
+        gid = normalize_korean_group_id(
+            str(k_meta.get("group_id") or getattr(q_obj, "passage_group_id", "") or ""),
+            q_obj.q_num,
+        )
+        g_key = (
+            (getattr(rw_item, "passage_group_key", "") or "").strip()
+            or f"{q_obj.exam_name}::{gid or q_obj.q_num}"
+        )
+        bucket = groups.setdefault(
+            g_key,
+            {
+                "vid": str(k_meta.get("variant_id") or "").strip(),
+                "passage": (getattr(rw_item, "shared_passage", "") or str(k_meta.get("passage_text") or getattr(q_obj, "passage_text", "") or "")).strip(),
+                "gid": gid,
+                "section": str(k_meta.get("section") or getattr(q_obj, "curriculum_subject", "") or "독서"),
+                "subgenre": str(k_meta.get("subgenre") or ""),
+                "stems": [],
+            },
+        )
+        bucket["stems"].append(str(rw_item.rewritten_stem or ""))
+
+    variant_ids: list[str] = []
+    for bucket in groups.values():
+        vid = bucket["vid"]
+        if not vid and bucket["passage"] and bucket["stems"]:
+            c_key = ctx.storage.build_korean_pool_key(
+                bucket["passage"],
+                group_id=bucket["gid"],
+                korean_section=bucket["section"],
+                question_count=len(bucket["stems"]),
+                korean_subgenre=bucket["subgenre"],
+            )
+            vid = ctx.storage.build_korean_set_variant_id(c_key, bucket["stems"])
+        if vid:
+            variant_ids.append(vid)
+
+    if variant_ids:
+        ctx.storage.mark_user_seen_korean_sets(ctx.current_user.username, variant_ids)
+
+
+record_korean_seen_for_user = _record_korean_seen_for_user
+
+
 def _infer_exam_subject(items: list[dict[str, Any]]) -> str:
     from src.models import infer_subject_category
 

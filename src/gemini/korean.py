@@ -862,11 +862,16 @@ def generate_korean_set_reconstruction(
     korean_section: str = "독서",
     korean_subgenre: str = "",
     passage_topic: str = "",
+    *,
+    storage: Any = None,
+    use_cache: bool = True,
+    username: str = "",
 ) -> list[tuple[QuestionRecord, RewrittenQuestion]]:
     """
     국어 지문 1개 세트(원본 문항 수 N개, 보통 3~6문항)를 받아
     지문을 정제·표지 검증한 뒤 N개의 수능형 국어 문항 세트를 창작하고,
     Gate 1(하드 규칙) + Gate 2(정답 은닉 Blind Solver) + 결함 슬롯 재출제 + 정답 분산까지 완료해 반환한다.
+    storage가 주어지면 미열람 풀 캐시를 우선 조회하고, 신규 생성 성공 시 풀에 영구 저장한다.
     공통 지문은 RewrittenQuestion.shared_passage에 분리 저장하여 PDF·웹 풀기에서 1회만 출력한다.
     """
     ordered_recs = sorted(source_records, key=lambda r: r.q_num)
@@ -878,6 +883,39 @@ def generate_korean_set_reconstruction(
     clean_passage = clean_korean_exam_passage(passage_text or "", is_poetry_or_dialogue=is_keep_lines)
     if not clean_passage:
         raise ValueError("국어 지문 원문(passage_text)이 비어 있어 세트 문항을 재구성할 수 없습니다.")
+
+    gid = normalize_korean_group_id(getattr(ordered_recs[0], "passage_group_id", ""), ordered_recs[0].q_num)
+    group_key = f"{ordered_recs[0].exam_name}::{gid or ordered_recs[0].q_num}"
+
+    cache_key = ""
+    if storage is not None and hasattr(storage, "build_korean_pool_key"):
+        cache_key = storage.build_korean_pool_key(
+            clean_passage,
+            group_id=gid,
+            korean_section=korean_section,
+            question_count=n_questions,
+            korean_subgenre=korean_subgenre,
+        )
+        if use_cache and hasattr(storage, "get_cached_korean_set"):
+            cached_hit = storage.get_cached_korean_set(
+                cache_key,
+                expected_count=n_questions,
+                username=username,
+            )
+            if cached_hit is not None:
+                cached_rws, _ = cached_hit
+                return [
+                    (
+                        ordered_recs[idx],
+                        cached_rws[idx].model_copy(
+                            update={
+                                "original_question_id": ordered_recs[idx].id,
+                                "passage_group_key": group_key,
+                            }
+                        ),
+                    )
+                    for idx in range(n_questions)
+                ]
 
     allowed_markers = _extract_korean_passage_markers(clean_passage)
     marker_note = _format_marker_inventory_note(allowed_markers)
@@ -1042,8 +1080,6 @@ def generate_korean_set_reconstruction(
 
     raw_intro = re.sub(r"^\s*\[?\s*\d{1,2}\s*[~\-～]\s*\d{1,2}\s*\]?\s*", "", (parsed.set_intro or "").strip()).strip()
     set_instruction = raw_intro or "다음 글을 읽고 물음에 답하시오."
-    gid = normalize_korean_group_id(getattr(ordered_recs[0], "passage_group_id", ""), ordered_recs[0].q_num)
-    group_key = f"{ordered_recs[0].exam_name}::{gid or ordered_recs[0].q_num}"
 
     results: list[tuple[QuestionRecord, RewrittenQuestion]] = []
     for idx, gq in enumerate(sanitized_qs):
@@ -1069,7 +1105,21 @@ def generate_korean_set_reconstruction(
         )
         results.append((base_rec, rw))
 
-    return balance_korean_answer_distribution(results)
+    final_pairs = balance_korean_answer_distribution(results)
+    if cache_key and storage is not None and hasattr(storage, "save_cached_korean_set") and final_pairs:
+        try:
+            storage.save_cached_korean_set(
+                cache_key,
+                [rw for _, rw in final_pairs],
+                exam_name=ordered_recs[0].exam_name,
+                group_id=gid,
+                korean_section=korean_section,
+                korean_subgenre=korean_subgenre,
+                passage_topic=passage_topic or getattr(ordered_recs[0], "passage_topic", ""),
+            )
+        except Exception:
+            pass
+    return final_pairs
 
 
 def generate_korean_question_explanation(

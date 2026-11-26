@@ -71,7 +71,7 @@
 - **`src/ui/tab3_concept.py` [탭 3]**: 공용 개념서·교과서 DB 구축 및 2022 개정 교육과정 공식 기준표(NCIC 고시 PDF / 교육부 원문 동기화) 관리.
 - **`src/ui/tab4_dictionary.py` & `src/ui/tab4_vocab_quiz.py` [탭 4]**: 수능 영단어 사전(`data/csat_vocab_seed.json` + AI 검색 캐시), 기출 핵심 어휘 연동, 나만의 단어장 & PDF, 객관식/플래시카드 퀴즈.
 - **`src/ui/my_exams_tab.py` [나의 시험지]**: 계정별·과목별 자동 저장된 시험지 목록 조회, PDF 다운로드, 웹 재풀이 로드.
-- **`src/ui/admin_tab.py` & `src/ui/admin_pools.py` [관리자]**: 입금 승인 대기열(원클릭 승인·반려·환불 회수)·입금 계좌/송금 링크/Discord 웹훅 설정, 입금 승인 실매출 기반 원가율 대시보드, 회원 등급·만료일 관리, 서버 디스크/Git/풀 관리.
+- **`src/ui/admin_tab.py` & `src/ui/admin_pools.py` [관리자]**: 입금 승인 대기열(원클릭 승인·반려·환불 회수)·입금 계좌/송금 링크/Discord 웹훅 설정, 입금 승인 실매출 기반 원가율 대시보드, 회원 등급·만료일 관리, 서버 디스크/Git/풀(영어 v3·국어 변형·분석지) 관리.
 
 ### 4.2 Gemini AI 도메인 서비스 (`src/gemini/` & 파사드)
 - **`src/gemini/usage.py` & `src/gemini/core.py`**: 경량 토큰 추적(`bind_usage_tracker`, `submit_with_usage_context`, `ForbiddenTermRemainingError`)과 GenAI 클라이언트·재시도·폴백·비전 최적화·구조화 파싱 분리.
@@ -87,7 +87,7 @@
 ### 4.3 코어 스키마 · 인증 · 저장소 · PDF · 교육과정 엔진 (`src/`)
 - **`src/models/` (`question.py`, `concept.py`, `korean.py`, `english.py`, `user.py`, `payment.py`, `vocab.py`, `__init__.py`)**: PEP 562 지연 export 기반 Pydantic v2 스키마 패키지.
 - **`src/auth/` (`tokens.py`, `oauth.py`, `accounts.py`, `quota.py`, `payments.py`, `__init__.py`)**: PBKDF2 인증, 서명 세션 토큰, Google OAuth 2.0, 30일 유료 만료·환불 부채 상계·결제 승인 서비스, 등급·크레딧 쿼터 관리.
-- **`src/storage/` (`base.py`, `exam_store.py`, `user_exams_store.py`, `payment_store.py`, `english_pool_store.py`, `analysis_pool_store.py`, `vocab_store.py`, `__init__.py`)**: `StorageManager` — `threading.RLock` + 원자적 파일 교체(`_atomic_write_text`/`_bytes`), `mtime_ns`/`size` 캐시, 읽기 전용 `load_db_readonly()` & O(1) `get_db_summary_counts()`.
+- **`src/storage/` (`base.py`, `exam_store.py`, `user_exams_store.py`, `payment_store.py`, `english_pool_store.py`, `korean_pool_store.py`, `analysis_pool_store.py`, `vocab_store.py`, `__init__.py`)**: `StorageManager` — `threading.RLock` + 원자적 파일 교체(`_atomic_write_text`/`_bytes`), `mtime_ns`/`size` 캐시, 읽기 전용 `load_db_readonly()` & O(1) `get_db_summary_counts()`.
 - **`src/curriculum_2022/` (`catalog.py`, `importers.py`, `grounding.py`, `__init__.py`)**: 2022 개정 교육과정 편제표·NCIC 성취기준 로드·파싱·검증.
 - **`src/pdf_parser/` (`common.py`, `metadata_and_pairing.py`, `concept_slicer.py`, `exam_cropper.py`, `english_source_extractor.py`, `__init__.py`)**: PyMuPDF 기반 문항 영역 크롭, 2단 레이아웃 파싱, 개념서 슬라이싱, 해설지 매칭, 영어 문제지/해설지 `[해석]` 무손실 추출 및 문장별 1:1 DP 정렬(AI 미사용).
 - **`src/pdf/` (`styles.py`, `common.py`, `poetry_renderer.py`, `korean_analysis_pdf.py`, `english_analysis_pdf.py`, `exam_pdf.py`, `vocab_pdf.py`, `__init__.py`)**: 맞춤형 2단 시험지, 국어·영어 지문 분석지, 영단어장 PDF 렌더링.
@@ -107,7 +107,7 @@
   - `exam_db/users.json`, `exam_db/credit_ledger.jsonl`, `exam_db/payment_settings.json`, `exam_db/payment_orders.json`: 회원 계정, 등급·만료일·환불부채·크레딧·원가 통계, 크레딧 원장 및 입금 계좌/결제 주문 DB
   - `exam_db/fx_rate_cache.json`: 일일 USD→KRW 환율 캐시
   - `exam_db/english_question_pool.json`, `english_analysis_pool.json`, `english_analysis_pdfs/`, `user_english_history.json`, `english_dict_cache.json`, `user_vocab/`
-  - `exam_db/korean_analysis_pool.json`, `korean_analysis_pdfs/`
+  - `exam_db/korean_question_pool.json`, `user_korean_history.json`, `korean_analysis_pool.json`, `korean_analysis_pdfs/`
   - `exam_db/saved_exams/`: 사용자별 자동 저장된 맞춤형 시험지 및 PDF
   - `exam_db/ncic_standards.json`: 런타임에 추가된 NCIC 성취기준 (자동 업데이트 시 `data/curriculum_2022.json` 충돌 방지를 위해 우선 이관됨)
   - `concept_db/concept_books.json`: 공용 개념서·교과서 단원 및 화이트리스트 DB

@@ -687,6 +687,17 @@ def _render_admin_panel(ctx: AppContext) -> None:
 
             _render_english_pool_admin_section(ctx)
 
+    kor_q_pool_exp = create_lazy_expander(
+        "📖 국어 변형 문제 세트 풀(Pool) 캐시 관리",
+        expanded=False,
+        key="admin_kor_q_pool_exp",
+    )
+    with kor_q_pool_exp:
+        if is_container_open(kor_q_pool_exp):
+            from src.ui.admin_pools import _render_korean_pool_admin_section
+
+            _render_korean_pool_admin_section(ctx)
+
     kor_pool_exp = create_lazy_expander(
         "📖 국어 지문 분석지 캐시 · PDF DB 관리",
         expanded=False,

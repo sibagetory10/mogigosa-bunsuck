@@ -149,13 +149,24 @@ def render_tab2_korean_transform_section(
             sec_tag = s_entry["curr_subj"]
             topic_tag = s_entry["passage_topic"] or "주제 미상"
             kor_sec_chk = _classify_kor_sec(sec_tag)
+            m_sub_chk = re.search(r"\(([^)]+)\)", sec_tag)
+            kor_sub_chk = m_sub_chk.group(1) if m_sub_chk else ""
             c_key_chk = storage.build_korean_analysis_key(
                 s_entry["passage_text"],
                 s_entry["group_id"],
                 kor_sec_chk,
             )
+            q_pool_key_chk = storage.build_korean_pool_key(
+                s_entry["passage_text"],
+                group_id=s_entry["group_id"],
+                korean_section=kor_sec_chk,
+                question_count=len(q_nums),
+                korean_subgenre=kor_sub_chk,
+            )
+            pool_cnt_chk = storage.get_korean_pool_set_count(q_pool_key_chk)
             pdf_status_tag = " · 📑 분석지PDF DB" if storage.has_korean_analysis_pdf(c_key_chk) else ""
-            set_label = f"[{s_entry['exam_name']}] [{s_entry['group_id']}번] ({sec_tag} · {len(q_nums)}문항{pdf_status_tag}) — {topic_tag}"
+            pool_status_tag = f" · 🎯 변형DB {pool_cnt_chk}세트" if pool_cnt_chk > 0 else ""
+            set_label = f"[{s_entry['exam_name']}] [{s_entry['group_id']}번] ({sec_tag} · {len(q_nums)}문항{pool_status_tag}{pdf_status_tag}) — {topic_tag}"
             is_chk = st.checkbox(
                 set_label,
                 value=False,
@@ -231,10 +242,6 @@ def render_tab2_korean_transform_section(
         kor_api_key, kor_key_label = resolve_active_gemini_api_key(
             current_user, creds.gemini_api_key, model_name=EXAM_TAGGING_MODEL
         )
-        if not kor_api_key:
-            st.error(f"사용 가능한 Gemini API 키({kor_key_label})가 설정되지 않았습니다.")
-            return
-
         uname_kor = current_user.username if current_user is not None else ""
         reserve_c = len(chosen_sets) * CREDIT_COST_KOREAN_SET_TRANSFORM
         ok_res, reservation, res_msg = acquire_credit_reservation(
@@ -250,78 +257,148 @@ def render_tab2_korean_transform_section(
 
         new_matched: list[dict[str, Any]] = []
         succeeded_sets = 0
+        cache_hit_cnt = 0
+        ai_gen_cnt = 0
         actual_c = 0
+        seen_variant_ids: list[str] = []
         try:
-            with usage_scope_fn():
-                with st.spinner(f"🤖 {MODEL_LABELS.get(EXAM_TAGGING_MODEL, EXAM_TAGGING_MODEL)}로 국어 지문 세트({len(chosen_sets)}개 세트) 변형문제 병렬 생성·검증 중..."):
-                    from src.gemini.korean import (
-                        balance_korean_answer_distribution,
-                        generate_korean_set_reconstruction,
-                    )
+            from src.gemini.korean import (
+                balance_korean_answer_distribution,
+                generate_korean_set_reconstruction,
+            )
 
-                    def _run_kor_set(set_idx: int, s_entry: dict[str, Any]):
-                        curr_subj = s_entry["curr_subj"]
-                        kor_sec = _classify_kor_sec(curr_subj)
-                        m_sub = re.search(r"\(([^)]+)\)", curr_subj)
-                        kor_sub = m_sub.group(1) if m_sub else ""
-                        pairs = generate_korean_set_reconstruction(
-                            api_key=kor_api_key,
-                            model_name=EXAM_TAGGING_MODEL,
-                            source_records=s_entry["records"],
-                            passage_text=s_entry["passage_text"],
-                            korean_section=kor_sec,
-                            korean_subgenre=kor_sub,
-                            passage_topic=s_entry["passage_topic"],
-                        )
-                        return set_idx, kor_sec, kor_sub, pairs
-
-                    slot_results: dict[int, tuple[str, str, list[Any]]] = {}
-                    with concurrent.futures.ThreadPoolExecutor(
-                        max_workers=min(3, len(chosen_sets))
-                    ) as executor:
-                        fut_map = {
-                            submit_with_usage_context(executor, _run_kor_set, idx_c, s_entry): (idx_c, s_entry)
-                            for idx_c, s_entry in enumerate(chosen_sets)
-                        }
-                        for fut in concurrent.futures.as_completed(fut_map):
-                            idx_c, s_entry = fut_map[fut]
-                            try:
-                                _, kor_sec, kor_sub, pairs = fut.result()
-                                if pairs:
-                                    slot_results[idx_c] = (kor_sec, kor_sub, pairs)
-                            except Exception as exc:
-                                st.error(f"[{s_entry['exam_name']} {s_entry['group_id']}번] 세트 재구성 실패: {exc}")
-
-                    combined_pairs: list[tuple[Any, Any]] = []
-                    pair_metas: list[tuple[dict[str, Any], str, str]] = []
-                    for idx_c, s_entry in enumerate(chosen_sets):
-                        res_t = slot_results.get(idx_c)
-                        if not res_t:
-                            continue
-                        kor_sec, kor_sub, pairs = res_t
-                        succeeded_sets += 1
-                        for rec, rw in pairs:
-                            combined_pairs.append((rec, rw))
-                            pair_metas.append((s_entry, kor_sec, kor_sub))
-
-                    if combined_pairs:
-                        balanced_pairs = balance_korean_answer_distribution(combined_pairs)
-                        for (rec, rw), (s_entry, kor_sec, kor_sub) in zip(balanced_pairs, pair_metas):
-                            new_matched.append(
-                                {
-                                    "question": rec,
-                                    "judgment": None,
-                                    "crop_png_bytes": None,
-                                    "rewritten": rw,
-                                    "concept_reference": f"출처: {s_entry['exam_name']} [{s_entry['group_id']}번]",
-                                    "korean_meta": {
-                                        "section": kor_sec,
-                                        "subgenre": kor_sub,
-                                        "group_id": s_entry["group_id"],
-                                        "passage_text": getattr(rw, "shared_passage", "") or s_entry["passage_text"],
-                                    },
+            slot_results: dict[int, tuple[str, str, list[Any], str]] = {}
+            miss_indices: list[int] = []
+            for idx_c, s_entry in enumerate(chosen_sets):
+                curr_subj = s_entry["curr_subj"]
+                kor_sec = _classify_kor_sec(curr_subj)
+                m_sub = re.search(r"\(([^)]+)\)", curr_subj)
+                kor_sub = m_sub.group(1) if m_sub else ""
+                ordered_recs = sorted(s_entry["records"], key=lambda r: r.q_num)
+                c_key = storage.build_korean_pool_key(
+                    s_entry["passage_text"],
+                    group_id=s_entry["group_id"],
+                    korean_section=kor_sec,
+                    question_count=len(ordered_recs),
+                    korean_subgenre=kor_sub,
+                )
+                cached_hit = storage.get_cached_korean_set(
+                    c_key,
+                    expected_count=len(ordered_recs),
+                    username=uname_kor,
+                )
+                if cached_hit is not None:
+                    cached_rws, hit_vid = cached_hit
+                    group_key = f"{ordered_recs[0].exam_name}::{s_entry['group_id'] or ordered_recs[0].q_num}"
+                    hit_pairs = [
+                        (
+                            ordered_recs[i],
+                            cached_rws[i].model_copy(
+                                update={
+                                    "original_question_id": ordered_recs[i].id,
+                                    "passage_group_key": group_key,
                                 }
+                            ),
+                        )
+                        for i in range(len(ordered_recs))
+                    ]
+                    slot_results[idx_c] = (kor_sec, kor_sub, hit_pairs, hit_vid)
+                    cache_hit_cnt += 1
+                else:
+                    miss_indices.append(idx_c)
+
+            if miss_indices and not kor_api_key:
+                st.error(f"사용 가능한 Gemini API 키({kor_key_label})가 설정되지 않았습니다.")
+            elif miss_indices:
+                with usage_scope_fn():
+                    with st.spinner(
+                        f"🤖 {MODEL_LABELS.get(EXAM_TAGGING_MODEL, EXAM_TAGGING_MODEL)}로 "
+                        f"국어 지문 세트 {len(miss_indices)}개 신규 생성·검수 중 "
+                        f"(DB 풀 즉시 로드 {cache_hit_cnt}세트)..."
+                    ):
+                        def _run_kor_set(set_idx: int):
+                            s_entry = chosen_sets[set_idx]
+                            curr_subj = s_entry["curr_subj"]
+                            kor_sec = _classify_kor_sec(curr_subj)
+                            m_sub = re.search(r"\(([^)]+)\)", curr_subj)
+                            kor_sub = m_sub.group(1) if m_sub else ""
+                            pairs = generate_korean_set_reconstruction(
+                                api_key=kor_api_key,
+                                model_name=EXAM_TAGGING_MODEL,
+                                source_records=s_entry["records"],
+                                passage_text=s_entry["passage_text"],
+                                korean_section=kor_sec,
+                                korean_subgenre=kor_sub,
+                                passage_topic=s_entry["passage_topic"],
+                                storage=storage,
+                                use_cache=False,
+                                username=uname_kor,
                             )
+                            c_k = storage.build_korean_pool_key(
+                                s_entry["passage_text"],
+                                group_id=s_entry["group_id"],
+                                korean_section=kor_sec,
+                                question_count=len(pairs),
+                                korean_subgenre=kor_sub,
+                            )
+                            vid = storage.build_korean_set_variant_id(
+                                c_k, [rw.rewritten_stem for _, rw in pairs]
+                            )
+                            return set_idx, kor_sec, kor_sub, pairs, vid
+
+                        with concurrent.futures.ThreadPoolExecutor(
+                            max_workers=min(3, len(miss_indices))
+                        ) as executor:
+                            fut_map = {
+                                submit_with_usage_context(executor, _run_kor_set, idx_m): idx_m
+                                for idx_m in miss_indices
+                            }
+                            for fut in concurrent.futures.as_completed(fut_map):
+                                idx_m = fut_map[fut]
+                                s_entry = chosen_sets[idx_m]
+                                try:
+                                    _, kor_sec, kor_sub, pairs, vid = fut.result()
+                                    if pairs:
+                                        slot_results[idx_m] = (kor_sec, kor_sub, pairs, vid)
+                                        ai_gen_cnt += 1
+                                except Exception as exc:
+                                    st.error(f"[{s_entry['exam_name']} {s_entry['group_id']}번] 세트 재구성 실패: {exc}")
+
+            combined_pairs: list[tuple[Any, Any]] = []
+            pair_metas: list[tuple[dict[str, Any], str, str, str]] = []
+            for idx_c, s_entry in enumerate(chosen_sets):
+                res_t = slot_results.get(idx_c)
+                if not res_t:
+                    continue
+                kor_sec, kor_sub, pairs, vid = res_t
+                succeeded_sets += 1
+                if vid:
+                    seen_variant_ids.append(vid)
+                for rec, rw in pairs:
+                    combined_pairs.append((rec, rw))
+                    pair_metas.append((s_entry, kor_sec, kor_sub, vid))
+
+            if combined_pairs:
+                balanced_pairs = balance_korean_answer_distribution(combined_pairs)
+                for (rec, rw), (s_entry, kor_sec, kor_sub, vid) in zip(balanced_pairs, pair_metas):
+                    new_matched.append(
+                        {
+                            "question": rec,
+                            "judgment": None,
+                            "crop_png_bytes": None,
+                            "rewritten": rw,
+                            "concept_reference": f"출처: {s_entry['exam_name']} [{s_entry['group_id']}번]",
+                            "korean_meta": {
+                                "section": kor_sec,
+                                "subgenre": kor_sub,
+                                "group_id": s_entry["group_id"],
+                                "passage_text": getattr(rw, "shared_passage", "") or s_entry["passage_text"],
+                                "variant_id": vid,
+                            },
+                        }
+                    )
+            if uname_kor and seen_variant_ids:
+                storage.mark_user_seen_korean_sets(uname_kor, seen_variant_ids)
             actual_c = succeeded_sets * CREDIT_COST_KOREAN_SET_TRANSFORM
         finally:
             settle_credit_reservation(
@@ -342,8 +419,10 @@ def render_tab2_korean_transform_section(
             st.session_state["ai_explanations"] = {}
             st.session_state["ai_chats"] = {}
             bal_msg = format_credit_balance_inline(storage, uname_kor, charged=actual_c)
+            pool_detail = f"DB 풀 즉시 로드 {cache_hit_cnt}세트 · 신규 AI 생성·DB 저장 {ai_gen_cnt}세트"
             st.success(
-                f"🎯 총 {succeeded_sets}개 지문 세트({len(new_matched)}문항) 변형문제 생성 및 2-Gate 검수 완료! 아래 [모드 A] PDF 또는 [모드 B] 웹 풀기를 이용해 주세요.{bal_msg}"
+                f"🎯 총 {succeeded_sets}개 지문 세트({len(new_matched)}문항) 변형문제 준비 완료! "
+                f"({pool_detail}) 아래 [모드 A] PDF 또는 [모드 B] 웹 풀기를 이용해 주세요.{bal_msg}"
             )
 
     if run_kor_analysis_btn:
