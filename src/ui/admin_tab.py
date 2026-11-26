@@ -41,7 +41,7 @@ from src.config import (
     resolve_billing_api_key,
 )
 from src.fx_rate import get_daily_gemini_fx_rate
-from src.ui.common import create_lazy_expander, is_container_open
+from src.ui.common import create_lazy_tabs, is_container_open
 from src.ui.context import AppContext
 
 
@@ -286,7 +286,7 @@ def _render_payment_admin_section(
                 st.error(msg_d)
 
 
-def _render_admin_panel(ctx: AppContext) -> None:
+def _render_member_and_billing_admin_section(ctx: AppContext) -> None:
     st.subheader("🛡️ 관리자 회원 관리 (등급 설정 · 실제 API 토큰 & 원화 비용 모니터링)")
     st.caption(
         "가입한 회원 목록 및 실제 API 토큰·비용 내역은 `./exam_db/users.json`에 영구 저장되며 Google Drive 연동 시 자동 동기화됩니다."
@@ -654,71 +654,84 @@ def _render_admin_panel(ctx: AppContext) -> None:
                 elif del_note:
                     st.warning(del_note)
 
-    storage_exp = create_lazy_expander(
-        "💾 서버 디스크 저장공간 · 앱 DB 용량 모니터링",
-        expanded=False,
-        key="admin_storage_stats_exp",
+
+def _render_db_admin_hub(ctx: AppContext) -> None:
+    """서버 디스크·앱 DB 용량 및 과목별 변형/분석지 캐시 풀 관리를 한 곳에 묶어 렌더링한다."""
+    st.subheader("🗄️ DB · 캐시 풀 통합 관리")
+    st.caption(
+        "서버 저장공간·앱 DB 용량 모니터링과 영어/국어 변형 문제 풀 및 지문 분석지 PDF DB를 한 화면에서 관리합니다."
     )
-    with storage_exp:
-        if is_container_open(storage_exp):
+    (
+        tab_storage,
+        tab_eng_pool,
+        tab_kor_pool,
+        tab_kor_analysis,
+        tab_eng_analysis,
+    ) = create_lazy_tabs(
+        [
+            "💾 DB 용량 모니터링",
+            "🔤 영어 변형 풀",
+            "📖 국어 변형 풀",
+            "📖 국어 분석지 DB",
+            "🔤 영어 분석지 DB",
+        ],
+        key="admin_db_subtabs",
+    )
+
+    with tab_storage:
+        if is_container_open(tab_storage):
             from src.ui.admin_pools import _render_server_storage_admin_section
 
             _render_server_storage_admin_section(ctx)
 
-    git_exp = create_lazy_expander(
-        "🔄 서버 Git 동기화 · 자동 업데이트 제어",
-        expanded=False,
-        key="admin_git_update_exp",
-    )
-    with git_exp:
-        if is_container_open(git_exp):
-            from src.ui.admin_pools import _render_server_git_update_admin_section
-
-            _render_server_git_update_admin_section()
-
-    eng_pool_exp = create_lazy_expander(
-        "🔤 영어 변형 문제 풀(Pool) 캐시 관리",
-        expanded=False,
-        key="admin_eng_pool_exp",
-    )
-    with eng_pool_exp:
-        if is_container_open(eng_pool_exp):
+    with tab_eng_pool:
+        if is_container_open(tab_eng_pool):
             from src.ui.admin_pools import _render_english_pool_admin_section
 
             _render_english_pool_admin_section(ctx)
 
-    kor_q_pool_exp = create_lazy_expander(
-        "📖 국어 변형 문제 세트 풀(Pool) 캐시 관리",
-        expanded=False,
-        key="admin_kor_q_pool_exp",
-    )
-    with kor_q_pool_exp:
-        if is_container_open(kor_q_pool_exp):
+    with tab_kor_pool:
+        if is_container_open(tab_kor_pool):
             from src.ui.admin_pools import _render_korean_pool_admin_section
 
             _render_korean_pool_admin_section(ctx)
 
-    kor_pool_exp = create_lazy_expander(
-        "📖 국어 지문 분석지 캐시 · PDF DB 관리",
-        expanded=False,
-        key="admin_kor_analysis_pool_exp",
-    )
-    with kor_pool_exp:
-        if is_container_open(kor_pool_exp):
+    with tab_kor_analysis:
+        if is_container_open(tab_kor_analysis):
             from src.ui.admin_pools import _render_korean_analysis_pool_admin_section
 
             _render_korean_analysis_pool_admin_section(ctx)
 
-    eng_an_pool_exp = create_lazy_expander(
-        "🔤 영어 지문 분석지 캐시 · PDF DB 관리",
-        expanded=False,
-        key="admin_eng_analysis_pool_exp",
-    )
-    with eng_an_pool_exp:
-        if is_container_open(eng_an_pool_exp):
+    with tab_eng_analysis:
+        if is_container_open(tab_eng_analysis):
             from src.ui.admin_pools import _render_english_analysis_pool_admin_section
 
             _render_english_analysis_pool_admin_section(ctx)
+
+
+def _render_admin_panel(ctx: AppContext) -> None:
+    tab_members, tab_db, tab_server = create_lazy_tabs(
+        [
+            "👥 회원 · 결제 · 비용",
+            "🗄️ DB · 캐시 풀 관리",
+            "⚙️ 서버 · Git 동기화",
+        ],
+        key="admin_main_tabs",
+    )
+
+    with tab_members:
+        if is_container_open(tab_members):
+            _render_member_and_billing_admin_section(ctx)
+
+    with tab_db:
+        if is_container_open(tab_db):
+            _render_db_admin_hub(ctx)
+
+    with tab_server:
+        if is_container_open(tab_server):
+            from src.ui.admin_pools import _render_server_git_update_admin_section
+
+            _render_server_git_update_admin_section()
 
 
 render_admin_panel = _render_admin_panel

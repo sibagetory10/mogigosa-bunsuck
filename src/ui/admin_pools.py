@@ -26,7 +26,6 @@ def _format_bytes_human(num_bytes: int | float) -> str:
 
 
 def _render_server_storage_admin_section(ctx: AppContext) -> None:
-    st.divider()
     hdr_c1, hdr_c2 = st.columns([3.5, 1])
     with hdr_c1:
         st.subheader("💾 서버 저장공간 & 앱 DB 용량 모니터링")
@@ -127,7 +126,6 @@ def _get_cached_git_status_snapshot(repo_dir_str: str) -> dict[str, Any]:
 
 
 def _render_server_git_update_admin_section() -> None:
-    st.divider()
     repo_dir = Path(__file__).resolve().parents[2]
     hdr_c1, hdr_c2 = st.columns([3.5, 1])
     with hdr_c1:
@@ -337,7 +335,6 @@ def _render_english_batch_builder_expander(ctx: AppContext) -> None:
 
 
 def _render_english_pool_admin_section(ctx: AppContext) -> None:
-    st.divider()
     st.subheader("🔤 영어 변형 문제 풀(Pool) 캐시 관리 (v3)")
     st.caption(
         "파이썬 하드 규칙 + Blind Solver 검수를 통과한 영어 변형 문항은 `./exam_db/english_question_pool.json`에 "
@@ -437,7 +434,6 @@ def _render_english_pool_admin_section(ctx: AppContext) -> None:
 
 
 def _render_korean_pool_admin_section(ctx: AppContext) -> None:
-    st.divider()
     st.subheader("📖 국어 변형 문제 세트 풀(Pool) 캐시 관리 (v2)")
     st.caption(
         "2-Gate 검수(하드 규칙 + Blind Solver)를 통과한 국어 변형 세트는 `./exam_db/korean_question_pool.json`에 "
@@ -605,7 +601,6 @@ def _render_korean_pool_admin_section(ctx: AppContext) -> None:
 
 
 def _render_korean_analysis_pool_admin_section(ctx: AppContext) -> None:
-    st.divider()
     st.subheader("📖 국어 지문 분석지 캐시 · PDF DB 관리")
     st.caption(
         "최초 생성된 국어 지문 분석지는 `./exam_db/korean_analysis_pool.json`과 "
@@ -743,7 +738,6 @@ def _render_korean_analysis_pool_admin_section(ctx: AppContext) -> None:
 
 
 def _render_english_analysis_pool_admin_section(ctx: AppContext) -> None:
-    st.divider()
     st.subheader("🔤 영어 지문 분석지 캐시 · PDF DB 관리")
     st.caption(
         "최초 생성된 영어 지문 분석지는 `./exam_db/english_analysis_pool.json`과 "
