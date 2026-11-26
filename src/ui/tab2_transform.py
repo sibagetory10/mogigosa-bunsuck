@@ -344,15 +344,9 @@ def _render_tab2_direct_pdf_panel(ctx: AppContext) -> None:
 
 def _render_tab2_korean_transform_section(ctx: AppContext) -> None:
     """[탭 2 - 국어 모드] src/ui/tab2_korean.py로 분리된 국어 세트 변형·분석 UI를 호출한다."""
-    from src.ui.tab2_korean import render_tab2_korean_transform_section
+    from src.ui.tab2_korean import _render_tab2_korean_transform_section as _render_kor
 
-    render_tab2_korean_transform_section(
-        storage=ctx.storage,
-        current_user=ctx.current_user,
-        creds=ctx.creds,
-        ensure_token_quota_fn=lambda: _ensure_token_quota(ctx),
-        usage_scope_fn=lambda: _usage_scope(ctx),
-    )
+    _render_kor(ctx)
 
 
 def render_tab2(ctx: AppContext) -> None:
@@ -845,7 +839,7 @@ def render_tab2(ctx: AppContext) -> None:
                         "수능·모의고사 영어 지문 맞춤형 변형 모의고사"
                         if is_all_eng_matched
                         else (
-                            "수능·모의고사 국어(독서·문학) 지문 세트 변형 모의고사"
+                            "수능·모의고사 국어 지문 세트 맞춤형 변형 모의고사"
                             if is_all_kor_matched
                             else "2022 개정 교육과정 개념서 맞춤형 기출 모의고사"
                         )

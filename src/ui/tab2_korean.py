@@ -1,48 +1,62 @@
 from __future__ import annotations
 
 import concurrent.futures
-import html
+import hashlib
+import html as _html
+import json
 import re
-from typing import Any, Callable
+from datetime import datetime
+from typing import Any
 
 import streamlit as st
 
 from src.auth import (
-    CREDIT_COST_KOREAN_ANALYSIS,
     CREDIT_COST_KOREAN_SET_TRANSFORM,
-    acquire_credit_reservation,
+    TIER_LABELS,
+    can_use_premium_features,
+    consume_extraction_quota,
     get_max_batch_questions,
     resolve_active_gemini_api_key,
-    settle_credit_reservation,
 )
-from src.config import (
-    EXAM_TAGGING_MODEL,
-    MODEL_LABELS,
+from src.config import EXAM_TAGGING_MODEL, MODEL_LABELS
+from src.models import QuestionRecord, normalize_korean_group_id
+from src.ui.common import (
+    _auto_save_current_exam,
+    _build_exam_sig,
+    _record_korean_seen_for_user,
+    _usage_scope,
+    format_credit_balance_inline,
+    settle_credits,
+    try_reserve_credits,
 )
-from src.gemini import submit_with_usage_context
-from src.models import normalize_korean_group_id
-from src.ui.common import format_credit_balance_inline
+from src.ui.context import AppContext
+from src.ui_styles import render_chips
+
+_KOR_SECTIONS = ["독서", "문학", "화법과 작문", "언어와 매체"]
 
 
-def render_tab2_korean_transform_section(
-    *,
-    storage: Any,
-    current_user: Any,
-    creds: Any,
-    ensure_token_quota_fn: Callable[[], bool],
-    usage_scope_fn: Callable[[], Any],
-) -> None:
-    """[탭 2 - 국어 모드] DB에 저장된 국어 독서·문학 지문 세트를 선택해 세트 전체 문항을 자유 유형으로 재구성한다."""
-    st.subheader("1️⃣ 국어(독서 · 문학) 기출 지문 세트 선택 & 전체 문항 재구성")
-    max_batch_q = get_max_batch_questions(current_user)
-    user_max_jobs = None if max_batch_q is None else max_batch_q
-    max_limit_badge = "제한 없음" if user_max_jobs is None else f"1회 최대 **{user_max_jobs}문항**까지"
-    st.caption(
-        f"💡 **[탭 1]**에서 수집한 국어 전 영역(**독서 · 문학 · 화법과 작문 · 언어와 매체**) 지문/문항 세트를 선택하면, "
-        f"해당 세트의 문항 수만큼 AI가 핵심 출제 포인트를 바탕으로 **자유 유형 세트 문항을 일괄 재창작**합니다. ({max_limit_badge})"
-    )
+def _classify_kor_sec(cs: str) -> str:
+    txt = (cs or "").strip()
+    if "문학" in txt:
+        return "문학"
+    if "화법" in txt or "작문" in txt:
+        return "화법과 작문"
+    if "언어" in txt or "매체" in txt or "문법" in txt:
+        return "언어와 매체"
+    return "독서"
 
-    all_db = storage.load_db_readonly()
+
+def _extract_kor_subgenre(cs: str) -> str:
+    m = re.search(r"\(([^)]+)\)", cs or "")
+    return m.group(1).strip() if m else ""
+
+
+def _filter_korean_db_sets(
+    ctx: AppContext,
+    key_prefix: str,
+) -> tuple[bool, list[dict[str, Any]]]:
+    """기출 DB 국어 지문 세트를 조회하고 회차·영역·키워드 필터 UI를 렌더링한다."""
+    all_db = ctx.storage.load_db_readonly()
     kor_recs = [
         r
         for r in all_db
@@ -52,16 +66,17 @@ def render_tab2_korean_transform_section(
 
     if not kor_recs:
         st.info(
-            "아직 DB에 저장된 **국어(독서·문학) 지문 세트**가 없습니다. "
-            "**[📥 탭 1]**에서 국어 모의고사 문제지+해설지 PDF를 먼저 수집·추출해 주세요."
+            "아직 DB에 저장된 **국어 지문 세트**가 없습니다. "
+            "**[📥 탭 1]**에서 국어 모의고사 문제지+해설지 PDF를 먼저 수집·추출하거나, "
+            "우측 **[✍️ 새 국어 지문 직접 붙여넣기]** 탭을 이용해 주세요."
         )
-        return
+        return False, []
 
-    # (exam_name, passage_group_id) 단위로 세트 묶기
     sets_map: dict[tuple[str, str], dict[str, Any]] = {}
     for r in sorted(kor_recs, key=lambda x: (x.exam_name, x.q_num)):
         gid = normalize_korean_group_id(getattr(r, "passage_group_id", ""), r.q_num)
         key = (r.exam_name, gid)
+        curr_subj = (r.curriculum_subject or "독서").strip()
         entry = sets_map.setdefault(
             key,
             {
@@ -70,7 +85,10 @@ def render_tab2_korean_transform_section(
                 "records": [],
                 "passage_text": "",
                 "passage_topic": "",
-                "curr_subj": r.curriculum_subject or "독서",
+                "curr_subj": curr_subj,
+                "kor_sec": _classify_kor_sec(curr_subj),
+                "kor_sub": _extract_kor_subgenre(curr_subj),
+                "key_vocabulary": [],
             },
         )
         entry["records"].append(r)
@@ -80,674 +98,629 @@ def render_tab2_korean_transform_section(
         t_txt = (getattr(r, "passage_topic", "") or "").strip()
         if len(t_txt) > len(entry["passage_topic"]):
             entry["passage_topic"] = t_txt
+        for kw in (getattr(r, "key_vocabulary", None) or []):
+            kw_s = str(kw).strip()
+            if kw_s and kw_s not in entry["key_vocabulary"]:
+                entry["key_vocabulary"].append(kw_s)
 
     set_entries = sorted(
         sets_map.values(),
         key=lambda e: (e["exam_name"], min(x.q_num for x in e["records"])),
     )
 
-    fc1, fc2, fc3 = st.columns([1.3, 1.1, 1.3])
+    f_c1, f_c2, f_c3 = st.columns([1.2, 1.1, 1.3])
     avail_kor_exams = sorted({e["exam_name"] for e in set_entries}, reverse=True)
-    with fc1:
-        sel_kor_exams = st.multiselect(
-            "모의고사 회차 필터 (복수 선택)",
-            options=avail_kor_exams,
-            default=[],
-            placeholder="전체 회차",
-            key="tab2_kor_filter_exams",
+    with f_c1:
+        sel_kor_exam = st.selectbox(
+            "모의고사 회차 필터",
+            options=["전체"] + avail_kor_exams,
+            key=f"{key_prefix}_filter_exam",
         )
-    with fc2:
-        sel_kor_secs = st.multiselect(
-            "영역 필터 (복수 선택)",
-            options=["독서", "문학", "화법과 작문", "언어와 매체"],
-            default=[],
-            placeholder="전체 영역",
-            key="tab2_kor_filter_secs",
+    with f_c2:
+        sel_kor_sec = st.selectbox(
+            "영역 필터",
+            options=["전체"] + _KOR_SECTIONS,
+            key=f"{key_prefix}_filter_sec",
         )
-    with fc3:
+    with f_c3:
         kor_kw = st.text_input(
             "주제·작품명·본문 키워드 검색",
             placeholder="예: 박완서, 현대시, 논리실증주의, 법...",
-            key="tab2_kor_filter_kw",
+            key=f"{key_prefix}_filter_kw",
         )
-
-    def _classify_kor_sec(cs: str) -> str:
-        if "문학" in cs:
-            return "문학"
-        if "화법" in cs or "작문" in cs:
-            return "화법과 작문"
-        if "언어" in cs or "매체" in cs or "문법" in cs:
-            return "언어와 매체"
-        return "독서"
 
     kw_low = (kor_kw or "").strip().lower()
     filtered_sets: list[dict[str, Any]] = []
     for e in set_entries:
-        if sel_kor_exams and e["exam_name"] not in sel_kor_exams:
+        if sel_kor_exam != "전체" and e["exam_name"] != sel_kor_exam:
             continue
-        sec_label = _classify_kor_sec(e["curr_subj"])
-        if sel_kor_secs and sec_label not in sel_kor_secs:
+        if sel_kor_sec != "전체" and e["kor_sec"] != sel_kor_sec:
             continue
         if kw_low:
             blob = " ".join(
-                [e["exam_name"], e["curr_subj"], e["passage_topic"], e["passage_text"]]
+                [
+                    e["exam_name"],
+                    e["curr_subj"],
+                    e["passage_topic"],
+                    " ".join(e.get("key_vocabulary") or []),
+                    e["passage_text"],
+                ]
             ).lower()
             if kw_low not in blob:
                 continue
         filtered_sets.append(e)
 
-    if not filtered_sets:
-        st.warning("조건에 맞는 국어 지문 세트가 없습니다. 필터를 조정해 주세요.")
+    return True, filtered_sets
+
+
+def _render_korean_passage_preview_expander(filtered_sets: list[dict[str, Any]]) -> None:
+    """조회된 국어 기출 지문 원문·어휘 미리보기 Expander를 렌더링한다."""
+    with st.expander("📖 조회된 기출 국어 지문 원문·어휘 미리보기", expanded=False):
+        for s_entry in filtered_sets[:30]:
+            q_label = f"{s_entry['exam_name']} {s_entry['group_id']}번"
+            sec_tag = s_entry["curr_subj"]
+            topic_tag = (s_entry.get("passage_topic") or "-").strip()
+            st.markdown(f"**📌 {q_label}** (`{sec_tag}` · 주제: {topic_tag})")
+            if s_entry.get("key_vocabulary"):
+                render_chips(s_entry["key_vocabulary"], variant="amber", limit=10)
+            st.markdown(
+                f"<div class='eng-given-box' style='white-space:pre-wrap;'>{_html.escape(s_entry['passage_text'])}</div>",
+                unsafe_allow_html=True,
+            )
+
+
+def _execute_korean_transform_jobs(
+    ctx: AppContext,
+    jobs: list[dict[str, Any]],
+    source_summary_label: str,
+    force_regenerate: bool = False,
+) -> None:
+    """국어 지문 세트 변형 작업 목록을 정액 크레딧(세트당 10C · 풀 동일) 선예치·자동정산 하에 실행한다."""
+    if not jobs:
+        st.warning("변형할 국어 지문 세트를 최소 1개 이상 선택해 주세요.")
         return
 
-    st.caption(f"총 **{len(filtered_sets)}개** 국어 지문 세트가 조회되었습니다. 재구성할 세트를 체크한 뒤 실행 버튼을 누르세요.")
-
-    with st.form("tab2_kor_set_transform_form", border=True):
-        selected_set_indices: list[int] = []
-        for idx, s_entry in enumerate(filtered_sets):
-            q_nums = [r.q_num for r in s_entry["records"]]
-            sec_tag = s_entry["curr_subj"]
-            topic_tag = s_entry["passage_topic"] or "주제 미상"
-            kor_sec_chk = _classify_kor_sec(sec_tag)
-            m_sub_chk = re.search(r"\(([^)]+)\)", sec_tag)
-            kor_sub_chk = m_sub_chk.group(1) if m_sub_chk else ""
-            c_key_chk = storage.build_korean_analysis_key(
-                s_entry["passage_text"],
-                s_entry["group_id"],
-                kor_sec_chk,
-            )
-            q_pool_key_chk = storage.build_korean_pool_key(
-                s_entry["passage_text"],
-                group_id=s_entry["group_id"],
-                korean_section=kor_sec_chk,
-                question_count=len(q_nums),
-                korean_subgenre=kor_sub_chk,
-            )
-            pool_cnt_chk = storage.get_korean_pool_set_count(q_pool_key_chk)
-            pdf_status_tag = " · 📑 분석지PDF DB" if storage.has_korean_analysis_pdf(c_key_chk) else ""
-            pool_status_tag = f" · 🎯 변형DB {pool_cnt_chk}세트" if pool_cnt_chk > 0 else ""
-            set_label = f"[{s_entry['exam_name']}] [{s_entry['group_id']}번] ({sec_tag} · {len(q_nums)}문항{pool_status_tag}{pdf_status_tag}) — {topic_tag}"
-            is_chk = st.checkbox(
-                set_label,
-                value=False,
-                key=f"tab2_kor_set_chk_{s_entry['exam_name']}_{s_entry['group_id']}_{idx}",
-            )
-            if is_chk:
-                selected_set_indices.append(idx)
-            with st.expander(f"📄 지문 미리보기: {s_entry['exam_name']} [{s_entry['group_id']}번]", expanded=False):
-                st.text(s_entry["passage_text"][:1500] + ("..." if len(s_entry["passage_text"]) > 1500 else ""))
-
-        opt_c1, opt_c2 = st.columns(2)
-        with opt_c1:
-            include_kor_diagrams = st.checkbox(
-                "🎨 비문학·문학 이해용 도식 그림 포함",
-                value=True,
-                key="tab2_kor_include_diagrams",
-            )
-        with opt_c2:
-            include_kor_passage = st.checkbox(
-                "📄 원문 지문 전체 포함 (ON/OFF)",
-                value=False,
-                key="tab2_kor_include_passage",
-            )
-        opt_c3, opt_c4 = st.columns(2)
-        with opt_c3:
-            enable_kor_web_search = st.checkbox(
-                "🌐 문학 웹검색 정밀 분석 (EBS·백과 우선)",
-                value=True,
-                key="tab2_kor_enable_web_search",
-            )
-        with opt_c4:
-            enable_kor_proofread = st.checkbox(
-                "🔍 2차 원문 대조 교정 (느림)",
-                value=False,
-                key="tab2_kor_enable_proofread",
-            )
-        kb_c1, kb_c2 = st.columns(2)
-        with kb_c1:
-            run_kor_btn = st.form_submit_button(
-                f"🚀 선택한 국어 지문 세트 변형문제 생성 (세트당 {CREDIT_COST_KOREAN_SET_TRANSFORM}C)",
-                type="primary",
-                width="stretch",
-            )
-        with kb_c2:
-            run_kor_analysis_btn = st.form_submit_button(
-                f"📑 선택한 지문 분석지 PDF 생성 (세트당 {CREDIT_COST_KOREAN_ANALYSIS}C · 캐시 동일)",
-                type="secondary",
-                width="stretch",
-            )
-
-    if run_kor_btn:
-        if not selected_set_indices:
-            st.error("최소 1개 이상의 국어 지문 세트를 체크해 주세요.")
-            return
-
-        chosen_sets = [filtered_sets[i] for i in selected_set_indices]
-        total_est_q = sum(len(s["records"]) for s in chosen_sets)
-        if user_max_jobs is not None and total_est_q > user_max_jobs:
+    user_max_jobs = get_max_batch_questions(ctx.current_user)
+    if user_max_jobs is not None:
+        adjusted_jobs: list[dict[str, Any]] = []
+        acc_q = 0
+        trimmed = False
+        for job in jobs:
+            j_copy = dict(job)
+            recs = list(j_copy["records"])
+            if j_copy.get("is_direct_input") and len(recs) > user_max_jobs and not adjusted_jobs:
+                recs = recs[:user_max_jobs]
+                j_copy["records"] = recs
+                j_copy["group_id"] = f"1~{len(recs)}"
+                trimmed = True
+            if acc_q + len(recs) <= user_max_jobs or not adjusted_jobs:
+                adjusted_jobs.append(j_copy)
+                acc_q += len(recs)
+            else:
+                trimmed = True
+                break
+        if trimmed:
+            total_req_q = sum(len(j["records"]) for j in jobs)
             st.warning(
-                f"⚠️ 현재 등급은 1회 실행당 최대 {user_max_jobs}문항까지만 생성됩니다. "
-                f"(선택 세트 총 {total_est_q}문항 → 앞의 세트부터 최대 {user_max_jobs}문항 범위 내로 제한)"
+                f"⚠️ 현재 등급({TIER_LABELS.get(ctx.current_user.tier, ctx.current_user.tier)})은 1회 실행당 최대 **{user_max_jobs}문항**까지만 생성됩니다. "
+                f"(요청 총 {total_req_q}문항 → 최대 {user_max_jobs}문항 범위 내로 실행)"
             )
-            trimmed_sets: list[dict[str, Any]] = []
-            acc = 0
-            for s in chosen_sets:
-                if acc + len(s["records"]) <= user_max_jobs or not trimmed_sets:
-                    trimmed_sets.append(s)
-                    acc += len(s["records"])
-                else:
-                    break
-            chosen_sets = trimmed_sets
+            jobs = adjusted_jobs
 
-        kor_api_key, kor_key_label = resolve_active_gemini_api_key(
-            current_user, creds.gemini_api_key, model_name=EXAM_TAGGING_MODEL
+    uname_kor = ctx.current_user.username if ctx.current_user is not None else ""
+    reserve_credits = len(jobs) * CREDIT_COST_KOREAN_SET_TRANSFORM
+    ok_res, reservation = try_reserve_credits(
+        ctx,
+        reserve_credits,
+        f"국어 지문 세트 변형 ({len(jobs)}세트)",
+    )
+    if not ok_res or reservation is None:
+        return
+
+    assembled: list[dict[str, Any]] = []
+    succeeded_sets = 0
+    cache_hit_cnt = 0
+    ai_gen_cnt = 0
+    actual_credits = 0
+    seen_variant_ids: list[str] = []
+    try:
+        from src.gemini.korean import (
+            balance_korean_answer_distribution,
+            generate_korean_set_reconstruction,
         )
-        uname_kor = current_user.username if current_user is not None else ""
-        reserve_c = len(chosen_sets) * CREDIT_COST_KOREAN_SET_TRANSFORM
-        ok_res, reservation, res_msg = acquire_credit_reservation(
-            storage,
-            uname_kor,
-            reserve_credits=reserve_c,
-            reason=f"국어 지문 세트 변형 ({len(chosen_sets)}세트)",
-        )
-        if not ok_res or reservation is None:
-            if res_msg:
-                st.error(res_msg)
-            return
+        from src.gemini.usage import submit_with_usage_context
 
-        new_matched: list[dict[str, Any]] = []
-        succeeded_sets = 0
-        cache_hit_cnt = 0
-        ai_gen_cnt = 0
-        actual_c = 0
-        seen_variant_ids: list[str] = []
-        try:
-            from src.gemini.korean import (
-                balance_korean_answer_distribution,
-                generate_korean_set_reconstruction,
-            )
+        slot_results: dict[int, tuple[str, str, list[Any], str]] = {}
+        miss_indices: list[int] = []
+        for idx_c, job in enumerate(jobs):
+            kor_sec = str(job.get("kor_sec") or _classify_kor_sec(job.get("curr_subj", "")))
+            kor_sub = str(job.get("kor_sub") or _extract_kor_subgenre(job.get("curr_subj", "")))
+            ordered_recs = sorted(job["records"], key=lambda r: r.q_num)
 
-            slot_results: dict[int, tuple[str, str, list[Any], str]] = {}
-            miss_indices: list[int] = []
-            for idx_c, s_entry in enumerate(chosen_sets):
-                curr_subj = s_entry["curr_subj"]
-                kor_sec = _classify_kor_sec(curr_subj)
-                m_sub = re.search(r"\(([^)]+)\)", curr_subj)
-                kor_sub = m_sub.group(1) if m_sub else ""
-                ordered_recs = sorted(s_entry["records"], key=lambda r: r.q_num)
-                c_key = storage.build_korean_pool_key(
-                    s_entry["passage_text"],
-                    group_id=s_entry["group_id"],
+            cached_hit = None
+            if not force_regenerate:
+                c_key = ctx.storage.build_korean_pool_key(
+                    job["passage_text"],
+                    group_id=job["group_id"],
                     korean_section=kor_sec,
                     question_count=len(ordered_recs),
                     korean_subgenre=kor_sub,
                 )
-                cached_hit = storage.get_cached_korean_set(
+                cached_hit = ctx.storage.get_cached_korean_set(
                     c_key,
                     expected_count=len(ordered_recs),
                     username=uname_kor,
                 )
-                if cached_hit is not None:
-                    cached_rws, hit_vid = cached_hit
-                    group_key = f"{ordered_recs[0].exam_name}::{s_entry['group_id'] or ordered_recs[0].q_num}"
-                    hit_pairs = [
-                        (
-                            ordered_recs[i],
-                            cached_rws[i].model_copy(
-                                update={
-                                    "original_question_id": ordered_recs[i].id,
-                                    "passage_group_key": group_key,
-                                }
-                            ),
-                        )
-                        for i in range(len(ordered_recs))
-                    ]
-                    slot_results[idx_c] = (kor_sec, kor_sub, hit_pairs, hit_vid)
-                    cache_hit_cnt += 1
-                else:
-                    miss_indices.append(idx_c)
+            if cached_hit is not None:
+                cached_rws, hit_vid = cached_hit
+                group_key = f"{ordered_recs[0].exam_name}::{job['group_id'] or ordered_recs[0].q_num}"
+                hit_pairs = [
+                    (
+                        ordered_recs[i],
+                        cached_rws[i].model_copy(
+                            update={
+                                "original_question_id": ordered_recs[i].id,
+                                "passage_group_key": group_key,
+                            }
+                        ),
+                    )
+                    for i in range(len(ordered_recs))
+                ]
+                slot_results[idx_c] = (kor_sec, kor_sub, hit_pairs, hit_vid)
+                cache_hit_cnt += 1
+            else:
+                miss_indices.append(idx_c)
 
-            if miss_indices and not kor_api_key:
-                st.error(f"사용 가능한 Gemini API 키({kor_key_label})가 설정되지 않았습니다.")
-            elif miss_indices:
-                with usage_scope_fn():
+        if miss_indices:
+            kor_api_key, kor_key_label = resolve_active_gemini_api_key(
+                ctx.current_user, ctx.creds.gemini_api_key, model_name=EXAM_TAGGING_MODEL
+            )
+            if not kor_api_key:
+                st.error(f"국어 세트 변형용 Gemini API 키({kor_key_label})가 설정되지 않았습니다.")
+            else:
+                with _usage_scope(ctx):
+                    n_workers = max(1, min(3, len(miss_indices)))
                     with st.spinner(
                         f"🤖 {MODEL_LABELS.get(EXAM_TAGGING_MODEL, EXAM_TAGGING_MODEL)}로 "
                         f"국어 지문 세트 {len(miss_indices)}개 신규 생성·검수 중 "
                         f"(DB 풀 즉시 로드 {cache_hit_cnt}세트)..."
                     ):
                         def _run_kor_set(set_idx: int):
-                            s_entry = chosen_sets[set_idx]
-                            curr_subj = s_entry["curr_subj"]
-                            kor_sec = _classify_kor_sec(curr_subj)
-                            m_sub = re.search(r"\(([^)]+)\)", curr_subj)
-                            kor_sub = m_sub.group(1) if m_sub else ""
+                            j_item = jobs[set_idx]
+                            k_sec = str(j_item.get("kor_sec") or _classify_kor_sec(j_item.get("curr_subj", "")))
+                            k_sub = str(j_item.get("kor_sub") or _extract_kor_subgenre(j_item.get("curr_subj", "")))
                             pairs = generate_korean_set_reconstruction(
                                 api_key=kor_api_key,
                                 model_name=EXAM_TAGGING_MODEL,
-                                source_records=s_entry["records"],
-                                passage_text=s_entry["passage_text"],
-                                korean_section=kor_sec,
-                                korean_subgenre=kor_sub,
-                                passage_topic=s_entry["passage_topic"],
-                                storage=storage,
+                                source_records=j_item["records"],
+                                passage_text=j_item["passage_text"],
+                                korean_section=k_sec,
+                                korean_subgenre=k_sub,
+                                passage_topic=j_item.get("passage_topic", ""),
+                                storage=ctx.storage,
                                 use_cache=False,
                                 username=uname_kor,
                             )
-                            c_k = storage.build_korean_pool_key(
-                                s_entry["passage_text"],
-                                group_id=s_entry["group_id"],
-                                korean_section=kor_sec,
+                            c_k = ctx.storage.build_korean_pool_key(
+                                j_item["passage_text"],
+                                group_id=j_item["group_id"],
+                                korean_section=k_sec,
                                 question_count=len(pairs),
-                                korean_subgenre=kor_sub,
+                                korean_subgenre=k_sub,
                             )
-                            vid = storage.build_korean_set_variant_id(
+                            vid = ctx.storage.build_korean_set_variant_id(
                                 c_k, [rw.rewritten_stem for _, rw in pairs]
                             )
-                            return set_idx, kor_sec, kor_sub, pairs, vid
+                            return set_idx, k_sec, k_sub, pairs, vid
 
-                        with concurrent.futures.ThreadPoolExecutor(
-                            max_workers=min(3, len(miss_indices))
-                        ) as executor:
+                        with concurrent.futures.ThreadPoolExecutor(max_workers=n_workers) as executor:
                             fut_map = {
                                 submit_with_usage_context(executor, _run_kor_set, idx_m): idx_m
                                 for idx_m in miss_indices
                             }
                             for fut in concurrent.futures.as_completed(fut_map):
                                 idx_m = fut_map[fut]
-                                s_entry = chosen_sets[idx_m]
+                                j_item = jobs[idx_m]
                                 try:
-                                    _, kor_sec, kor_sub, pairs, vid = fut.result()
+                                    _, k_sec, k_sub, pairs, vid = fut.result()
                                     if pairs:
-                                        slot_results[idx_m] = (kor_sec, kor_sub, pairs, vid)
+                                        slot_results[idx_m] = (k_sec, k_sub, pairs, vid)
                                         ai_gen_cnt += 1
                                 except Exception as exc:
-                                    st.error(f"[{s_entry['exam_name']} {s_entry['group_id']}번] 세트 재구성 실패: {exc}")
+                                    err_tag = (
+                                        j_item["exam_name"]
+                                        if j_item.get("is_direct_input")
+                                        else f"{j_item['exam_name']} {j_item['group_id']}번"
+                                    )
+                                    st.error(f"❌ [{err_tag}] 세트 재구성 실패: {exc}")
 
-            combined_pairs: list[tuple[Any, Any]] = []
-            pair_metas: list[tuple[dict[str, Any], str, str, str]] = []
-            for idx_c, s_entry in enumerate(chosen_sets):
-                res_t = slot_results.get(idx_c)
-                if not res_t:
-                    continue
-                kor_sec, kor_sub, pairs, vid = res_t
-                succeeded_sets += 1
-                if vid:
-                    seen_variant_ids.append(vid)
-                for rec, rw in pairs:
-                    combined_pairs.append((rec, rw))
-                    pair_metas.append((s_entry, kor_sec, kor_sub, vid))
+        combined_pairs: list[tuple[Any, Any]] = []
+        pair_metas: list[tuple[dict[str, Any], str, str, str]] = []
+        for idx_c, job in enumerate(jobs):
+            res_t = slot_results.get(idx_c)
+            if not res_t:
+                continue
+            k_sec, k_sub, pairs, vid = res_t
+            succeeded_sets += 1
+            if vid:
+                seen_variant_ids.append(vid)
+            for rec, rw in pairs:
+                combined_pairs.append((rec, rw))
+                pair_metas.append((job, k_sec, k_sub, vid))
 
-            if combined_pairs:
-                balanced_pairs = balance_korean_answer_distribution(combined_pairs)
-                for (rec, rw), (s_entry, kor_sec, kor_sub, vid) in zip(balanced_pairs, pair_metas):
-                    new_matched.append(
-                        {
-                            "question": rec,
-                            "judgment": None,
-                            "crop_png_bytes": None,
-                            "rewritten": rw,
-                            "concept_reference": f"출처: {s_entry['exam_name']} [{s_entry['group_id']}번]",
-                            "korean_meta": {
-                                "section": kor_sec,
-                                "subgenre": kor_sub,
-                                "group_id": s_entry["group_id"],
-                                "passage_text": getattr(rw, "shared_passage", "") or s_entry["passage_text"],
-                                "variant_id": vid,
-                            },
-                        }
-                    )
-            if uname_kor and seen_variant_ids:
-                storage.mark_user_seen_korean_sets(uname_kor, seen_variant_ids)
-            actual_c = succeeded_sets * CREDIT_COST_KOREAN_SET_TRANSFORM
-        finally:
-            settle_credit_reservation(
-                storage,
-                reservation,
-                actual_credits=actual_c,
-                detail_note=f"국어 세트 변형 ({succeeded_sets}/{len(chosen_sets)}세트 성공 · {actual_c:,}C 확정)",
-            )
-
-        if new_matched:
-            exam_labels = list(dict.fromkeys(s["exam_name"] for s in chosen_sets if s.get("exam_name")))
-            st.session_state["matched_items"] = new_matched
-            st.session_state["concept_source_label"] = ", ".join(exam_labels) if exam_labels else "국어 기출 지문 세트"
-            st.session_state["generated_exam_pdf"] = None
-            st.session_state["generated_exam_pdf_sig"] = ""
-            st.session_state["user_answers"] = {}
-            st.session_state["graded"] = False
-            st.session_state["ai_explanations"] = {}
-            st.session_state["ai_chats"] = {}
-            bal_msg = format_credit_balance_inline(storage, uname_kor, charged=actual_c)
-            pool_detail = f"DB 풀 즉시 로드 {cache_hit_cnt}세트 · 신규 AI 생성·DB 저장 {ai_gen_cnt}세트"
-            st.success(
-                f"🎯 총 {succeeded_sets}개 지문 세트({len(new_matched)}문항) 변형문제 준비 완료! "
-                f"({pool_detail}) 아래 [모드 A] PDF 또는 [모드 B] 웹 풀기를 이용해 주세요.{bal_msg}"
-            )
-
-    if run_kor_analysis_btn:
-        if not selected_set_indices:
-            st.error("분석지를 생성할 국어 지문 세트를 최소 1개 이상 체크해 주세요.")
-            return
-
-        chosen_sets = [filtered_sets[i] for i in selected_set_indices]
-        uname_kor = current_user.username if current_user is not None else ""
-        reserve_c_an = len(chosen_sets) * CREDIT_COST_KOREAN_ANALYSIS
-        ok_res_an, reservation_an, res_msg_an = acquire_credit_reservation(
-            storage,
-            uname_kor,
-            reserve_credits=reserve_c_an,
-            reason=f"국어 지문 분석지 ({len(chosen_sets)}세트)",
-        )
-        if not ok_res_an or reservation_an is None:
-            if res_msg_an:
-                st.error(res_msg_an)
-            return
-
-        actual_c_an = 0
-        succeeded_an_sets = 0
-        try:
-            prepared_slots: list[dict[str, Any]] = []
-            missing_ai_indices: list[int] = []
-            missing_diag_indices: list[int] = []
-            for idx_s, s_entry in enumerate(chosen_sets):
-                curr_subj = s_entry["curr_subj"]
-                kor_sec = _classify_kor_sec(curr_subj)
-                m_sub = re.search(r"\(([^)]+)\)", curr_subj)
-                kor_sub = m_sub.group(1) if m_sub else ""
-                c_key = storage.build_korean_analysis_key(
-                    s_entry["passage_text"],
-                    s_entry["group_id"],
-                    kor_sec,
+        if combined_pairs:
+            balanced_pairs = balance_korean_answer_distribution(combined_pairs)
+            for (rec, rw), (job, k_sec, k_sub, vid) in zip(balanced_pairs, pair_metas):
+                is_direct = bool(job.get("is_direct_input"))
+                ref_lbl = (
+                    f"📚 출처: {job['exam_name']}"
+                    if is_direct
+                    else f"출처: {job['exam_name']} [{job['group_id']}번]"
                 )
-                cached_an = storage.get_cached_korean_analysis(c_key)
-                cached_pdf = storage.get_korean_analysis_pdf_bytes(c_key) if include_kor_diagrams else None
-                prepared_slots.append(
+                assembled.append(
                     {
-                        "entry": s_entry,
-                        "curr_subj": curr_subj,
-                        "kor_sec": kor_sec,
-                        "kor_sub": kor_sub,
-                        "cache_key": c_key,
-                        "analysis": cached_an,
-                        "pdf_bytes": cached_pdf,
+                        "question": rec,
+                        "judgment": None,
+                        "crop_png_bytes": None,
+                        "rewritten": rw,
+                        "concept_reference": ref_lbl,
+                        "korean_meta": {
+                            "section": k_sec,
+                            "subgenre": k_sub,
+                            "group_id": job["group_id"],
+                            "passage_text": getattr(rw, "shared_passage", "") or job["passage_text"],
+                            "variant_id": vid,
+                            "is_direct_input": is_direct,
+                        },
                     }
                 )
-                if cached_an is None:
-                    missing_ai_indices.append(idx_s)
-                elif (
-                    include_kor_diagrams
-                    and kor_sec in ("독서", "문학")
-                    and getattr(cached_an, "visual_diagram", None) is None
-                ):
-                    missing_diag_indices.append(idx_s)
-                    prepared_slots[idx_s]["pdf_bytes"] = None
+        if uname_kor and seen_variant_ids:
+            ctx.storage.mark_user_seen_korean_sets(uname_kor, seen_variant_ids)
+        actual_credits = succeeded_sets * CREDIT_COST_KOREAN_SET_TRANSFORM
+    finally:
+        settle_credits(
+            ctx,
+            reservation,
+            actual_credits,
+            detail_note=f"국어 세트 변형 ({succeeded_sets}/{len(jobs)}세트 성공 · {actual_credits:,}C 확정)",
+        )
 
-            pdf_hit_cnt = sum(1 for sl in prepared_slots if sl["pdf_bytes"] is not None)
-            json_to_pdf_cnt = 0
-            ai_gen_cnt = 0
+    if not assembled:
+        st.warning("생성된 국어 변형 문항이 없습니다. (선예치 크레딧 전액 자동 환불됨)")
+        return
 
-            if missing_ai_indices or missing_diag_indices:
-                kor_api_key, kor_key_label = resolve_active_gemini_api_key(
-                    current_user, creds.gemini_api_key, model_name=EXAM_TAGGING_MODEL
-                )
-                if not kor_api_key:
-                    st.error(f"사용 가능한 Gemini API 키({kor_key_label})가 설정되지 않았습니다.")
-                    return
+    consume_extraction_quota(ctx.storage, uname_kor, len(assembled))
 
-                with usage_scope_fn():
-                    need_total = len(missing_ai_indices) + len(missing_diag_indices)
-                    mode_lbl = "2차 교정 포함" if enable_kor_proofread else "고속 병렬"
-                    with st.spinner(
-                        f"📑 {MODEL_LABELS.get(EXAM_TAGGING_MODEL, EXAM_TAGGING_MODEL)}로 "
-                        f"국어 지문 분석지·도식 생성 ({mode_lbl}) {need_total}건 병렬 진행 중 "
-                        f"(DB 로드 {len(chosen_sets) - len(missing_ai_indices)}세트)..."
-                    ):
-                        if missing_ai_indices:
-                            def _run_ai_slot(slot_i: int):
-                                from src.gemini.korean import generate_korean_passage_analysis
+    st.session_state["matched_items"] = assembled
+    st.session_state["match_diagnostics"] = []
+    st.session_state["concept_source_label"] = source_summary_label
+    st.session_state["generated_exam_pdf"] = None
+    st.session_state["generated_exam_pdf_sig"] = ""
+    st.session_state["user_answers"] = {}
+    st.session_state["graded"] = False
+    st.session_state["ai_explanations"] = {}
+    st.session_state["ai_chats"] = {}
 
-                                slot = prepared_slots[slot_i]
-                                s_entry = slot["entry"]
-                                an_out = generate_korean_passage_analysis(
-                                    api_key=kor_api_key,
-                                    model_name=EXAM_TAGGING_MODEL,
-                                    exam_name=s_entry["exam_name"],
-                                    group_id=s_entry["group_id"],
-                                    passage_text=s_entry["passage_text"],
-                                    korean_section=slot["kor_sec"],
-                                    korean_subgenre=slot["kor_sub"],
-                                    passage_topic=s_entry["passage_topic"],
-                                    enable_proofread=enable_kor_proofread,
-                                    enable_web_search=enable_kor_web_search,
-                                )
-                                return slot_i, an_out
+    if can_use_premium_features(ctx.current_user):
+        try:
+            from src.pdf.exam_pdf import generate_custom_exam_pdf
 
-                            with concurrent.futures.ThreadPoolExecutor(
-                                max_workers=min(4, len(missing_ai_indices))
-                            ) as executor:
-                                fut_map = {
-                                    submit_with_usage_context(executor, _run_ai_slot, si): si
-                                    for si in missing_ai_indices
-                                }
-                                for fut in concurrent.futures.as_completed(fut_map):
-                                    si = fut_map[fut]
-                                    slot = prepared_slots[si]
-                                    s_entry = slot["entry"]
-                                    try:
-                                        _, an_out = fut.result()
-                                        slot["analysis"] = an_out
-                                        ai_gen_cnt += 1
-                                        storage.save_cached_korean_analysis(
-                                            slot["cache_key"],
-                                            an_out,
-                                            exam_name=s_entry["exam_name"],
-                                            group_id=s_entry["group_id"],
-                                            korean_section=slot["kor_sec"],
-                                            korean_subgenre=slot["kor_sub"],
-                                        )
-                                    except Exception as exc:
-                                        st.error(f"[{s_entry['exam_name']} {s_entry['group_id']}번] 지문 분석 실패: {exc}")
-
-                        valid_diag_indices = [
-                            si for si in missing_diag_indices if prepared_slots[si]["analysis"] is not None
-                        ]
-                        if valid_diag_indices:
-                            def _run_diag_slot(slot_i: int):
-                                from src.gemini.korean import generate_korean_visual_diagram
-
-                                slot = prepared_slots[slot_i]
-                                s_entry = slot["entry"]
-                                cur_an = slot["analysis"]
-                                diag_out = generate_korean_visual_diagram(
-                                    api_key=kor_api_key,
-                                    model_name=EXAM_TAGGING_MODEL,
-                                    passage_text=s_entry["passage_text"],
-                                    title=cur_an.title,
-                                    core_theme=cur_an.core_theme,
-                                    korean_section=slot["kor_sec"],
-                                )
-                                return slot_i, diag_out
-
-                            with concurrent.futures.ThreadPoolExecutor(
-                                max_workers=min(4, len(valid_diag_indices))
-                            ) as executor:
-                                fut_map = {
-                                    submit_with_usage_context(executor, _run_diag_slot, si): si
-                                    for si in valid_diag_indices
-                                }
-                                for fut in concurrent.futures.as_completed(fut_map):
-                                    si = fut_map[fut]
-                                    slot = prepared_slots[si]
-                                    s_entry = slot["entry"]
-                                    cur_an = slot["analysis"]
-                                    try:
-                                        _, diag_out = fut.result()
-                                        updated_an = cur_an.model_copy(update={"visual_diagram": diag_out})
-                                        slot["analysis"] = updated_an
-                                        storage.save_cached_korean_analysis(
-                                            slot["cache_key"],
-                                            updated_an,
-                                            exam_name=s_entry["exam_name"],
-                                            group_id=s_entry["group_id"],
-                                            korean_section=slot["kor_sec"],
-                                            korean_subgenre=slot["kor_sub"],
-                                        )
-                                    except Exception as exc:
-                                        st.warning(f"[{s_entry['exam_name']} {s_entry['group_id']}번] 이해 도식 생성 건너뜀: {exc}")
-
-            analyses_list: list[dict[str, Any]] = []
-            pdf_parts: list[bytes] = []
-            if prepared_slots:
-                from src.pdf.korean_analysis_pdf import (
-                    _is_korean_poetry_item,
-                    generate_korean_passage_analysis_pdf,
-                    generate_korean_passage_only_pdf,
-                )
-
-            for slot in prepared_slots:
-                if slot["analysis"] is None and slot["pdf_bytes"] is None:
-                    continue
-                s_entry = slot["entry"]
-                single_item = {
-                    "exam_name": s_entry["exam_name"],
-                    "group_id": s_entry["group_id"],
-                    "section_label": slot["curr_subj"],
-                    "subgenre": slot["kor_sub"],
-                    "passage_text": s_entry["passage_text"],
-                    "analysis": slot["analysis"],
-                }
-                is_poetry_slot = _is_korean_poetry_item(
-                    slot["curr_subj"], slot["kor_sub"], s_entry["passage_text"], slot["analysis"]
-                )
-                if slot["pdf_bytes"] is None:
-                    try:
-                        single_pdf = generate_korean_passage_analysis_pdf(
-                            [single_item],
-                            include_diagrams=include_kor_diagrams,
-                            include_passage=False,
+            default_title = "수능·모의고사 국어 지문 세트 맞춤형 변형 모의고사"
+            default_layout = "2단 모의고사 스타일"
+            items_sig = hashlib.sha256(
+                json.dumps(
+                    [
+                        (
+                            it["question"].id,
+                            getattr(it.get("rewritten"), "rewritten_stem", ""),
+                            getattr(it.get("rewritten"), "rewritten_choices", []),
+                            default_title,
+                            default_layout,
+                            False,
                         )
-                        if include_kor_diagrams:
-                            storage.save_korean_analysis_pdf_bytes(slot["cache_key"], single_pdf)
-                        slot["pdf_bytes"] = single_pdf
-                        if slot not in [prepared_slots[i] for i in missing_ai_indices]:
-                            json_to_pdf_cnt += 1
-                    except Exception as exc:
-                        st.error(f"[{s_entry['exam_name']} {s_entry['group_id']}번] 지문 분석 PDF 생성 실패: {exc}")
-                        continue
-
-                # 시 갈래는 분석 PDF 자체에 밑줄 원문이 항상 포함되므로 원문 전용 PDF 중복 병합 제외
-                passage_pdf_bytes = None
-                if include_kor_passage and not is_poetry_slot:
-                    passage_pdf_bytes = storage.get_korean_passage_pdf_bytes(slot["cache_key"])
-                    if passage_pdf_bytes is None and (s_entry.get("passage_text") or "").strip():
-                        try:
-                            passage_pdf_bytes = generate_korean_passage_only_pdf(single_item)
-                            storage.save_korean_passage_pdf_bytes(slot["cache_key"], passage_pdf_bytes)
-                        except Exception as exc_p:
-                            st.warning(f"[{s_entry['exam_name']} {s_entry['group_id']}번] 원문 PDF 생성 건너뜀: {exc_p}")
-
-                pdf_parts.append(slot["pdf_bytes"])
-                succeeded_an_sets += 1
-                if include_kor_passage and passage_pdf_bytes:
-                    pdf_parts.append(passage_pdf_bytes)
-                if slot["analysis"] is not None:
-                    analyses_list.append(single_item)
-
-            if pdf_parts:
-                try:
-                    from src.pdf.common import merge_korean_analysis_pdfs
-
-                    pdf_bytes = merge_korean_analysis_pdfs(pdf_parts)
-                    st.session_state["kor_analysis_results"] = analyses_list
-                    st.session_state["kor_analysis_pdf"] = pdf_bytes
-                    actual_c_an = succeeded_an_sets * CREDIT_COST_KOREAN_ANALYSIS
-                except Exception as exc:
-                    st.error(f"분석지 PDF 병합 실패: {exc}")
-                    actual_c_an = 0
-        finally:
-            settle_credit_reservation(
-                storage,
-                reservation_an,
-                actual_credits=actual_c_an,
-                detail_note=f"국어 지문 분석지 ({succeeded_an_sets}/{len(chosen_sets)}세트 성공 · {actual_c_an:,}C 확정)",
+                        for it in assembled
+                    ],
+                    ensure_ascii=False,
+                ).encode("utf-8")
+            ).hexdigest()[:16]
+            pre_pdf_bytes = generate_custom_exam_pdf(
+                items=assembled,
+                exam_title=default_title,
+                source_label=source_summary_label or "국어 기출 지문 세트",
+                whitelist=None,
+                two_column=True,
+                include_original_for_rewritten=False,
             )
-
-        if actual_c_an > 0:
-            detail_notes: list[str] = [f"저장 PDF 즉시 이어붙이기 {pdf_hit_cnt}세트"]
-            if json_to_pdf_cnt > 0:
-                detail_notes.append(f"기존 분석 JSON→PDF 저장 {json_to_pdf_cnt}세트")
-            if ai_gen_cnt > 0:
-                detail_notes.append(f"신규 AI 분석+PDF 저장 {ai_gen_cnt}세트")
-            mode_note = "원문 지문 포함 ON" if include_kor_passage else "원문 지문 제외 OFF"
-            bal_msg = format_credit_balance_inline(storage, uname_kor, charged=actual_c_an)
-            st.success(
-                f"📑 총 {len(analyses_list)}개 국어 지문 분석지 합본 PDF가 생성되었습니다! ({mode_note} · "
-                f"{' · '.join(detail_notes)}){bal_msg}"
+            st.session_state["generated_exam_pdf"] = pre_pdf_bytes
+            st.session_state["generated_exam_pdf_sig"] = items_sig
+            _record_korean_seen_for_user(ctx, assembled)
+            _auto_save_current_exam(
+                ctx,
+                assembled,
+                title=default_title,
+                pdf_bytes=pre_pdf_bytes,
+                sig=_build_exam_sig(assembled),
             )
+        except Exception:
+            pass
 
-    saved_analyses: list[dict[str, Any]] = st.session_state.get("kor_analysis_results") or []
-    saved_analysis_pdf: bytes | None = st.session_state.get("kor_analysis_pdf")
-    if saved_analyses and saved_analysis_pdf:
-        st.markdown("#### 📑 생성된 국어 정밀 지문 분석지 (수능·학원형)")
-        with st.container(border=True):
-            dl_c1, dl_c2 = st.columns([2.2, 1.0])
-            with dl_c1:
-                st.write(f"총 **{len(saved_analyses)}개** 지문 세트 분석 완료 (핵심 주제 · 전개 흐름 · 문단별 요약 · 표지/어휘 · 출제 포인트 포함)")
-            with dl_c2:
-                st.download_button(
-                    "📥 지문 분석지 PDF 다운로드",
-                    data=saved_analysis_pdf,
-                    file_name="국어_정밀_지문_분석지.pdf",
-                    mime="application/pdf",
-                    type="primary",
-                    width="stretch",
-                    key="kor_analysis_pdf_dl_btn",
+    rem_msg = format_credit_balance_inline(
+        ctx.storage,
+        uname_kor,
+        charged=actual_credits,
+    )
+    pool_detail = f"DB 풀 즉시 로드 {cache_hit_cnt}세트 · 신규 AI 생성·DB 저장 {ai_gen_cnt}세트"
+    st.success(
+        f"🎯 총 **{succeeded_sets}개 지문 세트({len(assembled)}문항)**의 수능형 국어 변형 문제 출제가 완료되었습니다! "
+        f"({pool_detail}) 아래 모드 A(시험지 PDF) 또는 모드 B(웹 바로 풀기)에서 확인하세요.{rem_msg}"
+    )
+
+
+def _render_korean_transform_submode(ctx: AppContext) -> None:
+    """국어 서브모드 1: 수능 국어 지문 세트 자유 유형 변형문제 생성 UI."""
+    user_max_jobs = get_max_batch_questions(ctx.current_user)
+    max_limit_badge = (
+        f"1회 최대 **{user_max_jobs}문항**"
+        if user_max_jobs is not None
+        else "1회 문항 수 **제한 없음**"
+    )
+
+    kor_tab_db, kor_tab_direct = st.tabs(
+        [
+            "📂 기출 DB 국어 지문에서 선택 (회차·영역별 검색)",
+            "✍️ 새 국어 지문 직접 붙여넣기",
+        ]
+    )
+
+    with kor_tab_db:
+        has_db_recs, filtered_sets = _filter_korean_db_sets(ctx, key_prefix="tab2_kor_tr")
+        if has_db_recs:
+            if not filtered_sets:
+                st.warning("조건에 맞는 국어 지문 세트가 없습니다. 필터를 조정해 주세요.")
+            else:
+                st.caption(
+                    f"총 **{len(filtered_sets)}개** 국어 지문 세트가 조회되었습니다. "
+                    f"(과금 방지를 위해 기본 미선택 상태이며, 현재 등급은 {max_limit_badge} 생성 가능합니다.)"
                 )
-            for idx_a, an_item in enumerate(saved_analyses, start=1):
-                an = an_item["analysis"]
-                with st.expander(
-                    f"{idx_a}. [{an_item['exam_name']} · {an_item['group_id']}번] {an.title} ({an_item['section_label']})",
-                    expanded=(idx_a == 1),
-                ):
-                    st.info(f"**핵심 주제:** {an.core_theme}")
-                    st.success(f"**전개 흐름:** {an.structure_flow}")
-                    _v_diag = getattr(an, "visual_diagram", None)
-                    if _v_diag is not None and (
-                        getattr(_v_diag, "nodes", None)
-                        or getattr(_v_diag, "graph_spec", None)
-                        or getattr(_v_diag, "emotion_points", None)
-                    ):
-                        try:
-                            from src.diagram_renderer import render_korean_diagram_png
+                with st.form("tab2_kor_db_transform_form", border=True):
+                    cap_txt = f"최대 {user_max_jobs}문항" if user_max_jobs is not None else "문항 수 제한 없음"
+                    force_regen_db = st.checkbox(
+                        "🔄 기존 변형 풀 무시하고 새로 문항 출제",
+                        value=False,
+                        key="tab2_kor_db_force_regen",
+                    )
 
-                            st.image(
-                                render_korean_diagram_png(_v_diag),
-                                caption=f"🖼️ {_v_diag.title}",
-                                width="stretch",
-                            )
-                        except Exception:
-                            pass
-                    if an.paragraph_summaries:
-                        st.markdown("**📌 문단 · 연별 요약**")
-                        for ps in an.paragraph_summaries:
-                            kp = f" *(포인트: {ps.key_point})*" if ps.key_point else ""
-                            st.write(f"- **[{ps.label}]** {ps.summary}{kp}")
-                    if an.marker_and_vocab_notes:
-                        st.markdown("**🔖 지문 핵심 개념 정의**")
-                        for mv in an.marker_and_vocab_notes:
-                            st.write(f"- **`{mv.term}`**: {mv.meaning}")
-                    if an.area_specific_notes:
-                        st.markdown(f"**📖 영역별 핵심 정리 ({an_item['section_label']})**")
-                        for note in an.area_specific_notes:
-                            st.write(f"- {note}")
-                    if an.exam_checkpoints:
-                        st.markdown("**⚠️ 출제 예상 포인트 및 오답 주의사항**")
-                        for cp in an.exam_checkpoints:
-                            st.write(f"- {cp}")
-                    if getattr(an, "poetry_underline_notes", None):
-                        st.markdown("**✍️ 원문 시구 밑줄 해설**")
-                        for idx_p, pn in enumerate(an.poetry_underline_notes, start=1):
-                            st.write(f"- **({idx_p}) <u>{pn.quote}</u>**: {pn.explanation}", unsafe_allow_html=True)
+                    st.markdown("---")
+                    hdr_limit = f"1회 최대 {user_max_jobs}문항" if user_max_jobs is not None else "원하는 만큼 선택 가능"
+                    st.markdown(f"**✅ 변형할 국어 기출 지문 세트 선택 (모두 기본 미선택 · {hdr_limit}):**")
+
+                    checked_sets: list[dict[str, Any]] = []
+                    for s_idx, s_entry in enumerate(filtered_sets):
+                        q_nums = [r.q_num for r in s_entry["records"]]
+                        sec_tag = s_entry["curr_subj"]
+                        topic_tag = (s_entry.get("passage_topic") or "").strip()
+                        p_preview = re.sub(r"\s+", " ", (s_entry.get("passage_text") or "").strip())[:115]
+                        q_pool_key_chk = ctx.storage.build_korean_pool_key(
+                            s_entry["passage_text"],
+                            group_id=s_entry["group_id"],
+                            korean_section=s_entry["kor_sec"],
+                            question_count=len(q_nums),
+                            korean_subgenre=s_entry["kor_sub"],
+                        )
+                        pool_cnt_chk = ctx.storage.get_korean_pool_set_count(q_pool_key_chk)
+                        pool_status_tag = f" · 🎯 변형DB {pool_cnt_chk}세트" if pool_cnt_chk > 0 else ""
+                        row_label = (
+                            f"[{s_entry['exam_name']} {s_entry['group_id']}번] 영역: {sec_tag} · {len(q_nums)}문항{pool_status_tag}"
+                            + (f" · 주제: {topic_tag}" if topic_tag else "")
+                            + f" — \"{p_preview}...\""
+                        )
+                        if st.checkbox(
+                            row_label,
+                            value=False,
+                            key=f"tab2_kor_set_chk_{s_entry['exam_name']}_{s_entry['group_id']}_{s_idx}",
+                        ):
+                            checked_sets.append(s_entry)
+
+                    est_sets = len(checked_sets)
+                    est_qs = sum(len(s["records"]) for s in checked_sets)
+                    if est_sets > 0:
+                        eff_qs = min(est_qs, user_max_jobs) if user_max_jobs is not None else est_qs
+                        st.info(
+                            f"📊 **예상 AI 호출: {est_sets}세트 (총 {eff_qs}문항 · {cap_txt})** · "
+                            f"요청 {est_qs}문항 (세트당 {CREDIT_COST_KOREAN_SET_TRANSFORM}C · 자유 유형 2-Gate 자동 재구성)"
+                        )
+                    else:
+                        st.info(
+                            f"📊 **예상 AI 호출: N세트 ({cap_txt})** · "
+                            "체크한 세트 수만큼 호출됩니다 (세트당 자유 유형 자동 재구성)."
+                        )
+
+                    run_kor_db_btn = st.form_submit_button(
+                        f"🚀 선택한 기출 국어 지문 세트 변형문제 생성 (세트당 {CREDIT_COST_KOREAN_SET_TRANSFORM}C · 캐시 풀 동일)",
+                        type="primary",
+                        width="stretch",
+                    )
+
+                _render_korean_passage_preview_expander(filtered_sets)
+
+                if run_kor_db_btn:
+                    if not checked_sets:
+                        st.error("변형할 국어 지문 세트를 최소 1개 이상 체크해 주세요.")
+                    else:
+                        jobs = [
+                            {
+                                "exam_name": s_entry["exam_name"],
+                                "group_id": s_entry["group_id"],
+                                "records": s_entry["records"],
+                                "passage_text": s_entry["passage_text"],
+                                "passage_topic": s_entry.get("passage_topic", ""),
+                                "curr_subj": s_entry["curr_subj"],
+                                "kor_sec": s_entry["kor_sec"],
+                                "kor_sub": s_entry["kor_sub"],
+                                "is_direct_input": False,
+                            }
+                            for s_entry in checked_sets
+                        ]
+                        used_exams = list(dict.fromkeys(j["exam_name"] for j in jobs if j.get("exam_name")))
+                        summary_lbl = (
+                            f"{used_exams[0]} 외 {len(used_exams) - 1}개 회차 ({len(jobs)}세트)"
+                            if len(used_exams) > 1
+                            else (f"{used_exams[0]} ({len(jobs)}세트)" if used_exams else "국어 기출 지문 세트")
+                        )
+                        _execute_korean_transform_jobs(
+                            ctx,
+                            jobs=jobs,
+                            source_summary_label=summary_lbl,
+                            force_regenerate=force_regen_db,
+                        )
+
+    with kor_tab_direct:
+        with st.form("tab2_kor_direct_transform_form", border=True):
+            st.markdown("**✍️ 변형할 새 국어 지문을 붙여넣고 영역과 세트 문항 수를 선택하세요:**")
+            d_c1, d_c2, d_c3, d_c4 = st.columns([1.3, 0.9, 1.0, 0.8])
+            with d_c1:
+                direct_src_name = st.text_input(
+                    "출처 표기 (시험지·해설 표시용)",
+                    value="직접 입력 국어 지문",
+                    key="tab2_kor_direct_src",
+                )
+            with d_c2:
+                direct_sec = st.selectbox(
+                    "영역 선택",
+                    options=_KOR_SECTIONS,
+                    index=0,
+                    key="tab2_kor_direct_sec",
+                )
+            with d_c3:
+                direct_sub = st.text_input(
+                    "세부 갈래 (선택)",
+                    value="",
+                    placeholder="예: 사회·경제, 현대시, 고전소설...",
+                    key="tab2_kor_direct_subgenre",
+                )
+            with d_c4:
+                direct_q_cnt = int(
+                    st.selectbox(
+                        "세트당 생성 문항 수",
+                        options=[3, 4, 5, 6],
+                        index=1,
+                        format_func=lambda n: f"{n}문항",
+                        key="tab2_kor_direct_q_cnt",
+                    )
+                )
+
+            direct_force_regen = st.checkbox(
+                "🔄 기존 변형 풀 무시하고 새로 문항 출제",
+                value=False,
+                key="tab2_kor_direct_force_regen",
+            )
+            direct_passage_raw = st.text_area(
+                "국어 지문 원문 입력 (여러 개의 지문을 한 번에 넣으려면 지문 사이에 '---' 줄을 넣어 구분하세요)",
+                height=220,
+                placeholder="변형할 국어 지문 원문을 붙여넣으세요...",
+                key="tab2_kor_direct_text",
+            )
+            direct_chunk_cnt = (
+                len([ch for ch in re.split(r"\n\s*-{3,}\s*\n", (direct_passage_raw or "").strip()) if ch.strip()])
+                or 1
+            )
+            raw_direct_qs = direct_chunk_cnt * direct_q_cnt
+            eff_direct_qs = min(raw_direct_qs, user_max_jobs) if user_max_jobs is not None else raw_direct_qs
+            lim_note_d = f"최대 {user_max_jobs}문항" if user_max_jobs is not None else "문항 수 제한 없음"
+            st.info(
+                f"📊 **예상 AI 호출: {direct_chunk_cnt}세트 (총 {eff_direct_qs}문항 · {lim_note_d})** · "
+                f"세트당 {direct_q_cnt}문항 자유 유형 2-Gate 자동 재구성"
+            )
+            run_kor_direct_btn = st.form_submit_button(
+                f"🚀 직접 입력한 국어 지문으로 수능형 변형 문제 생성 (세트당 {CREDIT_COST_KOREAN_SET_TRANSFORM}C · 캐시 풀 동일)",
+                type="primary",
+                width="stretch",
+            )
+
+        if run_kor_direct_btn:
+            raw_chunks = [
+                ch.strip()
+                for ch in re.split(r"\n\s*-{3,}\s*\n", (direct_passage_raw or "").strip())
+                if ch.strip()
+            ]
+            if not raw_chunks:
+                st.error("변형할 국어 지문 텍스트를 입력해 주세요.")
+            else:
+                base_src = (direct_src_name or "직접 입력 국어 지문").strip()
+                clean_sub = (direct_sub or "").strip()
+                curr_subj_lbl = f"{direct_sec}({clean_sub})" if clean_sub else direct_sec
+                now_str = datetime.now().isoformat(timespec="seconds")
+                direct_jobs: list[dict[str, Any]] = []
+                for c_idx, chunk_txt in enumerate(raw_chunks, start=1):
+                    src_title = f"{base_src} #{c_idx}" if len(raw_chunks) > 1 else base_src
+                    chunk_hash = hashlib.md5(chunk_txt.encode("utf-8")).hexdigest()[:8]
+                    gid = f"1~{direct_q_cnt}"
+                    virtual_recs = [
+                        QuestionRecord(
+                            id=f"direct_kor_{chunk_hash}_{c_idx}_{q_i}",
+                            exam_name=src_title,
+                            q_num=q_i,
+                            subject_category="국어",
+                            curriculum_subject=curr_subj_lbl,
+                            unit_name="직접 입력 지문",
+                            min_grade=1,
+                            core_principles=["국어 지문 세트 변형"],
+                            required_terms=[],
+                            is_single_concept=False,
+                            answer="1",
+                            official_explanation="",
+                            question_text=chunk_txt,
+                            passage_group_id=gid,
+                            passage_text=chunk_txt,
+                            created_at=now_str,
+                        )
+                        for q_i in range(1, direct_q_cnt + 1)
+                    ]
+                    direct_jobs.append(
+                        {
+                            "exam_name": src_title,
+                            "group_id": gid,
+                            "records": virtual_recs,
+                            "passage_text": chunk_txt,
+                            "passage_topic": "",
+                            "curr_subj": curr_subj_lbl,
+                            "kor_sec": direct_sec,
+                            "kor_sub": clean_sub,
+                            "is_direct_input": True,
+                        }
+                    )
+                _execute_korean_transform_jobs(
+                    ctx,
+                    jobs=direct_jobs,
+                    source_summary_label=base_src,
+                    force_regenerate=direct_force_regen,
+                )
 
 
+def _render_tab2_korean_transform_section(ctx: AppContext) -> None:
+    """탭 2 국어 과목 전용: [변형문제 생성]과 [국어 지문 분석지 PDF 생성] 작업 모드로 분리해 렌더링한다."""
+    st.subheader("1️⃣ 국어 작업 모드 선택")
+    kor_sub_mode = st.radio(
+        "수행할 국어 작업을 선택하세요",
+        options=[
+            "🚀 국어 지문 세트 변형문제 생성",
+            "📑 국어 지문 정밀 분석지 PDF 생성",
+        ],
+        horizontal=True,
+        key="tab2_kor_sub_mode",
+    )
+    if kor_sub_mode.startswith("📑"):
+        from src.ui.tab2_korean_analysis import _render_korean_analysis_submode
+
+        _render_korean_analysis_submode(ctx)
+    else:
+        _render_korean_transform_submode(ctx)
+
+
+def render_tab2_korean_transform_section(
+    ctx: AppContext | None = None,
+    **_: Any,
+) -> None:
+    """하위 호환 래퍼: AppContext를 받아 국어 작업 모드 섹션을 렌더링한다."""
+    if ctx is not None:
+        _render_tab2_korean_transform_section(ctx)

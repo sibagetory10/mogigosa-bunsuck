@@ -339,6 +339,8 @@ def _format_english_source_text(q: QuestionRecord) -> str:
 
 def _format_korean_source_text(q: QuestionRecord, item: dict[str, Any]) -> str:
     k_meta = item.get("korean_meta") or {}
+    if k_meta.get("is_direct_input") or "직접 입력" in (q.exam_name or ""):
+        return f"출처: {q.exam_name}"
     gid = str(k_meta.get("group_id") or getattr(q, "passage_group_id", "") or q.q_num).strip()
     return f"출처: {q.exam_name} [{gid}번]"
 

@@ -66,7 +66,7 @@
 - **`src/ui/tab1_upload.py`, `tab1_pairing.py`, `tab1_tagging.py`, `tab1_batch_queue.py`, `tab1_db_explorer.py` [탭 1]**: 모의고사 PDF 수집(단일/대기열/EBSi), AI 표지·해설지 매칭, 문항 크롭(`CroppedQuestion`), 2022 원리·용어 분해 태깅, 과목별 기출 DB 탐색/수정/내보내기.
 - **`src/ui/tab2_transform.py` [탭 2 메인]**: 기준 개념서 범위 설정(공용 개념서 DB / 직접 PDF) → 화이트리스트 추출 → 기출 매칭 & 상위 용어 개조, 영어/국어 전용 변형 섹션 지연 분기.
 - **`src/ui/tab2_english.py` & `src/ui/tab2_english_analysis.py` [탭 2 - 영어]**: 11종 수능 독해 유형 변형 배치 실행 및 **영어 정밀 지문 분석지 PDF 생성/미리보기**.
-- **`src/ui/tab2_korean.py` [탭 2 - 국어]**: 독서·문학·화작·언매 지문 세트 선택, 지문 심층 분석, 시각 구조도 생성, 세트 전체 문항 병렬 재구성(2-Gate 검수 + 정답 분산) 및 PDF 생성/병합.
+- **`src/ui/tab2_korean.py` & `src/ui/tab2_korean_analysis.py` [탭 2 - 국어]**: 작업 모드 분리(지문 세트 변형문제 생성 / 정밀 지문 분석지 PDF 생성), 기출 DB 검색 및 새 지문 직접 붙여넣기(`---` 다중 지문), 2-Gate 세트 재구성·시각 구조도·분석지 PDF 생성/병합.
 - **`src/ui/tab2_quiz.py` [탭 2 - 실전 풀이]**: `@st.fragment` 기반 웹 바로 풀기, 국어 공통 지문 박스 표시, 자동 채점 성적표, 과목별(개념서·영어·국어) AI 해설 & 채팅, 문항별 개별 재변환.
 - **`src/ui/tab3_concept.py` [탭 3]**: 공용 개념서·교과서 DB 구축 및 2022 개정 교육과정 공식 기준표(NCIC 고시 PDF / 교육부 원문 동기화) 관리.
 - **`src/ui/tab4_dictionary.py` & `src/ui/tab4_vocab_quiz.py` [탭 4]**: 수능 영단어 사전(`data/csat_vocab_seed.json` + AI 검색 캐시), 기출 핵심 어휘 연동, 나만의 단어장 & PDF, 객관식/플래시카드 퀴즈.

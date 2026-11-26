@@ -202,7 +202,12 @@ def _render_mode_b_solve_fragment(
                 if is_eng_item:
                     st.caption(eng_source_caption)
                 elif is_kor_item:
-                    st.caption(f"출처: {q.exam_name} [{kor_gid}번]")
+                    kor_src_caption = (
+                        f"출처: {q.exam_name}"
+                        if kor_meta.get("is_direct_input") or "직접 입력" in (q.exam_name or "")
+                        else f"출처: {q.exam_name} [{kor_gid}번]"
+                    )
+                    st.caption(kor_src_caption)
                 else:
                     st.caption(
                         f"출처: {q.exam_name} {q.q_num}번 · 본질 원리: {', '.join(q.core_principles)}"
